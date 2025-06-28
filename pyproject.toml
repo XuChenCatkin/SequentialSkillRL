@@ -6,7 +6,7 @@ authors = [
     {name = "Xu Chen",email = "xchen.catkin@gmail.com"}
 ]
 readme = "README.md"
-requires-python = "==3.8"
+requires-python = ">=3.8, <=3.9"
 dependencies = [
     "minihack (>=1.0.2,<2.0.0)",
     "matplotlib (>=3.10.3,<4.0.0)"
