@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.8, <=3.9"
 dependencies = [
     "minihack (>=1.0.2,<2.0.0)",
-    "matplotlib (>=3.5,<3.10)"
+    "matplotlib (==3.5.3)"
 ]
 
 
