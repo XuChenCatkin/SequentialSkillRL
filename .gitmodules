@@ -1,0 +1,3 @@
+[submodule "minihack"]
+	path = minihack
+	url = https://github.com/XuChenCatkin/minihack.git
