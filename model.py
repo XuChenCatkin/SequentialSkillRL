@@ -21,7 +21,7 @@ Outputs
 The model is split into four blocks:
     1. GlyphCNN  -> 64-d feature
     2. StatsMLP  -> 32-d feature
-    3. MsgGRU    -> 128-d feature
+    3. MsgGRU    -> 12-d feature
     4. FusionMLP -> mu, logvar  (dim=LATENT_DIM)
 
 Back-prop uses the standard VAE loss (BCE + KL).
@@ -33,10 +33,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ------------------------- hyper‑params ------------------------------ #
-GLYPH_EMB = 16      # char‑id embedding dim
+CHAR_DIM = 256      # ASCII code space for characters
+CHAR_EMB = 16      # char‑id embedding dim
+COLOR_DIM = 16      # colour id space for colours
 COLOR_EMB = 4       # colour‑id embedding dim
+GLYPH_EMB = CHAR_EMB + COLOR_EMB  # glyph embedding dim
 LATENT_DIM = 64     # z‑dim for VAE
 MSG_VOCAB = 256     # byte‑pair vocabulary size for message tokens
+GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
+PADDING_IDX = GLYPH_DIM  # padding index for glyphs
 
 # ------------------------- 1. Glyph encoder -------------------------- #
 class GlyphCNN(nn.Module):
@@ -44,7 +49,7 @@ class GlyphCNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(GLYPH_EMB+COLOR_EMB, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(GLYPH_EMB, 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
             nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
             nn.AdaptiveAvgPool2d(1)  # -> [B,64,1,1]
@@ -53,6 +58,10 @@ class GlyphCNN(nn.Module):
     def forward(self, glyph_emb: torch.Tensor) -> torch.Tensor:  # [B,C,H,W]
         x = self.net(glyph_emb)
         return x.view(x.size(0), -1)  # [B,64]
+    
+    def get_output_channels(self) -> int:
+        """Returns the number of output channels after self.net."""
+        return 64
 
 # ------------------------- 2. Stats MLP ------------------------------ #
 class StatsMLP(nn.Module):
@@ -64,32 +73,43 @@ class StatsMLP(nn.Module):
         )
     def forward(self, stats: torch.Tensor) -> torch.Tensor:
         return self.net(stats)  # [B,32]
+    
+    def get_output_channels(self) -> int:
+        """Returns the number of output channels after self.net."""
+        return 32
 
 # ------------------------- 3. Message GRU ---------------------------- #
 class MessageGRU(nn.Module):
-    def __init__(self, vocab: int=MSG_VOCAB, emb: int=64, hid: int=128):
+    def __init__(self, vocab: int=MSG_VOCAB, emb: int=8, hid: int=12):
         super().__init__()
         self.emb = nn.Embedding(vocab, emb, padding_idx=0)
         self.gru = nn.GRU(emb, hid, batch_first=True)
     def forward(self, msg_tokens: torch.Tensor) -> torch.Tensor:
         # msg_tokens: [B,T]
         emb = self.emb(msg_tokens)
-        _, h = self.gru(emb)      # h: [1,B,128]
-        return h.squeeze(0)       # [B,128]
+        _, h = self.gru(emb)      # h: [1,B,12]
+        return h.squeeze(0)       # [B,12]
+    def get_output_channels(self) -> int:
+        """Returns the number of output channels after self.gru."""
+        return 12
 
 # ------------------------- 4. Fusion / VAE --------------------------- #
 class MiniHackVAE(nn.Module):
     def __init__(self, stats_dim: int):
         super().__init__()
         # embeddings for glyph char + colour
-        self.char_emb = nn.Embedding(256, GLYPH_EMB)
-        self.col_emb  = nn.Embedding(16,   COLOR_EMB)
+        self.char_emb = nn.Embedding(CHAR_DIM,  CHAR_EMB)
+        self.col_emb  = nn.Embedding(COLOR_DIM, COLOR_EMB)
+        self.glyph_emb = nn.Embedding(GLYPH_DIM + 1, GLYPH_EMB, padding_idx=PADDING_IDX)  # +1 for padding
 
         self.glyph_cnn = GlyphCNN()
         self.stats_mlp = StatsMLP(stats_dim)
         self.msg_gru   = MessageGRU()
 
-        fusion_in = 64 + 32 + 128  # cnn + stats + msg
+        fusion_in = self.glyph_cnn.get_output_channels() + \
+                    self.stats_mlp.get_output_channels() + \
+                    self.msg_gru.get_output_channels() + \
+                    GLYPH_EMB # cnn + stats + msg + bag of glyphs
         self.to_latent = nn.Sequential(
             nn.LayerNorm(fusion_in),
             nn.Linear(fusion_in, 256), nn.ReLU(),
@@ -108,6 +128,15 @@ class MiniHackVAE(nn.Module):
         std = torch.exp(0.5*logvar)
         eps = torch.randn_like(std)
         return mu + std*eps
+    
+    def _encode_glyphs_to_bag(self, glyph_chars, glyph_colors, max_len=64):
+        """Encodes glyphs into a bag-of-glyphs representation."""
+        # Create a bag of glyphs tensor
+        B, H, W = glyph_chars.size()
+        bag = torch.zeros(B, max_len, dtype=torch.long, device=glyph_chars.device)
+        
+        # Encode each glyph as a unique id
+        g_ids = glyph_chars << 4 + glyph_colors
 
     # --------------- forward --------------- #
     def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens):
@@ -117,6 +146,9 @@ class MiniHackVAE(nn.Module):
             self.col_emb(glyph_colors)
         ], dim=1)                # [B, C=20, H, W]
         glyph_feat = self.glyph_cnn(g_emb)
+        
+        g_ids = glyph_chars << 4 + glyph_colors  # [B, H, W]
+        
 
         stats_feat = self.stats_mlp(blstats)
         msg_feat   = self.msg_gru(msg_tokens)
