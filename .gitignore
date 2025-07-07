@@ -199,3 +199,5 @@ nle_data/
 
 # ignore .vscode
 .vscode/
+
+*.whl
