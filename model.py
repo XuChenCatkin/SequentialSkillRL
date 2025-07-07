@@ -1,30 +1,52 @@
-# MiniHack Variational Auto‑Encoder (glyph‐chars + colours + messages)
+# MiniHack Variational Auto‑Encoder (glyph‐chars + colours + messages + blstats + hero info)
 # ---------------------------------------------------------------------
 # Author: Xu Chen
 # Date  : 30/06/2025
 """
-A light-weight VAE for MiniHack observations.
+A comprehensive VAE for MiniHack observations with mixed discrete/continuous modeling.
+
+This VAE handles multiple input modalities and provides both embedding-level and raw-level
+reconstruction for flexible representation learning and generation.
 
 Inputs (per time-step)
 ---------------------
-* glyph_chars : LongTensor[B,H,W]-ASCII code 0-255 per cell
-* glyph_colors: LongTensor[B,H,W]-colour id 0-15  per cell
-* blstats     : FloatTensor[B, N_b]-raw scalar stats (hp, gold, …)
-* message_txt : LongTensor[B,T_msg]-pre-tokenised message line
+* glyph_chars : LongTensor[B,H,W] - ASCII character codes (0-255) per map cell
+* glyph_colors: LongTensor[B,H,W] - color indices (0-15) per map cell  
+* blstats     : FloatTensor[B,27] - game statistics (hp, gold, position, etc.)
+* msg_tokens  : LongTensor[B,256] - tokenized message text (0-255 + SOS/EOS)
+* hero_info   : LongTensor[B,4] - hero attributes [role, race, gender, alignment]
 
-Outputs
+Outputs  
 -------
-* recon_glyph_logits   -  pixel-wise categorical reconstruction
-* recon_msg_logits     -  token-wise categorical reconstruction
-* mu, logvar           -  latent Gaussian params (for KL)
+* Raw Reconstruction Logits (for discrete generation):
+* char_logits, color_logits - pixel-wise categorical distributions
+* stats_continuous - continuous stats on original scale  
+* stats_discrete_logits - hunger/dungeon/level classification logits
+* msg_logits - token-wise categorical distributions
+* hero_logits - hero attribute classification logits
 
-The model is split into four blocks:
-    1. GlyphCNN  -> 64-d feature
-    2. StatsMLP  -> 32-d feature
-    3. MsgGRU    -> 12-d feature
-    4. FusionMLP -> mu, logvar  (dim=LATENT_DIM)
+* Embedding Reconstructions (for continuous generation):
+* glyph_emb_decoded, stats_emb_decoded, msg_emb_decoded - continuous embeddings
+* mu, logvar - latent Gaussian parameters (for KL divergence)
 
-Back-prop uses the standard VAE loss (BCE + KL).
+Architecture
+-----------
+**Encoder**: 5 parallel feature extractors → fusion → latent space (64-dim)
+    1. GlyphCNN: [B,H,W] → [B,64] - spatial glyph features
+    2. GlyphBag: [B,H,W] → [B,32] - permutation-invariant glyph features  
+    3. StatsMLP: [B,27] → [B,16] - preprocessed game statistics
+    4. MessageGRU: [B,256] → [B,12] - bidirectional message encoding
+    5. HeroEmb: [B,4] → [B,16] - hero attribute embeddings
+
+**Decoder**: Shared latent → specialized heads for each modality
+    - Supports both discrete (logits) and continuous (embeddings) reconstruction
+    - Uses mixed loss: MSE for continuous stats, CrossEntropy for discrete components
+
+**Key Features**:
+- Low-rank + diagonal covariance for flexible posterior modeling
+- BlstatsPreprocessor: BatchNorm + embeddings for mixed continuous/discrete stats
+- Teacher forcing for autoregressive message decoding
+- Optional glyph bag and hero info for enhanced representation learning
 """
 
 from __future__ import annotations
@@ -43,7 +65,7 @@ LATENT_DIM = 64     # z‑dim for VAE
 BLSTATS_DIM = 27   # raw scalar stats (hp, gold, …)
 MSG_VOCAB = 256     # Nethack takes 0-255 byte for char of messages
 GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
-PADDING_IDX = GLYPH_DIM  # padding index for glyphs
+PADDING_IDX = [CHAR_DIM, COLOR_DIM]  # padding index for glyphs
 LOW_RANK = 4      # low-rank factorisation rank for covariance
 # NetHack map dimensions (from NetHack source: include/config.h)
 MAP_HEIGHT = 21     # ROWNO - number of rows in the map
@@ -94,8 +116,8 @@ class GlyphCNN(nn.Module):
     """3-layer conv on [B, C= (char_emb+color_emb), H, W]."""
     def __init__(self):
         super().__init__()
-        self.char_emb = nn.Embedding(CHAR_DIM, CHAR_EMB)
-        self.col_emb  = nn.Embedding(COLOR_DIM, COLOR_EMB)
+        self.char_emb = nn.Embedding(CHAR_DIM + 1, CHAR_EMB)
+        self.col_emb  = nn.Embedding(COLOR_DIM + 1, COLOR_EMB)
         self.net = nn.Sequential(
             nn.Conv2d(GLYPH_EMB, 32, 3, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
@@ -117,7 +139,7 @@ class GlyphCNN(nn.Module):
         """Returns the number of output channels after self.net."""
         return 64
     
-class GlyphBag(nn.Module):
+class GlyphBag(GlyphCNN):
     """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
     def __init__(self, max_len=64, logger: logging.Logger=None):
         super().__init__()
@@ -128,7 +150,6 @@ class GlyphBag(nn.Module):
             self.logger.warning(f"max_len ({max_len}) is larger than GLYPH_DIM ({GLYPH_DIM}), truncating to {GLYPH_DIM}.")
             max_len = GLYPH_DIM
         self.max_len = max_len  # max number of unique glyphs in the bag
-        self.emb = nn.Embedding(GLYPH_DIM + 1, GLYPH_EMB, padding_idx=PADDING_IDX)  # +1 for padding
         self.net = nn.RNN(GLYPH_EMB, 32, batch_first=True)  # simple RNN for bag encoding
             
         
@@ -136,14 +157,14 @@ class GlyphBag(nn.Module):
         """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
         # Create a bag of glyphs tensor
         B, H, W = glyph_chars.size()
-        bag = torch.zeros(B, self.max_len, dtype=torch.long, device=glyph_chars.device)
+        bag = torch.zeros(B, self.max_len, 2, dtype=torch.long, device=glyph_chars.device)
         
         # Encode each glyph as a unique id
-        g_ids = (glyph_chars << 4) + glyph_colors
-        g_ids = g_ids.view(B, -1)  # flatten to [B, H*W]
+        g_ids = torch.concat([glyph_chars.unsqueeze(1), glyph_colors.unsqueeze(1)], dim=1)  # [B, 2, H, W]
+        g_ids = g_ids.view(B, 2, -1)  # flatten to [B, 2, H*W]
         # for each batch, create a sorted bag of glyphs
         for b in range(B):
-            unique_glyphs, counts = torch.unique(g_ids[b], return_counts=True)
+            unique_glyphs, counts = torch.unique(g_ids[b], return_counts=True, dim=1)
             sorted_indices = torch.argsort(unique_glyphs)
             sorted_glyphs = unique_glyphs[sorted_indices]
             sorted_counts = counts[sorted_indices]
@@ -155,17 +176,21 @@ class GlyphBag(nn.Module):
             # Fill the bag with glyph ids (up to max_len)
             bag[b, :len(sorted_glyphs)] = sorted_glyphs[:self.max_len]
             bag[b, len(sorted_glyphs):] = PADDING_IDX  # pad the rest
-        return bag  # [B, max_len] of glyph ids
+        return bag  # [B, max_len, 2] of glyph ids
 
     def forward(self, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Encode glyphs to bag
         bag = self.encode_glyphs_to_bag(glyph_chars, glyph_colors)
-        emb = self.emb(bag)  # [B, max_len] -> [B, max_len, GLYPH_EMB]
+        char_bag = bag[:, :, 0]  # [B, max_len] of char ids
+        color_bag = bag[:, :, 1]  # [B, max_len] of color ids
+        char_emb = super().char_emb(char_bag)  # [B, max_len] -> [B, max_len, CHAR_EMB]
+        color_emb = super().col_emb(color_bag)  # [B, max_len] -> [B, max_len, COLOR_EMB]
+        emb = torch.cat([char_emb, color_emb], dim=2)  # [B, max_len, GLYPH_EMB]
         # Use RNN to encode the bag into a fixed-size vector
         packed_emb = nn.utils.rnn.pack_padded_sequence(emb, lengths=(bag != PADDING_IDX).sum(dim=1).cpu(), batch_first=True, enforce_sorted=False)
         _, h = self.net(packed_emb)  # h: [1,B,32]
         features = h.squeeze(0)  # [B,32]
-        return features, emb, bag # [B, max_len, GLYPH_EMB], [B, max_len]
+        return features, emb, bag # [B, max_len, GLYPH_EMB], [B, max_len, 2]
         
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
@@ -382,7 +407,10 @@ class HeroEmbedding(nn.Module):
     
 
 class MiniHackVAE(nn.Module):
-    def __init__(self, bInclude_glyph_bag=True, bInclude_hero=True, logger: logging.Logger=None):
+    def __init__(self, 
+                 bInclude_glyph_bag=True, 
+                 bInclude_hero=True, 
+                 logger: logging.Logger=None):
         super().__init__()
         self.logger = logger or logging.getLogger(__name__)
         self.glyph_cnn = GlyphCNN()
@@ -410,17 +438,17 @@ class MiniHackVAE(nn.Module):
         # We will have 3 categories of decoder heads:
         # 1. For reconstruction of observations:
         #    - glyphs (pixel-wise categorical for both char and color)
-        #    - glyphs_bag (pixel-wise categorical)
+        #    - glyphs_bag (pixel-wise categorical) (optional)
         #    - stats (pixel-wise categorical)
         #    - messages (token-wise categorical)
-        #    - heros (token-wise categorical)
+        #    - heros (token-wise categorical) (optional)
         # 2. For reconstruction of frozen embeddings (optional):
         #    - glyph_char_embeddings (pixel-wise continuous)
         #    - glyph_color_embeddings (pixel-wise continuous)
-        #    - glyph_bag_embeddings (pixel-wise continuous)
+        #    - glyph_bag_embeddings (pixel-wise continuous) (optional)
         #    - stats_embeddings (pixel-wise continuous)
         #    - messages_embeddings (pixel-wise continuous)
-        #    - heros_embeddings (pixel-wise continuous)
+        #    - heros_embeddings (pixel-wise continuous) (optional)
         # 3. For dynamic predictions p(x_{t+1} | z_t, a_t, h_t, c)
         
         # This will be shared across all decoders
@@ -447,7 +475,7 @@ class MiniHackVAE(nn.Module):
         )
         
         # glyph bag embeddings
-        # Note: glyph bag reconstruction is derived from char/color logits
+        # Note: glyph bag reconstruction (if required) is derived from char/color logits
         # No separate head needed since glyph bag is just unique combinations of char+color
         
         # stats embeddings
@@ -460,27 +488,6 @@ class MiniHackVAE(nn.Module):
         self.decode_msg_latent2hidden = nn.Linear(256, self.msg_gru.hid_dim)  # [B, 256] -> [B, hid_dim]
         self.decode_msg_gru = nn.GRU(self.msg_gru.emb_dim, self.msg_gru.hid_dim, batch_first=True)  # [B, T, emb_dim] -> [B, T, hid_dim]
         self.decode_msg_hidden2emb = nn.Linear(self.msg_gru.hid_dim, self.msg_gru.emb_dim)  # [B, T, hid_dim] -> [B, T, emb_dim]
-        
-        # hero embeddings
-        self.decode_role_emb = nn.Sequential(
-            nn.Linear(256, 32), nn.ReLU(),
-            nn.Linear(32, ROLE_EMB)  # [B, emb_dim]
-        )
-        
-        self.decode_race_emb = nn.Sequential(
-            nn.Linear(256, 16), nn.ReLU(),
-            nn.Linear(16, RACE_EMB)  # [B, emb_dim]
-        )
-        
-        self.decode_gend_emb = nn.Sequential(
-            nn.Linear(256, 8), nn.ReLU(),
-            nn.Linear(8, GEND_EMB)  # [B, emb_dim]
-        )
-        
-        self.decode_align_emb = nn.Sequential(
-            nn.Linear(256, 8), nn.ReLU(),
-            nn.Linear(8, ALIGN_EMB)  # [B, emb_dim]
-        )
         
         # ------------- Decode logits ----------------
         # These will take the embedding as starting point
@@ -523,27 +530,6 @@ class MiniHackVAE(nn.Module):
         # messages - use extended vocabulary to include SOS/EOS tokens
         self.decode_msg = nn.Linear(self.msg_gru.emb_dim, self.msg_gru.vocab)  # [B, T, emb_dim] -> [B, T, vocab_size]
         
-        # hero
-        self.decode_role = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(ROLE_EMB, ROLE_CAD),  # [B, ROLE_EMB] -> [B, ROLE_CAD]
-        )
-        
-        self.decode_race = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(RACE_EMB, RACE_CAD), # [B. RACE_EMB] -> [B, RACE_CAD]
-        )
-        
-        self.decode_gend = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(GEND_EMB, GEND_CAD),  # [B, GEND_EMB] -> [B, GEND_CAD]
-        )
-        
-        self.decode_align = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(ALIGN_EMB, ALIGN_CAD),  # [B, ALIGN_EMB] -> [B, ALIGN_CAD]
-        )
-        
         # Dynamic prediction heads
         # It takes latent z, action a, HDP HMM state h and hero info c
         # TODO: Implement dynamic prediction heads
@@ -582,7 +568,7 @@ class MiniHackVAE(nn.Module):
         features = [glyph_feat, stats_feat, msg_feat]
         
         if self.include_glyph_bag:
-            glyph_bag_feat, glyph_bag_emb, glyph_bag = self.glyph_bag(glyph_chars, glyph_colors) # [B,32], [B,max_len,20], [B,max_len]
+            glyph_bag_feat, glyph_bag_emb, glyph_bag = self.glyph_bag(glyph_chars, glyph_colors) # [B,32], [B,max_len,20], [B,max_len, 2]
             features.append(glyph_bag_feat)
         else:
             glyph_bag_emb = None
@@ -635,17 +621,6 @@ class MiniHackVAE(nn.Module):
         # Convert hidden states back to embeddings
         msg_emb_decoded = self.decode_msg_hidden2emb(msg_hidden_decoded)  # [B, 256, hid_dim] -> [B, 256, emb_dim]
         
-        if self.include_hero:
-            role_emb_decoded = self.decode_role_emb(shared_features) # [B, ROLE_EMB]
-            race_emb_decoded = self.decode_race_emb(shared_features) # [B, RACE_EMB]
-            gend_emb_decoded = self.decode_gend_emb(shared_features) # [B, GEND_EMB]
-            align_emb_decoded = self.decode_align_emb(shared_features) # [B, ALIGN_EMB]
-        else:
-            role_emb_decoded = None
-            race_emb_decoded = None
-            gend_emb_decoded = None
-            align_emb_decoded = None
-        
         # logits
         # char logits takes first 16 channels of glyph_emb_decoded
         # color logits takes last 4 channels of glyph_emb_decoded
@@ -667,109 +642,29 @@ class MiniHackVAE(nn.Module):
         
         # Message decoding - GRU approach with proper teacher forcing
         msg_logits = self.decode_msg(msg_emb_decoded)  # [B, 256, emb_dim] -> [B, 256, MSG_VOCAB]
-        
-        # Derive glyph bag logits from char and color logits (no separate head needed)
-        if self.include_glyph_bag:
-            # We need the target glyph bag to compute logits - extract it from input
-            glyph_bag_logits = self._derive_glyph_bag_logits(char_logits, color_logits, glyph_bag)
-        else:
-            glyph_bag_logits = None
-            
-        if self.include_hero:
-            role_logits = self.decode_role(role_emb_decoded)  # [B, ROLE_EMB] -> [B, ROLE_CAD]
-            race_logits = self.decode_race(race_emb_decoded)  # [B, RACE_EMB] -> [B, RACE_CAD]
-            gend_logits = self.decode_gend(gend_emb_decoded)  # [B, GEND_EMB] -> [B, GEND_CAD]
-            align_logits = self.decode_align(align_emb_decoded)  # [B, ALIGN_EMB] -> [B, ALIGN_CAD]
-        else:
-            role_logits = None
-            race_logits = None
-            gend_logits = None
-            align_logits = None
 
         return {
             'glyph_emb_decoded': glyph_emb_decoded,  # [B, 20, 21, 79]
             'stats_emb_decoded': stats_emb_decoded,  # [B, 30]
             'msg_emb_decoded': msg_emb_decoded,  # [B, 256, emb_dim]
-            'role_emb_decoded': role_emb_decoded,  # [B, ROLE_EMB]
-            'race_emb_decoded': race_emb_decoded,  # [B, RACE_EMB]
-            'gend_emb_decoded': gend_emb_decoded,  # [B, GEND_EMB]
-            'align_emb_decoded': align_emb_decoded,  # [B, ALIGN_EMB]
             'char_logits': char_logits, # [B, 256, 21, 79]
             'color_logits': color_logits,  # [B, 16, 21, 79]
-            'glyph_bag_logits': glyph_bag_logits,  # [B, GLYPH_DIM + 1]
             'stats_continuous': stats_continuous,  # [B, 19]
             'hunger_state_logits': hunger_state_logits,  # [B, 6]
             'dungeon_number_logits': dungeon_number_logits,  # [B, 11]
             'level_number_logits': level_number_logits,  # [B, 51]
             'msg_logits': msg_logits, # [B, 256, MSG_VOCAB]
-            'role_logits': role_logits,  # [B, ROLE_CAD]
-            'race_logits': race_logits,  # [B, RACE_CAD]
-            'gend_logits': gend_logits,  # [B, GEND_CAD]
-            'align_logits': align_logits,  # [B, ALIGN_CAD]
             'target_char_emb': char_emb,  # [B, 16, H, W]
             'target_color_emb': color_emb,  # [B, 4, H, W]  
             'target_stats_emb': stats_emb,  # [B, emb_dim]
             'target_msg_emb': msg_emb_no_shift,  # [B, T, emb_dim]
-            'target_glyph_bag_emb': glyph_bag_emb if glyph_bag_emb is not None else None,  # [B, max_len, 20]
-            'target_glyph_bag': glyph_bag,  # [B, max_len] - for glyph bag reconstruction loss
+            'target_glyph_bag_emb': glyph_bag_emb,  # [B, max_len, 20]
+            'target_glyph_bag': glyph_bag,  # [B, max_len, 2] - for glyph bag reconstruction loss
             'target_hero_emb': hero_emb_dict,  # dict of embeddings
             'mu': mu, # [B, LATENT_DIM]
             'logvar': logvar_diag, # [B, LATENT_DIM]
             'lowrank_factors': lowrank_factors # [B, LATENT_DIM, LOW_RANK]
         }
-
-    def _derive_glyph_bag_logits(self, char_logits, color_logits, target_glyph_bag=None):
-        """
-        Derive glyph bag logits from char and color logits.
-        
-        Args:
-            char_logits: [B, 256, H, W] - character logits
-            color_logits: [B, 16, H, W] - color logits  
-            target_glyph_bag: [B, max_len] - target glyph bag for computing unique combinations
-            
-        Returns:
-            glyph_bag_logits: [B, max_len, GLYPH_DIM + 1] - logits for glyph bag reconstruction
-        """
-        B, _, H, W = char_logits.shape
-        
-        if target_glyph_bag is None:
-            # If no target provided, we can't compute bag logits
-            return None
-            
-        max_len = target_glyph_bag.size(1)
-        
-        # Get probabilities from logits
-        char_probs = F.softmax(char_logits, dim=1)  # [B, 256, H, W]
-        color_probs = F.softmax(color_logits, dim=1)  # [B, 16, H, W]
-        
-        # Compute glyph probabilities: P(glyph_id) = P(char) * P(color)
-        # First, reshape to [B, 256, 16, H, W] for outer product
-        char_expanded = char_probs.unsqueeze(2)  # [B, 256, 1, H, W]
-        color_expanded = color_probs.unsqueeze(1)  # [B, 1, 16, H, W]
-        
-        # Outer product to get joint probabilities
-        glyph_probs = char_expanded * color_expanded  # [B, 256, 16, H, W]
-        
-        # Reshape to [B, GLYPH_DIM, H, W] where GLYPH_DIM = 256 * 16
-        glyph_probs = glyph_probs.view(B, GLYPH_DIM, H, W)
-        
-        # For each position in the glyph bag, extract the probability of that glyph
-        glyph_bag_probs = torch.zeros(B, max_len, GLYPH_DIM + 1, device=char_logits.device)
-        
-        for b in range(B):
-            for pos in range(max_len):
-                glyph_id = target_glyph_bag[b, pos].item()
-                if glyph_id == PADDING_IDX:
-                    # Padding token
-                    glyph_bag_probs[b, pos, -1] = 1.0
-                else:
-                    # Sum probabilities across all spatial locations for this glyph
-                    glyph_bag_probs[b, pos, glyph_id] = glyph_probs[b, glyph_id].sum()
-        
-        # Convert back to logits (add small epsilon to avoid log(0))
-        glyph_bag_logits = torch.log(glyph_bag_probs + 1e-8)
-        
-        return glyph_bag_logits
 
 # ------------------------- loss helpers ------------------------------ #
 
@@ -780,25 +675,17 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens, hero_
     # Extract outputs from model
     mu = model_output['mu']
     logvar = model_output['logvar']
+    lowrank_factors = model_output['lowrank_factors']
     
     # Raw reconstruction logits
     char_logits = model_output['char_logits']  # [B, 256, 21, 79]
     color_logits = model_output['color_logits']  # [B, 16, 21, 79]
-    stats_logits = model_output['stats_logits']  # [B, BLSTATS_DIM]
     msg_logits = model_output['msg_logits']  # [B, 256, MSG_VOCAB+2]
     
     # Embedding reconstructions (continuous targets)
     glyph_emb_decoded = model_output['glyph_emb_decoded']  # [B, 20, 21, 79]
     stats_emb_decoded = model_output['stats_emb_decoded']  # [B, 30]
     msg_emb_decoded = model_output['msg_emb_decoded']  # [B, 256, emb_dim]
-    
-    # Optional outputs (may be None)
-    glyph_bag_logits = model_output['glyph_bag_logits']
-    target_glyph_bag = model_output.get('target_glyph_bag', None)
-    role_logits = model_output['role_logits']
-    race_logits = model_output['race_logits'] 
-    gend_logits = model_output['gend_logits']
-    align_logits = model_output['align_logits']
     
     # ============= Raw Reconstruction Losses =============
     raw_losses = {}
@@ -874,20 +761,6 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens, hero_
     msg_tokens_with_eos[mask, msg_lengths[mask]] = MSG_VOCAB + 1  # EOS token
     raw_losses['msg'] = F.cross_entropy(msg_logits.view(-1, msg_logits.size(-1)), msg_tokens_with_eos.view(-1), reduction='mean', ignore_index=0)
     
-    # Optional reconstructions
-    if glyph_bag_logits is not None and target_glyph_bag is not None:
-        # Reshape logits for cross entropy: [B, max_len, GLYPH_DIM + 1] -> [B * max_len, GLYPH_DIM + 1]
-        glyph_bag_logits_flat = glyph_bag_logits.view(-1, glyph_bag_logits.size(-1))
-        target_glyph_bag_flat = target_glyph_bag.view(-1)
-        raw_losses['glyph_bag'] = F.cross_entropy(glyph_bag_logits_flat, target_glyph_bag_flat, reduction='mean')
-        
-    if hero_info is not None and role_logits is not None:
-        role, race, gend, align = hero_info[:, 0], hero_info[:, 1], hero_info[:, 2], hero_info[:, 3]
-        raw_losses['role'] = F.cross_entropy(role_logits, role, reduction='mean')
-        raw_losses['race'] = F.cross_entropy(race_logits, race, reduction='mean') 
-        raw_losses['gend'] = F.cross_entropy(gend_logits, gend, reduction='mean')
-        raw_losses['align'] = F.cross_entropy(align_logits, align, reduction='mean')
-    
     # ============= Embedding Reconstruction Losses =============
     emb_losses = {}
     
@@ -899,35 +772,17 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens, hero_
     
     # Embedding reconstruction losses
     # Split glyph embeddings back to char/color
-    char_emb_recon = glyph_emb_decoded[:, :16, :, :]  # First 16 channels [B, 16, H, W]
-    color_emb_recon = glyph_emb_decoded[:, 16:, :, :]  # Last 4 channels [B, 4, H, W]
+    char_emb_recon, color_emb_recon = torch.split(glyph_emb_decoded, [CHAR_EMB, COLOR_EMB], dim=1)  # Split into char and color embeddings
     
-    emb_losses['char_emb'] = F.mse_loss(char_emb_recon, target_char_emb, reduction='mean')
-    emb_losses['color_emb'] = F.mse_loss(color_emb_recon, target_color_emb, reduction='mean')
+    emb_losses['char_emb'] = F.mse_loss(char_emb_recon, target_char_emb.detach(), reduction='mean')
+    emb_losses['color_emb'] = F.mse_loss(color_emb_recon, target_color_emb.detach(), reduction='mean')
     
     # Stats embedding loss
     # stats_emb_decoded is [B, 30], target_stats_emb is [B, 30]
-    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded, target_stats_emb, reduction='mean')
+    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded, target_stats_emb.detach(), reduction='mean')
     
     # Message embedding loss
-    emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded, target_msg_emb, reduction='mean')
-    
-    # Hero embedding losses
-    target_hero_emb = model_output.get('target_hero_emb', None)
-    if target_hero_emb is not None:
-        role_emb_decoded = model_output.get('role_emb_decoded', None)
-        race_emb_decoded = model_output.get('race_emb_decoded', None)
-        gend_emb_decoded = model_output.get('gend_emb_decoded', None)
-        align_emb_decoded = model_output.get('align_emb_decoded', None)
-        
-        if role_emb_decoded is not None:
-            emb_losses['role_emb'] = F.mse_loss(role_emb_decoded, target_hero_emb['role'], reduction='mean')
-        if race_emb_decoded is not None:
-            emb_losses['race_emb'] = F.mse_loss(race_emb_decoded, target_hero_emb['race'], reduction='mean')
-        if gend_emb_decoded is not None:
-            emb_losses['gend_emb'] = F.mse_loss(gend_emb_decoded, target_hero_emb['gend'], reduction='mean')
-        if align_emb_decoded is not None:
-            emb_losses['align_emb'] = F.mse_loss(align_emb_decoded, target_hero_emb['align'], reduction='mean')
+    emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded, target_msg_emb.detach(), reduction='mean')
     
     # ============= Combine Losses =============
     
@@ -938,8 +793,22 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens, hero_
     total_emb_loss = sum(emb_losses.values())
     
     # KL divergence
-    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    
+    # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
+    # KL divergence for low-rank approximation
+    if lowrank_factors is not None:
+        Sigma_q = torch.bmm(lowrank_factors, lowrank_factors.transpose(1, 2)) + torch.diag_embed(torch.exp(logvar))
+    else:
+        # If no low-rank factors, just use diagonal covariance
+        Sigma_q = torch.diag_embed(torch.exp(logvar))
+    # KL divergence: D_KL(q(z|x) || p(z)) =
+    # 0.5 * (tr(Sigma_q) + mu^T * mu - d - log(det(Sigma_q)))
+    # where d is the dimensionality of the latent space (LATENT_DIM)
+    d = mu.size(1)
+    tr_Sigma_q = torch.trace(Sigma_q)  # Trace of Sigma_q
+    mu2 = (mu.T @ mu).view(-1) # mu^T * mu. [B,]
+    log_det_Sigma_q = torch.logdet(Sigma_q)  # log(det(Sigma_q))
+    kl_loss = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
+    kl_loss = kl_loss.mean()  # Average over batch
     # Total weighted loss
     total_loss = (weight_raw * total_raw_loss + 
                   weight_emb * total_emb_loss + 
@@ -947,8 +816,8 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens, hero_
     
     return {
         'total_loss': total_loss,
-        'raw_loss': total_raw_loss,
-        'emb_loss': total_emb_loss,
+        'total_raw_loss': total_raw_loss,
+        'total_emb_loss': total_emb_loss,
         'kl_loss': kl_loss,
         'raw_losses': raw_losses,
         'emb_losses': emb_losses
