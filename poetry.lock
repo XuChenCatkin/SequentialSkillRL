@@ -1233,7 +1233,7 @@ test = ["pytest (>=7.2)", "pytest-cov (>=4.0)"]
 
 [[package]]
 name = "nle"
-version = "1.2.0+6465c47"
+version = "1.2.0+785dcd1"
 description = "The NetHack Learning Environment (NLE): a reinforcement learning environment based on NetHack"
 optional = false
 python-versions = ">=3.8"
