@@ -655,7 +655,7 @@ class MiniHackVAE(nn.Module):
             nn.Linear(128, self.inv_encoder.hid_dim * 3)  # [B, 256] -> [B, hid_dim * 3] (for oclass + str)
         )
         self.decode_inv_class_rnn_emb = nn.RNN(CHAR_EMB, self.inv_encoder.hid_dim, batch_first=True)  # RNN for object class decoding, [B, 55, CHAR_EMB] -> [B, 55, hid_dim]
-        self.decode_inv_class_hidden2emb = nn.Linear(self.inv_encoder.hid_dim, self.inv_encoder.char_emb.embedding_dim)  # [B, 55, hid_dim] -> [B, 55, CHAR_EMB]
+        self.decode_inv_class_hidden2emb = nn.Linear(self.inv_encoder.hid_dim, self.glyph_cnn.char_emb.embedding_dim)  # [B, 55, hid_dim] -> [B, 55, CHAR_EMB]
         self.decode_inv_str_gru_emb = nn.GRU(self.inv_encoder.str_emb_dim, self.inv_encoder.hid_dim, batch_first=True, bidirectional=True)  # GRU for string decoding, [B*55, 80, emb_dim] -> [B*55, 80, hid_dim * 2]
         self.decode_inv_str_hidden2emb = nn.Linear(self.inv_encoder.hid_dim * 2, self.inv_encoder.str_emb_dim)  # [B*55, 80, hid_dim * 2] -> [B*55, 80, str_emb]
         
