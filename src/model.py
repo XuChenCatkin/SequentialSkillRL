@@ -12,7 +12,7 @@ Inputs (per time-step)
 ---------------------
 * glyph_chars : LongTensor[B,H,W] - ASCII character codes (32-127) per map cell
 * glyph_colors: LongTensor[B,H,W] - color indices (0-15) per map cell  
-* blstats     : FloatTensor[B,27] - game statistics (hp, gold, position, etc.)
+* blstats     : FloatTensor[B,27] - game statistics (hp, gold, position, etc.) - processed to 43 dims
 * msg_tokens  : LongTensor[B,256] - tokenized message text (0-127 + SOS/EOS)
 * hero_info   : LongTensor[B,4] - hero attributes [role, race, gender, alignment]
 * inv_oclasses: LongTensor[B,55] - inventory object classes (0-18)
@@ -39,7 +39,7 @@ Architecture
 **Encoder**: 6 parallel feature extractors → fusion → latent space (64-dim)
     1. GlyphCNN: [B,H,W] → [B,64] - spatial glyph features
     2. GlyphBag: [B,H,W] → [B,32] - permutation-invariant glyph features  
-    3. StatsMLP: [B,27] → [B,16] - preprocessed game statistics
+    3. StatsMLP: [B,27] → [B,16] - preprocessed game statistics (43 processed dims)
     4. MessageGRU: [B,256] → [B,12] - bidirectional message encoding
     5. HeroEmb: [B,4] → [B,16] - hero attribute embeddings
     6. InventoryEncoder: [B,55] & [B,55,80] → [B,24] - inventory features
@@ -92,6 +92,24 @@ INV_MAX_SIZE = 55      # Maximum inventory size in NetHack
 INV_STR_LEN = 80       # Maximum string length for inventory descriptions
 INV_OCLASS_DIM = 19    # Object class cardinality (0-18)
 
+# Condition mask constants (blstats[25] bit field)
+CONDITION_BITS = [
+    0x00000001,  # Stoned
+    0x00000002,  # Slimed  
+    0x00000004,  # Strangled
+    0x00000008,  # Food Poisoning
+    0x00000010,  # Terminal Illness
+    0x00000020,  # Blind
+    0x00000040,  # Deaf
+    0x00000080,  # Stunned
+    0x00000100,  # Confused
+    0x00000200,  # Hallucinating
+    0x00000400,  # Levitating
+    0x00000800,  # Flying
+    0x00001000,  # Riding
+]
+NUM_CONDITIONS = len(CONDITION_BITS)  # 13 condition bits
+
 # blstats meanings
 BLSTATS_CAT = [
     "x_coordinate",      # 0: Current x position (0-78)
@@ -115,12 +133,12 @@ BLSTATS_CAT = [
     "experience_level",  # 18: Experience level (1-30)
     "experience_points", # 19: Experience points (0-999999+)
     "time",              # 20: Game time (0-999999+)
-    "hunger_state",      # 21: Hunger state (0-5)
+    "hunger_state",      # 21: Hunger state (0-6: Satiated, Not Hungry, Hungry, Weak, Fainting, Faint, Starved)
     "carrying_capacity", # 22: How much you can carry (0-999)
     "dungeon_number",    # 23: Which dungeon you're in (0-10)
     "level_number",      # 24: Level within the dungeon (0-50)
-    "unknown_25",        # 25: Unknown field
-    "unknown_26",        # 26: Unknown field (often -1)
+    "condition_mask",    # 25: Condition mask (bitfield)
+    "alignment",         # 26: Alignment (-1 to 1, -1=chaotic, 0=neutral, 1=lawful)
 ]
 
 # Inventory object class mappings
@@ -241,21 +259,27 @@ class BlstatsPreprocessor(nn.Module):
     - blstats[2-8]: attributes (strength, dex, con, int, wis, cha)
     - blstats[9]: score, blstats[13]: gold, blstats[19]: exp_points, blstats[20]: time
     - blstats[10-11]: hp/max_hp, blstats[14-15]: energy/max_energy
-    - blstats[21]: hunger_state (0-5), blstats[23]: dungeon_num, blstats[24]: level_num
-    - ignore game time and last 2 stats (blstats[25-26])
+    - blstats[21]: hunger_state (0-6), blstats[23]: dungeon_num, blstats[24]: level_num
+    - blstats[25]: condition_mask (bitfield) - special handling for multiple conditions
+    - ignore game time (blstats[20]) and alignment (blstats[26] - already in hero_info)
     """
     def __init__(self, stats_dim=27):
         super().__init__()
         self.stats_dim = stats_dim
-        self.useful_dims = [i for i in range(stats_dim) if i not in [20, 25, 26]]  # Ignore time and last two stats
+        self.useful_dims = [i for i in range(stats_dim) if i not in [20, 26]]  # Ignore time and alignment
         # Define discrete stats that need embeddings
         self.discrete_indices = [21, 23, 24]  # hunger_state, dungeon_number, level_number
-        self.continuous_indices = [i for i in self.useful_dims if i not in self.discrete_indices] # size 21
+        self.condition_index = 25  # Special handling for condition mask
+        self.continuous_indices = [i for i in self.useful_dims if i not in self.discrete_indices + [self.condition_index]]
         
         # Embedding layers for discrete stats
-        self.hunger_emb = nn.Embedding(6, 3)    # Hunger states (0-5)
+        self.hunger_emb = nn.Embedding(7, 3)    # Hunger states (0-6)
         self.dungeon_emb = nn.Embedding(11, 4)  # Dungeon numbers (0-10)
         self.level_emb = nn.Embedding(51, 4)    # Level numbers (0-50)
+        
+        # Condition mask processing - decode each bit as separate binary features
+        self.num_conditions = NUM_CONDITIONS
+        self.condition_bits = CONDITION_BITS
         
         # BatchNorm for continuous stats
         self.batch_norm = nn.BatchNorm1d(len(self.continuous_indices) - 2)  # -2 for removed max_hp/max_energy
@@ -312,7 +336,14 @@ class BlstatsPreprocessor(nn.Module):
         continuous_normalized = self.batch_norm(continuous_processed)  # [B, 19]
         
         # Process discrete stats
-        hunger_state = torch.clamp(blstats[:, 21].long(), 0, 5)
+        # if the stats are out of bounds, log the issue
+        if blstats[:, 21].max() > 6 or blstats[:, 21].min() < 0:
+            logging.warning(f"Hunger state out of bounds: {blstats[:, 21].min()} to {blstats[:, 21].max()}")
+        if blstats[:, 23].max() > 10 or blstats[:, 23].min() < 0:
+            logging.warning(f"Dungeon number out of bounds: {blstats[:, 23].min()} to {blstats[:, 23].max()}")
+        if blstats[:, 24].max() > 50 or blstats[:, 24].min() < 0:
+            logging.warning(f"Level number out of bounds: {blstats[:, 24].min()} to {blstats[:, 24].max()}")
+        hunger_state = torch.clamp(blstats[:, 21].long(), 0, 6)
         dungeon_num = torch.clamp(blstats[:, 23].long(), 0, 10)
         level_num = torch.clamp(blstats[:, 24].long(), 0, 50)
         
@@ -320,27 +351,38 @@ class BlstatsPreprocessor(nn.Module):
         dungeon_emb = self.dungeon_emb(dungeon_num)
         level_emb = self.level_emb(level_num)
         
+        # Process condition mask (bitfield)
+        condition_mask = blstats[:, self.condition_index].long()  # [B]
+        condition_features = []
+        for bit_value in self.condition_bits:
+            # Extract each bit as a binary feature
+            is_condition_active = ((condition_mask & bit_value) > 0).float()  # [B]
+            condition_features.append(is_condition_active.unsqueeze(-1))  # [B, 1]
+        condition_vector = torch.cat(condition_features, dim=-1)  # [B, 13]
+        
         # Combine all features
         processed_stats = torch.cat([
             continuous_normalized,  # [B, 19]
             hunger_emb,            # [B, 3]
             dungeon_emb,           # [B, 4]
-            level_emb              # [B, 4]
-        ], dim=1) # [B, 19 + 3 + 4 + 4] = [B, 30]
+            level_emb,             # [B, 4]
+            condition_vector       # [B, 13]
+        ], dim=1) # [B, 19 + 3 + 4 + 4 + 13] = [B, 43]
         
         return processed_stats
     
     def get_output_dim(self):
         """Returns the output dimension of processed stats"""
         continuous_dim = len(self.continuous_indices) - 2  # -2 for removed max_hp/max_energy
-        discrete_dim = 3 + 4 + 4  # hunger + dungeon + level embeddings
-        return continuous_dim + discrete_dim  # 19 + 11 = 30
+        discrete_dim = 3 + 4 + 4  # hunger + dungeon + level embeddings (no alignment)
+        condition_dim = self.num_conditions  # Binary features for each condition bit
+        return continuous_dim + discrete_dim + condition_dim  # 19 + 11 + 13 = 43
 
 class StatsMLP(nn.Module):
     def __init__(self, stats: int=BLSTATS_DIM, emb_dim: int=64):
         super().__init__()
         self.preprocessor = BlstatsPreprocessor(stats_dim=stats)
-        input_dim = self.preprocessor.get_output_dim()  # 30 dimensions after preprocessing
+        input_dim = self.preprocessor.get_output_dim()  # 43 dimensions after preprocessing
         
         self.net = nn.Sequential(
             nn.Linear(input_dim, 32), nn.ReLU(),
@@ -348,8 +390,8 @@ class StatsMLP(nn.Module):
         )
         
     def forward(self, stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        processed = self.preprocessor(stats)  # [B, 27] -> [B, 30]
-        features = self.net(processed)  # [B, 30] -> [B, 16]
+        processed = self.preprocessor(stats)  # [B, 27] -> [B, 43]
+        features = self.net(processed)  # [B, 43] -> [B, 16]
         return features, processed
     
     def get_output_channels(self) -> int:
@@ -641,7 +683,7 @@ class MiniHackVAE(nn.Module):
         # stats embeddings
         self.decode_stats_emb = nn.Sequential(
             nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, self.stats_mlp.preprocessor.get_output_dim())  # [B, 256] -> [B, 30]
+            nn.Linear(128, self.stats_mlp.preprocessor.get_output_dim())  # [B, 256] -> [B, 43]
         )
         
         # Message decoder - use unidirectional GRU with proper hidden state size
@@ -674,15 +716,15 @@ class MiniHackVAE(nn.Module):
         # Split into discrete and continuous components
         self.decode_stats_continuous = nn.Sequential(
             nn.ReLU(), 
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 64), nn.ReLU(),  # [B, 30] -> [B, 64]
+            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 64), nn.ReLU(),  # [B, 43] -> [B, 64]
             nn.Linear(64, 19),  # [B, 64] -> [B, 19] for normalized continuous stats (matches BatchNorm input)
         )
         
-        # Discrete stats: hunger_state (0-5), dungeon_number (0-10), level_number (0-50)
+        # Discrete stats: hunger_state (0-6), dungeon_number (0-10), level_number (0-50)
         self.decode_hunger_state = nn.Sequential(
             nn.ReLU(),
             nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 6),  # [B, 32] -> [B, 6] for hunger states
+            nn.Linear(32, 7),  # [B, 32] -> [B, 7] for hunger states
         )
         
         self.decode_dungeon_number = nn.Sequential(
@@ -789,7 +831,7 @@ class MiniHackVAE(nn.Module):
         
         # Decode embeddings
         glyph_emb_decoded = self.decode_glyph_emb(shared_features)  # [B, 20, 21, 79]
-        stats_emb_decoded = self.decode_stats_emb(shared_features)  # [B, 30]
+        stats_emb_decoded = self.decode_stats_emb(shared_features)  # [B, 43]
         
         # Message decoding - autoregressive GRU decoding with proper hidden state
         msg_hidden_init = self.decode_msg_latent2hidden(shared_features)  # [B, 256] -> [B, hid_dim]
@@ -849,7 +891,7 @@ class MiniHackVAE(nn.Module):
         running_mean = self.stats_mlp.preprocessor.batch_norm.running_mean
         stats_continuous = stats_continuous_normalized * running_var.sqrt() + running_mean
         
-        hunger_state_logits = self.decode_hunger_state(stats_emb_decoded)      # [B, 6]
+        hunger_state_logits = self.decode_hunger_state(stats_emb_decoded)      # [B, 7]
         dungeon_number_logits = self.decode_dungeon_number(stats_emb_decoded)  # [B, 11]
         level_number_logits = self.decode_level_number(stats_emb_decoded)      # [B, 51]
         
@@ -866,14 +908,14 @@ class MiniHackVAE(nn.Module):
 
         return {
             'glyph_emb_decoded': glyph_emb_decoded,  # [B, 20, 21, 79]
-            'stats_emb_decoded': stats_emb_decoded,  # [B, 30]
+            'stats_emb_decoded': stats_emb_decoded,  # [B, 43]
             'msg_emb_decoded': msg_emb_decoded,  # [B, 256, emb_dim]
             'inv_oclasses_emb_decoded': inv_oclasses_emb_decoded,  # [B, 55, CHAR_EMB]
             'inv_str_emb_decoded': inv_str_emb_decoded,  # [B, 55, 80, str_emb]
             'char_logits': char_logits, # [B, 256, 21, 79]
             'color_logits': color_logits,  # [B, 16, 21, 79]
             'stats_continuous': stats_continuous,  # [B, 19]
-            'hunger_state_logits': hunger_state_logits,  # [B, 6]
+            'hunger_state_logits': hunger_state_logits,  # [B, 7]
             'dungeon_number_logits': dungeon_number_logits,  # [B, 11]
             'level_number_logits': level_number_logits,  # [B, 51]
             'msg_logits': msg_logits, # [B, 256, MSG_VOCAB]
@@ -911,7 +953,7 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens, hero_
     
     # Embedding reconstructions (continuous targets)
     glyph_emb_decoded = model_output['glyph_emb_decoded']  # [B, 20, 21, 79]
-    stats_emb_decoded = model_output['stats_emb_decoded']  # [B, 30]
+    stats_emb_decoded = model_output['stats_emb_decoded']  # [B, 43]
     msg_emb_decoded = model_output['msg_emb_decoded']  # [B, 256, emb_dim]
     
     # ============= Raw Reconstruction Losses =============
@@ -1025,7 +1067,7 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens, hero_
     emb_losses['color_emb'] = F.mse_loss(color_emb_recon, target_color_emb.detach(), reduction='mean')
     
     # Stats embedding loss
-    # stats_emb_decoded is [B, 30], target_stats_emb is [B, 30]
+    # stats_emb_decoded is [B, 45], target_stats_emb is [B, 45]
     emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded, target_stats_emb.detach(), reduction='mean')
     
     # Message embedding loss
