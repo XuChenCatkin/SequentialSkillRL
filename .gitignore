@@ -201,3 +201,5 @@ nle_data/
 .vscode/
 
 *.whl
+
+data/
