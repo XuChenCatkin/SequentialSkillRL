@@ -633,6 +633,7 @@ class MultiModalHackVAE(nn.Module):
             nn.LayerNorm(fusion_in),
             nn.Linear(fusion_in, 256), nn.ReLU(),
         )
+        self.latent_dim = LATENT_DIM
         self.mu_head     = nn.Linear(256, LATENT_DIM)
         self.logvar_diag_head = nn.Linear(256, LATENT_DIM)  # diagonal part
         self.lowrank_factor_head = nn.Linear(256, LATENT_DIM * LOW_RANK)  # low-rank factors
@@ -937,7 +938,7 @@ class MultiModalHackVAE(nn.Module):
 
 # ------------------------- loss helpers ------------------------------ #
 
-def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None,
+def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens,
              inv_oclasses=None, inv_strs=None, weight_emb=1.0, weight_raw=0.1, kl_beta=1.0):
     """VAE loss with separate embedding and raw reconstruction losses."""
     

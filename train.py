@@ -36,6 +36,7 @@ import nle.dataset as nld
 from nle.nethack import tty_render
 import matplotlib.pyplot as plt
 import time
+import logging
 
 # Import our utility functions
 import sys
@@ -213,9 +214,11 @@ class NetHackDataCollector:
                 for time_idx in range(minibatch['tty_chars'].shape[1]):
                     
                     game_id = int(minibatch['gameids'][game_idx, time_idx])
-                    timestamp = float(minibatch['timestamps'][game_idx, time_idx])
-                    score = float(minibatch['scores'][game_idx, time_idx])
-                    
+                    if 'scores' in minibatch:
+                        score = float(minibatch['scores'][game_idx, time_idx])
+                    else:
+                        score = 0.0
+
                     # Get TTY data
                     tty_chars = minibatch['tty_chars'][game_idx, time_idx]
                     tty_colors = minibatch['tty_colors'][game_idx, time_idx]
@@ -237,7 +240,7 @@ class NetHackDataCollector:
                     game_colors_minibatch[game_idx, time_idx] = tty_components['game_colors']
                     status_chars_minibatch[game_idx, time_idx] = tty_components['status_chars']
                     hero_info_minibatch[game_idx, time_idx] = hero_info
-                    blstats_minibatch[game_idx, time_idx] = adapter(tty_components['game_chars'], status_lines, score, timestamp)
+                    blstats_minibatch[game_idx, time_idx] = adapter(tty_components['game_chars'], status_lines, score)
 
             minibatch['message_chars'] = message_chars_minibatch
             minibatch['game_chars'] = game_chars_minibatch
@@ -246,9 +249,138 @@ class NetHackDataCollector:
             minibatch['hero_info'] = hero_info_minibatch
             minibatch['blstats'] = blstats_minibatch
             collected_batches.append(minibatch)
+            batch_count += 1
 
         print(f"✅ Successfully collected {len(collected_batches)} batches from {batch_count} processed batches")
         return collected_batches
+    
+    def save_collected_data(self, collected_batches: List[Dict], save_path: str) -> None:
+        """
+        Save collected batch data to disk for later reloading.
+        
+        Args:
+            collected_batches: List of processed batch dictionaries from collect_data_batch
+            save_path: Path to save the data (should end with .pkl or .pt)
+        """
+        print(f"💾 Saving {len(collected_batches)} collected batches to {save_path}...")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # Prepare data to save
+        save_data = {
+            'collected_batches': collected_batches,
+            'game_hero_info': self.game_hero_info,  # Save cached hero info
+            'num_batches': len(collected_batches),
+            'save_timestamp': time.time(),
+            'batch_shapes': {
+                'game_chars': collected_batches[0]['game_chars'].shape if collected_batches else None,
+                'game_colors': collected_batches[0]['game_colors'].shape if collected_batches else None,
+                'hero_info': collected_batches[0]['hero_info'].shape if collected_batches else None,
+                'blstats': collected_batches[0]['blstats'].shape if collected_batches else None,
+                'message_chars': collected_batches[0]['message_chars'].shape if collected_batches else None
+            }
+        }
+        
+        # Save using appropriate method based on file extension
+        if save_path.endswith('.pt'):
+            torch.save(save_data, save_path)
+        elif save_path.endswith('.pkl'):
+            with open(save_path, 'wb') as f:
+                pickle.dump(save_data, f)
+        else:
+            # Default to pickle
+            with open(save_path + '.pkl', 'wb') as f:
+                pickle.dump(save_data, f)
+            save_path = save_path + '.pkl'
+        
+        # Calculate file size
+        file_size = os.path.getsize(save_path) / (1024 * 1024)  # MB
+        print(f"✅ Data saved successfully!")
+        print(f"   📁 File: {save_path}")
+        print(f"   📊 Size: {file_size:.1f} MB")
+        print(f"   🎯 Batches: {len(collected_batches)}")
+    
+    def load_collected_data(self, load_path: str) -> List[Dict]:
+        """
+        Load previously saved collected batch data from disk.
+        
+        Args:
+            load_path: Path to the saved data file
+            
+        Returns:
+            List of processed batch dictionaries
+        """
+        print(f"📁 Loading collected batches from {load_path}...")
+        
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"❌ File not found: {load_path}")
+        
+        # Load using appropriate method based on file extension
+        if load_path.endswith('.pt'):
+            save_data = torch.load(load_path, map_location='cpu')
+        elif load_path.endswith('.pkl'):
+            with open(load_path, 'rb') as f:
+                save_data = pickle.load(f)
+        else:
+            # Try both formats
+            try:
+                save_data = torch.load(load_path, map_location='cpu')
+            except:
+                with open(load_path, 'rb') as f:
+                    save_data = pickle.load(f)
+        
+        # Extract data
+        collected_batches = save_data['collected_batches']
+        self.game_hero_info = save_data.get('game_hero_info', {}) | self.game_hero_info  # Restore cached hero info
+        
+        # Calculate file size
+        file_size = os.path.getsize(load_path) / (1024 * 1024)  # MB
+        print(f"✅ Data loaded successfully!")
+        print(f"   📁 File: {load_path}")
+        print(f"   📊 Size: {file_size:.1f} MB")
+        print(f"   🎯 Batches: {len(collected_batches)}")
+        print(f"   🎮 Cached hero info: {len(self.game_hero_info)} games")
+        if collected_batches:
+            print(f"   📐 Batch shape: {collected_batches[0]['tty_chars'].shape}")
+        
+        return collected_batches
+    
+    def collect_or_load_data(self, dataset_name: str, adapter: callable, save_path: str, 
+                           max_batches: int = 1000, batch_size: int = 32, seq_length: int = 32,
+                           force_recollect: bool = False) -> List[Dict]:
+        """
+        Collect data from dataset or load from saved file if it exists.
+        
+        Args:
+            dataset_name: Name of dataset in database
+            adapter: Data adapter for processing
+            save_path: Path to save/load the data
+            max_batches: Maximum number of batches to collect (if collecting)
+            batch_size: Batch size for dataset loader (if collecting)
+            seq_length: Sequence length for dataset loader (if collecting)
+            force_recollect: If True, always collect fresh data even if saved file exists
+            
+        Returns:
+            List of processed data samples
+        """
+        if not force_recollect and os.path.exists(save_path):
+            print(f"🔄 Found existing data file, loading instead of collecting...")
+            return self.load_collected_data(save_path)
+        else:
+            print(f"🆕 Collecting fresh data...")
+            collected_batches = self.collect_data_batch(
+                dataset_name=dataset_name,
+                adapter=adapter,
+                max_batches=max_batches,
+                batch_size=batch_size,
+                seq_length=seq_length
+            )
+            
+            # Save for future use
+            self.save_collected_data(collected_batches, save_path)
+            return collected_batches
+
 class BLStatsAdapter:
     """
     Converts TTY data to MultiModalHackVAE expected format
@@ -489,7 +621,7 @@ class BLStatsAdapter:
         
         return stats
     
-    def __call__(self, game_chars: np.ndarray, status_lines: List[str], score: float = 0.0, timestamp: float = 0.0) -> np.ndarray:
+    def __call__(self, game_chars: np.ndarray, status_lines: List[str], score: float = 0.0) -> np.ndarray:
         """
         Create accurate 27-dimensional blstats from TTY data
         
@@ -553,7 +685,7 @@ class BLStatsAdapter:
         blstats[19] = parsed_stats.get('exp_points', 0)
         
         # Time (20) - NLE_BL_TIME
-        blstats[20] = int(parsed_stats.get('time', timestamp))
+        blstats[20] = int(parsed_stats.get('time', 0))
         
         # Hunger state (21) - NLE_BL_HUNGER
         hunger_state = parsed_stats.get('hunger_state')
@@ -755,143 +887,93 @@ def evaluate_vae(model, test_loader, device, beta=1.0):
             total_kl_loss / num_batches)
 
 
-def train_vae(train_samples, test_samples, 
-              latent_dim=128, 
-              batch_size=32, 
-              num_epochs=50, 
-              learning_rate=1e-3,
-              beta=1.0,
-              save_path="nethack_vae.pth"):
-    """
-    Complete VAE training pipeline
-    
-    Args:
-        train_samples: Training data samples
-        test_samples: Test data samples
-        latent_dim: Dimension of latent space
-        batch_size: Batch size for training
-        num_epochs: Number of training epochs
-        learning_rate: Learning rate for optimizer
-        beta: Weight for KL divergence in loss
-        save_path: Path to save trained model
-    """
-    print("=" * 60)
-    print("TRAINING VAE ON NETHACK DATA")
-    print("=" * 60)
-    
-    # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Create datasets and dataloaders
-    train_dataset = NetHackDataset(train_samples, target_type='reconstruction')
-    test_dataset = NetHackDataset(test_samples, target_type='reconstruction')
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    print(f"📊 Training Setup:")
-    print(f"  - Training samples: {len(train_samples)}")
-    print(f"  - Test samples: {len(test_samples)}")
-    print(f"  - Batch size: {batch_size}")
-    print(f"  - Latent dimension: {latent_dim}")
-    print(f"  - Learning rate: {learning_rate}")
-    print(f"  - Beta (KL weight): {beta}")
-    
-    # Initialize model
-    model = NetHackVAE(latent_dim=latent_dim).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
-    # Training history
-    train_losses = []
-    test_losses = []
-    
-    print(f"\n🚀 Starting training for {num_epochs} epochs...")
-    
-    for epoch in range(num_epochs):
-        start_time = time.time()
-        
-        # Train for one epoch
-        train_loss, train_recon, train_kl = train_vae_epoch(
-            model, train_loader, optimizer, device, beta
-        )
-        
-        # Evaluate on test set
-        test_loss, test_recon, test_kl = evaluate_vae(
-            model, test_loader, device, beta
-        )
-        
-        # Record losses
-        train_losses.append(train_loss)
-        test_losses.append(test_loss)
-        
-        epoch_time = time.time() - start_time
-        
-        # Print progress
-        if epoch % 5 == 0 or epoch == num_epochs - 1:
-            print(f"Epoch {epoch+1:3d}/{num_epochs}: "
-                  f"Train Loss: {train_loss:.2f} (Recon: {train_recon:.2f}, KL: {train_kl:.2f}) | "
-                  f"Test Loss: {test_loss:.2f} (Recon: {test_recon:.2f}, KL: {test_kl:.2f}) | "
-                  f"Time: {epoch_time:.1f}s")
-    
-    # Save trained model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'latent_dim': latent_dim,
-        'train_losses': train_losses,
-        'test_losses': test_losses,
-        'final_train_loss': train_losses[-1],
-        'final_test_loss': test_losses[-1],
-    }, save_path)
-    
-    print(f"\n✅ Training completed!")
-    print(f"  - Final train loss: {train_losses[-1]:.2f}")
-    print(f"  - Final test loss: {test_losses[-1]:.2f}")
-    print(f"  - Model saved to: {save_path}")
-    
-    return model, train_losses, test_losses
-
-
-def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict], 
-                      epochs: int = 10, batch_size: int = 32, learning_rate: float = 1e-3,
-                      latent_dim: int = 64, save_path: str = "models/minihack_vae.pth",
-                      device: str = None, include_inventory: bool = False) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
+def train_multimodalhack_vae(
+    train_file: str, 
+    test_file: str,                     
+    dbfilename: str = 'ttyrecs.db',
+    epochs: int = 10, 
+    batch_size: int = 32, 
+    sequence_size: int = 32, 
+    training_batches: int = 100,
+    testing_batches: int = 20,
+    max_training_batches: int = 1000,
+    max_testing_batches: int = 200,
+    learning_rate: float = 1e-3,
+    save_path: str = "models/multimodal_hack_vae.pth",
+    device: str = None, 
+    include_inventory: bool = False,
+    logging: logging.Logger = None,
+    data_cache_dir: str = "data_cache",
+    force_recollect: bool = False) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
     """
     Train MultiModalHackVAE on NetHack Learning Dataset
 
     Args:
-        train_samples: List of training samples (TTY format)
-        test_samples: List of testing samples (TTY format)
+        train_file: Path to the training samples
+        test_file: Path to the testing samples
+        dbfilename: Path to the NetHack Learning Dataset database file
         epochs: Number of training epochs
         batch_size: Training batch size
         learning_rate: Learning rate for optimizer
-        latent_dim: Latent dimension for VAE
         save_path: Path to save trained model
         device: Device to use ('cuda' or 'cpu')
         include_inventory: Whether to include inventory processing
+        data_cache_dir: Directory to cache processed data
+        force_recollect: Force data recollection even if cache exists
         
     Returns:
         Tuple of (trained_model, train_losses, test_losses)
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    print(f"🔥 Training MiniHackVAE with {len(train_samples)} train samples, {len(test_samples)} test samples")
-    print(f"   Device: {device}")
-    print(f"   Latent dim: {latent_dim}")
-    print(f"   Include inventory: {include_inventory}")
-    
-    # Create adapter and datasets
-    adapter = TTYToMultiModalHackAdapter()
-    train_dataset = NetHackDataset(train_samples, adapter)
-    test_dataset = NetHackDataset(test_samples, adapter)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    print(f"🔥 Training MultiModalHackVAE with {training_batches} train batches, {testing_batches} test batches")
+    print(f"   Epochs: {epochs}")
+    print(f"   Batch size: {batch_size}")
+    print(f"   Sequence size: {sequence_size}")
+    print(f"   Device: {device}")
+    print(f"   Include inventory: {include_inventory}")
+    print(f"   Data cache: {data_cache_dir}")
     
+    # Create adapter and datasets with caching
+    adapter = BLStatsAdapter()
+    collector = NetHackDataCollector(dbfilename)
+    
+    # Create cache directory
+    os.makedirs(data_cache_dir, exist_ok=True)
+    
+    # Cache file names based on dataset parameters
+    train_cache_file = os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}.pt")
+    test_cache_file = os.path.join(data_cache_dir, f"{test_file}_b{batch_size}_s{sequence_size}_m{max_testing_batches}.pt")
+
+    # Collect or load training data
+    print(f"\n📊 Preparing training data...")
+    train_dataset = collector.collect_or_load_data(
+        dataset_name=train_file,
+        adapter=adapter,
+        save_path=train_cache_file,
+        max_batches=max_training_batches,
+        batch_size=batch_size,
+        seq_length=sequence_size,
+        force_recollect=force_recollect
+    )
+    train_dataset = train_dataset[:training_batches] if len(train_dataset) > training_batches else train_dataset
+    
+    # Collect or load testing data
+    print(f"\n📊 Preparing testing data...")
+    test_dataset = collector.collect_or_load_data(
+        dataset_name=test_file,
+        adapter=adapter,
+        save_path=test_cache_file,
+        max_batches=max_testing_batches,
+        batch_size=batch_size,
+        seq_length=sequence_size,
+        force_recollect=force_recollect
+    )
+    test_dataset = test_dataset[:testing_batches] if len(test_dataset) > testing_batches else test_dataset
+
     # Initialize model
-    model = MultiModalHackVAE(latent_dim=latent_dim, include_inventory=include_inventory)
+    model = MultiModalHackVAE(bInclude_inventory=include_inventory, logger=logging)
     model = model.to(device)
     
     # Initialize optimizer
@@ -911,7 +993,7 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
         epoch_train_loss = 0.0
         batch_count = 0
         
-        with tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
+        with tqdm(train_dataset, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
             for batch in pbar:
                 optimizer.zero_grad()
                 
@@ -925,25 +1007,20 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
                 
                 # Forward pass
                 model_output = model(
-                    glyph_chars=batch_device['glyph_chars'],
-                    glyph_colors=batch_device['glyph_colors'], 
+                    glyph_chars=batch_device['game_chars'],
+                    glyph_colors=batch_device['game_colors'], 
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['msg_tokens'],
-                    hero_info=batch_device['hero_info'],
-                    inv_oclasses=batch_device['inv_oclasses'],
-                    inv_strs=batch_device['inv_strs']
+                    hero_info=batch_device['hero_info']
                 )
                 
                 # Calculate loss
                 loss_dict = vae_loss(
                     model_output=model_output,
-                    glyph_chars=batch_device['glyph_chars'],
-                    glyph_colors=batch_device['glyph_colors'],
+                    glyph_chars=batch_device['game_chars'],
+                    glyph_colors=batch_device['game_colors'],
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['msg_tokens'],
-                    hero_info=batch_device['hero_info'],
-                    inv_oclasses=batch_device['inv_oclasses'],
-                    inv_strs=batch_device['inv_strs'],
                     weight_emb=1.0,
                     weight_raw=0.1,
                     kl_beta=1.0
@@ -958,12 +1035,19 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
                 epoch_train_loss += loss.item()
                 batch_count += 1
                 
+                raw_losses = loss_dict['raw_losses']
+                emb_losses = loss_dict['emb_losses']
+                for key, value in raw_losses.items():
+                    pbar.set_postfix({f'{key}': f"{value.item():.2f}"})
+                for key, value in emb_losses.items():
+                    pbar.set_postfix({f'{key}': f"{value.item():.2f}"})
+
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f"{loss.item():.2f}",
-                    'raw': f"{loss_dict['total_raw_loss'].item():.2f}",
-                    'emb': f"{loss_dict['total_emb_loss'].item():.2f}",
-                    'kl': f"{loss_dict['kl_loss'].item():.2f}"
+                    'total_raw': f"{loss_dict['total_raw_loss'].item():.2f}",
+                    'total_emb': f"{loss_dict['total_emb_loss'].item():.2f}",
+                    'kl': f"{loss_dict['kl_loss'].item():.2f}",
                 })
         
         avg_train_loss = epoch_train_loss / batch_count
@@ -975,7 +1059,7 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
         test_batch_count = 0
         
         with torch.no_grad():
-            for batch in test_loader:
+            for batch in test_dataset:
                 # Move batch to device
                 batch_device = {}
                 for key, value in batch.items():
@@ -986,13 +1070,11 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
                 
                 # Forward pass
                 model_output = model(
-                    glyph_chars=batch_device['glyph_chars'],
-                    glyph_colors=batch_device['glyph_colors'], 
+                    glyph_chars=batch_device['game_chars'],
+                    glyph_colors=batch_device['game_colors'], 
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['msg_tokens'],
-                    hero_info=batch_device['hero_info'],
-                    inv_oclasses=batch_device['inv_oclasses'],
-                    inv_strs=batch_device['inv_strs']
+                    hero_info=batch_device['hero_info']
                 )
                 
                 # Calculate loss
@@ -1001,10 +1083,7 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
                     glyph_chars=batch_device['glyph_chars'],
                     glyph_colors=batch_device['glyph_colors'],
                     blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['msg_tokens'],
-                    hero_info=batch_device['hero_info'],
-                    inv_oclasses=batch_device['inv_oclasses'],
-                    inv_strs=batch_device['inv_strs'],
+                    msg_tokens=batch_device['msg_tokens'],                    
                     weight_emb=1.0,
                     weight_raw=0.1,
                     kl_beta=1.0
@@ -1022,7 +1101,7 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'latent_dim': latent_dim,
+        'latent_dim': model.latent_dim,
         'include_inventory': include_inventory,
         'train_losses': train_losses,
         'test_losses': test_losses,
@@ -1030,7 +1109,7 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
         'final_test_loss': test_losses[-1],
     }, save_path)
     
-    print(f"\n✅ MiniHackVAE training completed!")
+    print(f"\n✅ MultiModalVAE training completed!")
     print(f"  - Final train loss: {train_losses[-1]:.2f}")
     print(f"  - Final test loss: {test_losses[-1]:.2f}")
     print(f"  - Model saved to: {save_path}")
@@ -1038,13 +1117,12 @@ def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict]
     return model, train_losses, test_losses
 
 
-def visualize_reconstructions(model, test_samples, device, num_samples=4, save_path="reconstructions.png"):
+def visualize_reconstructions(model, test_dataset, device, num_samples=4, save_path="reconstructions.png"):
     """Visualize VAE reconstructions"""
     model.eval()
     
     # Get a few test samples
-    test_dataset = NetHackDataset(test_samples[:num_samples], target_type='reconstruction')
-    test_loader = DataLoader(test_dataset, batch_size=num_samples, shuffle=False)
+    test_loader = test_dataset[:num_samples]
     
     with torch.no_grad():
         batch = next(iter(test_loader))
@@ -1092,16 +1170,12 @@ def analyze_latent_space(model, samples, device, save_path="latent_analysis.png"
     """Analyze the learned latent space"""
     model.eval()
     
-    # Get latent representations for all samples
-    dataset = NetHackDataset(samples, target_type='reconstruction')
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
-    
     latent_vectors = []
     game_ids = []
     messages = []
     
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in samples:
             data = batch['input'].to(device)
             mu, logvar = model.encode(data)
             
@@ -1134,4 +1208,25 @@ def analyze_latent_space(model, samples, device, save_path="latent_analysis.png"
 
 
 if __name__ == "__main__":
-    pass
+    # Example usage
+    train_file = "nld-nao-training"
+    test_file = "nld-nao-testing"
+
+    # Example 1: Regular training with data caching
+    model, train_losses, test_losses = train_multimodalhack_vae(
+        train_file=train_file,
+        test_file=test_file,
+        epochs=10,
+        batch_size=32,
+        sequence_size=32,
+        learning_rate=1e-3,
+        save_path="models/multimodal_hack_vae.pth",
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        include_inventory=False,
+        data_cache_dir="data_cache",  # Data will be cached here
+        force_recollect=False  # Use cached data if available
+    )
+    
+    # Example visualization (commented out due to missing NetHackDataset)
+    # visualize_reconstructions(model, test_file, device='cuda', num_samples=4)
+    # analyze_latent_space(model, test_file, device='cuda')
