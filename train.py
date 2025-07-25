@@ -25,9 +25,9 @@ warnings.filterwarnings('ignore')
 sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
 import env_utils
 
-# Add src to path for importing the existing MiniHackVAE
+# Add src to path for importing the existing MultiModalHackVAE
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from model import MiniHackVAE, vae_loss
+from model import MultiModalHackVAE, vae_loss
 import torch.optim as optim
 import sqlite3
 import random
@@ -49,105 +49,122 @@ class NetHackDataCollector:
     def __init__(self, dbfilename: str = "ttyrecs.db"):
         self.dbfilename = dbfilename
         self.collected_data = []
+        self.game_hero_info = {} # game_id -> hero_info tensor [4,]
         
-    def detect_inventory_screen(self, tty_chars: np.ndarray) -> Dict:
+        # NetHack mappings for hero info parsing
+        self.role_mapping = {
+            'archaeologist': 0, 'barbarian': 1, 'caveman': 2, 'cavewoman': 2,
+            'healer': 3, 'knight': 4, 'monk': 5, 'priest': 6, 'priestess': 6,
+            'ranger': 7, 'rogue': 8, 'samurai': 9, 'tourist': 10, 'valkyrie': 11,
+            'wizard': 12
+        }
+        
+        self.race_mapping = {
+            'human': 0, 
+            'humanity': 0,  # 'humanity' is a common term in NetHack
+            'hum': 0,
+            'elf': 1, 
+            'elven': 1,
+            'elvenkind': 1,
+            'dwarf': 2, 
+            'dwarven': 2,
+            'dwarvenkind': 2,
+            'dwa': 2,
+            'gnome': 3, 
+            'gnomish': 3,
+            'gnomehood': 3,
+            'gno': 3,
+            'orc': 4,
+            'orcish': 4,
+            'orcdom': 4
+        }
+        
+        self.gender_mapping = {
+            'male': 0, 'female': 1, 'neuter': 2  # Note: 0=male, 1=female, 2=neuter in NetHack
+        }
+        
+        self.alignment_mapping = {
+            'lawful': 1, 'neutral': 0, 'chaotic': -1
+        }
+        
+    def get_hero_info(self, game_id: int, message: str) -> Optional[torch.Tensor]:
         """
-        Detect if current screen shows inventory and extract items
+        Get hero info tensor for a specific game ID.
         
         Args:
-            tty_chars: TTY characters array (24, 80)
+            game_id: Unique identifier for the game
+            message: Welcome message from the game
+
+        Returns:
+            Hero info tensor [4,] with [role, race, gender, alignment] or None if not found
+        """
+        hero_info = self.game_hero_info.get(game_id)
+        if hero_info is not None:
+            return hero_info
+        # If not found, try to parse from message
+        return self.parse_hero_info_from_message(game_id, message)
+
+    def parse_hero_info_from_message(self, game_id: int, message: str) -> Optional[torch.Tensor]:
+        """
+        Parse hero information from NetHack welcome message and return tensor, also cache it into dict.
+        
+        Args:
+            game_id: Unique game identifier
+            message: Welcome message like "Hello Agent, welcome to NetHack! You are a neutral female human Monk"
             
         Returns:
-            Dict with inventory info
+            Hero info tensor [4,] with [role, race, gender, alignment] or None if parsing fails
         """
-        # Convert to text
-        screen_lines = []
-        for row in range(tty_chars.shape[0]):
-            line = ''.join([chr(c) if 32 <= c <= 126 else ' ' for c in tty_chars[row]])
-            screen_lines.append(line.rstrip())
+        if not message or 'welcome to nethack' not in message.lower():
+            return None
         
-        screen_text = ' '.join(screen_lines).lower()
+        import re
+        message_lower = message.lower()
+        words = re.findall(r'\b\w+\b', message_lower)  # Extract word characters only
         
-        # Detect inventory indicators
-        inventory_indicators = [
-            'you are carrying:',
-            'you are not carrying anything',
-            'inventory:',
-            'your possessions:',
-            'items carried:',
-        ]
+        # Extract alignment
+        alignment = None
+        for align_name, align_value in self.alignment_mapping.items():
+            if align_name in words:
+                alignment = align_value
+                break
         
-        is_inventory = any(indicator in screen_text for indicator in inventory_indicators)
+        # Extract gender  
+        gender = None
+        for gender_name, gender_value in self.gender_mapping.items():
+            if gender_name in words:
+                gender = gender_value
+                break
         
-        # Extract items in a) b) c) format
-        items = []
-        item_pattern_count = 0
+        # Extract race
+        race = None
+        for race_name, race_value in self.race_mapping.items():
+            if race_name in words:
+                race = race_value
+                break
         
-        for i, line in enumerate(screen_lines):
-            line = line.strip()
-            if len(line) > 2 and line[1] == ')' and line[0].isalpha():
-                items.append({
-                    'slot': line[0],
-                    'description': line[2:].strip(),
-                    'line_number': i
-                })
-                item_pattern_count += 1
+        # Extract role
+        role = None
+        for role_name, role_value in self.role_mapping.items():
+            if role_name in words:
+                role = role_value
+                if 'man' or 'priest' in role_name and not gender:
+                    gender = self.gender_mapping['male']
+                elif 'woman' or 'priestess' in role_name and not gender:
+                    gender = self.gender_mapping['female']
+                elif not gender:
+                    gender = self.gender_mapping['neuter']  # Default to neuter if not specified
+                break
         
-        # If we have multiple item patterns, likely inventory
-        if item_pattern_count >= 2:
-            is_inventory = True
+        # Only return if we found all required components
+        if all(x is not None for x in [alignment, gender, race, role]):
+            hero_info = torch.tensor([role, race, gender, alignment], dtype=torch.int8)
+            self.game_hero_info[game_id] = hero_info
+            return hero_info
         
-        return {
-            'is_inventory': is_inventory,
-            'is_empty': 'not carrying anything' in screen_text,
-            'items': items,
-            'item_count': len(items),
-            'inventory_features': self._extract_inventory_features(items)
-        }
+        return None
     
-    def _extract_inventory_features(self, items: List[Dict]) -> Dict:
-        """Extract numerical features from inventory items"""
-        features = {
-            'total_items': len(items),
-            'equipped_items': 0,
-            'food_items': 0,
-            'weapon_items': 0,
-            'armor_items': 0,
-            'potion_items': 0,
-            'scroll_items': 0,
-            'tool_items': 0,
-            'ring_items': 0,
-            'wand_items': 0,
-        }
-        
-        for item in items:
-            desc_lower = item['description'].lower()
-            
-            # Count equipped items
-            if 'being worn' in desc_lower or 'wielded' in desc_lower:
-                features['equipped_items'] += 1
-            
-            # Categorize items
-            if any(food in desc_lower for food in ['food', 'ration', 'apple', 'orange', 'banana']):
-                features['food_items'] += 1
-            elif any(weapon in desc_lower for weapon in ['sword', 'dagger', 'bow', 'arrow', 'spear', 'mace']):
-                features['weapon_items'] += 1
-            elif any(armor in desc_lower for armor in ['armor', 'helm', 'shield', 'boots', 'gloves', 'cloak']):
-                features['armor_items'] += 1
-            elif 'potion' in desc_lower:
-                features['potion_items'] += 1
-            elif 'scroll' in desc_lower:
-                features['scroll_items'] += 1
-            elif any(tool in desc_lower for tool in ['tool', 'key', 'lamp', 'pick-axe']):
-                features['tool_items'] += 1
-            elif 'ring' in desc_lower:
-                features['ring_items'] += 1
-            elif 'wand' in desc_lower:
-                features['wand_items'] += 1
-        
-        return features
-    
-    def collect_data_batch(self, dataset_name: str, max_samples: int = 1000, 
+    def collect_data_batch(self, dataset_name: str, adapter: callable, max_batches: int = 1000, 
                           batch_size: int = 32, seq_length: int = 32) -> List[Dict]:
         """
         Collect data from the dataset for VAE training
@@ -161,7 +178,8 @@ class NetHackDataCollector:
         Returns:
             List of processed data samples
         """
-        print(f"Collecting {max_samples} samples from {dataset_name} for VAE training...")
+        print(f"Collecting {max_batches} batches from {dataset_name} for VAE training...")
+        print(f"  - Batch size: {batch_size}, Sequence length: {seq_length}")
         
         # Create dataset loader
         dataset = nld.TtyrecDataset(
@@ -172,34 +190,35 @@ class NetHackDataCollector:
             shuffle=True
         )
         
-        collected_samples = []
-        sample_count = 0
-        processed_count = 0
+        collected_batches = []
+        batch_count = 0
         
         for batch_idx, minibatch in enumerate(dataset):
-            if sample_count >= max_samples:
+            if batch_count >= max_batches:
                 break
                 
-            if batch_idx % 50 == 0:
-                print(f"Processing batch {batch_idx}, collected {sample_count}/{max_samples} samples...")
+            print(f"Processing batch {batch_idx + 1}...")
             
+            num_games, num_time = minibatch['tty_chars'].shape[:2]
+            message_chars_minibatch = torch.empty((num_games, num_time, 80), dtype=torch.int8)
+            game_chars_minibatch = torch.empty((num_games, num_time, 21, 79), dtype=torch.int8)
+            game_colors_minibatch = torch.empty((num_games, num_time, 21, 79), dtype=torch.int8)
+            status_chars_minibatch = torch.empty((num_games, num_time, 2, 80), dtype=torch.int8)
+            hero_info_minibatch = torch.empty((num_games, num_time, 4), dtype=torch.int8)
+            blstats_minibatch = torch.empty((num_games, num_time, 27), dtype=torch.float8)
+
             # Process each game in the batch
             for game_idx in range(minibatch['tty_chars'].shape[0]):
                 # Process each timestep
                 for time_idx in range(minibatch['tty_chars'].shape[1]):
-                    if sample_count >= max_samples:
-                        break
                     
-                    # Skip padding (gameid = 0)
-                    if minibatch['gameids'][game_idx, time_idx] == 0:
-                        continue
-                    
-                    processed_count += 1
+                    game_id = int(minibatch['gameids'][game_idx, time_idx])
+                    timestamp = float(minibatch['timestamps'][game_idx, time_idx])
+                    score = float(minibatch['scores'][game_idx, time_idx])
                     
                     # Get TTY data
                     tty_chars = minibatch['tty_chars'][game_idx, time_idx]
                     tty_colors = minibatch['tty_colors'][game_idx, time_idx]
-                    tty_cursor = minibatch['tty_cursor'][game_idx, time_idx]
                     
                     # Separate TTY components using our utility function
                     tty_components = separate_tty_components(tty_chars, tty_colors)
@@ -207,131 +226,44 @@ class NetHackDataCollector:
                     # Extract text information
                     current_message = get_current_message(tty_chars)
                     status_lines = get_status_lines(tty_chars)
-                    game_map = get_game_map(tty_chars, tty_colors)
                     
-                    # Optional: detect inventory for potential future analysis
-                    inventory_info = self.detect_inventory_screen(tty_chars)
-                    
-                    # Create sample
-                    sample = {
-                        # Metadata
-                        'gameid': int(minibatch['gameids'][game_idx, time_idx]),
-                        'timestep': time_idx,
-                        'timestamp': minibatch['timestamps'][game_idx, time_idx],
-                        'keypress': int(minibatch['keypresses'][game_idx, time_idx]),
-                        'score': int(minibatch['scores'][game_idx, time_idx]),
-                        'done': bool(minibatch['done'][game_idx, time_idx]),
-                        
-                        # TTY components (for VAE training)
-                        'tty_chars': tty_chars.astype(np.uint8),
-                        'tty_colors': tty_colors.astype(np.int8),
-                        'tty_cursor': tty_cursor.astype(np.uint8),
-                        
-                        # Separated components
-                        'message_chars': tty_components['message_chars'].astype(np.uint8),
-                        'message_colors': tty_components['message_colors'].astype(np.int8),
-                        'game_chars': tty_components['game_chars'].astype(np.uint8),
-                        'game_colors': tty_components['game_colors'].astype(np.int8),
-                        'status_chars': tty_components['status_chars'].astype(np.uint8),
-                        'status_colors': tty_components['status_colors'].astype(np.int8),
-                        
-                        # Text information
-                        'current_message': current_message,
-                        'status_lines': status_lines,
-                        
-                        # Keep inventory info for potential future use (even if rarely found)
-                        'is_inventory_screen': inventory_info['is_inventory'],
-                        'inventory_items': inventory_info['items'],
-                        'inventory_features': inventory_info['inventory_features'],
-                    }
-                    
-                    collected_samples.append(sample)
-                    sample_count += 1
-            
-            # Break from batch loop if we have enough samples
-            if sample_count >= max_samples:
-                break
-        
-        print(f"✅ Successfully collected {len(collected_samples)} samples from {processed_count} processed screens")
-        return collected_samples
+                    hero_info = self.get_hero_info(game_id, current_message)
+                    if hero_info is None:
+                        raise Exception(f"⚠️ No hero info found for game {game_id}, skipping sample")
 
+                    # Fill in the minibatch tensors
+                    message_chars_minibatch[game_idx, time_idx] = tty_components['message_chars']
+                    game_chars_minibatch[game_idx, time_idx] = tty_components['game_chars']
+                    game_colors_minibatch[game_idx, time_idx] = tty_components['game_colors']
+                    status_chars_minibatch[game_idx, time_idx] = tty_components['status_chars']
+                    hero_info_minibatch[game_idx, time_idx] = hero_info
+                    blstats_minibatch[game_idx, time_idx] = adapter(tty_components['game_chars'], status_lines, score, timestamp)
 
-class NetHackDataset(Dataset):
-    """PyTorch Dataset for NetHack data"""
-    
-    def __init__(self, samples: List[Dict], target_type: str = 'reconstruction'):
-        """
-        Args:
-            samples: List of processed samples
-            target_type: Type of target ('reconstruction', 'inventory', 'action')
-        """
-        self.samples = samples
-        self.target_type = target_type
-        
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        
-        # Input: TTY characters and colors
-        tty_chars = torch.tensor(sample['tty_chars'], dtype=torch.float32)
-        tty_colors = torch.tensor(sample['tty_colors'], dtype=torch.float32)
-        
-        # Combine chars and colors as input
-        input_tensor = torch.stack([tty_chars, tty_colors], dim=0)  # Shape: (2, 24, 80)
-        
-        if self.target_type == 'reconstruction':
-            # For VAE: target is same as input
-            target = input_tensor
-        elif self.target_type == 'inventory':
-            # For inventory prediction: target is inventory features
-            inv_features = sample['inventory_features']
-            target = torch.tensor([
-                inv_features['total_items'],
-                inv_features['equipped_items'],
-                inv_features['food_items'],
-                inv_features['weapon_items'],
-                inv_features['armor_items'],
-                inv_features['potion_items'],
-                inv_features['scroll_items'],
-                inv_features['tool_items'],
-                inv_features['ring_items'],
-                inv_features['wand_items'],
-            ], dtype=torch.float32)
-        elif self.target_type == 'action':
-            # For action prediction: target is next action
-            target = torch.tensor(sample['keypress'], dtype=torch.long)
-        
-        return {
-            'input': input_tensor,
-            'target': target,
-            'metadata': {
-                'gameid': sample['gameid'],
-                'timestep': sample['timestep'],
-                'is_inventory_screen': sample['is_inventory_screen'],
-                'current_message': sample['current_message'],
-            }
-        }
+            minibatch['message_chars'] = message_chars_minibatch
+            minibatch['game_chars'] = game_chars_minibatch
+            minibatch['game_colors'] = game_colors_minibatch
+            minibatch['status_chars'] = status_chars_minibatch
+            minibatch['hero_info'] = hero_info_minibatch
+            minibatch['blstats'] = blstats_minibatch
+            collected_batches.append(minibatch)
 
-
-class TTYToMiniHackAdapter:
+        print(f"✅ Successfully collected {len(collected_batches)} batches from {batch_count} processed batches")
+        return collected_batches
+class BLStatsAdapter:
     """
-    Converts TTY data to MiniHackVAE expected format
-    
+    Converts TTY data to MultiModalHackVAE expected format
+
     TTY data format (from NetHack Learning Dataset):
     - chars: (24, 80) array of ASCII characters
     - colors: (24, 80) array of color indices
     - cursor: (y, x) position
-    
-    MiniHackVAE expected format:
+
+    MultiModalHackVAE expected format:
     - glyph_chars: LongTensor[B,H,W] - ASCII character codes (32-127) per map cell
     - glyph_colors: LongTensor[B,H,W] - color indices (0-15) per map cell  
     - blstats: FloatTensor[B,27] - game statistics (hp, gold, position, etc.)
     - msg_tokens: LongTensor[B,256] - tokenized message text (0-127 + SOS/EOS)
     - hero_info: optional dict with role, race, gender, alignment
-    - inv_oclasses: optional LongTensor[B,55] - inventory object classes
-    - inv_strs: optional LongTensor[B,55,80] - inventory string descriptions
     """
     
     def __init__(self):
@@ -394,23 +326,7 @@ class TTYToMiniHackAdapter:
             'overloaded': 5   # OVERLOADED
         }
     
-    def extract_status_line(self, chars: np.ndarray) -> List[str]:
-        """Extract NetHack status lines from TTY bottom rows"""
-        status_lines = []
-        
-        # NetHack specifically uses rows 22 and 23 for status information
-        status_row_indices = [22, 23]
-        
-        for row_idx in status_row_indices:
-            if row_idx < chars.shape[0]:
-                line = ''.join([chr(c) if 32 <= c <= 126 else ' ' for c in chars[row_idx]])
-                line = line.strip()
-                if line:
-                    status_lines.append(line)
-        
-        return status_lines
-    
-    def find_player_position(self, chars: np.ndarray) -> Tuple[int, int]:
+    def _find_player_position(self, chars: np.ndarray) -> Tuple[int, int]:
         """
         Find player position by locating '@' symbol on the game map
         
@@ -432,7 +348,7 @@ class TTYToMiniHackAdapter:
         # If '@' not found, return center of map as fallback
         return (self.map_width // 2, self.map_height // 2)
     
-    def parse_status_comprehensive(self, status_lines: List[str]) -> Dict:
+    def _parse_status_comprehensive(self, status_lines: List[str]) -> Dict:
         """Comprehensive status line parsing with multiple format support"""
         if not status_lines:
             return {}
@@ -573,8 +489,7 @@ class TTYToMiniHackAdapter:
         
         return stats
     
-    def create_accurate_blstats(self, chars: np.ndarray, cursor: Tuple[int, int], 
-                                score: float = 0.0, timestamp: float = 0.0) -> np.ndarray:
+    def __call__(self, game_chars: np.ndarray, status_lines: List[str], score: float = 0.0, timestamp: float = 0.0) -> np.ndarray:
         """
         Create accurate 27-dimensional blstats from TTY data
         
@@ -584,18 +499,17 @@ class TTYToMiniHackAdapter:
         4. Use reasonable defaults for stats not available in status line
         """
         # Parse status line first
-        status_lines = self.extract_status_line(chars)
-        parsed_stats = self.parse_status_comprehensive(status_lines)
+        parsed_stats = self._parse_status_comprehensive(status_lines)
         
         # Create 27-dimensional blstats array
         blstats = np.zeros(27, dtype=np.int64)
         
         # Position (0, 1) - Find player '@' on map, not from status line
-        player_x, player_y = self.find_player_position(chars)
+        player_x, player_y = self._find_player_position(game_chars)
         blstats[0] = player_x  # NLE_BL_X - x coordinate
         blstats[1] = player_y  # NLE_BL_Y - y coordinate
         
-        # CORRECTED: Use exact NLE blstats mapping from nle/include/nletypes.h
+        # Use exact NLE blstats mapping from nle/include/nletypes.h
         blstats[2] = parsed_stats.get('strength', 16)     # NLE_BL_STR25 - strength 3..25
         blstats[3] = blstats[2]  # NLE_BL_STR125 - strength 3..125 (not available from tty_chars)
         blstats[4] = parsed_stats.get('dexterity', 16)    # NLE_BL_DEX - dexterity
@@ -670,514 +584,6 @@ class TTYToMiniHackAdapter:
             blstats[26] = 0  # Default to neutral when not specified
         
         return blstats
-        
-    def extract_map_from_tty(self, chars: np.ndarray, colors: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract game map from TTY data"""
-        # TTY is (24, 80), map is typically rows 1-21, cols 0-78
-        map_chars = chars[self.map_start_row:self.map_end_row, :self.map_width]  # (21, 79)
-        map_colors = colors[self.map_start_row:self.map_end_row, :self.map_width]  # (21, 79)
-        
-        return torch.tensor(map_chars, dtype=torch.long), torch.tensor(map_colors, dtype=torch.long)
-    
-    def extract_message_from_tty(self, chars: np.ndarray) -> torch.Tensor:
-        """Extract message from top row of TTY and convert to tokens"""
-        # Message is typically in the top row
-        message_chars = chars[0, :]  # (80,)
-        
-        # Convert to valid message tokens (0-127, pad with 0s)
-        msg_tokens = []
-        for char in message_chars:
-            if 32 <= char <= 127:  # Valid printable ASCII
-                msg_tokens.append(char)
-            elif char == 0:  # Already padding
-                break
-            else:
-                msg_tokens.append(32)  # Replace invalid with space
-        
-        # Pad or truncate to 256 tokens
-        msg_tensor = torch.zeros(256, dtype=torch.long)
-        if msg_tokens:
-            msg_len = min(len(msg_tokens), 256)
-            msg_tensor[:msg_len] = torch.tensor(msg_tokens[:msg_len], dtype=torch.long)
-        
-        return msg_tensor
-    
-    def create_dummy_inventory(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Create dummy inventory data - can be None for optional parameters"""
-        # Return None to skip inventory for now
-        return None, None
-    
-    def convert_tty_batch(self, tty_batch: Dict[str, torch.Tensor], 
-                         game_manager: Optional['GameSequenceManager'] = None,
-                         samples_metadata: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
-        """
-        Convert a batch of TTY data to MiniHackVAE format with improved blstats.
-        Uses GameSequenceManager for hero info extraction and caching.
-        
-        Args:
-            tty_batch: Dict with keys 'chars', 'colors', 'cursor', 'score', 'timestamp'
-                - chars: (B, 24, 80)
-                - colors: (B, 24, 80)  
-                - cursor: (B, 2)
-                - score: (B,)
-                - timestamp: (B,)
-            game_manager: GameSequenceManager for hero info handling
-            samples_metadata: Optional list of sample metadata (for game_id, etc.)
-        
-        Returns:
-            Dict with MiniHackVAE expected format including accurate blstats
-        """
-        batch_size = tty_batch['chars'].shape[0]
-        device = tty_batch['chars'].device
-        
-        # Convert each sample in the batch
-        glyph_chars_list = []
-        glyph_colors_list = []
-        blstats_list = []
-        msg_tokens_list = []
-        
-        for i in range(batch_size):
-            chars_i = tty_batch['chars'][i].cpu().numpy()  # (24, 80)
-            colors_i = tty_batch['colors'][i].cpu().numpy()  # (24, 80)
-            cursor_i = (tty_batch['cursor'][i, 0].item(), tty_batch['cursor'][i, 1].item())
-            score_i = tty_batch['score'][i].item() if 'score' in tty_batch else 0.0
-            timestamp_i = tty_batch['timestamp'][i].item() if 'timestamp' in tty_batch else 0.0
-            
-            # Extract map
-            map_chars, map_colors = self.extract_map_from_tty(chars_i, colors_i)
-            glyph_chars_list.append(map_chars)
-            glyph_colors_list.append(map_colors)
-            
-            # Extract message
-            msg_tokens = self.extract_message_from_tty(chars_i)
-            msg_tokens_list.append(msg_tokens)
-            
-            # Extract blstats using improved method
-            blstats = self.create_accurate_blstats(chars_i, cursor_i, score_i, timestamp_i)
-            blstats_list.append(torch.tensor(blstats, dtype=torch.float32))
-        
-        # Get hero info using GameSequenceManager
-        hero_info_batch = None
-        if game_manager is not None and samples_metadata is not None:
-            hero_info_batch = game_manager.get_hero_info_batch(samples_metadata, device)
-        
-        # Stack into batches
-        result = {
-            'glyph_chars': torch.stack(glyph_chars_list).to(device),      # (B, 21, 79)
-            'glyph_colors': torch.stack(glyph_colors_list).to(device),    # (B, 21, 79)
-            'blstats': torch.stack(blstats_list).to(device),              # (B, 27)
-            'msg_tokens': torch.stack(msg_tokens_list).to(device),        # (B, 256)
-            'hero_info': hero_info_batch,                                 # Hero info if available
-            'inv_oclasses': None,                                         # None for now
-            'inv_strs': None                                              # None for now
-        }
-        
-        return result
-    
-    def extract_hero_info_for_game_sequence(self, samples: List[Dict], game_id: Optional[int] = None) -> Optional[torch.Tensor]:
-        """
-        Extract hero info for a specific game sequence from the first welcome message found.
-        This ensures hero info is consistent throughout the entire game.
-        
-        Args:
-            samples: List of samples from the same game
-            game_id: Optional game ID to filter samples
-            
-        Returns:
-            Hero info tensor (4,) with [role, race, gender, alignment] or None if not found
-        """
-        # Filter by game_id if provided
-        if game_id is not None:
-            samples = [s for s in samples if s.get('gameid') == game_id]
-        
-        # Look for welcome message in chronological order (earliest first)
-        sorted_samples = sorted(samples, key=lambda x: x.get('timestep', 0))
-        
-        for sample in sorted_samples:
-            if 'message' in sample and sample['message']:
-                message = sample['message'].strip()
-                if message.startswith('Hello') and 'welcome to NetHack' in message:
-                    hero_info_dict = self.parse_hero_info_from_message(message)
-                    if hero_info_dict:
-                        return self.create_hero_info_from_dict(hero_info_dict)
-        return None
-    
-    def ensure_hero_info_format(self, hero_info: Optional[Union[torch.Tensor, Dict]], batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
-        """
-        Ensure hero_info is in the correct [B, 4] tensor format.
-        
-        Args:
-            hero_info: Hero info in various formats (tensor, dict, or None)
-            batch_size: Target batch size
-            device: Target device
-            
-        Returns:
-            Hero info tensor of shape [B, 4] or None if no hero info available
-        """
-        if hero_info is None:
-            return None
-        
-        # Convert to single tensor if it's a dict
-        if isinstance(hero_info, dict):
-            if all(key in hero_info for key in ['role', 'race', 'gender', 'alignment']):
-                hero_tensor = torch.tensor([
-                    hero_info['role'],
-                    hero_info['race'], 
-                    hero_info['gender'],
-                    hero_info['alignment']
-                ], dtype=torch.float32)
-            else:
-                return None
-        elif isinstance(hero_info, torch.Tensor):
-            hero_tensor = hero_info.clone()
-        else:
-            return None
-        
-        # Ensure it's the right shape and type
-        if hero_tensor.dim() == 1 and hero_tensor.size(0) == 4:
-            # Single hero info - replicate across batch
-            batch_hero_info = hero_tensor.unsqueeze(0).expand(batch_size, -1).to(device)
-            return batch_hero_info
-        elif hero_tensor.dim() == 2 and hero_tensor.size() == (batch_size, 4):
-            # Already correct batch format
-            return hero_tensor.to(device)
-        else:
-            # Invalid format
-            return None
-    
-
-class GameSequenceManager:
-    """
-    Centralized manager for hero information persistence throughout NetHack game sequences.
-    Handles hero info extraction, caching, and batch processing for mixed-game scenarios.
-    """
-    
-    def __init__(self):
-        self.game_hero_info = {}  # game_id -> hero_info tensor [4,]
-        
-        # NetHack mappings for hero info parsing
-        self.role_mapping = {
-            'archaeologist': 0, 'barbarian': 1, 'caveman': 2, 'cavewoman': 2,
-            'healer': 3, 'knight': 4, 'monk': 5, 'priest': 6, 'priestess': 6,
-            'ranger': 7, 'rogue': 8, 'samurai': 9, 'tourist': 10, 'valkyrie': 11,
-            'wizard': 12
-        }
-        
-        self.race_mapping = {
-            'human': 0, 'elf': 1, 'dwarf': 2, 'gnome': 3, 'orc': 4
-        }
-        
-        self.gender_mapping = {
-            'male': 1, 'female': 0  # Note: 0=female, 1=male in NetHack
-        }
-        
-        self.alignment_mapping = {
-            'lawful': 1, 'neutral': 0, 'chaotic': -1
-        }
-    
-    def parse_hero_info_from_message(self, message: str) -> Optional[torch.Tensor]:
-        """
-        Parse hero information from NetHack welcome message and return tensor.
-        
-        Args:
-            message: Welcome message like "Hello Agent, welcome to NetHack! You are a neutral female human Monk"
-            
-        Returns:
-            Hero info tensor [4,] with [role, race, gender, alignment] or None if parsing fails
-        """
-        if not message or 'welcome to nethack' not in message.lower():
-            return None
-        
-        import re
-        message_lower = message.lower()
-        words = re.findall(r'\b\w+\b', message_lower)  # Extract word characters only
-        
-        # Extract alignment
-        alignment = None
-        for align_name, align_value in self.alignment_mapping.items():
-            if align_name in words:
-                alignment = align_value
-                break
-        
-        # Extract gender  
-        gender = None
-        for gender_name, gender_value in self.gender_mapping.items():
-            if gender_name in words:
-                gender = gender_value
-                break
-        
-        # Extract race
-        race = None
-        for race_name, race_value in self.race_mapping.items():
-            if race_name in words:
-                race = race_value
-                break
-        
-        # Extract role
-        role = None
-        for role_name, role_value in self.role_mapping.items():
-            if role_name in words:
-                role = role_value
-                break
-        
-        # Only return if we found all required components
-        if all(x is not None for x in [alignment, gender, race, role]):
-            return torch.tensor([role, race, gender, alignment], dtype=torch.float32)
-        
-        return None
-    
-    def get_hero_info_for_game(self, game_id: int, samples: List[Dict]) -> Optional[torch.Tensor]:
-        """
-        Get hero info for a specific game, extracting from welcome message if not cached.
-        
-        Args:
-            game_id: Game ID to get hero info for
-            samples: List of samples from this game (to find welcome message)
-            
-        Returns:
-            Hero info tensor [4,] or None if not found
-        """
-        # Check cache first
-        if game_id in self.game_hero_info:
-            return self.game_hero_info[game_id]
-        
-        # Find welcome message in samples (should be in earliest timestep)
-        game_samples = [s for s in samples if s.get('gameid') == game_id]
-        sorted_samples = sorted(game_samples, key=lambda x: x.get('timestep', 0))
-        
-        for sample in sorted_samples:
-            if 'message' in sample and sample['message']:
-                message = sample['message'].strip()
-                if message.startswith('Hello') and 'welcome to NetHack' in message:
-                    hero_info = self.parse_hero_info_from_message(message)
-                    if hero_info is not None:
-                        # Cache for future use
-                        self.game_hero_info[game_id] = hero_info
-                        return hero_info
-        
-        return None
-    
-    def get_hero_info_batch(self, samples_metadata: List[Dict], device: torch.device) -> Optional[torch.Tensor]:
-        """
-        Get hero info batch for mixed-game samples, ensuring [B, 4] format.
-        
-        Args:
-            samples_metadata: List of sample metadata with 'gameid' and 'message' fields
-            device: Target device for tensors
-            
-        Returns:
-            Hero info tensor [B, 4] or None if no hero info available
-        """
-        batch_size = len(samples_metadata)
-        hero_info_list = []
-        
-        for metadata in samples_metadata:
-            game_id = metadata.get('gameid', 0)
-            sample_hero_info = None
-            
-            # Check cache first
-            if game_id in self.game_hero_info:
-                sample_hero_info = self.game_hero_info[game_id]
-            else:
-                # Try to extract from current sample message
-                message = metadata.get('message', '')
-                if message:
-                    message = message.strip()
-                    if message.startswith('Hello') and 'welcome to NetHack' in message:
-                        hero_info = self.parse_hero_info_from_message(message)
-                        if hero_info is not None:
-                            # Cache for future use
-                            self.game_hero_info[game_id] = hero_info
-                            sample_hero_info = hero_info
-            
-            hero_info_list.append(sample_hero_info)
-        
-        # Check if we have any valid hero info
-        valid_hero_info = [h for h in hero_info_list if h is not None]
-        if not valid_hero_info:
-            return None
-        
-        # Create batch tensor
-        batch_hero_info = torch.zeros((batch_size, 4), dtype=torch.float32, device=device)
-        
-        for i, hero_info in enumerate(hero_info_list):
-            if hero_info is not None:
-                batch_hero_info[i] = hero_info.to(device)
-            else:
-                # Use zeros for missing hero info (model should handle this)
-                batch_hero_info[i] = torch.zeros(4, dtype=torch.float32, device=device)
-        
-        return batch_hero_info
-    
-    def preload_hero_info(self, all_samples: List[Dict]):
-        """
-        Preload hero info for all games in the dataset.
-        
-        Args:
-            all_samples: All samples in the dataset
-        """
-        # Group samples by game_id
-        games = {}
-        for sample in all_samples:
-            game_id = sample.get('gameid', 0)
-            if game_id not in games:
-                games[game_id] = []
-            games[game_id].append(sample)
-        
-        # Extract hero info for each game
-        for game_id, game_samples in games.items():
-            if game_id not in self.game_hero_info:
-                self.get_hero_info_for_game(game_id, game_samples)
-    
-    def clear_cache(self):
-        """Clear cached hero info (useful when switching datasets)"""
-        self.game_hero_info.clear()
-
-
-class MiniHackDataset(Dataset):
-    """
-    Dataset wrapper for NetHack data that converts TTY format to MiniHackVAE expected format.
-    Supports hero information persistence throughout game sequences.
-    """
-    def __init__(self, data_entries: List[Dict], adapter: TTYToMiniHackAdapter, 
-                 use_game_manager: bool = True):
-        self.data_entries = data_entries
-        self.adapter = adapter
-        self.use_game_manager = use_game_manager
-        
-        # Initialize game sequence manager for hero info persistence
-        if use_game_manager:
-            self.game_manager = GameSequenceManager()
-            # Preload hero info for all games in the dataset
-            self.game_manager.preload_hero_info(data_entries)
-        else:
-            self.game_manager = None
-        
-    def __len__(self):
-        return len(self.data_entries)
-    
-    def __getitem__(self, idx):
-        entry = self.data_entries[idx]
-        
-        # Convert TTY data to tensors
-        chars = torch.tensor(entry['chars'], dtype=torch.long)  # (24, 80)
-        colors = torch.tensor(entry['colors'], dtype=torch.long)  # (24, 80)
-        cursor = torch.tensor([entry['cursor'][0], entry['cursor'][1]], dtype=torch.long)  # (2,)
-        score = torch.tensor(entry.get('score', 0.0), dtype=torch.float32)  # scalar
-        timestamp = torch.tensor(entry.get('timestamp', 0.0), dtype=torch.float32)  # scalar
-        
-        # Create batch format (add batch dimension)
-        tty_batch = {
-            'chars': chars.unsqueeze(0),    # (1, 24, 80)
-            'colors': colors.unsqueeze(0),  # (1, 24, 80)
-            'cursor': cursor.unsqueeze(0),  # (1, 2)
-            'score': score.unsqueeze(0),    # (1,)
-            'timestamp': timestamp.unsqueeze(0)  # (1,)
-        }
-        
-        # Create metadata for GameSequenceManager
-        metadata = [{
-            'gameid': entry.get('gameid', 0),
-            'message': entry.get('message', ''),
-            'timestep': entry.get('timestep', 0)
-        }]
-        
-        # Convert to MiniHackVAE format and remove batch dimension
-        minihack_data = self.adapter.convert_tty_batch(
-            tty_batch, 
-            game_manager=self.game_manager,
-            samples_metadata=metadata
-        )
-        
-        result = {}
-        for key, value in minihack_data.items():
-            if value is not None:
-                result[key] = value.squeeze(0)  # Remove batch dimension
-            else:
-                result[key] = None
-        
-        # Add original metadata for collate function
-        result['_metadata'] = metadata[0]
-                
-        return result
-
-
-def create_mixed_game_collate_fn(adapter: TTYToMiniHackAdapter, game_manager: Optional[GameSequenceManager] = None):
-    """
-    Create a custom collate function that handles mixed-game batches properly.
-    Each sample in the batch gets its own game-specific hero info.
-    
-    Args:
-        adapter: TTYToMiniHackAdapter instance
-        game_manager: Optional GameSequenceManager for hero info caching
-        
-    Returns:
-        Collate function for DataLoader
-    """
-    def custom_collate_fn(batch):
-        """
-        Custom collate function for mixed-game batches.
-        
-        Args:
-            batch: List of samples from MiniHackDataset.__getitem__()
-            
-        Returns:
-            Batched data with proper hero info handling
-        """
-        # Handle None values in batch
-        batch = [item for item in batch if item is not None]
-        if not batch:
-            return None
-        
-        # Extract metadata for hero info processing
-        samples_metadata = [item.get('_metadata', {}) for item in batch]
-        
-        # Stack the main data
-        batch_size = len(batch)
-        device = batch[0]['glyph_chars'].device if batch else torch.device('cpu')
-        
-        try:
-            glyph_chars = torch.stack([item['glyph_chars'] for item in batch])  # (B, H, W)
-            glyph_colors = torch.stack([item['glyph_colors'] for item in batch])  # (B, H, W)
-            blstats = torch.stack([item['blstats'] for item in batch])  # (B, 27)
-            msg_tokens = torch.stack([item['msg_tokens'] for item in batch])  # (B, 256)
-        except Exception as e:
-            print(f"Error stacking batch tensors: {e}")
-            return None
-        
-        # Get per-sample hero info using game manager
-        hero_info_batch = None
-        if game_manager is not None:
-            hero_info_batch = game_manager.get_hero_info_batch(samples_metadata, device)
-        else:
-            # Fallback: collect hero info from individual samples
-            hero_info_list = [item.get('hero_info') for item in batch]
-            valid_hero_info = [h for h in hero_info_list if h is not None]
-            if valid_hero_info:
-                hero_info_batch = torch.zeros((batch_size, 4), dtype=torch.float32, device=device)
-                for i, hero_info in enumerate(hero_info_list):
-                    if hero_info is not None:
-                        if hero_info.dim() == 1:
-                            hero_info_batch[i] = hero_info.to(device)
-                        else:
-                            hero_info_batch[i] = hero_info.squeeze().to(device)
-                    else:
-                        hero_info_batch[i] = torch.zeros(4, dtype=torch.float32, device=device)
-        
-        # Build final batch
-        result = {
-            'glyph_chars': glyph_chars,
-            'glyph_colors': glyph_colors,
-            'blstats': blstats,
-            'msg_tokens': msg_tokens,
-            'hero_info': hero_info_batch,
-            'inv_oclasses': None,
-            'inv_strs': None
-        }
-        
-        return result
-    
-    return custom_collate_fn
 
 
 class NetHackVAE(nn.Module):
@@ -1447,13 +853,13 @@ def train_vae(train_samples, test_samples,
     return model, train_losses, test_losses
 
 
-def train_minihack_vae(train_samples: List[Dict], test_samples: List[Dict], 
+def train_multimodalhack_vae(train_samples: List[Dict], test_samples: List[Dict], 
                       epochs: int = 10, batch_size: int = 32, learning_rate: float = 1e-3,
                       latent_dim: int = 64, save_path: str = "models/minihack_vae.pth",
-                      device: str = None, include_inventory: bool = False) -> Tuple[MiniHackVAE, List[float], List[float]]:
+                      device: str = None, include_inventory: bool = False) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
     """
-    Train MiniHackVAE on NetHack Learning Dataset
-    
+    Train MultiModalHackVAE on NetHack Learning Dataset
+
     Args:
         train_samples: List of training samples (TTY format)
         test_samples: List of testing samples (TTY format)
@@ -1477,15 +883,15 @@ def train_minihack_vae(train_samples: List[Dict], test_samples: List[Dict],
     print(f"   Include inventory: {include_inventory}")
     
     # Create adapter and datasets
-    adapter = TTYToMiniHackAdapter()
-    train_dataset = MiniHackDataset(train_samples, adapter)
-    test_dataset = MiniHackDataset(test_samples, adapter)
-    
+    adapter = TTYToMultiModalHackAdapter()
+    train_dataset = NetHackDataset(train_samples, adapter)
+    test_dataset = NetHackDataset(test_samples, adapter)
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     
     # Initialize model
-    model = MiniHackVAE(latent_dim=latent_dim, include_inventory=include_inventory)
+    model = MultiModalHackVAE(latent_dim=latent_dim, include_inventory=include_inventory)
     model = model.to(device)
     
     # Initialize optimizer
@@ -1727,246 +1133,5 @@ def analyze_latent_space(model, samples, device, save_path="latent_analysis.png"
     return latent_vectors, game_ids, messages
 
 
-def create_train_test_split(samples: List[Dict], test_ratio: float = 0.2, 
-                           random_seed: int = 42) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Split samples into train and test sets
-    
-    Args:
-        samples: List of data samples
-        test_ratio: Fraction of data for testing
-        random_seed: Random seed for reproducibility
-        
-    Returns:
-        Tuple of (train_samples, test_samples)
-    """
-    print(f"Splitting {len(samples)} samples into train/test (test_ratio={test_ratio})")
-    
-    # Set random seed for reproducibility
-    random.seed(random_seed)
-    np.random.seed(random_seed)
-    
-    # Shuffle samples
-    shuffled_samples = samples.copy()
-    random.shuffle(shuffled_samples)
-    
-    # Split
-    test_size = int(len(shuffled_samples) * test_ratio)
-    test_samples = shuffled_samples[:test_size]
-    train_samples = shuffled_samples[test_size:]
-    
-    print(f"Train samples: {len(train_samples)}")
-    print(f"Test samples: {len(test_samples)}")
-    
-    return train_samples, test_samples
-
-
-def save_dataset(samples: List[Dict], filepath: str):
-    """Save dataset to disk"""
-    print(f"Saving dataset to {filepath}")
-    with open(filepath, 'wb') as f:
-        pickle.dump(samples, f)
-    print(f"Saved {len(samples)} samples")
-
-
-def load_dataset(filepath: str) -> List[Dict]:
-    """Load dataset from disk"""
-    print(f"Loading dataset from {filepath}")
-    with open(filepath, 'rb') as f:
-        samples = pickle.load(f)
-    print(f"Loaded {len(samples)} samples")
-    return samples
-
-
-def test_data_collection(max_samples: int = 100):
-    """Test data collection with small samples"""
-    print("=" * 60)
-    print("TESTING DATA COLLECTION PIPELINE")
-    print("=" * 60)
-    
-    # Initialize collector
-    collector = NetHackDataCollector()
-    
-    try:
-        samples = collector.collect_data_batch(
-            dataset_name="taster-dataset",
-            max_samples=max_samples,
-            batch_size=16,
-            seq_length=32
-        )
-        
-        print(f"\n✅ Successfully collected {len(samples)} samples")
-        
-        # Analyze collected data
-        print(f"📊 Data Analysis:")
-        print(f"  - Total samples: {len(samples)}")
-        print(f"  - Unique games: {len(set(s['gameid'] for s in samples))}")
-        print(f"  - Score range: {min(s['score'] for s in samples)} - {max(s['score'] for s in samples)}")
-        
-        # Show sample data
-        sample = samples[0]
-        print(f"\n📋 Sample Data Structure:")
-        print(f"  - TTY chars shape: {sample['tty_chars'].shape}")
-        print(f"  - TTY colors shape: {sample['tty_colors'].shape}")
-        print(f"  - Game chars shape: {sample['game_chars'].shape}")
-        print(f"  - Message: '{sample['current_message']}'")
-        print(f"  - Status: {sample['status_lines']}")
-        
-        # Test train/test split
-        print(f"\n🔀 Testing Train/Test Split:")
-        train_samples, test_samples = create_train_test_split(samples, test_ratio=0.2)
-        
-        # Test PyTorch Dataset
-        print(f"\n🔥 Testing PyTorch Dataset:")
-        dataset = NetHackDataset(train_samples, target_type='reconstruction')
-        dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
-        
-        batch = next(iter(dataloader))
-        print(f"  - Input shape: {batch['input'].shape}")
-        print(f"  - Target shape: {batch['target'].shape}")
-        print(f"  - Batch size: {len(batch['metadata']['gameid'])}")
-        
-        # Test action prediction dataset
-        print(f"\n⚡ Testing Action Prediction Dataset:")
-        action_dataset = NetHackDataset(train_samples, target_type='action')
-        action_dataloader = DataLoader(action_dataset, batch_size=8, shuffle=True)
-        
-        action_batch = next(iter(action_dataloader))
-        print(f"  - Input shape: {action_batch['input'].shape}")
-        print(f"  - Target shape: {action_batch['target'].shape}")
-        print(f"  - Sample actions: {action_batch['target'][:5]}")
-        
-        # Test saving/loading
-        print(f"\n💾 Testing Save/Load:")
-        save_dataset(samples[:20], "test_dataset.pkl")
-        loaded_samples = load_dataset("test_dataset.pkl")
-        print(f"  - Original: {len(samples[:20])} samples")
-        print(f"  - Loaded: {len(loaded_samples)} samples")
-        
-        # Clean up test file
-        Path("test_dataset.pkl").unlink()
-        
-        print(f"\n✅ ALL TESTS PASSED!")
-        return samples
-        
-    except Exception as e:
-        print(f"\n❌ Error during testing: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def collect_training_data(max_samples: int = 5000, save_path: str = "nethack_dataset.pkl"):
-    """Collect dataset for VAE training"""
-    print("=" * 60)
-    print("COLLECTING TRAINING DATA")
-    print("=" * 60)
-    
-    collector = NetHackDataCollector()
-    
-    try:
-        # Collect training data
-        print(f"Collecting {max_samples} samples for VAE training...")
-        samples = collector.collect_data_batch(
-            dataset_name="taster-dataset",
-            max_samples=max_samples,
-            batch_size=64,
-            seq_length=128
-        )
-        
-        # Analyze the collected data
-        print(f"\n📊 Dataset Analysis:")
-        print(f"  - Total samples: {len(samples)}")
-        print(f"  - Unique games: {len(set(s['gameid'] for s in samples))}")
-        print(f"  - Data size: ~{len(samples) * 24 * 80 * 2 / 1024 / 1024:.1f} MB")
-        
-        # Show data distribution
-        scores = [s['score'] for s in samples]
-        keypresses = [s['keypress'] for s in samples]
-        print(f"  - Score range: {min(scores)} - {max(scores)}")
-        print(f"  - Unique actions: {len(set(keypresses))}")
-        print(f"  - Most common actions: {sorted(set(keypresses), key=keypresses.count, reverse=True)[:10]}")
-        
-        # Create train/test split
-        train_samples, test_samples = create_train_test_split(samples, test_ratio=0.2)
-        
-        # Save datasets
-        save_dataset(train_samples, f"train_{save_path}")
-        save_dataset(test_samples, f"test_{save_path}")
-        save_dataset(samples, save_path)  # Full dataset
-        
-        print(f"\n✅ Dataset saved!")
-        print(f"  - Full dataset: {len(samples)} samples -> {save_path}")
-        print(f"  - Training: {len(train_samples)} samples -> train_{save_path}")
-        print(f"  - Testing: {len(test_samples)} samples -> test_{save_path}")
-        
-        return train_samples, test_samples, samples
-        
-    except Exception as e:
-        print(f"\n❌ Error during collection: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, None
-
-
 if __name__ == "__main__":
-    # Test with small samples first
-    print("1️⃣ Testing basic data collection...")
-    test_samples = test_data_collection(max_samples=100)
-    
-    if test_samples:
-        print("\n2️⃣ Ready for full data collection!")
-        
-        # Ask user if they want to proceed with full collection
-        print("\n🚀 To complete the full VAE training pipeline:")
-        print("\n📋 Step 1: Collect training data")
-        print("  train_samples, test_samples, full_samples = collect_training_data(max_samples=2000)")
-        
-        print("\n🧠 Step 2: Train VAE")
-        print("  model, train_losses, test_losses = train_vae(train_samples, test_samples, num_epochs=25)")
-        
-        print("\n� Step 3: Analyze results")
-        print("  visualize_reconstructions(model, test_samples, device)")
-        print("  latent_vectors, game_ids, messages = analyze_latent_space(model, test_samples, device)")
-        
-        print("\n💡 Complete example:")
-        print("```python")
-        print("# Collect data")
-        print("train_data, test_data, full_data = collect_training_data(max_samples=2000)")
-        print("")
-        print("# Train VAE")
-        print("device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')")
-        print("model, train_losses, test_losses = train_vae(")
-        print("    train_data, test_data, ")
-        print("    latent_dim=128, batch_size=32, num_epochs=25")
-        print(")")
-        print("")
-        print("# Analyze results")
-        print("visualize_reconstructions(model, test_data, device)")
-        print("latent_vectors, _, _ = analyze_latent_space(model, test_data, device)")
-        print("")
-        print("# Use latent representations for downstream tasks")
-        print("print(f'Latent representation shape: {latent_vectors.shape}')")
-        print("```")
-        
-        print("\n🎯 Your VAE will learn to:")
-        print("  - Encode NetHack screens into a compact latent space")
-        print("  - Reconstruct screens from latent representations")
-        print("  - Capture meaningful game state information")
-        print("  - Enable analysis of game progression patterns")
-        
-        print("\n🆕 NEW: MiniHackVAE Integration!")
-        print("  You can now use the sophisticated MiniHackVAE from src/model.py")
-        print("  Example:")
-        print("  ```python")
-        print("  # Use the advanced MiniHackVAE instead of simple NetHackVAE")
-        print("  train_data, test_data, _ = collect_training_data(max_samples=1000)")
-        print("  model, train_losses, test_losses = train_minihack_vae(")
-        print("      train_data, test_data, ")
-        print("      epochs=15, batch_size=16, latent_dim=64")
-        print("  )")
-        print("  ```")
-        print("  ✨ Features: Multi-modal encoding, sophisticated decoders, flexible covariance")
-        
-    else:
-        print("❌ Basic testing failed")
+    pass

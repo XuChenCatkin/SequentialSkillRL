@@ -81,8 +81,8 @@ MAX_X_COORD = 78    # Maximum x coordinate (width - 1)
 MAX_Y_COORD = 20    # Maximum y coordinate (height - 1)
 ROLE_CAD = 13     # role cardinality for MiniHack (e.g. 4 for 'knight')
 RACE_CAD = 5      # race cardinality for MiniHack (e.g. 0 for 'human')
-GEND_CAD = 2      # gender cardinality for MiniHack (e.g. 0 for 'female')
-ALIGN_CAD = 3     # alignment cardinality for MiniHack (e.g. 0 for 'lawful')
+GEND_CAD = 3      # gender cardinality for MiniHack (e.g. 'male', 'female', 'neuter')
+ALIGN_CAD = 3     # alignment cardinality for MiniHack (e.g. 1 for 'lawful')
 ROLE_EMB = 8      # role embedding dim
 RACE_EMB = 4      # race embedding dim
 GEND_EMB = 2      # gender embedding dim
@@ -604,7 +604,7 @@ class InventoryEncoder(GlyphCNN):
         """Returns the number of output channels."""
         return self.output_dim
 
-class MiniHackVAE(nn.Module):
+class MultiModalHackVAE(nn.Module):
     def __init__(self, 
                  bInclude_glyph_bag=True, 
                  bInclude_hero=True,
