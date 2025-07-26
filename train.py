@@ -41,7 +41,7 @@ import logging
 # Import our utility functions
 import sys
 sys.path.append('./utils')
-from env_utils import separate_tty_components, get_current_message, get_status_lines, get_game_map
+from env_utils import get_current_message, get_status_lines, get_game_map, detect_valid_map
 
 
 class NetHackDataCollector:
@@ -54,7 +54,8 @@ class NetHackDataCollector:
         
         # NetHack mappings for hero info parsing
         self.role_mapping = {
-            'archaeologist': 0, 'barbarian': 1, 'caveman': 2, 'cavewoman': 2,
+            'archaeologist': 0, 'archeologist': 0,  # Handle both spellings
+            'barbarian': 1, 'caveman': 2, 'cavewoman': 2,
             'healer': 3, 'knight': 4, 'monk': 5, 'priest': 6, 'priestess': 6,
             'ranger': 7, 'rogue': 8, 'samurai': 9, 'tourist': 10, 'valkyrie': 11,
             'wizard': 12
@@ -123,6 +124,9 @@ class NetHackDataCollector:
         message_lower = message.lower()
         words = re.findall(r'\b\w+\b', message_lower)  # Extract word characters only
         
+        print(f"DEBUG: Message: '{message[:150]}...'")
+        print(f"DEBUG: Words found: {words}")  # All words for debugging
+        
         # Extract alignment
         alignment = None
         for align_name, align_value in self.alignment_mapping.items():
@@ -149,24 +153,29 @@ class NetHackDataCollector:
         for role_name, role_value in self.role_mapping.items():
             if role_name in words:
                 role = role_value
-                if 'man' or 'priest' in role_name and not gender:
-                    gender = self.gender_mapping['male']
-                elif 'woman' or 'priestess' in role_name and not gender:
-                    gender = self.gender_mapping['female']
-                elif not gender:
-                    gender = self.gender_mapping['neuter']  # Default to neuter if not specified
+                # Set gender based on role if not already set
+                if not gender:
+                    if 'man' in role_name or role_name == 'priest':
+                        gender = self.gender_mapping['male']
+                    elif 'woman' in role_name or role_name == 'priestess' or role_name == 'valkyrie':
+                        gender = self.gender_mapping['female']
+                    else:
+                        gender = self.gender_mapping['neuter']  # Default for other roles
                 break
         
         # Only return if we found all required components
+        print(f"DEBUG: Found - alignment:{alignment}, gender:{gender}, race:{race}, role:{role}")
         if all(x is not None for x in [alignment, gender, race, role]):
             hero_info = torch.tensor([role, race, gender, alignment], dtype=torch.int8)
             self.game_hero_info[game_id] = hero_info
+            print(f"DEBUG: Successfully parsed hero info: {hero_info}")
             return hero_info
         
+        print(f"DEBUG: Failed to parse hero info - missing components")
         return None
     
     def collect_data_batch(self, dataset_name: str, adapter: callable, max_batches: int = 1000, 
-                          batch_size: int = 32, seq_length: int = 32) -> List[Dict]:
+                          batch_size: int = 32, seq_length: int = 32, game_ids: List[int] | None = None) -> List[Dict]:
         """
         Collect data from the dataset for VAE training
         
@@ -188,7 +197,8 @@ class NetHackDataCollector:
             batch_size=batch_size,
             seq_length=seq_length,
             dbfilename=self.dbfilename,
-            shuffle=True
+            shuffle=True,
+            gameids=game_ids
         )
         
         collected_batches = []
@@ -201,12 +211,13 @@ class NetHackDataCollector:
             print(f"Processing batch {batch_idx + 1}...")
             
             num_games, num_time = minibatch['tty_chars'].shape[:2]
-            message_chars_minibatch = torch.empty((num_games, num_time, 80), dtype=torch.int8)
+            message_chars_minibatch = torch.empty((num_games, num_time, 256), dtype=torch.int8)
             game_chars_minibatch = torch.empty((num_games, num_time, 21, 79), dtype=torch.int8)
             game_colors_minibatch = torch.empty((num_games, num_time, 21, 79), dtype=torch.int8)
             status_chars_minibatch = torch.empty((num_games, num_time, 2, 80), dtype=torch.int8)
             hero_info_minibatch = torch.empty((num_games, num_time, 4), dtype=torch.int8)
-            blstats_minibatch = torch.empty((num_games, num_time, 27), dtype=torch.float8)
+            blstats_minibatch = torch.empty((num_games, num_time, 27), dtype=torch.float32)
+            valid_screen_minibatch = torch.ones((num_games, num_time), dtype=torch.bool)
 
             # Process each game in the batch
             for game_idx in range(minibatch['tty_chars'].shape[0]):
@@ -223,24 +234,31 @@ class NetHackDataCollector:
                     tty_chars = minibatch['tty_chars'][game_idx, time_idx]
                     tty_colors = minibatch['tty_colors'][game_idx, time_idx]
                     
-                    # Separate TTY components using our utility function
-                    tty_components = separate_tty_components(tty_chars, tty_colors)
+                    is_valid_map = detect_valid_map(tty_chars)
+                    if not is_valid_map:
+                        valid_screen_minibatch[game_idx, time_idx] = False
+                        continue
+                    
+                    game_map = get_game_map(tty_chars, tty_colors)
                     
                     # Extract text information
                     current_message = get_current_message(tty_chars)
+                    message_chars = np.array([ord(c) for c in current_message.ljust(256)])
                     status_lines = get_status_lines(tty_chars)
+                    status_chars = tty_chars[22:, :]
                     
                     hero_info = self.get_hero_info(game_id, current_message)
                     if hero_info is None:
+                        print(tty_render(tty_chars, tty_colors))
                         raise Exception(f"⚠️ No hero info found for game {game_id}, skipping sample")
 
                     # Fill in the minibatch tensors
-                    message_chars_minibatch[game_idx, time_idx] = tty_components['message_chars']
-                    game_chars_minibatch[game_idx, time_idx] = tty_components['game_chars']
-                    game_colors_minibatch[game_idx, time_idx] = tty_components['game_colors']
-                    status_chars_minibatch[game_idx, time_idx] = tty_components['status_chars']
+                    message_chars_minibatch[game_idx, time_idx] = torch.from_numpy(message_chars).to(torch.int8)
+                    game_chars_minibatch[game_idx, time_idx] = torch.from_numpy(game_map['chars']).to(torch.int8)
+                    game_colors_minibatch[game_idx, time_idx] = torch.from_numpy(game_map['colors']).to(torch.int8)
+                    status_chars_minibatch[game_idx, time_idx] = torch.from_numpy(status_chars).to(torch.int8)
                     hero_info_minibatch[game_idx, time_idx] = hero_info
-                    blstats_minibatch[game_idx, time_idx] = adapter(tty_components['game_chars'], status_lines, score)
+                    blstats_minibatch[game_idx, time_idx] = torch.from_numpy(adapter(game_map['chars'], status_lines, score)).to(torch.float32)
 
             minibatch['message_chars'] = message_chars_minibatch
             minibatch['game_chars'] = game_chars_minibatch
@@ -248,6 +266,7 @@ class NetHackDataCollector:
             minibatch['status_chars'] = status_chars_minibatch
             minibatch['hero_info'] = hero_info_minibatch
             minibatch['blstats'] = blstats_minibatch
+            minibatch['valid_screen'] = valid_screen_minibatch
             collected_batches.append(minibatch)
             batch_count += 1
 
@@ -348,7 +367,7 @@ class NetHackDataCollector:
     
     def collect_or_load_data(self, dataset_name: str, adapter: callable, save_path: str, 
                            max_batches: int = 1000, batch_size: int = 32, seq_length: int = 32,
-                           force_recollect: bool = False) -> List[Dict]:
+                           force_recollect: bool = False, game_ids: List[int] | None = None) -> List[Dict]:
         """
         Collect data from dataset or load from saved file if it exists.
         
@@ -374,7 +393,8 @@ class NetHackDataCollector:
                 adapter=adapter,
                 max_batches=max_batches,
                 batch_size=batch_size,
-                seq_length=seq_length
+                seq_length=seq_length,
+                game_ids=game_ids
             )
             
             # Save for future use
@@ -463,22 +483,20 @@ class BLStatsAdapter:
         Find player position by locating '@' symbol on the game map
         
         Args:
-            chars: TTY characters array (24, 80)
+            chars: Game characters array (21, 79) - already cropped from TTY
             
         Returns:
             Tuple of (x, y) coordinates, or cursor position if '@' not found
         """
-        # Search for '@' symbol (ASCII 64) in the map region (rows 1-21)
-        for y in range(self.map_start_row, self.map_end_row):
-            for x in range(self.map_width):
+        # Search for '@' symbol (ASCII 64) in the game map
+        height, width = chars.shape
+        for y in range(height):
+            for x in range(width):
                 if chars[y, x] == ord('@'):
-                    # Return 0-indexed coordinates relative to map
-                    map_x = x
-                    map_y = y - self.map_start_row  # Adjust for map offset
-                    return (map_x, map_y)
+                    return (x, y)
         
         # If '@' not found, return center of map as fallback
-        return (self.map_width // 2, self.map_height // 2)
+        return (width // 2, height // 2)
     
     def _parse_status_comprehensive(self, status_lines: List[str]) -> Dict:
         """Comprehensive status line parsing with multiple format support"""
@@ -898,6 +916,8 @@ def train_multimodalhack_vae(
     testing_batches: int = 20,
     max_training_batches: int = 1000,
     max_testing_batches: int = 200,
+    training_game_ids: List[int] | None = None,
+    testing_game_ids: List[int] | None = None,
     learning_rate: float = 1e-3,
     save_path: str = "models/multimodal_hack_vae.pth",
     device: str = None, 
@@ -955,7 +975,8 @@ def train_multimodalhack_vae(
         max_batches=max_training_batches,
         batch_size=batch_size,
         seq_length=sequence_size,
-        force_recollect=force_recollect
+        force_recollect=force_recollect,
+        game_ids=training_game_ids
     )
     train_dataset = train_dataset[:training_batches] if len(train_dataset) > training_batches else train_dataset
     
@@ -968,7 +989,8 @@ def train_multimodalhack_vae(
         max_batches=max_testing_batches,
         batch_size=batch_size,
         seq_length=sequence_size,
-        force_recollect=force_recollect
+        force_recollect=force_recollect,
+        game_ids=testing_game_ids
     )
     test_dataset = test_dataset[:testing_batches] if len(test_dataset) > testing_batches else test_dataset
 
@@ -1010,7 +1032,7 @@ def train_multimodalhack_vae(
                     glyph_chars=batch_device['game_chars'],
                     glyph_colors=batch_device['game_colors'], 
                     blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['msg_tokens'],
+                    msg_tokens=batch_device['message_chars'],
                     hero_info=batch_device['hero_info']
                 )
                 
@@ -1020,7 +1042,8 @@ def train_multimodalhack_vae(
                     glyph_chars=batch_device['game_chars'],
                     glyph_colors=batch_device['game_colors'],
                     blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['msg_tokens'],
+                    msg_tokens=batch_device['message_chars'],
+                    valid_screen=batch_device['valid_screen'],
                     weight_emb=1.0,
                     weight_raw=0.1,
                     kl_beta=1.0
@@ -1073,7 +1096,7 @@ def train_multimodalhack_vae(
                     glyph_chars=batch_device['game_chars'],
                     glyph_colors=batch_device['game_colors'], 
                     blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['msg_tokens'],
+                    msg_tokens=batch_device['message_chars'],
                     hero_info=batch_device['hero_info']
                 )
                 
@@ -1083,7 +1106,7 @@ def train_multimodalhack_vae(
                     glyph_chars=batch_device['glyph_chars'],
                     glyph_colors=batch_device['glyph_colors'],
                     blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['msg_tokens'],                    
+                    msg_tokens=batch_device['message_chars'],                    
                     weight_emb=1.0,
                     weight_raw=0.1,
                     kl_beta=1.0
@@ -1209,23 +1232,49 @@ def analyze_latent_space(model, samples, device, save_path="latent_analysis.png"
 
 if __name__ == "__main__":
     # Example usage
-    train_file = "nld-nao-training"
-    test_file = "nld-nao-testing"
+    train_file = "nld-aa-training"
+    test_file = "nld-aa-testing"
 
-    # Example 1: Regular training with data caching
-    model, train_losses, test_losses = train_multimodalhack_vae(
-        train_file=train_file,
-        test_file=test_file,
-        epochs=10,
-        batch_size=32,
-        sequence_size=32,
-        learning_rate=1e-3,
-        save_path="models/multimodal_hack_vae.pth",
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        include_inventory=False,
-        data_cache_dir="data_cache",  # Data will be cached here
-        force_recollect=False  # Use cached data if available
+    # test collecting and saving data
+    collector = NetHackDataCollector('ttyrecs.db')
+    adapter = BLStatsAdapter()
+    train_dataset = collector.collect_or_load_data(
+        dataset_name=train_file,
+        adapter=adapter,
+        save_path="data_cache/train_data_taster.pt",
+        max_batches=1000,
+        batch_size=1,
+        seq_length=32,
+        force_recollect=True
     )
+    test_dataset = collector.collect_or_load_data(
+        dataset_name=test_file,
+        adapter=adapter,
+        save_path="data_cache/test_data_taster.pt",
+        max_batches=200,
+        batch_size=1,
+        seq_length=32,
+        force_recollect=True
+    )
+    
+        
+    # # Example 1: Regular training with data caching
+    # model, train_losses, test_losses = train_multimodalhack_vae(
+    #     train_file=train_file,
+    #     test_file=test_file,
+    #     epochs=10,
+    #     batch_size=1,
+    #     sequence_size=32,
+    #     learning_rate=1e-3,
+    #     training_batches=5,
+    #     testing_batches=2,
+    #     training_game_ids=[12304],
+    #     save_path="models/multimodal_hack_vae.pth",
+    #     device='cuda' if torch.cuda.is_available() else 'cpu',
+    #     include_inventory=False,
+    #     data_cache_dir="data_cache",  # Data will be cached here
+    #     force_recollect=False  # Use cached data if available
+    # )
     
     # Example visualization (commented out due to missing NetHackDataset)
     # visualize_reconstructions(model, test_file, device='cuda', num_samples=4)

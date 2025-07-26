@@ -938,8 +938,18 @@ class MultiModalHackVAE(nn.Module):
 
 # ------------------------- loss helpers ------------------------------ #
 
-def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens,
-             inv_oclasses=None, inv_strs=None, weight_emb=1.0, weight_raw=0.1, kl_beta=1.0):
+def vae_loss(
+    model_output, 
+    glyph_chars, 
+    glyph_colors, 
+    blstats, 
+    msg_tokens,
+    valid_screen,
+    inv_oclasses=None, 
+    inv_strs=None, 
+    weight_emb=1.0, 
+    weight_raw=0.1, 
+    kl_beta=1.0):
     """VAE loss with separate embedding and raw reconstruction losses."""
     
     # Extract outputs from model
@@ -961,9 +971,9 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens,
     raw_losses = {}
     
     # Glyph reconstruction (chars + colors)
-    raw_losses['char'] = F.cross_entropy(char_logits, glyph_chars, reduction='mean')
-    raw_losses['color'] = F.cross_entropy(color_logits, glyph_colors, reduction='mean')
-    
+    raw_losses['char'] = F.cross_entropy(char_logits[valid_screen], glyph_chars[valid_screen], reduction='mean')
+    raw_losses['color'] = F.cross_entropy(color_logits[valid_screen], glyph_colors[valid_screen], reduction='mean')
+
     # Stats reconstruction - separate losses for continuous and discrete components
     # Extract model outputs
     stats_continuous = model_output['stats_continuous']  # [B, 19] - already inverted to original scale
@@ -1012,10 +1022,11 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens,
     continuous_targets_final = continuous_targets_processed[:, keep_indices]  # [B, 19]
     
     # Calculate losses - stats_continuous should match the processed targets (after inversion)
-    raw_losses['stats_continuous'] = F.mse_loss(stats_continuous, continuous_targets_final, reduction='mean')
-    raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits, discrete_targets[0], reduction='mean')
-    raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits, discrete_targets[1], reduction='mean')
-    raw_losses['stats_level'] = F.cross_entropy(level_number_logits, discrete_targets[2], reduction='mean')
+    # Apply valid_screen mask to stats losses
+    raw_losses['stats_continuous'] = F.mse_loss(stats_continuous[valid_screen], continuous_targets_final[valid_screen], reduction='mean')
+    raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], discrete_targets[0][valid_screen], reduction='mean')
+    raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], discrete_targets[1][valid_screen], reduction='mean')
+    raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], discrete_targets[2][valid_screen], reduction='mean')
     
     # Total stats loss
     raw_losses['stats'] = (raw_losses['stats_continuous'] + 
@@ -1023,30 +1034,37 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens,
                           raw_losses['stats_dungeon'] + 
                           raw_losses['stats_level'])
     
-    # Message reconstruction
+    # Message reconstruction - apply valid_screen mask
     msg_lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
     msg_tokens_with_eos = msg_tokens.clone()
     # Add EOS tokens where there's space
     mask = msg_lengths < msg_tokens.size(1)
     msg_tokens_with_eos[mask, msg_lengths[mask]] = MSG_VOCAB + 1  # EOS token
-    raw_losses['msg'] = F.cross_entropy(msg_logits.view(-1, msg_logits.size(-1)), msg_tokens_with_eos.view(-1), reduction='mean', ignore_index=0)
     
-    # Inventory reconstruction (optional)
+    # Apply valid_screen mask to message loss
+    raw_losses['msg'] = F.cross_entropy(
+        msg_logits[valid_screen].view(-1, msg_logits.size(-1)), 
+        msg_tokens_with_eos[valid_screen].view(-1), 
+        reduction='mean', 
+        ignore_index=0
+    )
+    
+    # Inventory reconstruction (optional) - apply valid_screen mask
     inv_oclasses_logits = model_output['inv_oclasses_logits']
     inv_strs_logits = model_output['inv_strs_logits']
     if inv_oclasses_logits is not None and inv_strs_logits is not None and inv_oclasses is not None and inv_strs is not None:
         # Object class reconstruction
         raw_losses['inv_oclasses'] = F.cross_entropy(
-            inv_oclasses_logits.view(-1, INV_OCLASS_DIM), 
-            inv_oclasses.view(-1), 
+            inv_oclasses_logits[valid_screen].view(-1, INV_OCLASS_DIM), 
+            inv_oclasses[valid_screen].view(-1), 
             reduction='mean', 
             ignore_index=18  # Padding index
         )
         
         # String reconstruction
         raw_losses['inv_strs'] = F.cross_entropy(
-            inv_strs_logits.view(-1, MSG_VOCAB + 2), 
-            inv_strs.view(-1), 
+            inv_strs_logits[valid_screen].view(-1, MSG_VOCAB + 2), 
+            inv_strs[valid_screen].view(-1), 
             reduction='mean', 
             ignore_index=0  # Padding index
         )
@@ -1060,26 +1078,26 @@ def vae_loss(model_output, glyph_chars, glyph_colors, blstats, msg_tokens,
     target_stats_emb = model_output['target_stats_emb']  # [B, emb_dim] 
     target_msg_emb = model_output['target_msg_emb']  # [B, 256, emb_dim]
     
-    # Embedding reconstruction losses
+    # Embedding reconstruction losses - apply valid_screen mask
     # Split glyph embeddings back to char/color
     char_emb_recon, color_emb_recon = torch.split(glyph_emb_decoded, [CHAR_EMB, COLOR_EMB], dim=1)  # Split into char and color embeddings
     
-    emb_losses['char_emb'] = F.mse_loss(char_emb_recon, target_char_emb.detach(), reduction='mean')
-    emb_losses['color_emb'] = F.mse_loss(color_emb_recon, target_color_emb.detach(), reduction='mean')
+    emb_losses['char_emb'] = F.mse_loss(char_emb_recon[valid_screen], target_char_emb[valid_screen].detach(), reduction='mean')
+    emb_losses['color_emb'] = F.mse_loss(color_emb_recon[valid_screen], target_color_emb[valid_screen].detach(), reduction='mean')
     
     # Stats embedding loss
     # stats_emb_decoded is [B, 45], target_stats_emb is [B, 45]
-    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded, target_stats_emb.detach(), reduction='mean')
+    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded[valid_screen], target_stats_emb[valid_screen].detach(), reduction='mean')
     
     # Message embedding loss
-    emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded, target_msg_emb.detach(), reduction='mean')
+    emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded[valid_screen], target_msg_emb[valid_screen].detach(), reduction='mean')
     
     # Inventory embedding loss (optional)
     inv_oclasses_emb_decoded = model_output['inv_oclasses_emb_decoded'] # [B, 55, CHAR_EMB]
     inv_str_emb_decoded = model_output['inv_str_emb_decoded'] # [B, 55, 80, str_emb]
     if inv_oclasses_emb_decoded is not None and inv_str_emb_decoded is not None:
-        emb_losses['inv_oclasses_emb'] = F.mse_loss(inv_oclasses_emb_decoded, model_output['target_inv_oclassess_emb'].detach(), reduction='mean')
-        emb_losses['inv_strs_emb'] = F.mse_loss(inv_str_emb_decoded, model_output['target_inv_strs_emb'].detach(), reduction='mean')
+        emb_losses['inv_oclasses_emb'] = F.mse_loss(inv_oclasses_emb_decoded[valid_screen], model_output['target_inv_oclassess_emb'][valid_screen].detach(), reduction='mean')
+        emb_losses['inv_strs_emb'] = F.mse_loss(inv_str_emb_decoded[valid_screen], model_output['target_inv_strs_emb'][valid_screen].detach(), reduction='mean')
     
     # ============= Combine Losses =============
     

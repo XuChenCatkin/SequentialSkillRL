@@ -203,3 +203,4 @@ nle_data/
 *.whl
 
 data/
+data_cache/
