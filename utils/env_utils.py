@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 def separate_tty_components(tty_chars, tty_colors):
     """
@@ -13,7 +14,7 @@ def separate_tty_components(tty_chars, tty_colors):
     """
     messages = get_current_message(tty_chars)
     # convert messages to ASCI characters and pad to 256 characters
-    messages_chars = np.array([ord(c) for c in messages.ljust(256)])
+    messages_chars = np.array([ord(c) for c in messages.ljust(256, chr(0))])
     game_map = get_game_map(tty_chars, tty_colors)
     return {
         # Message line (top of screen)
@@ -128,9 +129,10 @@ def get_game_map(tty_chars, tty_colors):
     
     # We pad on top of the map to make it 21 times 79. We pad it with spaces
     if map_start_row > 1:
-        padding = np.full((map_start_row - 1, map_width), ord(' '), dtype=np.int8)
-        tty_chars_new = np.vstack((padding, tty_chars[map_start_row:map_end_row, :map_width]))
-        tty_colors_new = np.vstack((np.zeros_like(padding), tty_colors[map_start_row:map_end_row, :map_width]))
+        padding = torch.full((map_start_row - 1, map_width), ord(' '), dtype=torch.int32, device=tty_chars.device)
+        tty_chars_new = torch.cat([padding, tty_chars[map_start_row:map_end_row, :map_width]], dim=0)
+        color_padding = torch.zeros_like(padding, dtype=tty_colors.dtype)
+        tty_colors_new = torch.cat([color_padding, tty_colors[map_start_row:map_end_row, :map_width]], dim=0)
     else:
         tty_chars_new = tty_chars[map_start_row:map_end_row, :map_width]
         tty_colors_new = tty_colors[map_start_row:map_end_row, :map_width]

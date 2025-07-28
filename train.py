@@ -166,7 +166,7 @@ class NetHackDataCollector:
         # Only return if we found all required components
         print(f"DEBUG: Found - alignment:{alignment}, gender:{gender}, race:{race}, role:{role}")
         if all(x is not None for x in [alignment, gender, race, role]):
-            hero_info = torch.tensor([role, race, gender, alignment], dtype=torch.int8)
+            hero_info = torch.tensor([role, race, gender, alignment], dtype=torch.int32)
             self.game_hero_info[game_id] = hero_info
             print(f"DEBUG: Successfully parsed hero info: {hero_info}")
             return hero_info
@@ -211,12 +211,19 @@ class NetHackDataCollector:
             print(f"Processing batch {batch_idx + 1}...")
             
             num_games, num_time = minibatch['tty_chars'].shape[:2]
-            message_chars_minibatch = torch.empty((num_games, num_time, 256), dtype=torch.int8)
-            game_chars_minibatch = torch.empty((num_games, num_time, 21, 79), dtype=torch.int8)
-            game_colors_minibatch = torch.empty((num_games, num_time, 21, 79), dtype=torch.int8)
-            status_chars_minibatch = torch.empty((num_games, num_time, 2, 80), dtype=torch.int8)
-            hero_info_minibatch = torch.empty((num_games, num_time, 4), dtype=torch.int8)
-            blstats_minibatch = torch.empty((num_games, num_time, 27), dtype=torch.float32)
+            
+            # convert numpy arrays to torch tensors in minibatch
+            # Initialize tensors for the minibatch
+            for key, item in minibatch.items():
+                if isinstance(item, np.ndarray):
+                    minibatch[key] = torch.from_numpy(item)
+
+            message_chars_minibatch = torch.zeros((num_games, num_time, 256), dtype=torch.int32)
+            game_chars_minibatch = torch.ones((num_games, num_time, 21, 79), dtype=torch.int32) * 32  # Fill with spaces
+            game_colors_minibatch = torch.zeros((num_games, num_time, 21, 79), dtype=torch.int32)
+            status_chars_minibatch = torch.zeros((num_games, num_time, 2, 80), dtype=torch.int32)
+            hero_info_minibatch = torch.ones((num_games, num_time, 4), dtype=torch.int32)
+            blstats_minibatch = torch.zeros((num_games, num_time, 27), dtype=torch.float32)
             valid_screen_minibatch = torch.ones((num_games, num_time), dtype=torch.bool)
 
             # Process each game in the batch
@@ -243,7 +250,7 @@ class NetHackDataCollector:
                     
                     # Extract text information
                     current_message = get_current_message(tty_chars)
-                    message_chars = np.array([ord(c) for c in current_message.ljust(256)])
+                    message_chars = torch.tensor([ord(c) for c in current_message.ljust(256, chr(0))], dtype=torch.int32)
                     status_lines = get_status_lines(tty_chars)
                     status_chars = tty_chars[22:, :]
                     
@@ -253,12 +260,12 @@ class NetHackDataCollector:
                         raise Exception(f"⚠️ No hero info found for game {game_id}, skipping sample")
 
                     # Fill in the minibatch tensors
-                    message_chars_minibatch[game_idx, time_idx] = torch.from_numpy(message_chars).to(torch.int8)
-                    game_chars_minibatch[game_idx, time_idx] = torch.from_numpy(game_map['chars']).to(torch.int8)
-                    game_colors_minibatch[game_idx, time_idx] = torch.from_numpy(game_map['colors']).to(torch.int8)
-                    status_chars_minibatch[game_idx, time_idx] = torch.from_numpy(status_chars).to(torch.int8)
+                    message_chars_minibatch[game_idx, time_idx] = message_chars
+                    game_chars_minibatch[game_idx, time_idx] = game_map['chars']
+                    game_colors_minibatch[game_idx, time_idx] = game_map['colors']
+                    status_chars_minibatch[game_idx, time_idx] = status_chars
                     hero_info_minibatch[game_idx, time_idx] = hero_info
-                    blstats_minibatch[game_idx, time_idx] = torch.from_numpy(adapter(game_map['chars'], status_lines, score)).to(torch.float32)
+                    blstats_minibatch[game_idx, time_idx] = adapter(game_map['chars'], status_lines, score)
 
             minibatch['message_chars'] = message_chars_minibatch
             minibatch['game_chars'] = game_chars_minibatch
@@ -337,7 +344,7 @@ class NetHackDataCollector:
         
         # Load using appropriate method based on file extension
         if load_path.endswith('.pt'):
-            save_data = torch.load(load_path, map_location='cpu')
+            save_data = torch.load(load_path, map_location='cpu', weights_only=False)
         elif load_path.endswith('.pkl'):
             with open(load_path, 'rb') as f:
                 save_data = pickle.load(f)
@@ -652,7 +659,7 @@ class BLStatsAdapter:
         parsed_stats = self._parse_status_comprehensive(status_lines)
         
         # Create 27-dimensional blstats array
-        blstats = np.zeros(27, dtype=np.int64)
+        blstats = torch.zeros(27, dtype=torch.float32)
         
         # Position (0, 1) - Find player '@' on map, not from status line
         player_x, player_y = self._find_player_position(game_chars)
@@ -945,7 +952,7 @@ def train_multimodalhack_vae(
         Tuple of (trained_model, train_losses, test_losses)
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device('cpu')  # Use CPU for debugging
 
     print(f"🔥 Training MultiModalHackVAE with {training_batches} train batches, {testing_batches} test batches")
     print(f"   Epochs: {epochs}")
@@ -1023,7 +1030,13 @@ def train_multimodalhack_vae(
                 batch_device = {}
                 for key, value in batch.items():
                     if value is not None and isinstance(value, torch.Tensor):
-                        batch_device[key] = value.to(device)
+                        value_device = value.to(device)
+                        # Reshape tensors from [B, T, ...] to [B*T, ...]
+                        # Multi-dimensional tensors (game_chars, game_colors, etc.)
+                        B, T = value_device.shape[:2]
+                        remaining_dims = value_device.shape[2:]
+                        batch_device[key] = value_device.view(B * T, *remaining_dims)
+                        
                     else:
                         batch_device[key] = value
                 
@@ -1087,7 +1100,12 @@ def train_multimodalhack_vae(
                 batch_device = {}
                 for key, value in batch.items():
                     if value is not None and isinstance(value, torch.Tensor):
-                        batch_device[key] = value.to(device)
+                        value_device = value.to(device)
+                        # Reshape tensors from [B, T, ...] to [B*T, ...]
+                        # Multi-dimensional tensors (game_chars, game_colors, etc.)
+                        B, T = value_device.shape[:2]
+                        remaining_dims = value_device.shape[2:]
+                        batch_device[key] = value_device.view(B * T, *remaining_dims)
                     else:
                         batch_device[key] = value
                 
@@ -1103,10 +1121,11 @@ def train_multimodalhack_vae(
                 # Calculate loss
                 loss_dict = vae_loss(
                     model_output=model_output,
-                    glyph_chars=batch_device['glyph_chars'],
-                    glyph_colors=batch_device['glyph_colors'],
+                    glyph_chars=batch_device['game_chars'],
+                    glyph_colors=batch_device['game_colors'],
                     blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['message_chars'],                    
+                    msg_tokens=batch_device['message_chars'],
+                    valid_screen=batch_device['valid_screen'],
                     weight_emb=1.0,
                     weight_raw=0.1,
                     kl_beta=1.0
@@ -1241,24 +1260,51 @@ if __name__ == "__main__":
     train_dataset = collector.collect_or_load_data(
         dataset_name=train_file,
         adapter=adapter,
-        save_path="data_cache/train_data_taster.pt",
-        max_batches=1000,
+        save_path="data_cache/train_data_mini_test.pt",
+        max_batches=3,  # Very small for testing
         batch_size=1,
-        seq_length=32,
-        force_recollect=True
+        seq_length=8,   # Very short sequences for testing
+        force_recollect=False  # Use cache if available
     )
     test_dataset = collector.collect_or_load_data(
         dataset_name=test_file,
         adapter=adapter,
-        save_path="data_cache/test_data_taster.pt",
-        max_batches=200,
+        save_path="data_cache/test_data_mini_test.pt",
+        max_batches=2,  # Very small for testing
         batch_size=1,
-        seq_length=32,
-        force_recollect=True
+        seq_length=8,   # Very short sequences for testing
+        force_recollect=False  # Use cache if available
     )
     
+    print(f"✅ Data collection completed!")
+    print(f"   📊 Train batches: {len(train_dataset)}")
+    print(f"   📊 Test batches: {len(test_dataset)}")
+    
+    # Mini test of train_multimodalhack_vae with very small samples
+    print(f"\n🧪 Starting mini test of train_multimodalhack_vae...")
+    model, train_losses, test_losses = train_multimodalhack_vae(
+        train_file=train_file,
+        test_file=test_file,
+        epochs=2,           # Very few epochs
+        batch_size=1,
+        sequence_size=8,    # Very short sequences
+        learning_rate=1e-3,
+        training_batches=2, # Very few batches
+        testing_batches=1,  # Very few batches
+        max_training_batches=3,
+        max_testing_batches=2,
+        save_path="models/mini_test_vae.pth",
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        include_inventory=False,
+        data_cache_dir="data_cache",
+        force_recollect=False  # Use the data we just collected
+    )
+    
+    print(f"\n🎉 Mini test completed successfully!")
+    print(f"   📈 Train losses: {train_losses}")
+    print(f"   📈 Test losses: {test_losses}")
         
-    # # Example 1: Regular training with data caching
+    # # Example 1: Regular training with data caching (commented out for testing)
     # model, train_losses, test_losses = train_multimodalhack_vae(
     #     train_file=train_file,
     #     test_file=test_file,

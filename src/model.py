@@ -70,9 +70,9 @@ COLOR_EMB = 4       # colour‑id embedding dim
 GLYPH_EMB = CHAR_EMB + COLOR_EMB  # glyph embedding dim
 LATENT_DIM = 64     # z‑dim for VAE
 BLSTATS_DIM = 27   # raw scalar stats (hp, gold, …)
-MSG_VOCAB = 128     # Nethack takes 0-127 byte for char of messages
+MSG_VOCAB = 128     # Nethack takes 32-127 byte for char of messages
 GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
-PADDING_IDX = [128, COLOR_DIM]  # padding index for glyphs
+PADDING_IDX = [CHAR_DIM, COLOR_DIM]  # padding index for glyphs
 LOW_RANK = 4      # low-rank factorisation rank for covariance
 # NetHack map dimensions (from NetHack source: include/config.h)
 MAP_HEIGHT = 21     # ROWNO - number of rows in the map
@@ -176,8 +176,11 @@ class GlyphCNN(nn.Module):
             nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
             nn.AdaptiveAvgPool2d(1)  # -> [B,64,1,1]
         )
-        
-    def forward(self, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    def forward(self, glyph_chars: torch.IntTensor, glyph_colors: torch.IntTensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # glyph_chars are in the range of [32, 127] (ASCII codes)
+        # shift to [0, 95] for model indices before embedding
+        glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Normalize to [0, 95]
         char_embedding = self.char_emb(glyph_chars)  # [B, H, W] -> [B, H, W, 16]
         char_embedding = char_embedding.permute(0, 3, 1, 2)  # [B, H, W, 16] -> [B, 16, H, W]
         color_embedding = self.col_emb(glyph_colors)  # [B, H, W] -> [B, H, W, 4]
@@ -191,7 +194,7 @@ class GlyphCNN(nn.Module):
         """Returns the number of output channels after self.net."""
         return 64
     
-class GlyphBag(GlyphCNN):
+class GlyphBag(nn.Module):
     """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
     def __init__(self, max_len=64, logger: logging.Logger=None):
         super().__init__()
@@ -216,9 +219,16 @@ class GlyphBag(GlyphCNN):
         g_ids = g_ids.view(B, 2, -1)  # flatten to [B, 2, H*W]
         # for each batch, create a sorted bag of glyphs
         for b in range(B):
+            # g_ids[b] has shape [2, H*W], find unique glyph pairs along dim=1
             unique_glyphs, counts = torch.unique(g_ids[b], return_counts=True, dim=1)
-            sorted_indices = torch.argsort(unique_glyphs)
-            sorted_glyphs = unique_glyphs[sorted_indices]
+            # Sort by the glyph pairs - need to sort by both char and color
+            # First sort by character (row 0), then by color (row 1) for ties
+            sorted_indices = torch.arange(unique_glyphs.size(1), device=unique_glyphs.device)
+            perm_sec = torch.argsort(unique_glyphs[1], stable=True)  # sort by color
+            sorted_indices = sorted_indices[perm_sec]  # apply color sort
+            perm_pri = torch.argsort(unique_glyphs[0][sorted_indices], stable=True)  # sort by char
+            sorted_indices = sorted_indices[perm_pri]  # apply char sort
+            sorted_glyphs = unique_glyphs[:, sorted_indices]
             sorted_counts = counts[sorted_indices]
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(f"Batch {b}: unique glyphs {unique_glyphs.size(0)}, counts {counts.size(0)}")
@@ -226,20 +236,22 @@ class GlyphBag(GlyphCNN):
             if len(sorted_glyphs) > self.max_len:
                 self.logger.warning(f"Batch {b}: Too many unique glyphs ({len(sorted_glyphs)}), truncating to {self.max_len}.")
             # Fill the bag with glyph ids (up to max_len)
-            bag[b, :len(sorted_glyphs)] = sorted_glyphs[:self.max_len]
-            bag[b, len(sorted_glyphs):] = PADDING_IDX  # pad the rest
+            bag[b, :min(sorted_glyphs.size(1), self.max_len)] = sorted_glyphs[:self.max_len].t()
+            bag[b, min(sorted_glyphs.size(1), self.max_len):] = torch.IntTensor(PADDING_IDX)  # pad the rest
         return bag  # [B, max_len, 2] of glyph ids
 
-    def forward(self, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, glyph_encoder: GlyphCNN, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Encode glyphs to bag
         bag = self.encode_glyphs_to_bag(glyph_chars, glyph_colors)
         char_bag = bag[:, :, 0]  # [B, max_len] of char ids
         color_bag = bag[:, :, 1]  # [B, max_len] of color ids
-        char_emb = super().char_emb(char_bag)  # [B, max_len] -> [B, max_len, CHAR_EMB]
-        color_emb = super().col_emb(color_bag)  # [B, max_len] -> [B, max_len, COLOR_EMB]
+        char_bag = torch.clamp(char_bag - 32, 0, CHAR_DIM - 1)  # Ensure char ids are in range [0, CHAR_DIM-1]
+        char_emb = glyph_encoder.char_emb(char_bag)  # [B, max_len] -> [B, max_len, CHAR_EMB]
+        color_emb = glyph_encoder.col_emb(color_bag)  # [B, max_len] -> [B, max_len, COLOR_EMB]
         emb = torch.cat([char_emb, color_emb], dim=2)  # [B, max_len, GLYPH_EMB]
         # Use RNN to encode the bag into a fixed-size vector
-        packed_emb = nn.utils.rnn.pack_padded_sequence(emb, lengths=(bag != PADDING_IDX).sum(dim=1).cpu(), batch_first=True, enforce_sorted=False)
+        padding_indices = torch.IntTensor(PADDING_IDX).to(bag.device)  # [2]
+        packed_emb = nn.utils.rnn.pack_padded_sequence(emb, lengths=(bag != padding_indices).all(dim=-1).sum(dim=1).cpu(), batch_first=True, enforce_sorted=False)
         _, h = self.net(packed_emb)  # h: [1,B,32]
         features = h.squeeze(0)  # [B,32]
         return features, emb, bag # [B, max_len, GLYPH_EMB], [B, max_len, 2]
@@ -417,8 +429,13 @@ class MessageGRU(nn.Module):
         """
         # calculate lengths for packing
         lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
-        msg_tokens_with_eos = msg_tokens.clone()
-        bHasSpace = (lengths < msg_tokens.size(1))  # check if there is space for EOS
+        # for entries who length is 0, pad a ' ' token
+        bempty = (lengths == 0)
+        padded_msg_tokens = msg_tokens.clone()  # clone to avoid modifying original
+        padded_msg_tokens[bempty, 0] = ord(' ')  # set space token for empty messages
+        lengths[bempty] = 1  # set length to 1 for empty messages
+        msg_tokens_with_eos = padded_msg_tokens.clone()
+        bHasSpace = (lengths < padded_msg_tokens.size(1))  # check if there is space for EOS
         msg_tokens_with_eos[bHasSpace, lengths[bHasSpace]] = self.eos  # set end-of-sequence token at the end of each message
         x = self.emb(msg_tokens_with_eos)  # [B, 256, emb_dim]
         # pack so GRU skips padding
@@ -438,10 +455,14 @@ class MessageGRU(nn.Module):
         """
         # calculate lengths for packing
         lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
-        shifted_tokens = torch.zeros_like(msg_tokens)
+        bempty = (lengths == 0)
+        padded_msg_tokens = msg_tokens.clone()  # clone to avoid modifying original
+        padded_msg_tokens[bempty, 0] = ord(' ')  # set space token for empty messages
+        lengths[bempty] = 1  # set length to 1 for empty messages
+        shifted_tokens = torch.zeros_like(padded_msg_tokens)
         shifted_tokens[:, 0] = self.sos  # set start-of-sequence token
-        shifted_tokens[:, 1:] = msg_tokens[:, :-1]  # shift right by 1
-        bHasSpace = (lengths < msg_tokens.size(1) - 1)  # check if there is space for EOS
+        shifted_tokens[:, 1:] = padded_msg_tokens[:, :-1]  # shift right by 1
+        bHasSpace = (lengths < padded_msg_tokens.size(1) - 1)  # check if there is space for EOS
         shifted_tokens[bHasSpace, lengths[bHasSpace]+1] = self.eos  # set end-of-sequence token at the end of each message
         # Get embeddings for shifted tokens
         shifted_embeddings = self.emb(shifted_tokens)  # [B, 256, emb_dim]
@@ -466,6 +487,8 @@ class HeroEmbedding(nn.Module):
         role_emb = self.role_emb(role)
         race_emb = self.race_emb(race)
         gend_emb = self.gend_emb(gend)
+        # normalise alignment to the range [0, ALIGN_CAD-1]
+        align = torch.clamp(align + 1, 0, ALIGN_CAD - 1)  # Ensure alignment is within bounds
         align_emb = self.align_emb(align)
         
         hero_vec = torch.cat([role_emb, race_emb, gend_emb, align_emb], dim=-1)
@@ -482,7 +505,7 @@ class HeroEmbedding(nn.Module):
         return ROLE_EMB + RACE_EMB + GEND_EMB + ALIGN_EMB  # 16
     
 
-class InventoryEncoder(GlyphCNN):
+class InventoryEncoder(nn.Module):
     """
     Encodes inventory using object classes (inv_oclasses) and string descriptions (inv_strs).
     We use char embeddings from GlyphCNN for object classes.
@@ -517,7 +540,7 @@ class InventoryEncoder(GlyphCNN):
             nn.Linear(hid, output_dim)
         )
         
-    def forward(self, inv_oclasses: torch.Tensor, inv_strs: torch.Tensor) -> torch.Tensor:
+    def forward(self, glyph_encoder: GlyphCNN, inv_oclasses: torch.Tensor, inv_strs: torch.Tensor) -> torch.Tensor:
         """
         Args:
             inv_oclasses: [B, 55] - object class indices
@@ -531,7 +554,7 @@ class InventoryEncoder(GlyphCNN):
         inv_class = torch.tensor(list(inv_class), dtype=torch.long, device=inv_oclasses.device).view(B, INV_MAX_SIZE)  # [B, 55]
         
         # Process object classes
-        inv_class_emb = super().char_emb(inv_class)  # [B, 55] -> [B, 55, CHAR_EMB]
+        inv_class_emb = glyph_encoder.char_emb(inv_class)  # [B, 55] -> [B, 55, CHAR_EMB]
         packed_inv_class_emb = nn.utils.rnn.pack_padded_sequence(
             inv_class_emb, (inv_oclasses != 18).sum(dim=1).cpu(),
             batch_first=True, enforce_sorted=False
@@ -567,7 +590,7 @@ class InventoryEncoder(GlyphCNN):
         return inv_features, inv_class_emb, str_emb  # return features, class embeddings, string embeddings
         # inv_class_emb: [B, 55, CHAR_EMB], str_emb: [B, 55, 80, str_emb]
         
-    def teacher_forcing_decorator(self, inv_oclasses: torch.Tensor, inv_strs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def teacher_forcing_decorator(self, glyph_encoder: GlyphCNN, inv_oclasses: torch.Tensor, inv_strs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             inv_oclasses: [B, 55] - object class indices
@@ -595,7 +618,7 @@ class InventoryEncoder(GlyphCNN):
         bHasSpace = lengths_strs < INV_STR_LEN - 1  # check if there is space for EOS
         shifted_strs[bHasSpace, lengths_strs[bHasSpace] + 1] = self.eos  # set end-of-sequence token
         # Get embeddings for shifted object classes and strings
-        shifted_oclass_emb = super().char_emb(shifted_oclasses)  # [B, 55] -> [B, 55, CHAR_EMB]
+        shifted_oclass_emb = glyph_encoder.char_emb(shifted_oclasses)  # [B, 55] -> [B, 55, CHAR_EMB]
         shifted_str_emb = self.char_emb(shifted_strs)  # [B*55, 80] -> [B*55, 80, str_emb]
         shifted_str_emb = shifted_str_emb.view(B, INV_MAX_SIZE, INV_STR_LEN, self.str_emb_dim)
         return shifted_oclasses, shifted_strs, shifted_oclass_emb, shifted_str_emb  # return shifted object classes and strings, and their embeddings
@@ -669,12 +692,13 @@ class MultiModalHackVAE(nn.Module):
             nn.Unflatten(1, (64, 1, 1)),  # [B, 64, 1, 1]
             
             # Upsample to target size: 21 x 79
-            # Step 1: [B, 64, 1, 1] -> [B, 32, 7, 26] (roughly 1/3 of target)
-            nn.ConvTranspose2d(64, 32, kernel_size=7, stride=1, padding=0),  # -> [B, 32, 7, 26]
+            # Step 1: [B, 64, 1, 1] -> [B, 32, 3, 10] 
+            nn.ConvTranspose2d(64, 32, kernel_size=(3, 10), stride=1, padding=0),  # -> [B, 32, 3, 10]
             nn.ReLU(),
             
-            # Step 2: [B, 32, 7, 26] -> [B, 20, 21, 79]
-            nn.ConvTranspose2d(32, GLYPH_EMB, kernel_size=(15, 54), stride=1, padding=0)  # -> [B, 20, 21, 79]
+            # Step 2: [B, 32, 3, 10] -> [B, 20, 21, 79]
+            # kernel_size needed: (21-3+1, 79-10+1) = (19, 70)
+            nn.ConvTranspose2d(32, GLYPH_EMB, kernel_size=(19, 70), stride=1, padding=0)  # -> [B, 20, 21, 79]
         )
         
         # glyph bag embeddings
@@ -759,7 +783,7 @@ class MultiModalHackVAE(nn.Module):
         z = mu + diag_std*eps1
         if lowrank_factors is not None:
             # If low-rank factors are provided, combine them with the diagonal std
-            eps2 = torch.randn_like(lowrank_factors)
+            eps2 = torch.randn((lowrank_factors.size(0), lowrank_factors.size(2)), device=lowrank_factors.device)  # [B, RANK]
             # Assuming lowrank_factors is [B, LATENT_DIM, RANK]
             lowrank_std = torch.bmm(lowrank_factors, eps2.unsqueeze(-1)).squeeze(-1)  # [B, LATENT_DIM]
             z += lowrank_std
@@ -784,7 +808,7 @@ class MultiModalHackVAE(nn.Module):
         features = [glyph_feat, stats_feat, msg_feat]
         
         if self.include_glyph_bag:
-            glyph_bag_feat, glyph_bag_emb, glyph_bag = self.glyph_bag(glyph_chars, glyph_colors) # [B,32], [B,max_len,20], [B,max_len, 2]
+            glyph_bag_feat, glyph_bag_emb, glyph_bag = self.glyph_bag(self.glyph_cnn, glyph_chars, glyph_colors) # [B,32], [B,max_len,20], [B,max_len, 2]
             features.append(glyph_bag_feat)
         else:
             glyph_bag_emb = None
@@ -808,9 +832,9 @@ class MultiModalHackVAE(nn.Module):
         
         # Inventory encoding (optional)
         if self.include_inventory and inv_oclasses is not None and inv_strs is not None:
-            inv_features, inv_oclasses_emb_no_shift, inv_str_emb_no_shift = self.inv_encoder(inv_oclasses, inv_strs)  # [B, output_dim]
+            inv_features, inv_oclasses_emb_no_shift, inv_str_emb_no_shift = self.inv_encoder(self.glyph_cnn, inv_oclasses, inv_strs)  # [B, output_dim]
             features.append(inv_features)
-            inv_oclasses_shift, inv_strs_shift, inv_oclasses_emb_shift, inv_strs_emb_shift = self.inv_encoder.teacher_forcing_decorator(inv_oclasses, inv_strs)  # [B, 55], [B, 55, 80], [B, 55, CHAR_EMB], [B, 55, 80, str_emb]
+            inv_oclasses_shift, inv_strs_shift, inv_oclasses_emb_shift, inv_strs_emb_shift = self.inv_encoder.teacher_forcing_decorator(self.glyph_cnn, inv_oclasses, inv_strs)  # [B, 55], [B, 55, 80], [B, 55, CHAR_EMB], [B, 55, 80, str_emb]
         else:
             inv_features = None
             inv_oclasses_shift = None
@@ -844,8 +868,8 @@ class MultiModalHackVAE(nn.Module):
         )
         # Decode messages using GRU
         packed_msg_hidden_decoded, _ = self.decode_msg_gru(packed_msg_emb_shift, msg_hidden_init.unsqueeze(0))  # hidden: [1, B, hid_dim]
-        # Unpack the output
-        msg_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(packed_msg_hidden_decoded, batch_first=True)
+        # Unpack the output - pad back to original length (256)
+        msg_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(packed_msg_hidden_decoded, batch_first=True, total_length=msg_emb_shift.size(1))
         # Convert hidden states back to embeddings
         msg_emb_decoded = self.decode_msg_hidden2emb(msg_hidden_decoded)  # [B, 256, hid_dim] -> [B, 256, emb_dim]
         
@@ -880,7 +904,7 @@ class MultiModalHackVAE(nn.Module):
         # logits
         # char logits takes first 16 channels of glyph_emb_decoded
         # color logits takes last 4 channels of glyph_emb_decoded
-        char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 256, 21, 79]
+        char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 96, 21, 79]
         color_logits = self.decode_colors(glyph_emb_decoded[:, CHAR_EMB:, :, :])  # [B, 4, 21, 79] -> [B, 16, 21, 79]
         
         # Decode stats - separate into continuous and discrete components
@@ -971,6 +995,7 @@ def vae_loss(
     raw_losses = {}
     
     # Glyph reconstruction (chars + colors)
+    glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Ensure valid range for chars
     raw_losses['char'] = F.cross_entropy(char_logits[valid_screen], glyph_chars[valid_screen], reduction='mean')
     raw_losses['color'] = F.cross_entropy(color_logits[valid_screen], glyph_colors[valid_screen], reduction='mean')
 
