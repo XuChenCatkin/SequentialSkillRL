@@ -462,8 +462,6 @@ class MessageGRU(nn.Module):
         shifted_tokens = torch.zeros_like(padded_msg_tokens)
         shifted_tokens[:, 0] = self.sos  # set start-of-sequence token
         shifted_tokens[:, 1:] = padded_msg_tokens[:, :-1]  # shift right by 1
-        bHasSpace = (lengths < padded_msg_tokens.size(1) - 1)  # check if there is space for EOS
-        shifted_tokens[bHasSpace, lengths[bHasSpace]+1] = self.eos  # set end-of-sequence token at the end of each message
         # Get embeddings for shifted tokens
         shifted_embeddings = self.emb(shifted_tokens)  # [B, 256, emb_dim]
         return shifted_tokens, shifted_embeddings  # return shifted tokens and embeddings
@@ -614,9 +612,6 @@ class InventoryEncoder(nn.Module):
         shifted_strs = flat_inv_strs.clone()
         shifted_strs[:, 0] = self.sos  # set start-of-sequence token
         shifted_strs[:, 1:] = flat_inv_strs[:, :-1]  # shift right by 1
-        lengths_strs = (flat_inv_strs != 0).sum(dim=-1)  # [B*55,] - count non-padding characters
-        bHasSpace = lengths_strs < INV_STR_LEN - 1  # check if there is space for EOS
-        shifted_strs[bHasSpace, lengths_strs[bHasSpace] + 1] = self.eos  # set end-of-sequence token
         # Get embeddings for shifted object classes and strings
         shifted_oclass_emb = glyph_encoder.char_emb(shifted_oclasses)  # [B, 55] -> [B, 55, CHAR_EMB]
         shifted_str_emb = self.char_emb(shifted_strs)  # [B*55, 80] -> [B*55, 80, str_emb]
