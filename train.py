@@ -218,10 +218,10 @@ class NetHackDataCollector:
                 if isinstance(item, np.ndarray):
                     minibatch[key] = torch.from_numpy(item)
 
-            message_chars_minibatch = torch.zeros((num_games, num_time, 256), dtype=torch.int32)
-            game_chars_minibatch = torch.ones((num_games, num_time, 21, 79), dtype=torch.int32) * 32  # Fill with spaces
-            game_colors_minibatch = torch.zeros((num_games, num_time, 21, 79), dtype=torch.int32)
-            status_chars_minibatch = torch.zeros((num_games, num_time, 2, 80), dtype=torch.int32)
+            message_chars_minibatch = torch.zeros((num_games, num_time, 256), dtype=torch.long)
+            game_chars_minibatch = torch.ones((num_games, num_time, 21, 79), dtype=torch.long) * 32  # Fill with spaces
+            game_colors_minibatch = torch.zeros((num_games, num_time, 21, 79), dtype=torch.long)
+            status_chars_minibatch = torch.zeros((num_games, num_time, 2, 80), dtype=torch.long)
             hero_info_minibatch = torch.ones((num_games, num_time, 4), dtype=torch.int32)
             blstats_minibatch = torch.zeros((num_games, num_time, 27), dtype=torch.float32)
             valid_screen_minibatch = torch.ones((num_games, num_time), dtype=torch.bool)
@@ -250,7 +250,7 @@ class NetHackDataCollector:
                     
                     # Extract text information
                     current_message = get_current_message(tty_chars)
-                    message_chars = torch.tensor([ord(c) for c in current_message.ljust(256, chr(0))], dtype=torch.int32)
+                    message_chars = torch.tensor([ord(c) for c in current_message.ljust(256, chr(0))], dtype=torch.long)
                     status_lines = get_status_lines(tty_chars)
                     status_chars = tty_chars[22:, :]
                     

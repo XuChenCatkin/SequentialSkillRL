@@ -764,6 +764,13 @@ class MultiModalHackVAE(nn.Module):
             nn.Linear(32, 51),  # [B, 32] -> [B, 51] for level numbers
         )
         
+        # Condition mask decoder - outputs 13 binary logits (one per condition bit)
+        self.decode_condition_mask = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
+            nn.Linear(32, 13),  # [B, 32] -> [B, 13] for condition bits (binary classification per bit)
+        )
+        
         # messages - use extended vocabulary to include SOS/EOS tokens
         self.decode_msg = nn.Linear(self.msg_gru.emb_dim, self.msg_gru.vocab)  # [B, T, emb_dim] -> [B, T, vocab_size]
         
@@ -837,6 +844,8 @@ class MultiModalHackVAE(nn.Module):
             inv_oclasses_shift, inv_strs_shift, inv_oclasses_emb_shift, inv_strs_emb_shift = self.inv_encoder.teacher_forcing_decorator(self.glyph_cnn, inv_oclasses, inv_strs)  # [B, 55], [B, 55, 80], [B, 55, CHAR_EMB], [B, 55, 80, str_emb]
         else:
             inv_features = None
+            inv_oclasses_emb_no_shift = None
+            inv_str_emb_no_shift = None
             inv_oclasses_shift = None
             inv_strs_shift = None
             inv_oclasses_emb_shift = None
@@ -919,6 +928,7 @@ class MultiModalHackVAE(nn.Module):
         hunger_state_logits = self.decode_hunger_state(stats_emb_decoded)      # [B, 7]
         dungeon_number_logits = self.decode_dungeon_number(stats_emb_decoded)  # [B, 11]
         level_number_logits = self.decode_level_number(stats_emb_decoded)      # [B, 51]
+        condition_mask_logits = self.decode_condition_mask(stats_emb_decoded)  # [B, 13]
         
         # Message decoding - GRU approach with proper teacher forcing
         msg_logits = self.decode_msg(msg_emb_decoded)  # [B, 256, emb_dim] -> [B, 256, MSG_VOCAB]
@@ -943,6 +953,7 @@ class MultiModalHackVAE(nn.Module):
             'hunger_state_logits': hunger_state_logits,  # [B, 7]
             'dungeon_number_logits': dungeon_number_logits,  # [B, 11]
             'level_number_logits': level_number_logits,  # [B, 51]
+            'condition_mask_logits': condition_mask_logits,  # [B, 13]
             'msg_logits': msg_logits, # [B, 256, MSG_VOCAB]
             'inv_oclasses_logits': inv_oclasses_logits,  # [B, 55, INV_OCLASS_DIM]
             'inv_strs_logits': inv_strs_logits,  # [B, 55, 80, MSG_VOCAB + 2]
@@ -1005,9 +1016,10 @@ def vae_loss(
     hunger_state_logits = model_output['hunger_state_logits']
     dungeon_number_logits = model_output['dungeon_number_logits']
     level_number_logits = model_output['level_number_logits']
+    condition_mask_logits = model_output['condition_mask_logits']  # [B, 13]
     
     # Extract relevant targets (24 dimensions, excluding time and unknowns)
-    relevant_indices = [i for i in range(27) if i not in [20, 25, 26]]  # Exclude time and unknowns
+    relevant_indices = [i for i in range(27) if i not in [20, 26]]  # Exclude time and unknowns
     target_stats = blstats[:, relevant_indices]  # [B, 24]
     
     # Separate continuous and discrete targets
@@ -1019,6 +1031,14 @@ def vae_loss(
     discrete_targets.append(blstats[:, 21].long())  # hunger_state
     discrete_targets.append(blstats[:, 23].long())  # dungeon_number  
     discrete_targets.append(blstats[:, 24].long())  # level_number
+    
+    # Prepare condition mask target - convert bitfield to binary vector (same as encoder)
+    condition_mask_target = blstats[:, 25].long()  # [B] - condition mask bitfield
+    condition_target_vector = []
+    for bit_value in CONDITION_BITS:
+        is_condition_active = ((condition_mask_target & bit_value) > 0).float()  # [B]
+        condition_target_vector.append(is_condition_active)
+    condition_target_vector = torch.stack(condition_target_vector, dim=1)  # [B, 13]
     
     # For continuous targets, we need to prepare them the same way as preprocessor does
     # The decoder outputs stats_continuous on the original scale, so we need to prepare the targets
@@ -1052,12 +1072,14 @@ def vae_loss(
     raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], discrete_targets[0][valid_screen], reduction='mean')
     raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], discrete_targets[1][valid_screen], reduction='mean')
     raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], discrete_targets[2][valid_screen], reduction='mean')
+    raw_losses['stats_condition'] = F.binary_cross_entropy_with_logits(condition_mask_logits[valid_screen], condition_target_vector[valid_screen], reduction='mean')
     
     # Total stats loss
     raw_losses['stats'] = (raw_losses['stats_continuous'] + 
                           raw_losses['stats_hunger'] + 
                           raw_losses['stats_dungeon'] + 
-                          raw_losses['stats_level'])
+                          raw_losses['stats_level'] + 
+                          raw_losses['stats_condition'])
     
     # Message reconstruction - apply valid_screen mask
     msg_lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
