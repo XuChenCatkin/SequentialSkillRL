@@ -1019,7 +1019,7 @@ def vae_loss(
     
     # Separate continuous and discrete targets
     discrete_indices = [21, 23, 24]  # hunger_state, dungeon_number, level_number (in original indexing)
-    continuous_indices = [i for i in relevant_indices if i not in discrete_indices]  # 21 indices
+    continuous_indices = [i for i in relevant_indices if i not in discrete_indices + [25]]  # 21 indices
     
     # Map discrete indices to the relevant_indices space
     discrete_targets = []
@@ -1161,7 +1161,7 @@ def vae_loss(
     # 0.5 * (tr(Sigma_q) + mu^T * mu - d - log(det(Sigma_q)))
     # where d is the dimensionality of the latent space (LATENT_DIM)
     d = mu.size(1)
-    tr_Sigma_q = torch.trace(Sigma_q)  # Trace of Sigma_q
+    tr_Sigma_q = torch.einsum('bii->b', Sigma_q)  # Trace of Sigma_q
     mu2 = (mu.T @ mu).view(-1) # mu^T * mu. [B,]
     log_det_Sigma_q = torch.logdet(Sigma_q)  # log(det(Sigma_q))
     kl_loss = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
