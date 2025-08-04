@@ -124,8 +124,8 @@ class NetHackDataCollector:
         message_lower = message.lower()
         words = re.findall(r'\b\w+\b', message_lower)  # Extract word characters only
         
-        print(f"DEBUG: Message: '{message[:150]}...'")
-        print(f"DEBUG: Words found: {words}")  # All words for debugging
+        #print(f"DEBUG: Message: '{message[:150]}...'")
+        #print(f"DEBUG: Words found: {words}")  # All words for debugging
         
         # Extract alignment
         alignment = None
@@ -164,14 +164,14 @@ class NetHackDataCollector:
                 break
         
         # Only return if we found all required components
-        print(f"DEBUG: Found - alignment:{alignment}, gender:{gender}, race:{race}, role:{role}")
+        #print(f"DEBUG: Found - alignment:{alignment}, gender:{gender}, race:{race}, role:{role}")
         if all(x is not None for x in [alignment, gender, race, role]):
             hero_info = torch.tensor([role, race, gender, alignment], dtype=torch.int32)
             self.game_hero_info[game_id] = hero_info
-            print(f"DEBUG: Successfully parsed hero info: {hero_info}")
+            #print(f"DEBUG: Successfully parsed hero info: {hero_info}")
             return hero_info
-        
-        print(f"DEBUG: Failed to parse hero info - missing components")
+
+        #print(f"DEBUG: Failed to parse hero info - missing components")
         return None
     
     def collect_data_batch(self, dataset_name: str, adapter: callable, max_batches: int = 1000, 
@@ -210,13 +210,17 @@ class NetHackDataCollector:
                 
             print(f"Processing batch {batch_idx + 1}...")
             
+            this_batch = {}  # Create new dictionary
+            
             num_games, num_time = minibatch['tty_chars'].shape[:2]
             
-            # convert numpy arrays to torch tensors in minibatch
-            # Initialize tensors for the minibatch
+            # Deep copy numpy arrays to torch tensors
             for key, item in minibatch.items():
                 if isinstance(item, np.ndarray):
-                    minibatch[key] = torch.from_numpy(item)
+                    # Create a copy of the numpy array first, then convert to tensor
+                    this_batch[key] = torch.tensor(item) 
+                else:
+                    this_batch[key] = item
 
             message_chars_minibatch = torch.zeros((num_games, num_time, 256), dtype=torch.long)
             game_chars_minibatch = torch.ones((num_games, num_time, 21, 79), dtype=torch.long) * 32  # Fill with spaces
@@ -227,19 +231,19 @@ class NetHackDataCollector:
             valid_screen_minibatch = torch.ones((num_games, num_time), dtype=torch.bool)
 
             # Process each game in the batch
-            for game_idx in range(minibatch['tty_chars'].shape[0]):
+            for game_idx in range(this_batch['tty_chars'].shape[0]):
                 # Process each timestep
-                for time_idx in range(minibatch['tty_chars'].shape[1]):
+                for time_idx in range(this_batch['tty_chars'].shape[1]):
                     
-                    game_id = int(minibatch['gameids'][game_idx, time_idx])
-                    if 'scores' in minibatch:
-                        score = float(minibatch['scores'][game_idx, time_idx])
+                    game_id = int(this_batch['gameids'][game_idx, time_idx])
+                    if 'scores' in this_batch:
+                        score = float(this_batch['scores'][game_idx, time_idx])
                     else:
                         score = 0.0
 
                     # Get TTY data
-                    tty_chars = minibatch['tty_chars'][game_idx, time_idx]
-                    tty_colors = minibatch['tty_colors'][game_idx, time_idx]
+                    tty_chars = this_batch['tty_chars'][game_idx, time_idx]
+                    tty_colors = this_batch['tty_colors'][game_idx, time_idx]
                     
                     is_valid_map = detect_valid_map(tty_chars)
                     if not is_valid_map:
@@ -267,14 +271,14 @@ class NetHackDataCollector:
                     hero_info_minibatch[game_idx, time_idx] = hero_info
                     blstats_minibatch[game_idx, time_idx] = adapter(game_map['chars'], status_lines, score)
 
-            minibatch['message_chars'] = message_chars_minibatch
-            minibatch['game_chars'] = game_chars_minibatch
-            minibatch['game_colors'] = game_colors_minibatch
-            minibatch['status_chars'] = status_chars_minibatch
-            minibatch['hero_info'] = hero_info_minibatch
-            minibatch['blstats'] = blstats_minibatch
-            minibatch['valid_screen'] = valid_screen_minibatch
-            collected_batches.append(minibatch)
+            this_batch['message_chars'] = message_chars_minibatch
+            this_batch['game_chars'] = game_chars_minibatch
+            this_batch['game_colors'] = game_colors_minibatch
+            this_batch['status_chars'] = status_chars_minibatch
+            this_batch['hero_info'] = hero_info_minibatch
+            this_batch['blstats'] = blstats_minibatch
+            this_batch['valid_screen'] = valid_screen_minibatch
+            collected_batches.append(this_batch)
             batch_count += 1
 
         print(f"✅ Successfully collected {len(collected_batches)} batches from {batch_count} processed batches")
@@ -931,9 +935,17 @@ def train_multimodalhack_vae(
     include_inventory: bool = False,
     logging: logging.Logger = None,
     data_cache_dir: str = "data_cache",
-    force_recollect: bool = False) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
+    force_recollect: bool = False,
+    # Adaptive loss weighting parameters
+    initial_weight_emb: float = 1.0,
+    final_weight_emb: float = 1.0,
+    initial_weight_raw: float = 0.2,
+    final_weight_raw: float = 1.0,
+    initial_kl_beta: float = 0.001,
+    final_kl_beta: float = 1.0,
+    warmup_epochs: int = 3) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
     """
-    Train MultiModalHackVAE on NetHack Learning Dataset
+    Train MultiModalHackVAE on NetHack Learning Dataset with adaptive loss weighting
 
     Args:
         train_file: Path to the training samples
@@ -947,6 +959,13 @@ def train_multimodalhack_vae(
         include_inventory: Whether to include inventory processing
         data_cache_dir: Directory to cache processed data
         force_recollect: Force data recollection even if cache exists
+        initial_weight_emb: Starting weight for embedding losses (high for warm-up)
+        final_weight_emb: Final weight for embedding losses
+        initial_weight_raw: Starting weight for raw reconstruction losses (low initially)
+        final_weight_raw: Final weight for raw reconstruction losses
+        initial_kl_beta: Starting KL divergence weight (very small initially)
+        final_kl_beta: Final KL divergence weight
+        warmup_epochs: Number of epochs for warm-up phase
         
     Returns:
         Tuple of (trained_model, train_losses, test_losses)
@@ -961,6 +980,28 @@ def train_multimodalhack_vae(
     print(f"   Device: {device}")
     print(f"   Include inventory: {include_inventory}")
     print(f"   Data cache: {data_cache_dir}")
+    print(f"   Adaptive Loss Weighting:")
+    print(f"     - Embedding weights: {initial_weight_emb:.3f} → {final_weight_emb:.3f}")
+    print(f"     - Raw weights: {initial_weight_raw:.3f} → {final_weight_raw:.3f}")
+    print(f"     - KL beta: {initial_kl_beta:.3f} → {final_kl_beta:.3f}")
+    print(f"     - Warmup epochs: {warmup_epochs}")
+    
+    def get_adaptive_weights(epoch: int, total_epochs: int) -> Tuple[float, float, float]:
+        """Calculate adaptive weights based on current epoch"""
+        # Linear interpolation for smooth transitions
+        progress = min(epoch / total_epochs, 1.0)
+        warmup_progress = min(epoch / warmup_epochs, 1.0) if warmup_epochs > 0 else 1.0
+        
+        # Embedding weight: high initially, then decrease
+        weight_emb = initial_weight_emb + (final_weight_emb - initial_weight_emb) * warmup_progress
+        
+        # Raw weight: low initially, then increase  
+        weight_raw = initial_weight_raw + (final_weight_raw - initial_weight_raw) * progress
+        
+        # KL beta: very small initially, then gradually increase (beta annealing)
+        kl_beta = initial_kl_beta + (final_kl_beta - initial_kl_beta) * progress
+        
+        return weight_emb, weight_raw, kl_beta
     
     # Create adapter and datasets with caching
     adapter = BLStatsAdapter()
@@ -1017,6 +1058,11 @@ def train_multimodalhack_vae(
     print(f"\n🎯 Starting training for {epochs} epochs...")
     
     for epoch in range(epochs):
+        # Calculate adaptive weights for this epoch
+        weight_emb, weight_raw, kl_beta = get_adaptive_weights(epoch, epochs)
+        
+        print(f"\n🎯 Epoch {epoch+1}/{epochs} - Adaptive weights: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
+        
         # Training phase
         model.train()
         epoch_train_loss = 0.0
@@ -1050,40 +1096,33 @@ def train_multimodalhack_vae(
                 )
                 
                 # Calculate loss
-                loss_dict = vae_loss(
+                train_loss_dict = vae_loss(
                     model_output=model_output,
                     glyph_chars=batch_device['game_chars'],
                     glyph_colors=batch_device['game_colors'],
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['message_chars'],
                     valid_screen=batch_device['valid_screen'],
-                    weight_emb=1.0,
-                    weight_raw=0.1,
-                    kl_beta=1.0
+                    weight_emb=weight_emb,
+                    weight_raw=weight_raw,
+                    kl_beta=kl_beta
                 )
-                
-                loss = loss_dict['total_loss']
-                
-                # Backward pass
-                loss.backward()
-                optimizer.step()
-                
-                epoch_train_loss += loss.item()
-                batch_count += 1
-                
-                raw_losses = loss_dict['raw_losses']
-                emb_losses = loss_dict['emb_losses']
-                for key, value in raw_losses.items():
-                    pbar.set_postfix({f'{key}': f"{value.item():.2f}"})
-                for key, value in emb_losses.items():
-                    pbar.set_postfix({f'{key}': f"{value.item():.2f}"})
 
-                # Update progress bar
+                train_loss = train_loss_dict['total_loss']
+
+                # Backward pass
+                train_loss.backward()
+                optimizer.step()
+
+                epoch_train_loss += train_loss.item()
+                batch_count += 1
+
+                # Update progress bar with summary metrics only
                 pbar.set_postfix({
-                    'loss': f"{loss.item():.2f}",
-                    'total_raw': f"{loss_dict['total_raw_loss'].item():.2f}",
-                    'total_emb': f"{loss_dict['total_emb_loss'].item():.2f}",
-                    'kl': f"{loss_dict['kl_loss'].item():.2f}",
+                    'loss': f"{train_loss.item():.2f}",
+                    'total_raw': f"{train_loss_dict['total_raw_loss'].item():.2f}",
+                    'total_emb': f"{train_loss_dict['total_emb_loss'].item():.2f}",
+                    'kl': f"{train_loss_dict['kl_loss'].item():.2f}",
                 })
         
         avg_train_loss = epoch_train_loss / batch_count
@@ -1119,25 +1158,49 @@ def train_multimodalhack_vae(
                 )
                 
                 # Calculate loss
-                loss_dict = vae_loss(
+                test_loss_dict = vae_loss(
                     model_output=model_output,
                     glyph_chars=batch_device['game_chars'],
                     glyph_colors=batch_device['game_colors'],
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['message_chars'],
                     valid_screen=batch_device['valid_screen'],
-                    weight_emb=1.0,
-                    weight_raw=0.1,
-                    kl_beta=1.0
+                    weight_emb=weight_emb,
+                    weight_raw=weight_raw,
+                    kl_beta=kl_beta
                 )
-                
-                epoch_test_loss += loss_dict['total_loss'].item()
+
+                test_loss = test_loss_dict['total_loss']
+                epoch_test_loss += test_loss.item()
                 test_batch_count += 1
         
         avg_test_loss = epoch_test_loss / test_batch_count if test_batch_count > 0 else 0.0
         test_losses.append(avg_test_loss)
         
-        print(f"Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.2f}, Test Loss = {avg_test_loss:.2f}")
+        # Print epoch summary with detailed loss breakdown
+        print(f"\n=== Epoch {epoch+1}/{epochs} Summary ===")
+        print(f"Average Train Loss: {avg_train_loss:.3f} | Average Test Loss: {avg_test_loss:.3f}")
+        print(f"Adaptive Weights Used: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
+        
+        # Show detailed modality breakdown for the last batch of training and testing
+        print(f"Final Training Batch Details:")
+        raw_losses = train_loss_dict['raw_losses']
+        emb_losses = train_loss_dict['emb_losses']
+        raw_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in raw_losses.items()])
+        emb_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in emb_losses.items()])
+        print(f"  Raw Losses: {raw_loss_str}")
+        print(f"  Emb Losses: {emb_loss_str}")
+        
+        
+        print(f"Final Testing Batch Details:")
+        raw_losses = test_loss_dict['raw_losses']
+        emb_losses = test_loss_dict['emb_losses']
+        raw_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in raw_losses.items()])
+        emb_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in emb_losses.items()])
+        print(f"  Raw Losses: {raw_loss_str}")
+        print(f"  Emb Losses: {emb_loss_str}")
+        
+        print("=" * 50)
     
     # Save trained model
     torch.save({
@@ -1285,43 +1348,29 @@ if __name__ == "__main__":
     model, train_losses, test_losses = train_multimodalhack_vae(
         train_file=train_file,
         test_file=test_file,
-        epochs=2,           # Very few epochs
-        batch_size=1,
-        sequence_size=8,    # Very short sequences
+        epochs=5,           # Very few epochs
+        batch_size=32,
+        sequence_size=32,    # Very short sequences
         learning_rate=1e-3,
-        training_batches=2, # Very few batches
+        training_batches=4, # Very few batches
         testing_batches=1,  # Very few batches
-        max_training_batches=3,
+        max_training_batches=5,
         max_testing_batches=2,
         save_path="models/mini_test_vae.pth",
         device='cuda' if torch.cuda.is_available() else 'cpu',
         include_inventory=False,
         data_cache_dir="data_cache",
-        force_recollect=False  # Use the data we just collected
+        force_recollect=False,  # Use the data we just collected
+        # Adaptive loss weighting for better training dynamics
+        initial_weight_emb=1.0,     # High emphasis on embeddings initially
+        final_weight_emb=0.2,       # Standard weight later
+        initial_weight_raw=0.2,   # Very low raw reconstruction initially  
+        final_weight_raw=1.0,       # Standard weight later
+        initial_kl_beta=0.0001,     # Very small KL penalty initially
+        final_kl_beta=0.1,          # Moderate KL penalty later (not too high for testing)
+        warmup_epochs=2             # 2 epochs of warm-up for quick testing
     )
     
     print(f"\n🎉 Mini test completed successfully!")
     print(f"   📈 Train losses: {train_losses}")
     print(f"   📈 Test losses: {test_losses}")
-        
-    # # Example 1: Regular training with data caching (commented out for testing)
-    # model, train_losses, test_losses = train_multimodalhack_vae(
-    #     train_file=train_file,
-    #     test_file=test_file,
-    #     epochs=10,
-    #     batch_size=1,
-    #     sequence_size=32,
-    #     learning_rate=1e-3,
-    #     training_batches=5,
-    #     testing_batches=2,
-    #     training_game_ids=[12304],
-    #     save_path="models/multimodal_hack_vae.pth",
-    #     device='cuda' if torch.cuda.is_available() else 'cpu',
-    #     include_inventory=False,
-    #     data_cache_dir="data_cache",  # Data will be cached here
-    #     force_recollect=False  # Use cached data if available
-    # )
-    
-    # Example visualization (commented out due to missing NetHackDataset)
-    # visualize_reconstructions(model, test_file, device='cuda', num_samples=4)
-    # analyze_latent_space(model, test_file, device='cuda')

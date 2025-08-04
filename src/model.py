@@ -977,6 +977,8 @@ def vae_loss(
     valid_screen,
     inv_oclasses=None, 
     inv_strs=None, 
+    raw_modality_weights={'char': 10.0, 'color': 10.0, 'stats': 1.0, 'msg': 0.5, 'inv_oclass': 1.0, 'inv_str': 1.0},
+    emb_modality_weights={'char_emb': 10.0, 'color_emb': 10.0, 'stats_emb': 1.0, 'msg_emb': 0.5, 'inv_oclasses_emb': 1.0, 'inv_strs_emb': 1.0},
     weight_emb=1.0, 
     weight_raw=0.1, 
     kl_beta=1.0):
@@ -1063,19 +1065,20 @@ def vae_loss(
     
     # Calculate losses - stats_continuous should match the processed targets (after inversion)
     # Apply valid_screen mask to stats losses
-    raw_losses['stats_continuous'] = F.mse_loss(stats_continuous[valid_screen], continuous_targets_final[valid_screen], reduction='mean')
-    raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], discrete_targets[0][valid_screen], reduction='mean')
-    raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], discrete_targets[1][valid_screen], reduction='mean')
-    raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], discrete_targets[2][valid_screen], reduction='mean')
-    raw_losses['stats_condition'] = F.binary_cross_entropy_with_logits(condition_mask_logits[valid_screen], condition_target_vector[valid_screen], reduction='mean')
-    
+    stat_raw_losses = {}
+    stat_raw_losses['stats_continuous'] = F.mse_loss(stats_continuous[valid_screen], continuous_targets_final[valid_screen], reduction='mean')
+    stat_raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], discrete_targets[0][valid_screen], reduction='mean')
+    stat_raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], discrete_targets[1][valid_screen], reduction='mean')
+    stat_raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], discrete_targets[2][valid_screen], reduction='mean')
+    stat_raw_losses['stats_condition'] = F.binary_cross_entropy_with_logits(condition_mask_logits[valid_screen], condition_target_vector[valid_screen], reduction='mean')
+
     # Total stats loss
-    raw_losses['stats'] = (raw_losses['stats_continuous'] + 
-                          raw_losses['stats_hunger'] + 
-                          raw_losses['stats_dungeon'] + 
-                          raw_losses['stats_level'] + 
-                          raw_losses['stats_condition'])
-    
+    raw_losses['stats'] = (stat_raw_losses['stats_continuous'] + 
+                          stat_raw_losses['stats_hunger'] + 
+                          stat_raw_losses['stats_dungeon'] + 
+                          stat_raw_losses['stats_level'] + 
+                          stat_raw_losses['stats_condition'])
+
     # Message reconstruction - apply valid_screen mask
     msg_lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
     msg_tokens_with_eos = msg_tokens.clone()
@@ -1144,11 +1147,11 @@ def vae_loss(
     # ============= Combine Losses =============
     
     # Sum raw reconstruction losses
-    total_raw_loss = sum(raw_losses.values())
+    total_raw_loss = sum(raw_losses[k] * raw_modality_weights.get(k, 1.0) for k in raw_losses)
     
     # Sum embedding losses (when implemented)
-    total_emb_loss = sum(emb_losses.values())
-    
+    total_emb_loss = sum(emb_losses[k] * emb_modality_weights.get(k, 1.0) for k in emb_losses)
+
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
     # KL divergence for low-rank approximation
@@ -1162,8 +1165,11 @@ def vae_loss(
     # where d is the dimensionality of the latent space (LATENT_DIM)
     d = mu.size(1)
     tr_Sigma_q = torch.einsum('bii->b', Sigma_q)  # Trace of Sigma_q
-    mu2 = (mu.T @ mu).view(-1) # mu^T * mu. [B,]
-    log_det_Sigma_q = torch.logdet(Sigma_q)  # log(det(Sigma_q))
+    mu2 = mu.square().sum(dim=1)  # mu^T * mu
+    sign, logabsdet = torch.linalg.slogdet(Sigma_q)  # log(det(Sigma_q))
+    if not torch.all(sign > 0):
+        raise ValueError("Covariance matrix Sigma_q is not positive definite.")
+    log_det_Sigma_q = logabsdet  # log(det(Sigma_q)) [B,]
     kl_loss = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
     kl_loss = kl_loss.mean()  # Average over batch
     # Total weighted loss
@@ -1177,7 +1183,8 @@ def vae_loss(
         'total_emb_loss': total_emb_loss,
         'kl_loss': kl_loss,
         'raw_losses': raw_losses,
-        'emb_losses': emb_losses
+        'emb_losses': emb_losses,
+        'raw_stats_losses': stat_raw_losses,
     }
 
 

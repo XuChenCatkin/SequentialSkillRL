@@ -136,11 +136,36 @@ def get_game_map(tty_chars, tty_colors):
     else:
         tty_chars_new = tty_chars[map_start_row:map_end_row, :map_width]
         tty_colors_new = tty_colors[map_start_row:map_end_row, :map_width]
+        
+    # Sometimes the map contains skill description and the color code is larger than 15, we crop it and pad with spaces
+    if tty_colors_new.max() > 15:
+        starting_col = torch.where(tty_colors_new > 15)[1].min()
+        padding_color = torch.full((tty_colors_new.shape[0], map_width - starting_col), 0, dtype=tty_colors_new.dtype, device=tty_colors_new.device)
+        padding_chars = torch.full((tty_colors_new.shape[0], map_width - starting_col), ord(' '), dtype=tty_chars_new.dtype, device=tty_chars_new.device)
+        tty_chars_new = torch.cat(
+            [tty_chars_new[:, :starting_col], padding_chars],
+            dim=1
+        )
+        tty_colors_new = torch.cat(
+            [tty_colors_new[:, :starting_col], padding_color],
+            dim=1
+        )
+    else:
+        starting_col = map_width
+    
+    assert tty_chars_new.shape[0] == 21, f"Expected 21 rows in game map, got {tty_chars_new.shape[0]}"
+    assert tty_chars_new.shape[1] == 79, f"Expected 79 columns in game map, got {tty_chars_new.shape[1]}"
+    
+    # Ensure colors are also 21x79
+    assert tty_colors_new.shape[0] == 21, f"Expected 21 rows in game map colors, got {tty_colors_new.shape[0]}"
+    assert tty_colors_new.shape[1] == 79, f"Expected 79 columns in game map colors, got {tty_colors_new.shape[1]}"
+    
     return {
         'chars': tty_chars_new,
         'colors': tty_colors_new,
         'map_start_row': map_start_row,  # Include boundary info for debugging
         'map_end_row': map_end_row,
+        'irr_starting_col': starting_col  # Include starting column for debugging
     }
 
 
