@@ -3,6 +3,7 @@ Complete VAE training pipeline for NetHack Learning Dataset
 Supports both the simple NetHackVAE and the sophisticated MiniHackVAE from src/model.py
 """
 import os
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,7 +20,18 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import warnings
 import re  # Add regex import for status line parsing
+import json
+from datetime import datetime
 warnings.filterwarnings('ignore')
+
+# HuggingFace integration imports
+try:
+    from huggingface_hub import HfApi, Repository, upload_file, create_repo, login
+    from huggingface_hub.utils import RepositoryNotFoundError
+    HF_AVAILABLE = True
+except ImportError:
+    print("⚠️  HuggingFace Hub not available. Install with: pip install huggingface_hub")
+    HF_AVAILABLE = False
 
 # Add utils to path for importing env_utils
 sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
@@ -945,6 +957,211 @@ def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress
         raise ValueError(f"Unknown shape: {shape}. Supported shapes: linear, cubic, sigmoid, cosine, exponential.")
 
 
+def save_checkpoint(
+    model: MultiModalHackVAE,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    train_losses: List[float],
+    test_losses: List[float],
+    checkpoint_dir: str = "checkpoints",
+    keep_last_n: int = 3,
+    upload_to_hf: bool = False,
+    hf_repo_name: str = None,
+    hf_token: str = None
+) -> str:
+    """
+    Save training checkpoint with optional HuggingFace upload
+    
+    Args:
+        model: Model to save
+        optimizer: Optimizer state to save
+        epoch: Current epoch number
+        train_losses: Training loss history
+        test_losses: Test loss history
+        checkpoint_dir: Directory to save checkpoints
+        keep_last_n: Number of recent checkpoints to keep (older ones are deleted)
+        upload_to_hf: Whether to upload checkpoint to HuggingFace
+        hf_repo_name: HuggingFace repository name
+        hf_token: HuggingFace token
+        
+    Returns:
+        Path to saved checkpoint
+    """
+    # Create checkpoint directory
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Create checkpoint filename
+    checkpoint_filename = f"checkpoint_epoch_{epoch+1:04d}.pth"
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
+    
+    # Prepare checkpoint data
+    checkpoint_data = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_losses': train_losses,
+        'test_losses': test_losses,
+        'model_config': {
+            'bInclude_inventory': getattr(model, 'bInclude_inventory', False),
+            'latent_dim': getattr(model, 'latent_dim', 256),
+        },
+        'checkpoint_timestamp': datetime.now().isoformat(),
+        'final_train_loss': train_losses[-1] if train_losses else None,
+        'final_test_loss': test_losses[-1] if test_losses else None,
+    }
+    
+    # Save checkpoint
+    torch.save(checkpoint_data, checkpoint_path)
+    print(f"💾 Checkpoint saved: {checkpoint_path}")
+    
+    # Upload to HuggingFace if requested
+    if upload_to_hf and hf_repo_name and HF_AVAILABLE:
+        try:
+            if hf_token:
+                login(token=hf_token)
+            
+            api = HfApi()
+            
+            # Upload checkpoint to checkpoints/ folder in repo
+            remote_path = f"checkpoints/{checkpoint_filename}"
+            api.upload_file(
+                path_or_fileobj=checkpoint_path,
+                path_in_repo=remote_path,
+                repo_id=hf_repo_name,
+                repo_type="model",
+                commit_message=f"Add checkpoint for epoch {epoch+1}"
+            )
+            print(f"☁️  Checkpoint uploaded to HuggingFace: {remote_path}")
+            
+        except Exception as e:
+            print(f"⚠️  Failed to upload checkpoint to HuggingFace: {e}")
+    
+    # Clean up old checkpoints (keep only last N)
+    if keep_last_n > 0:
+        cleanup_old_checkpoints(checkpoint_dir, keep_last_n)
+    
+    return checkpoint_path
+
+
+def cleanup_old_checkpoints(checkpoint_dir: str, keep_last_n: int) -> None:
+    """
+    Remove old checkpoint files, keeping only the most recent N checkpoints
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+        keep_last_n: Number of recent checkpoints to keep
+    """
+    try:
+        # Get all checkpoint files
+        checkpoint_files = []
+        for filename in os.listdir(checkpoint_dir):
+            if filename.startswith("checkpoint_epoch_") and filename.endswith(".pth"):
+                filepath = os.path.join(checkpoint_dir, filename)
+                # Extract epoch number for sorting
+                try:
+                    epoch_str = filename.replace("checkpoint_epoch_", "").replace(".pth", "")
+                    epoch_num = int(epoch_str)
+                    checkpoint_files.append((epoch_num, filepath))
+                except ValueError:
+                    continue
+        
+        # Sort by epoch number (newest first)
+        checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+        
+        # Remove old checkpoints
+        if len(checkpoint_files) > keep_last_n:
+            for epoch_num, filepath in checkpoint_files[keep_last_n:]:
+                os.remove(filepath)
+                print(f"🗑️  Removed old checkpoint: {os.path.basename(filepath)}")
+                
+    except Exception as e:
+        print(f"⚠️  Error cleaning up checkpoints: {e}")
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    model: MultiModalHackVAE = None,
+    optimizer: torch.optim.Optimizer = None,
+    device: str = "cpu"
+) -> Dict:
+    """
+    Load training checkpoint
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model: Model to load state into (optional)
+        optimizer: Optimizer to load state into (optional)
+        device: Device to load tensors on
+        
+    Returns:
+        Dictionary with checkpoint data
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    if model is not None:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    print(f"✅ Checkpoint loaded from: {checkpoint_path}")
+    print(f"   Epoch: {checkpoint['epoch'] + 1}")
+    print(f"   Train loss: {checkpoint['final_train_loss']:.4f}")
+    print(f"   Test loss: {checkpoint['final_test_loss']:.4f}")
+    
+    return checkpoint
+
+
+def resume_training_from_checkpoint(
+    checkpoint_path: str,
+    train_file: str,
+    test_file: str,
+    **training_kwargs
+) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
+    """
+    Resume training from a saved checkpoint
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        train_file: Training data file
+        test_file: Test data file
+        **training_kwargs: Additional arguments for train_multimodalhack_vae
+        
+    Returns:
+        Tuple of (model, train_losses, test_losses)
+    """
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    
+    # Extract configuration from checkpoint
+    start_epoch = checkpoint['epoch'] + 1
+    previous_train_losses = checkpoint['train_losses']
+    previous_test_losses = checkpoint['test_losses']
+    model_config = checkpoint['model_config']
+    
+    print(f"🔄 Resuming training from epoch {start_epoch}")
+    print(f"   Previous train loss: {previous_train_losses[-1]:.4f}")
+    print(f"   Previous test loss: {previous_test_losses[-1]:.4f}")
+    
+    # Update training kwargs with checkpoint config
+    training_kwargs.update({
+        'include_inventory': model_config.get('bInclude_inventory', False),
+        'resume_from_epoch': start_epoch,
+        'previous_train_losses': previous_train_losses,
+        'previous_test_losses': previous_test_losses,
+        'resume_checkpoint_path': checkpoint_path
+    })
+    
+    # Continue training
+    model, train_losses, test_losses = train_multimodalhack_vae(
+        train_file=train_file,
+        test_file=test_file,
+        **training_kwargs
+    )
+    
+    return model, train_losses, test_losses
+
+
 def train_multimodalhack_vae(
     train_file: str, 
     test_file: str,                     
@@ -954,17 +1171,17 @@ def train_multimodalhack_vae(
     sequence_size: int = 32, 
     training_batches: int = 100,
     testing_batches: int = 20,
-    max_training_batches: int = 1000,
-    max_testing_batches: int = 200,
+    max_training_batches: int = 100,
+    max_testing_batches: int = 20,
     training_game_ids: List[int] | None = None,
     testing_game_ids: List[int] | None = None,
     learning_rate: float = 1e-3,
-    save_path: str = "models/multimodal_hack_vae.pth",
     device: str = None, 
     include_inventory: bool = False,
     logging: logging.Logger = None,
     data_cache_dir: str = "data_cache",
     force_recollect: bool = False,
+    
     # Adaptive loss weighting parameters
     initial_weight_emb: float = 1.5,
     final_weight_emb: float = 1.0,
@@ -975,7 +1192,30 @@ def train_multimodalhack_vae(
     initial_kl_beta: float = 0.0001,
     final_kl_beta: float = 1.0,
     kl_beta_shape: str = 'cosine',
-    warmup_epoch_ratio: float = 0.3) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
+    warmup_epoch_ratio: float = 0.3,
+    
+    # Model saving and checkpointing parameters
+    save_path: str = "models/nethack-vae.pth",
+    save_checkpoints: bool = False,
+    checkpoint_dir: str = "checkpoints",
+    save_every_n_epochs: int = 2,
+    keep_last_n_checkpoints: int = 2,
+    
+    # HuggingFace integration parameters
+    upload_to_hf: bool = False,
+    hf_repo_name: str = None,
+    hf_token: str = None,
+    hf_private: bool = True,
+    hf_upload_artifacts: bool = True,
+    hf_upload_directly: bool = True,
+    hf_upload_checkpoints: bool = False,
+    hf_model_card_data: Dict = None,
+    
+    # Resume training parameters
+    resume_from_epoch: int = 0,
+    previous_train_losses: List[float] = None,
+    previous_test_losses: List[float] = None,
+    resume_checkpoint_path: str = None) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
     """
     Train MultiModalHackVAE on NetHack Learning Dataset with adaptive loss weighting
 
@@ -986,7 +1226,6 @@ def train_multimodalhack_vae(
         epochs: Number of training epochs
         batch_size: Training batch size
         learning_rate: Learning rate for optimizer
-        save_path: Path to save trained model
         device: Device to use ('cuda' or 'cpu')
         include_inventory: Whether to include inventory processing
         data_cache_dir: Directory to cache processed data
@@ -1100,15 +1339,22 @@ def train_multimodalhack_vae(
     # Initialize optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
-    # Create save directory
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    # Initialize loss tracking
+    train_losses = previous_train_losses[:] if previous_train_losses else []
+    test_losses = previous_test_losses[:] if previous_test_losses else []
     
-    train_losses = []
-    test_losses = []
+    # Resume from checkpoint if specified
+    if resume_checkpoint_path and os.path.exists(resume_checkpoint_path):
+        print(f"🔄 Resuming from checkpoint: {resume_checkpoint_path}")
+        checkpoint = load_checkpoint(resume_checkpoint_path, model, optimizer, device)
+        start_epoch = resume_from_epoch
+        print(f"   Resuming from epoch {start_epoch}/{epochs}")
+    else:
+        start_epoch = 0
+        
+    print(f"\n🎯 Starting training for {epochs} epochs (starting from epoch {start_epoch})...")
     
-    print(f"\n🎯 Starting training for {epochs} epochs...")
-    
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         # Calculate adaptive weights for this epoch
         weight_emb, weight_raw, kl_beta = get_adaptive_weights(epoch, epochs)
         
@@ -1252,23 +1498,154 @@ def train_multimodalhack_vae(
         print(f"  Emb Losses: {emb_loss_str}")
         
         print("=" * 50)
-    
-    # Save trained model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'latent_dim': model.latent_dim,
-        'include_inventory': include_inventory,
-        'train_losses': train_losses,
-        'test_losses': test_losses,
-        'final_train_loss': train_losses[-1],
-        'final_test_loss': test_losses[-1],
-    }, save_path)
+        
+        # Save checkpoint if requested
+        if save_checkpoints and (epoch + 1) % save_every_n_epochs == 0:
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                train_losses=train_losses,
+                test_losses=test_losses,
+                checkpoint_dir=checkpoint_dir,
+                keep_last_n=keep_last_n_checkpoints,
+                upload_to_hf=hf_upload_checkpoints and upload_to_hf,
+                hf_repo_name=hf_repo_name,
+                hf_token=hf_token
+            )
     
     print(f"\n✅ MultiModalVAE training completed!")
     print(f"  - Final train loss: {train_losses[-1]:.2f}")
     print(f"  - Final test loss: {test_losses[-1]:.2f}")
-    print(f"  - Model saved to: {save_path}")
+    
+    # HuggingFace upload if requested
+    if upload_to_hf and hf_repo_name and HF_AVAILABLE:
+        print(f"\n🤗 Uploading model to HuggingFace Hub...")
+        try:
+            # Prepare training configuration for model card
+            training_config = {
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "sequence_size": sequence_size,
+                "include_inventory": include_inventory,
+                "adaptive_weighting": {
+                    "initial_weight_emb": initial_weight_emb,
+                    "final_weight_emb": final_weight_emb,
+                    "weight_emb_shape": weight_emb_shape,
+                    "initial_weight_raw": initial_weight_raw,
+                    "final_weight_raw": final_weight_raw,
+                    "weight_raw_shape": weight_raw_shape,
+                    "initial_kl_beta": initial_kl_beta,
+                    "final_kl_beta": final_kl_beta,
+                    "kl_beta_shape": kl_beta_shape,
+                    "warmup_epoch_ratio": warmup_epoch_ratio
+                }
+            }
+            
+            # Merge with user-provided model card data
+            model_card_data = hf_model_card_data or {}
+            model_card_data.update({
+                "training_config": training_config,
+                "final_train_loss": train_losses[-1],
+                "final_test_loss": test_losses[-1],
+                "best_train_loss": min(train_losses),
+                "best_test_loss": min(test_losses),
+                "total_epochs": epochs
+            })
+            
+            # Upload model (save locally first or upload directly)
+            if hf_upload_directly:
+                repo_url = save_model_to_huggingface(
+                    model=model,
+                    repo_name=hf_repo_name,
+                    token=hf_token,
+                    private=hf_private,
+                    commit_message=f"Upload MultiModalHackVAE (epochs={epochs}, final_loss={train_losses[-1]:.4f})",
+                    model_card_data=model_card_data,
+                    upload_directly=True
+                )
+            else:
+                # Save model locally first
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'train_losses': train_losses,
+                    'test_losses': test_losses,
+                    'final_train_loss': train_losses[-1],
+                    'final_test_loss': test_losses[-1],
+                    'model_config': {
+                        'bInclude_inventory': include_inventory,
+                        'latent_dim': getattr(model, 'latent_dim', 256),
+                    },
+                    'training_timestamp': datetime.now().isoformat(),
+                }, save_path)
+                print(f"💾 Model saved locally: {save_path}")
+                
+                repo_url = save_model_to_huggingface(
+                    model=model,
+                    model_save_path=save_path,
+                    repo_name=hf_repo_name,
+                    token=hf_token,
+                    private=hf_private,
+                    commit_message=f"Upload MultiModalHackVAE (epochs={epochs}, final_loss={train_losses[-1]:.4f})",
+                    model_card_data=model_card_data,
+                    upload_directly=False
+                )
+            
+            # Upload training artifacts if requested
+            if hf_upload_artifacts:
+                upload_training_artifacts_to_huggingface(
+                    repo_name=hf_repo_name,
+                    train_losses=train_losses,
+                    test_losses=test_losses,
+                    training_config=training_config,
+                    token=hf_token
+                )
+                
+                # Create and upload demo notebook
+                create_model_demo_notebook(hf_repo_name, "demo_notebook.ipynb")
+                
+                from huggingface_hub import HfApi, login
+                api = HfApi()
+                if hf_token:
+                    login(token=hf_token)
+                    
+                api.upload_file(
+                    path_or_fileobj="demo_notebook.ipynb",
+                    path_in_repo="demo_notebook.ipynb",
+                    repo_id=hf_repo_name,
+                    repo_type="model",
+                    commit_message="Add demo notebook"
+                )
+                os.remove("demo_notebook.ipynb")
+            
+            print(f"🎉 Model successfully shared at: {repo_url}")
+            
+        except Exception as e:
+            print(f"❌ Failed to upload to HuggingFace: {e}")
+            print("   Model was still saved locally.")
+    
+    elif upload_to_hf and not HF_AVAILABLE:
+        print("⚠️  HuggingFace Hub not available. Install with: pip install huggingface_hub")
+    elif upload_to_hf and not hf_repo_name:
+        print("⚠️  HuggingFace upload requested but no repo_name provided")
+    elif not upload_to_hf:
+        # Save model locally
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'train_losses': train_losses,
+            'test_losses': test_losses,
+            'final_train_loss': train_losses[-1],
+            'final_test_loss': test_losses[-1],
+            'model_config': {
+                'bInclude_inventory': include_inventory,
+                'latent_dim': getattr(model, 'latent_dim', 256),
+            },
+            'training_timestamp': datetime.now().isoformat(),
+        }, save_path)
+        print(f"💾 Model saved locally: {save_path}")
     
     return model, train_losses, test_losses
 
@@ -1363,6 +1740,538 @@ def analyze_latent_space(model, samples, device, save_path="latent_analysis.png"
     return latent_vectors, game_ids, messages
 
 
+def save_model_to_huggingface(
+    model: MultiModalHackVAE,
+    model_save_path: str = None,
+    repo_name: str = None,
+    token: Optional[str] = None,
+    private: bool = True,
+    commit_message: str = "Upload MultiModalHackVAE model",
+    model_card_data: Optional[Dict] = None,
+    upload_directly: bool = False,
+    additional_files: Optional[Dict[str, str]] = None
+) -> str:
+    """
+    Save trained MultiModalHackVAE model to HuggingFace Hub
+    
+    Args:
+        model: Trained MultiModalHackVAE model
+        model_save_path: Local path where model is saved (optional if upload_directly=True)
+        repo_name: Name for the HuggingFace repository (e.g., "username/nethack-vae")
+        token: HuggingFace token (if None, will try to use cached token)
+        private: Whether to create a private repository
+        commit_message: Commit message for the upload
+        model_card_data: Additional metadata for the model card
+        upload_directly: If True, save model to temp file and upload directly without permanent local save
+        additional_files: Dict of {local_path: remote_path} for additional files to upload
+        
+    Returns:
+        Repository URL on HuggingFace Hub
+    """
+    if not HF_AVAILABLE:
+        raise ImportError("HuggingFace Hub is required. Install with: pip install huggingface_hub")
+    
+    # Login if token is provided
+    if token:
+        login(token=token)
+    
+    api = HfApi()
+    
+    try:
+        # Check if repository exists, create if not
+        try:
+            repo_info = api.repo_info(repo_id=repo_name, repo_type="model")
+            print(f"📁 Repository {repo_name} already exists")
+        except RepositoryNotFoundError:
+            print(f"🆕 Creating new repository: {repo_name}")
+            api.create_repo(repo_id=repo_name, private=private, repo_type="model")
+    
+        # Handle direct upload vs local file upload
+        temp_model_file = None
+        if upload_directly:
+            # Create temporary file for direct upload
+            import tempfile
+            temp_model_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pth')
+            model_save_path = temp_model_file.name
+            
+            # Save model state dict to temporary file
+            print(f"💾 Creating temporary model file for direct upload...")
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'model_config': {
+                    'bInclude_inventory': getattr(model, 'bInclude_inventory', False),
+                    'latent_dim': getattr(model, 'latent_dim', 256),
+                },
+                'upload_timestamp': datetime.now().isoformat(),
+            }, model_save_path)
+            temp_model_file.close()
+        elif model_save_path is None:
+            raise ValueError("Either model_save_path must be provided or upload_directly must be True")
+    
+        # Prepare model metadata
+        model_info = {
+            "model_type": "MultiModalHackVAE",
+            "framework": "PyTorch",
+            "task": "representation-learning",
+            "dataset": "NetHack Learning Dataset",
+            "latent_dim": getattr(model, 'latent_dim', 'unknown'),
+            "include_inventory": getattr(model, 'bInclude_inventory', False),
+            "architecture": "Multi-modal Variational Autoencoder for NetHack game states"
+        }
+        
+        if model_card_data:
+            model_info.update(model_card_data)
+        
+        # Create model card
+        model_card_content = f"""---
+license: mit
+language: en
+tags:
+- nethack
+- reinforcement-learning
+- variational-autoencoder
+- representation-learning
+- multimodal
+- world-modeling
+pipeline_tag: feature-extraction
+---
+
+# MultiModalHackVAE
+
+A multi-modal Variational Autoencoder trained on NetHack game states for representation learning.
+
+## Model Description
+
+This model is a MultiModalHackVAE that learns compact representations of NetHack game states by processing:
+- Game character grids (21x79)
+- Color information
+- Game statistics (blstats)
+- Message text
+- Bag of glyphs
+- Hero information (role, race, gender, alignment)
+
+## Model Details
+
+- **Model Type**: Multi-modal Variational Autoencoder
+- **Framework**: PyTorch
+- **Dataset**: NetHack Learning Dataset
+- **Latent Dimensions**: {model_info.get('latent_dim', 'unknown')}
+- **Include Inventory**: {model_info.get('include_inventory', False)}
+
+## Usage
+
+```python
+from train import load_model_from_huggingface
+import torch
+
+# Load the model
+model = load_model_from_huggingface("{repo_name}")
+
+# Example usage with synthetic data
+batch_size = 1
+game_chars = torch.randint(32, 127, (batch_size, 21, 79))
+game_colors = torch.randint(0, 16, (batch_size, 21, 79))
+blstats = torch.randn(batch_size, 27)
+msg_tokens = torch.randint(0, 128, (batch_size, 256))
+hero_info = torch.randint(0, 10, (batch_size, 4))
+
+with torch.no_grad():
+    output = model(
+        glyph_chars=game_chars,
+        glyph_colors=game_colors,
+        blstats=blstats,
+        msg_tokens=msg_tokens,
+        hero_info=hero_info
+    )
+    latent_mean = output['latent_mean']
+    reconstructions = output['reconstructions']
+```
+
+## Training
+
+This model was trained using adaptive loss weighting with:
+- Embedding warm-up for quick convergence
+- Gradual raw reconstruction focus
+- KL beta annealing for better latent structure
+
+## Citation
+
+If you use this model, please consider citing:
+
+```bibtex
+@misc{{nethack-vae,
+  title={{MultiModalHackVAE: Multi-modal Variational Autoencoder for NetHack}},
+  author={{Your Name}},
+  year={{2025}},
+  url={{https://huggingface.co/{repo_name}}}
+}}
+```
+"""
+        
+        # Save model card
+        model_card_path = "README.md"
+        with open(model_card_path, "w") as f:
+            f.write(model_card_content)
+        
+        # Save model config
+        config_path = "config.json"
+        with open(config_path, "w") as f:
+            json.dump(model_info, f, indent=2)
+        
+        # Upload files
+        print(f"📤 Uploading model to {repo_name}...")
+        
+        # Upload model file
+        api.upload_file(
+            path_or_fileobj=model_save_path,
+            path_in_repo="pytorch_model.bin",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message=commit_message
+        )
+        
+        # Upload model card
+        api.upload_file(
+            path_or_fileobj=model_card_path,
+            path_in_repo="README.md",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message="Add model card"
+        )
+        
+        # Upload config
+        api.upload_file(
+            path_or_fileobj=config_path,
+            path_in_repo="config.json",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message="Add model config"
+        )
+        
+        # Upload additional files if provided
+        if additional_files:
+            for local_path, remote_path in additional_files.items():
+                if os.path.exists(local_path):
+                    api.upload_file(
+                        path_or_fileobj=local_path,
+                        path_in_repo=remote_path,
+                        repo_id=repo_name,
+                        repo_type="model",
+                        commit_message=f"Add {remote_path}"
+                    )
+        
+        # Clean up temporary files
+        os.remove(model_card_path)
+        os.remove(config_path)
+        
+        # Clean up temporary model file if created
+        if temp_model_file is not None:
+            os.unlink(model_save_path)
+            print(f"🗑️  Cleaned up temporary model file")
+        
+        repo_url = f"https://huggingface.co/{repo_name}"
+        print(f"✅ Model successfully uploaded to: {repo_url}")
+        return repo_url
+        
+    except Exception as e:
+        print(f"❌ Error uploading to HuggingFace: {e}")
+        # Clean up temporary file on error
+        if temp_model_file is not None and os.path.exists(model_save_path):
+            os.unlink(model_save_path)
+        raise
+
+
+def load_model_from_huggingface(
+    repo_name: str,
+    token: Optional[str] = None,
+    device: str = "cpu",
+    **model_kwargs
+) -> MultiModalHackVAE:
+    """
+    Load MultiModalHackVAE model from HuggingFace Hub
+    
+    Args:
+        repo_name: HuggingFace repository name (e.g., "username/nethack-vae")
+        token: HuggingFace token (if needed for private repos)
+        device: Device to load the model on
+        **model_kwargs: Additional arguments for model initialization
+        
+    Returns:
+        Loaded MultiModalHackVAE model
+    """
+    if not HF_AVAILABLE:
+        raise ImportError("HuggingFace Hub is required. Install with: pip install huggingface_hub")
+    
+    # Login if token is provided
+    if token:
+        login(token=token)
+    
+    api = HfApi()
+    
+    try:
+        # Download config
+        config_path = api.hf_hub_download(
+            repo_id=repo_name,
+            filename="config.json",
+            repo_type="model"
+        )
+        
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        
+        # Download model file
+        model_path = api.hf_hub_download(
+            repo_id=repo_name,
+            filename="pytorch_model.bin",
+            repo_type="model"
+        )
+        
+        # Initialize model with config
+        model_config = {
+            "bInclude_inventory": config.get("include_inventory", False),
+            **model_kwargs
+        }
+        
+        model = MultiModalHackVAE(**model_config)
+        
+        # Load state dict
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        
+        model = model.to(device)
+        model.eval()
+        
+        print(f"✅ Model loaded from HuggingFace: {repo_name}")
+        return model
+        
+    except Exception as e:
+        print(f"❌ Error loading from HuggingFace: {e}")
+        raise
+
+
+def upload_training_artifacts_to_huggingface(
+    repo_name: str,
+    train_losses: List[float],
+    test_losses: List[float],
+    training_config: Dict,
+    token: Optional[str] = None,
+    plots_dir: str = "training_plots"
+) -> None:
+    """
+    Upload training artifacts (losses, plots, config) to HuggingFace
+    
+    Args:
+        repo_name: HuggingFace repository name
+        train_losses: List of training losses per epoch
+        test_losses: List of test losses per epoch
+        training_config: Dictionary with training configuration
+        token: HuggingFace token
+        plots_dir: Directory name for plots in the repo
+    """
+    if not HF_AVAILABLE:
+        print("⚠️  HuggingFace Hub not available, skipping artifact upload")
+        return
+    
+    if token:
+        login(token=token)
+    
+    api = HfApi()
+    
+    try:
+        # Create training plots
+        plt.figure(figsize=(12, 5))
+        
+        # Loss plot
+        plt.subplot(1, 2, 1)
+        epochs = range(1, len(train_losses) + 1)
+        plt.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
+        plt.plot(epochs, test_losses, 'r-', label='Test Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Test Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Loss improvement plot
+        plt.subplot(1, 2, 2)
+        if len(train_losses) > 1:
+            train_improvement = [(train_losses[0] - loss) / train_losses[0] * 100 for loss in train_losses]
+            test_improvement = [(test_losses[0] - loss) / test_losses[0] * 100 for loss in test_losses]
+            plt.plot(epochs, train_improvement, 'b-', label='Training Improvement (%)', linewidth=2)
+            plt.plot(epochs, test_improvement, 'r-', label='Test Improvement (%)', linewidth=2)
+            plt.xlabel('Epoch')
+            plt.ylabel('Improvement (%)')
+            plt.title('Loss Improvement Over Time')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig("training_curves.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # Save training data
+        training_data = {
+            "train_losses": train_losses,
+            "test_losses": test_losses,
+            "config": training_config,
+            "final_train_loss": train_losses[-1] if train_losses else None,
+            "final_test_loss": test_losses[-1] if test_losses else None,
+            "total_epochs": len(train_losses),
+            "best_train_loss": min(train_losses) if train_losses else None,
+            "best_test_loss": min(test_losses) if test_losses else None
+        }
+        
+        with open("training_data.json", "w") as f:
+            json.dump(training_data, f, indent=2)
+        
+        # Upload files
+        api.upload_file(
+            path_or_fileobj="training_curves.png",
+            path_in_repo=f"{plots_dir}/training_curves.png",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message="Add training curves"
+        )
+        
+        api.upload_file(
+            path_or_fileobj="training_data.json",
+            path_in_repo="training_data.json",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message="Add training data"
+        )
+        
+        # Clean up
+        os.remove("training_curves.png")
+        os.remove("training_data.json")
+        
+        print(f"✅ Training artifacts uploaded to {repo_name}")
+        
+    except Exception as e:
+        print(f"❌ Error uploading training artifacts: {e}")
+
+
+def create_model_demo_notebook(repo_name: str, save_path: str = "demo_notebook.ipynb") -> None:
+    """
+    Create a Jupyter notebook demonstrating model usage
+    
+    Args:
+        repo_name: HuggingFace repository name
+        save_path: Path to save the notebook
+    """
+    notebook_content = {
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [
+                    f"# MultiModalHackVAE Demo\n\n",
+                    f"This notebook demonstrates how to use the MultiModalHackVAE model from {repo_name}.\n\n",
+                    "## Installation\n\n",
+                    "```bash\n",
+                    "pip install torch transformers huggingface_hub\n",
+                    "# For NetHack environment (optional):\n",
+                    "pip install nle\n",
+                    "```"
+                ]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "source": [
+                    "import torch\n",
+                    "import numpy as np\n",
+                    "from huggingface_hub import hf_hub_download\n",
+                    "import json\n",
+                    "\n",
+                    "# Load model config\n",
+                    f"config_path = hf_hub_download(repo_id='{repo_name}', filename='config.json')\n",
+                    "with open(config_path, 'r') as f:\n",
+                    "    config = json.load(f)\n",
+                    "\n",
+                    "print('Model Configuration:')\n",
+                    "for key, value in config.items():\n",
+                    "    print(f'  {key}: {value}')"
+                ]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "source": [
+                    "# Load the model (you'll need to import your model class)\n",
+                    "# from your_package import MultiModalHackVAE\n",
+                    "# model = load_model_from_huggingface('{repo_name}')\n",
+                    "\n",
+                    "# Example synthetic data\n",
+                    "batch_size = 1\n",
+                    "game_chars = torch.randint(32, 127, (batch_size, 21, 79))\n",
+                    "game_colors = torch.randint(0, 16, (batch_size, 21, 79))\n",
+                    "blstats = torch.randn(batch_size, 27)\n",
+                    "msg_tokens = torch.randint(0, 128, (batch_size, 256))\n",
+                    "hero_info = torch.randint(0, 10, (batch_size, 4))\n",
+                    "\n",
+                    "print('Synthetic data shapes:')\n",
+                    "print(f'  game_chars: {game_chars.shape}')\n",
+                    "print(f'  game_colors: {game_colors.shape}')\n",
+                    "print(f'  blstats: {blstats.shape}')\n",
+                    "print(f'  msg_tokens: {msg_tokens.shape}')\n",
+                    "print(f'  hero_info: {hero_info.shape}')"
+                ]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "source": [
+                    "# Encode to latent space\n",
+                    "# with torch.no_grad():\n",
+                    "#     output = model(\n",
+                    "#         glyph_chars=game_chars,\n",
+                    "#         glyph_colors=game_colors,\n",
+                    "#         blstats=blstats,\n",
+                    "#         msg_tokens=msg_tokens,\n",
+                    "#         hero_info=hero_info\n",
+                    "#     )\n",
+                    "#     \n",
+                    "#     latent_mean = output['latent_mean']\n",
+                    "#     latent_logvar = output['latent_logvar']\n",
+                    "#     reconstructions = output['reconstructions']\n",
+                    "#     \n",
+                    "#     print(f'Latent representation shape: {latent_mean.shape}')\n",
+                    "#     print(f'Latent mean: {latent_mean[0][:5].tolist()}')\n",
+                    "\n",
+                    "print('Model inference example (uncomment when model is available)')"
+                ]
+            }
+        ],
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3"
+            },
+            "language_info": {
+                "name": "python",
+                "version": "3.8+"
+            }
+        },
+        "nbformat": 4,
+        "nbformat_minor": 4
+    }
+    
+    with open(save_path, "w") as f:
+        json.dump(notebook_content, f, indent=2)
+    
+    print(f"📓 Demo notebook created: {save_path}")
+
+
 if __name__ == "__main__":
     # Example usage
     train_file = "nld-aa-training"
@@ -1401,7 +2310,22 @@ if __name__ == "__main__":
     # print(f"   📊 Train batches: {len(train_dataset)}")
     # print(f"   📊 Test batches: {len(test_dataset)}")
     
-    # Mini test of train_multimodalhack_vae with very small samples
+    hf_model_card_data = {
+        "author": "Xu Chen",
+        "description": "Advanced NetHack VAE",
+        "tags": ["nethack", "reinforcement-learning", "multimodal", "world-modeling", "vae"],
+        "use_cases": [
+            "Game state representation learning",
+            "RL agent state abstraction",
+            "NetHack gameplay analysis"
+        ],
+        "metrics": {
+            "reconstruction_quality": "High",
+            "latent_dim": 256,
+            "compression_ratio": "21x79x16 -> 256"
+        }
+    }
+    
     print(f"\n🧪 Starting mini test of train_multimodalhack_vae...")
     model, train_losses, test_losses = train_multimodalhack_vae(
         train_file=train_file,
@@ -1414,11 +2338,24 @@ if __name__ == "__main__":
         testing_batches=1,  # Very few batches
         max_training_batches=max_training_batches,
         max_testing_batches=max_testing_batches,
-        save_path="models/mini_test_vae.pth",
+        save_path="models/nethack-vae.pth",
         device='cuda' if torch.cuda.is_available() else 'cpu',
         include_inventory=False,
         data_cache_dir="data_cache",
-        force_recollect=False  # Use the data we just collected
+        force_recollect=False,  # Use the data we just collected
+        
+        # Enable checkpointing
+        save_checkpoints=True,
+        checkpoint_dir="checkpoints",
+        save_every_n_epochs=2,
+        keep_last_n_checkpoints=2,
+        
+        # HuggingFace integration example
+        upload_to_hf=True,
+        hf_repo_name="CatkinChen/nethack-vae",
+        hf_upload_directly=True,  # Upload directly without extra local save
+        hf_upload_checkpoints=True,  # Also upload checkpoints
+        hf_model_card_data=hf_model_card_data
     )
     
     print(f"\n🎉 Mini test completed successfully!")
