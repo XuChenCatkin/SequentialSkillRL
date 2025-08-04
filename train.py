@@ -916,6 +916,35 @@ def evaluate_vae(model, test_loader, device, beta=1.0):
             total_kl_loss / num_batches)
 
 
+def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress: float, rate: float = 10.0, centre: float = 0.5) -> float:
+    """
+    Calculate ramped weight based on specified shape and progress
+    
+    Args:
+        initial_weight: Starting weight
+        final_weight: Final weight
+        shape: Shape of the ramp ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
+        progress: Progress from 0.0 to 1.0
+        rate: Rate of change (used for 'sigmoid' and 'exponential' shapes)
+        centre: Centre point (used for 'sigmoid' shape)
+
+    Returns:
+        Ramped weight value
+    """
+    if shape == 'linear':
+        return initial_weight + (final_weight - initial_weight) * progress
+    elif shape == 'cubic':
+        return initial_weight + (final_weight - initial_weight) * (progress ** 3)
+    elif shape == 'sigmoid':
+        return initial_weight + (final_weight - initial_weight) * (1 / (1 + np.exp(-rate * (progress - centre))))
+    elif shape == 'cosine':
+        return initial_weight + (final_weight - initial_weight) * (0.5 * (1 - np.cos(np.pi * progress)))
+    elif shape == 'exponential':
+        return initial_weight + (final_weight - initial_weight) * (1 - np.exp(-rate * progress))
+    else:
+        raise ValueError(f"Unknown shape: {shape}. Supported shapes: linear, cubic, sigmoid, cosine, exponential.")
+
+
 def train_multimodalhack_vae(
     train_file: str, 
     test_file: str,                     
@@ -937,13 +966,16 @@ def train_multimodalhack_vae(
     data_cache_dir: str = "data_cache",
     force_recollect: bool = False,
     # Adaptive loss weighting parameters
-    initial_weight_emb: float = 1.0,
+    initial_weight_emb: float = 1.5,
     final_weight_emb: float = 1.0,
+    weight_emb_shape: str = 'cubic',
     initial_weight_raw: float = 0.2,
     final_weight_raw: float = 1.0,
-    initial_kl_beta: float = 0.001,
+    weight_raw_shape: str = 'linear',
+    initial_kl_beta: float = 0.0001,
     final_kl_beta: float = 1.0,
-    warmup_epochs: int = 3) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
+    kl_beta_shape: str = 'cosine',
+    warmup_epoch_ratio: float = 0.3) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
     """
     Train MultiModalHackVAE on NetHack Learning Dataset with adaptive loss weighting
 
@@ -960,13 +992,16 @@ def train_multimodalhack_vae(
         data_cache_dir: Directory to cache processed data
         force_recollect: Force data recollection even if cache exists
         initial_weight_emb: Starting weight for embedding losses (high for warm-up)
-        final_weight_emb: Final weight for embedding losses
+        final_weight_emb: Final weight for embedding losses (stable after warm-up)
+        weight_emb_shape: Shape of embedding weight curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
         initial_weight_raw: Starting weight for raw reconstruction losses (low initially)
         final_weight_raw: Final weight for raw reconstruction losses
+        weight_raw_shape: Shape of raw weight curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
         initial_kl_beta: Starting KL divergence weight (very small initially)
         final_kl_beta: Final KL divergence weight
-        warmup_epochs: Number of epochs for warm-up phase
-        
+        kl_beta_shape: Shape of KL beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
+        warmup_epoch_ratio: Ratio of epochs for warm-up phase
+
     Returns:
         Tuple of (trained_model, train_losses, test_losses)
     """
@@ -984,23 +1019,39 @@ def train_multimodalhack_vae(
     print(f"     - Embedding weights: {initial_weight_emb:.3f} → {final_weight_emb:.3f}")
     print(f"     - Raw weights: {initial_weight_raw:.3f} → {final_weight_raw:.3f}")
     print(f"     - KL beta: {initial_kl_beta:.3f} → {final_kl_beta:.3f}")
-    print(f"     - Warmup epochs: {warmup_epochs}")
+    print(f"     - Warmup epochs: {int(warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
     
     def get_adaptive_weights(epoch: int, total_epochs: int) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current epoch"""
         # Linear interpolation for smooth transitions
         progress = min(epoch / total_epochs, 1.0)
-        warmup_progress = min(epoch / warmup_epochs, 1.0) if warmup_epochs > 0 else 1.0
-        
+        warmup_progress = min(epoch / int(warmup_epoch_ratio * total_epochs), 1.0) if warmup_epoch_ratio > 0 else 1.0
+
         # Embedding weight: high initially, then decrease
-        weight_emb = initial_weight_emb + (final_weight_emb - initial_weight_emb) * warmup_progress
+        weight_emb = ramp_weight(initial_weight=initial_weight_emb, 
+            final_weight=final_weight_emb, 
+            shape=weight_emb_shape, 
+            progress=warmup_progress
+        )
         
         # Raw weight: low initially, then increase  
-        weight_raw = initial_weight_raw + (final_weight_raw - initial_weight_raw) * progress
+        weight_raw = ramp_weight(initial_weight=initial_weight_raw, 
+            final_weight=final_weight_raw, 
+            shape=weight_raw_shape, 
+            progress=progress
+        )
         
         # KL beta: very small initially, then gradually increase (beta annealing)
-        kl_beta = initial_kl_beta + (final_kl_beta - initial_kl_beta) * progress
+        kl_beta = ramp_weight(initial_weight=initial_kl_beta, 
+            final_weight=final_kl_beta, 
+            shape=kl_beta_shape, 
+            progress=progress
+        )
         
+        # Log the adaptive weights
+        if logging:
+            logging.info(f"Epoch {epoch+1}/{total_epochs} - Adaptive weights: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
+
         return weight_emb, weight_raw, kl_beta
     
     # Create adapter and datasets with caching
@@ -1316,59 +1367,58 @@ if __name__ == "__main__":
     # Example usage
     train_file = "nld-aa-training"
     test_file = "nld-aa-testing"
-
-    # test collecting and saving data
-    collector = NetHackDataCollector('ttyrecs.db')
-    adapter = BLStatsAdapter()
-    train_dataset = collector.collect_or_load_data(
-        dataset_name=train_file,
-        adapter=adapter,
-        save_path="data_cache/train_data_mini_test.pt",
-        max_batches=3,  # Very small for testing
-        batch_size=1,
-        seq_length=8,   # Very short sequences for testing
-        force_recollect=False  # Use cache if available
-    )
-    test_dataset = collector.collect_or_load_data(
-        dataset_name=test_file,
-        adapter=adapter,
-        save_path="data_cache/test_data_mini_test.pt",
-        max_batches=2,  # Very small for testing
-        batch_size=1,
-        seq_length=8,   # Very short sequences for testing
-        force_recollect=False  # Use cache if available
-    )
+    data_cache_dir = "data_cache"
+    batch_size = 32
+    sequence_size = 32
+    max_training_batches = 100
+    max_testing_batches = 20
+    train_cache_file = os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}.pt")
+    test_cache_file = os.path.join(data_cache_dir, f"{test_file}_b{batch_size}_s{sequence_size}_m{max_testing_batches}.pt")
     
-    print(f"✅ Data collection completed!")
-    print(f"   📊 Train batches: {len(train_dataset)}")
-    print(f"   📊 Test batches: {len(test_dataset)}")
+    # # test collecting and saving data
+    # collector = NetHackDataCollector('ttyrecs.db')
+    # adapter = BLStatsAdapter()
+    # train_dataset = collector.collect_or_load_data(
+    #     dataset_name=train_file,
+    #     adapter=adapter,
+    #     save_path=train_cache_file,
+    #     max_batches=max_training_batches,
+    #     batch_size=batch_size,
+    #     seq_length=sequence_size,
+    #     force_recollect=True
+    # )
+    # test_dataset = collector.collect_or_load_data(
+    #     dataset_name=test_file,
+    #     adapter=adapter,
+    #     save_path=test_cache_file,
+    #     max_batches=max_testing_batches,
+    #     batch_size=batch_size,
+    #     seq_length=sequence_size,
+    #     force_recollect=True
+    # )
+    
+    # print(f"✅ Data collection completed!")
+    # print(f"   📊 Train batches: {len(train_dataset)}")
+    # print(f"   📊 Test batches: {len(test_dataset)}")
     
     # Mini test of train_multimodalhack_vae with very small samples
     print(f"\n🧪 Starting mini test of train_multimodalhack_vae...")
     model, train_losses, test_losses = train_multimodalhack_vae(
         train_file=train_file,
         test_file=test_file,
-        epochs=5,           # Very few epochs
-        batch_size=32,
-        sequence_size=32,    # Very short sequences
+        epochs=5,          
+        batch_size=batch_size,
+        sequence_size=sequence_size,    
         learning_rate=1e-3,
         training_batches=4, # Very few batches
         testing_batches=1,  # Very few batches
-        max_training_batches=5,
-        max_testing_batches=2,
+        max_training_batches=max_training_batches,
+        max_testing_batches=max_testing_batches,
         save_path="models/mini_test_vae.pth",
         device='cuda' if torch.cuda.is_available() else 'cpu',
         include_inventory=False,
         data_cache_dir="data_cache",
-        force_recollect=False,  # Use the data we just collected
-        # Adaptive loss weighting for better training dynamics
-        initial_weight_emb=1.0,     # High emphasis on embeddings initially
-        final_weight_emb=0.2,       # Standard weight later
-        initial_weight_raw=0.2,   # Very low raw reconstruction initially  
-        final_weight_raw=1.0,       # Standard weight later
-        initial_kl_beta=0.0001,     # Very small KL penalty initially
-        final_kl_beta=0.1,          # Moderate KL penalty later (not too high for testing)
-        warmup_epochs=2             # 2 epochs of warm-up for quick testing
+        force_recollect=False  # Use the data we just collected
     )
     
     print(f"\n🎉 Mini test completed successfully!")
