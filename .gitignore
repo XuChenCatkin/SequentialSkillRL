@@ -204,3 +204,5 @@ nle_data/
 
 data/
 data_cache/
+checkpoints/
+models/

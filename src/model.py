@@ -1187,4 +1187,30 @@ def vae_loss(
         'raw_stats_losses': stat_raw_losses,
     }
 
+def calc_eigen_values(mu: torch.Tensor, logvar: torch.Tensor, lowrank_factors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculate the eigenvalues and eigenvectors of the approximate posterior distribution.
 
+    Args:
+        mu: The mean of the latent distribution (B, latent_dim)
+        logvar: The log variance of the latent distribution (B, latent_dim)
+        lowrank_factors: The low-rank factors for the latent distribution (B, latent_dim, rank)
+
+    Returns:
+        A tuple containing the eigenvalues and eigenvectors.
+    """
+    B, D = mu.shape
+    r = lowrank_factors.shape[-1]
+    # Compute the covariance matrix
+    cov = torch.bmm(lowrank_factors, lowrank_factors.transpose(1, 2)) + torch.diag_embed(torch.exp(logvar))
+    cov = cov.mean(0)  # Average over batch dimension
+    assert cov.shape == (D, D), f"Covariance matrix shape mismatch: {cov.shape} != {(D, D)}"
+    mu_bar = mu.mean(0)
+    mu_c = mu - mu_bar
+    S_mu = (mu_c.T @ mu_c) / B
+    S = cov + S_mu  # Covariance matrix of the posterior distribution
+    # Ensure the covariance matrix is symmetric
+    S = (S + S.T) / 2
+    # Compute the eigenvalues and eigenvectors
+    eigenvalues, eigenvectors = torch.linalg.eigh(S)
+    return eigenvalues, eigenvectors

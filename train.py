@@ -21,8 +21,17 @@ from sklearn.manifold import TSNE
 import warnings
 import re  # Add regex import for status line parsing
 import json
+import logging
 from datetime import datetime
 warnings.filterwarnings('ignore')
+
+# Weights & Biases integration
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("⚠️  wandb not available. Install with: pip install wandb")
 
 # HuggingFace integration imports
 try:
@@ -39,7 +48,7 @@ import env_utils
 
 # Add src to path for importing the existing MultiModalHackVAE
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from model import MultiModalHackVAE, vae_loss
+from model import MultiModalHackVAE, vae_loss, calc_eigen_values
 import torch.optim as optim
 import sqlite3
 import random
@@ -1215,7 +1224,19 @@ def train_multimodalhack_vae(
     resume_from_epoch: int = 0,
     previous_train_losses: List[float] = None,
     previous_test_losses: List[float] = None,
-    resume_checkpoint_path: str = None) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
+    resume_checkpoint_path: str = None,
+    
+    # Weights & Biases monitoring parameters
+    use_wandb: bool = True,
+    wandb_project: str = "nethack-vae",
+    wandb_entity: str = None,
+    wandb_run_name: str = None,
+    wandb_tags: List[str] = None,
+    wandb_notes: str = None,
+    log_every_n_steps: int = 10,
+    log_model_architecture: bool = True,
+    log_gradients: bool = False,
+    log_model_weights: bool = False) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
     """
     Train MultiModalHackVAE on NetHack Learning Dataset with adaptive loss weighting
 
@@ -1247,18 +1268,79 @@ def train_multimodalhack_vae(
     if device is None:
         device = torch.device('cpu')  # Use CPU for debugging
 
-    print(f"🔥 Training MultiModalHackVAE with {training_batches} train batches, {testing_batches} test batches")
-    print(f"   Epochs: {epochs}")
-    print(f"   Batch size: {batch_size}")
-    print(f"   Sequence size: {sequence_size}")
-    print(f"   Device: {device}")
-    print(f"   Include inventory: {include_inventory}")
-    print(f"   Data cache: {data_cache_dir}")
-    print(f"   Adaptive Loss Weighting:")
-    print(f"     - Embedding weights: {initial_weight_emb:.3f} → {final_weight_emb:.3f}")
-    print(f"     - Raw weights: {initial_weight_raw:.3f} → {final_weight_raw:.3f}")
-    print(f"     - KL beta: {initial_kl_beta:.3f} → {final_kl_beta:.3f}")
-    print(f"     - Warmup epochs: {int(warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
+    # Setup logging
+    if logging is None:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('training.log')
+            ]
+        )
+        logger = logging.getLogger(__name__)
+    else:
+        logger = logging
+
+    # Initialize Weights & Biases if requested
+    if use_wandb and WANDB_AVAILABLE:
+        # Prepare configuration for wandb
+        wandb_config = {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "sequence_size": sequence_size,
+            "learning_rate": learning_rate,
+            "training_batches": training_batches,
+            "testing_batches": testing_batches,
+            "device": str(device),
+            "include_inventory": include_inventory,
+            "adaptive_weighting": {
+                "initial_weight_emb": initial_weight_emb,
+                "final_weight_emb": final_weight_emb,
+                "weight_emb_shape": weight_emb_shape,
+                "initial_weight_raw": initial_weight_raw,
+                "final_weight_raw": final_weight_raw,
+                "weight_raw_shape": weight_raw_shape,
+                "initial_kl_beta": initial_kl_beta,
+                "final_kl_beta": final_kl_beta,
+                "kl_beta_shape": kl_beta_shape,
+                "warmup_epoch_ratio": warmup_epoch_ratio
+            },
+            "checkpointing": {
+                "save_checkpoints": save_checkpoints,
+                "save_every_n_epochs": save_every_n_epochs,
+                "keep_last_n_checkpoints": keep_last_n_checkpoints
+            }
+        }
+        
+        # Initialize wandb run
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            config=wandb_config,
+            tags=wandb_tags,
+            notes=wandb_notes,
+            resume="allow" if resume_checkpoint_path else False
+        )
+        
+        logger.info("Weights & Biases initialized")
+        
+    elif use_wandb and not WANDB_AVAILABLE:
+        logger.warning("⚠️  wandb requested but not available. Install with: pip install wandb")
+
+    logger.info(f"🔥Training MultiModalHackVAE with {training_batches} train batches, {testing_batches} test batches")
+    logger.info(f"   Epochs: {epochs}")
+    logger.info(f"   Batch size: {batch_size}")
+    logger.info(f"   Sequence size: {sequence_size}")
+    logger.info(f"   Device: {device}")
+    logger.info(f"   Include inventory: {include_inventory}")
+    logger.info(f"   Data cache: {data_cache_dir}")
+    logger.info(f"   Adaptive Loss Weighting:")
+    logger.info(f"     - Embedding weights: {initial_weight_emb:.3f} → {final_weight_emb:.3f}")
+    logger.info(f"     - Raw weights: {initial_weight_raw:.3f} → {final_weight_raw:.3f}")
+    logger.info(f"     - KL beta: {initial_kl_beta:.3f} → {final_kl_beta:.3f}")
+    logger.info(f"     - Warmup epochs: {int(warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
     
     def get_adaptive_weights(epoch: int, total_epochs: int) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current epoch"""
@@ -1288,8 +1370,7 @@ def train_multimodalhack_vae(
         )
         
         # Log the adaptive weights
-        if logging:
-            logging.info(f"Epoch {epoch+1}/{total_epochs} - Adaptive weights: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
+        logger.debug(f"Epoch {epoch+1}/{total_epochs} - Adaptive weights: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
 
         return weight_emb, weight_raw, kl_beta
     
@@ -1305,7 +1386,7 @@ def train_multimodalhack_vae(
     test_cache_file = os.path.join(data_cache_dir, f"{test_file}_b{batch_size}_s{sequence_size}_m{max_testing_batches}.pt")
 
     # Collect or load training data
-    print(f"\n📊 Preparing training data...")
+    logger.info(f"📊 Preparing training data...")
     train_dataset = collector.collect_or_load_data(
         dataset_name=train_file,
         adapter=adapter,
@@ -1319,7 +1400,7 @@ def train_multimodalhack_vae(
     train_dataset = train_dataset[:training_batches] if len(train_dataset) > training_batches else train_dataset
     
     # Collect or load testing data
-    print(f"\n📊 Preparing testing data...")
+    logger.info(f"📊 Preparing testing data...")
     test_dataset = collector.collect_or_load_data(
         dataset_name=test_file,
         adapter=adapter,
@@ -1333,11 +1414,15 @@ def train_multimodalhack_vae(
     test_dataset = test_dataset[:testing_batches] if len(test_dataset) > testing_batches else test_dataset
 
     # Initialize model
-    model = MultiModalHackVAE(bInclude_inventory=include_inventory, logger=logging)
+    model = MultiModalHackVAE(bInclude_inventory=include_inventory, logger=logger)
     model = model.to(device)
     
     # Initialize optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # Log model architecture to wandb if requested
+    if use_wandb and WANDB_AVAILABLE and log_model_architecture:
+        wandb.watch(model, log_freq=log_every_n_steps, log_graph=True, log="all" if log_gradients else None)
     
     # Initialize loss tracking
     train_losses = previous_train_losses[:] if previous_train_losses else []
@@ -1345,25 +1430,37 @@ def train_multimodalhack_vae(
     
     # Resume from checkpoint if specified
     if resume_checkpoint_path and os.path.exists(resume_checkpoint_path):
-        print(f"🔄 Resuming from checkpoint: {resume_checkpoint_path}")
+        logger.info(f"🔄 Resuming from checkpoint: {resume_checkpoint_path}")
         checkpoint = load_checkpoint(resume_checkpoint_path, model, optimizer, device)
         start_epoch = resume_from_epoch
-        print(f"   Resuming from epoch {start_epoch}/{epochs}")
+        logger.info(f"   Resuming from epoch {start_epoch}/{epochs}")
     else:
         start_epoch = 0
         
-    print(f"\n🎯 Starting training for {epochs} epochs (starting from epoch {start_epoch})...")
+    logger.info(f"🎯 Starting training for {epochs} epochs (starting from epoch {start_epoch})...")
     
     for epoch in range(start_epoch, epochs):
         # Calculate adaptive weights for this epoch
         weight_emb, weight_raw, kl_beta = get_adaptive_weights(epoch, epochs)
         
-        print(f"\n🎯 Epoch {epoch+1}/{epochs} - Adaptive weights: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
+        logger.info(f"🎯 Epoch {epoch+1}/{epochs} - Adaptive weights: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
+        
+        # Log adaptive weights to wandb
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.log({
+                "epoch": epoch + 1,
+                "adaptive_weights/embedding": weight_emb,
+                "adaptive_weights/raw": weight_raw,
+                "adaptive_weights/kl_beta": kl_beta,
+                "progress/overall": epoch / epochs,
+                "progress/warmup": min(epoch / int(warmup_epoch_ratio * epochs), 1.0) if warmup_epoch_ratio > 0 else 1.0
+            }, step=epoch)
         
         # Training phase
         model.train()
         epoch_train_loss = 0.0
         batch_count = 0
+        step_count = 0
         
         with tqdm(train_dataset, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
             for batch in pbar:
@@ -1406,6 +1503,19 @@ def train_multimodalhack_vae(
                 )
 
                 train_loss = train_loss_dict['total_loss']
+                mu = model_output['mu'].detach()
+                logvar = model_output['logvar'].detach()
+                lowrank_factors = model_output['lowrank_factors'].detach()
+                approx_per_dim_kl = 0.5 * (torch.exp(logvar) + mu.pow(2) - 1 - logvar).mean(dim=0)
+                eigvals, _ = calc_eigen_values(mu, logvar, lowrank_factors)
+                eigvals = eigvals.flip(0)  # Sort in descending order
+                kl_eig = 0.5 * (eigvals - eigvals.log() - 1)
+                diag_var = torch.exp(logvar).mean(dim=0)
+                var_explained = eigvals.cumsum() / eigvals.sum()
+                median_idx = (var_explained >= 0.5).nonzero(as_tuple=True)[0][0]
+                median_ratio = (median_idx + 1) / len(var_explained)
+                ninety_percentile_idx = (var_explained >= 0.9).nonzero(as_tuple=True)[0][0]
+                ninety_percentile_ratio = (ninety_percentile_idx + 1) / len(var_explained)
 
                 # Backward pass
                 train_loss.backward()
@@ -1413,6 +1523,50 @@ def train_multimodalhack_vae(
 
                 epoch_train_loss += train_loss.item()
                 batch_count += 1
+
+                # Log to wandb every N steps if enabled
+                if use_wandb and WANDB_AVAILABLE and batch_count % log_every_n_steps == 0:
+                    wandb_log_dict = {
+                        # Training metrics
+                        "train/loss": train_loss.item(),
+                        "train/step": batch_count + (epoch - 1) * len(train_dataset),
+                        "train/epoch": epoch,
+                        
+                        # Loss components
+                        "train/raw_loss/total": train_loss_dict['total_raw_loss'].item(),
+                        "train/raw_loss/glyph_chars": train_loss_dict['raw_losses']['char'].item(),
+                        "train/raw_loss/glyph_colors": train_loss_dict['raw_losses']['color'].item(),
+                        "train/raw_loss/blstats": train_loss_dict['raw_losses']['blstats'].item(),
+                        "train/raw_loss/message": train_loss_dict['raw_losses']['msg'].item(),
+
+                        "train/emb_loss/total": train_loss_dict['total_emb_loss'].item(),
+                        "train/emb_loss/glyph_chars": train_loss_dict['emb_losses']['char_emb'].item(),
+                        "train/emb_loss/glyph_colors": train_loss_dict['emb_losses']['color_emb'].item(),
+                        "train/emb_loss/blstats": train_loss_dict['emb_losses']['stats_emb'].item(),
+                        "train/emb_loss/message": train_loss_dict['emb_losses']['msg_emb'].item(),
+
+                        "train/kl_loss": train_loss_dict['kl_loss'].item(),
+                        
+                        # Adaptive weights
+                        "adaptive_weights/emb_weight": weight_emb,
+                        "adaptive_weights/raw_weight": weight_raw,
+                        "adaptive_weights/kl_beta": kl_beta,
+                        
+                        # Model diagnostics
+                        "model/mu_var": mu.var(dim=0),
+                        "model/diag_var": diag_var,
+                        "model/approx_per_dim_kl": approx_per_dim_kl,
+                        "model/var_explained_median": median_ratio,
+                        "model/var_explained_90_percentile": ninety_percentile_ratio,
+                        "model/eigenval_max": eigvals[0].item(),
+                        "model/eigenval_min": eigvals[-1].item(),
+                        "model/eigenval_ratio": (eigvals[0] / eigvals[-1]).item(),
+                        "model/eigenval": eigvals,
+                        "model/kl_eigenval": kl_eig,
+                        "model/kl_eigenval_max": kl_eig.max().item(),
+                        "model/kl_eigenval_min": kl_eig.min().item()
+                    }
+                    wandb.log(wandb_log_dict)
 
                 # Update progress bar with summary metrics only
                 pbar.set_postfix({
@@ -1474,34 +1628,60 @@ def train_multimodalhack_vae(
         avg_test_loss = epoch_test_loss / test_batch_count if test_batch_count > 0 else 0.0
         test_losses.append(avg_test_loss)
         
-        # Print epoch summary with detailed loss breakdown
-        print(f"\n=== Epoch {epoch+1}/{epochs} Summary ===")
-        print(f"Average Train Loss: {avg_train_loss:.3f} | Average Test Loss: {avg_test_loss:.3f}")
-        print(f"Adaptive Weights Used: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
+        # Log epoch summary
+        logger.info(f"\n=== Epoch {epoch+1}/{epochs} Summary ===")
+        logger.info(f"Average Train Loss: {avg_train_loss:.3f} | Average Test Loss: {avg_test_loss:.3f}")
+        logger.info(f"Adaptive Weights Used: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
         
         # Show detailed modality breakdown for the last batch of training and testing
-        print(f"Final Training Batch Details:")
+        logger.info(f"Final Training Batch Details:")
         raw_losses = train_loss_dict['raw_losses']
         emb_losses = train_loss_dict['emb_losses']
         raw_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in raw_losses.items()])
         emb_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in emb_losses.items()])
-        print(f"  Raw Losses: {raw_loss_str}")
-        print(f"  Emb Losses: {emb_loss_str}")
+        logger.info(f"  Raw Losses: {raw_loss_str}")
+        logger.info(f"  Emb Losses: {emb_loss_str}")
         
-        
-        print(f"Final Testing Batch Details:")
+        logger.info(f"Final Testing Batch Details:")
         raw_losses = test_loss_dict['raw_losses']
         emb_losses = test_loss_dict['emb_losses']
         raw_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in raw_losses.items()])
         emb_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in emb_losses.items()])
-        print(f"  Raw Losses: {raw_loss_str}")
-        print(f"  Emb Losses: {emb_loss_str}")
+        logger.info(f"  Raw Losses: {raw_loss_str}")
+        logger.info(f"  Emb Losses: {emb_loss_str}")
+
+        logger.info(f"Variance of model output (mu): {', '.join(f'{v:.4f}' for v in mu.var(dim=0).tolist())}")
+        logger.info(f"Approximate per-dim KL: {', '.join(f'{v:.4f}' for v in approx_per_dim_kl.tolist())}")
+        logger.info(f"Eigenvalues of latent space: {', '.join(f'{v:.4f}' for v in eigvals.tolist())}")
+        logger.info(f"KL Eigenvalues: {', '.join(f'{v:.4f}' for v in kl_eig.tolist())}")
+        logger.info(f"Diagonal var: {', '.join(f'{v:.4f}' for v in diag_var.tolist())}")
+        logger.info(f"Variance explained by eigenvalues: {', '.join(f'{v:.4f}' for v in var_explained.tolist())}")
+
+        logger.info("=" * 50)
         
-        print("=" * 50)
+        # Log epoch metrics to wandb
+        if use_wandb and WANDB_AVAILABLE:
+            epoch_log_dict = {
+                # Epoch summaries
+                "epoch/train_loss": avg_train_loss,
+                "epoch/test_loss": avg_test_loss,
+                "epoch/number": epoch + 1,
+                
+                # Final batch details for comparison
+                "epoch/final_train_raw_total": train_loss_dict['total_raw_loss'].item(),
+                "epoch/final_train_emb_total": train_loss_dict['total_emb_loss'].item(),
+                "epoch/final_train_kl": train_loss_dict['kl_loss'].item(),
+                
+                "epoch/final_test_raw_total": test_loss_dict['total_raw_loss'].item(),
+                "epoch/final_test_emb_total": test_loss_dict['total_emb_loss'].item(),
+                "epoch/final_test_kl": test_loss_dict['kl_loss'].item()
+            }
+            wandb.log(epoch_log_dict)
+        
         
         # Save checkpoint if requested
         if save_checkpoints and (epoch + 1) % save_every_n_epochs == 0:
-            save_checkpoint(
+            checkpoint_path = save_checkpoint(
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
@@ -1513,14 +1693,24 @@ def train_multimodalhack_vae(
                 hf_repo_name=hf_repo_name,
                 hf_token=hf_token
             )
+            
+            # Log checkpoint save event to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    "checkpoint/saved": True,
+                    "checkpoint/epoch": epoch + 1,
+                    "checkpoint/path": checkpoint_path,
+                    "checkpoint/train_loss": avg_train_loss,
+                    "checkpoint/test_loss": avg_test_loss,
+                })
     
-    print(f"\n✅ MultiModalVAE training completed!")
-    print(f"  - Final train loss: {train_losses[-1]:.2f}")
-    print(f"  - Final test loss: {test_losses[-1]:.2f}")
+    logger.info(f"\n✅ MultiModalVAE training completed!")
+    logger.info(f"  - Final train loss: {train_losses[-1]:.2f}")
+    logger.info(f"  - Final test loss: {test_losses[-1]:.2f}")
     
     # HuggingFace upload if requested
     if upload_to_hf and hf_repo_name and HF_AVAILABLE:
-        print(f"\n🤗 Uploading model to HuggingFace Hub...")
+        logger.info(f"\n🤗 Uploading model to HuggingFace Hub...")
         try:
             # Prepare training configuration for model card
             training_config = {
@@ -1580,7 +1770,7 @@ def train_multimodalhack_vae(
                     },
                     'training_timestamp': datetime.now().isoformat(),
                 }, save_path)
-                print(f"💾 Model saved locally: {save_path}")
+                logger.info(f"💾 Model saved locally: {save_path}")
                 
                 repo_url = save_model_to_huggingface(
                     model=model,
@@ -1620,16 +1810,33 @@ def train_multimodalhack_vae(
                 )
                 os.remove("demo_notebook.ipynb")
             
-            print(f"🎉 Model successfully shared at: {repo_url}")
+            logger.info(f"🎉 Model successfully shared at: {repo_url}")
+            
+            # Log HuggingFace upload success to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    "huggingface/upload_success": True,
+                    "huggingface/repo_url": repo_url,
+                    "huggingface/artifacts_uploaded": hf_upload_artifacts,
+                    "huggingface/final_train_loss": train_losses[-1],
+                    "huggingface/final_test_loss": test_losses[-1],
+                })
             
         except Exception as e:
-            print(f"❌ Failed to upload to HuggingFace: {e}")
-            print("   Model was still saved locally.")
+            logger.error(f"❌ Failed to upload to HuggingFace: {e}")
+            logger.info("   Model was still saved locally.")
+            
+            # Log HuggingFace upload failure to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    "huggingface/upload_success": False,
+                    "huggingface/error": str(e),
+                })
     
     elif upload_to_hf and not HF_AVAILABLE:
-        print("⚠️  HuggingFace Hub not available. Install with: pip install huggingface_hub")
+        logger.warning("⚠️  HuggingFace Hub not available. Install with: pip install huggingface_hub")
     elif upload_to_hf and not hf_repo_name:
-        print("⚠️  HuggingFace upload requested but no repo_name provided")
+        logger.warning("⚠️  HuggingFace upload requested but no repo_name provided")
     elif not upload_to_hf:
         # Save model locally
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1645,7 +1852,22 @@ def train_multimodalhack_vae(
             },
             'training_timestamp': datetime.now().isoformat(),
         }, save_path)
-        print(f"💾 Model saved locally: {save_path}")
+        logger.info(f"💾 Model saved locally: {save_path}")
+    
+    # Final wandb logging and cleanup
+    if use_wandb and WANDB_AVAILABLE:
+        # Log final training summary
+        wandb.log({
+            "training/completed": True,
+            "training/total_epochs": epochs,
+            "training/best_train_loss": min(train_losses),
+            "training/best_test_loss": min(test_losses),
+            "training/final_train_loss": train_losses[-1],
+            "training/final_test_loss": test_losses[-1],
+        })
+        
+        # Mark run as finished
+        wandb.finish()
     
     return model, train_losses, test_losses
 
@@ -2349,6 +2571,18 @@ if __name__ == "__main__":
         checkpoint_dir="checkpoints",
         save_every_n_epochs=2,
         keep_last_n_checkpoints=2,
+        
+        # Wandb integration example
+        use_wandb=True,
+        wandb_project="nethack-vae",
+        wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
+        wandb_run_name="mini-test-run",
+        wandb_tags=["test", "mini-batch", "vae"],
+        wandb_notes="Mini test run with small data sample",
+        log_every_n_steps=1,  # Log every step for mini test
+        log_model_architecture=True,
+        log_gradients=True,
+        log_model_weights=True,
         
         # HuggingFace integration example
         upload_to_hf=True,
