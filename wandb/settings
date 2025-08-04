@@ -1,0 +1,5 @@
+[default]
+entity = xchen-catkin-ucl
+project = nethack-vae
+base_url = https://api.wandb.ai
+

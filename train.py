@@ -1187,7 +1187,7 @@ def train_multimodalhack_vae(
     learning_rate: float = 1e-3,
     device: str = None, 
     include_inventory: bool = False,
-    logging: logging.Logger = None,
+    logger: logging.Logger = None,
     data_cache_dir: str = "data_cache",
     force_recollect: bool = False,
     
@@ -1269,7 +1269,7 @@ def train_multimodalhack_vae(
         device = torch.device('cpu')  # Use CPU for debugging
 
     # Setup logging
-    if logging is None:
+    if logger is None:
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -1279,8 +1279,6 @@ def train_multimodalhack_vae(
             ]
         )
         logger = logging.getLogger(__name__)
-    else:
-        logger = logging
 
     # Initialize Weights & Biases if requested
     if use_wandb and WANDB_AVAILABLE:
@@ -1454,13 +1452,12 @@ def train_multimodalhack_vae(
                 "adaptive_weights/kl_beta": kl_beta,
                 "progress/overall": epoch / epochs,
                 "progress/warmup": min(epoch / int(warmup_epoch_ratio * epochs), 1.0) if warmup_epoch_ratio > 0 else 1.0
-            }, step=epoch)
+            })
         
         # Training phase
         model.train()
         epoch_train_loss = 0.0
         batch_count = 0
-        step_count = 0
         
         with tqdm(train_dataset, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
             for batch in pbar:
@@ -1511,7 +1508,7 @@ def train_multimodalhack_vae(
                 eigvals = eigvals.flip(0)  # Sort in descending order
                 kl_eig = 0.5 * (eigvals - eigvals.log() - 1)
                 diag_var = torch.exp(logvar).mean(dim=0)
-                var_explained = eigvals.cumsum() / eigvals.sum()
+                var_explained = eigvals.cumsum(dim=0) / eigvals.sum(dim=0)
                 median_idx = (var_explained >= 0.5).nonzero(as_tuple=True)[0][0]
                 median_ratio = (median_idx + 1) / len(var_explained)
                 ninety_percentile_idx = (var_explained >= 0.9).nonzero(as_tuple=True)[0][0]
@@ -1529,14 +1526,14 @@ def train_multimodalhack_vae(
                     wandb_log_dict = {
                         # Training metrics
                         "train/loss": train_loss.item(),
-                        "train/step": batch_count + (epoch - 1) * len(train_dataset),
-                        "train/epoch": epoch,
+                        "train/batch": batch_count,
+                        "train/epoch": epoch + 1,
                         
                         # Loss components
                         "train/raw_loss/total": train_loss_dict['total_raw_loss'].item(),
                         "train/raw_loss/glyph_chars": train_loss_dict['raw_losses']['char'].item(),
                         "train/raw_loss/glyph_colors": train_loss_dict['raw_losses']['color'].item(),
-                        "train/raw_loss/blstats": train_loss_dict['raw_losses']['blstats'].item(),
+                        "train/raw_loss/blstats": train_loss_dict['raw_losses']['stats'].item(),
                         "train/raw_loss/message": train_loss_dict['raw_losses']['msg'].item(),
 
                         "train/emb_loss/total": train_loss_dict['total_emb_loss'].item(),
@@ -2105,8 +2102,9 @@ with torch.no_grad():
         msg_tokens=msg_tokens,
         hero_info=hero_info
     )
-    latent_mean = output['latent_mean']
-    reconstructions = output['reconstructions']
+    latent_mean = output['mu']
+    latent_logvar = output['logvar']
+    lowrank_factors = output['lowrank_factors']
 ```
 
 ## Training
@@ -2123,7 +2121,7 @@ If you use this model, please consider citing:
 ```bibtex
 @misc{{nethack-vae,
   title={{MultiModalHackVAE: Multi-modal Variational Autoencoder for NetHack}},
-  author={{Your Name}},
+  author={{Xu Chen}},
   year={{2025}},
   url={{https://huggingface.co/{repo_name}}}
 }}
@@ -2131,12 +2129,12 @@ If you use this model, please consider citing:
 """
         
         # Save model card
-        model_card_path = "README.md"
+        model_card_path = "VAE_README.md"
         with open(model_card_path, "w") as f:
             f.write(model_card_content)
         
         # Save model config
-        config_path = "config.json"
+        config_path = "VAE_config.json"
         with open(config_path, "w") as f:
             json.dump(model_info, f, indent=2)
         
@@ -2462,9 +2460,9 @@ def create_model_demo_notebook(repo_name: str, save_path: str = "demo_notebook.i
                     "#         hero_info=hero_info\n",
                     "#     )\n",
                     "#     \n",
-                    "#     latent_mean = output['latent_mean']\n",
-                    "#     latent_logvar = output['latent_logvar']\n",
-                    "#     reconstructions = output['reconstructions']\n",
+                    "#     latent_mean = output['mu']\n",
+                    "#     latent_logvar = output['logvar']\n",
+                    "#     lowrank_factors = output['lowrank_factors']\n",
                     "#     \n",
                     "#     print(f'Latent representation shape: {latent_mean.shape}')\n",
                     "#     print(f'Latent mean: {latent_mean[0][:5].tolist()}')\n",
@@ -2543,8 +2541,7 @@ if __name__ == "__main__":
         ],
         "metrics": {
             "reconstruction_quality": "High",
-            "latent_dim": 256,
-            "compression_ratio": "21x79x16 -> 256"
+            "latent_dim": 64
         }
     }
     
@@ -2552,12 +2549,12 @@ if __name__ == "__main__":
     model, train_losses, test_losses = train_multimodalhack_vae(
         train_file=train_file,
         test_file=test_file,
-        epochs=5,          
+        epochs=10,          
         batch_size=batch_size,
         sequence_size=sequence_size,    
         learning_rate=1e-3,
-        training_batches=4, # Very few batches
-        testing_batches=1,  # Very few batches
+        training_batches=max_training_batches,
+        testing_batches=max_testing_batches,
         max_training_batches=max_training_batches,
         max_testing_batches=max_testing_batches,
         save_path="models/nethack-vae.pth",
@@ -2569,17 +2566,17 @@ if __name__ == "__main__":
         # Enable checkpointing
         save_checkpoints=True,
         checkpoint_dir="checkpoints",
-        save_every_n_epochs=2,
+        save_every_n_epochs=1,
         keep_last_n_checkpoints=2,
         
         # Wandb integration example
         use_wandb=True,
         wandb_project="nethack-vae",
         wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
-        wandb_run_name="mini-test-run",
-        wandb_tags=["test", "mini-batch", "vae"],
-        wandb_notes="Mini test run with small data sample",
-        log_every_n_steps=1,  # Log every step for mini test
+        wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+        wandb_tags=["nethack", "vae"],
+        wandb_notes="Full VAE training run",
+        log_every_n_steps=10,  # Log every 10 steps
         log_model_architecture=True,
         log_gradients=True,
         log_model_weights=True,
@@ -2591,7 +2588,7 @@ if __name__ == "__main__":
         hf_upload_checkpoints=True,  # Also upload checkpoints
         hf_model_card_data=hf_model_card_data
     )
-    
-    print(f"\n🎉 Mini test completed successfully!")
+
+    print(f"\n🎉 Full VAE training run completed successfully!")
     print(f"   📈 Train losses: {train_losses}")
     print(f"   📈 Test losses: {test_losses}")
