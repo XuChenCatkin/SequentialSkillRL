@@ -627,9 +627,16 @@ class MultiModalHackVAE(nn.Module):
                  bInclude_glyph_bag=True, 
                  bInclude_hero=True,
                  bInclude_inventory=True,
+                 dropout_rate=0.0,
+                 enable_dropout_on_latent=True,
+                 enable_dropout_on_decoder=True,
                  logger: logging.Logger=None):
         super().__init__()
         self.logger = logger or logging.getLogger(__name__)
+        self.dropout_rate = dropout_rate
+        self.enable_dropout_on_latent = enable_dropout_on_latent
+        self.enable_dropout_on_decoder = enable_dropout_on_decoder
+        
         self.glyph_cnn = GlyphCNN()
         self.glyph_bag = GlyphBag(logger=self.logger)  # for bag of glyphs
         self.stats_mlp = StatsMLP()
@@ -647,10 +654,20 @@ class MultiModalHackVAE(nn.Module):
                     (self.glyph_bag.get_output_channels() if bInclude_glyph_bag else 0) + \
                     (self.hero_emb.get_output_channels() if bInclude_hero else 0) + \
                     (self.inv_encoder.get_output_channels() if bInclude_inventory else 0)  # cnn + stats + msg + bag of glyphs + hero embedding + inventory
-        self.to_latent = nn.Sequential(
-            nn.LayerNorm(fusion_in),
-            nn.Linear(fusion_in, 256), nn.ReLU(),
-        )
+        
+        # Add dropout to the encoder fusion layer if enabled
+        if self.dropout_rate > 0.0 and self.enable_dropout_on_latent:
+            self.to_latent = nn.Sequential(
+                nn.LayerNorm(fusion_in),
+                nn.Dropout(self.dropout_rate),
+                nn.Linear(fusion_in, 256), nn.ReLU(),
+                nn.Dropout(self.dropout_rate),
+            )
+        else:
+            self.to_latent = nn.Sequential(
+                nn.LayerNorm(fusion_in),
+                nn.Linear(fusion_in, 256), nn.ReLU(),
+            )
         self.latent_dim = LATENT_DIM
         self.mu_head     = nn.Linear(256, LATENT_DIM)
         self.logvar_diag_head = nn.Linear(256, LATENT_DIM)  # diagonal part
@@ -673,9 +690,15 @@ class MultiModalHackVAE(nn.Module):
         # 3. For dynamic predictions p(x_{t+1} | z_t, a_t, h_t, c)
         
         # This will be shared across all decoders
-        self.decode_shared = nn.Sequential(
-            nn.Linear(LATENT_DIM, 256), nn.ReLU(),
-        )
+        if self.dropout_rate > 0.0 and self.enable_dropout_on_decoder:
+            self.decode_shared = nn.Sequential(
+                nn.Linear(LATENT_DIM, 256), nn.ReLU(),
+                nn.Dropout(self.dropout_rate),
+            )
+        else:
+            self.decode_shared = nn.Sequential(
+                nn.Linear(LATENT_DIM, 256), nn.ReLU(),
+            )
         
         # ------------- Decode embeddings ----------------
         
@@ -964,6 +987,21 @@ class MultiModalHackVAE(nn.Module):
             'mu': mu, # [B, LATENT_DIM]
             'logvar': logvar_diag, # [B, LATENT_DIM]
             'lowrank_factors': lowrank_factors # [B, LATENT_DIM, LOW_RANK]
+        }
+
+    def get_dropout_config(self):
+        """
+        Get dropout configuration for logging and debugging
+        
+        Returns:
+            Dict containing dropout configuration
+        """
+        return {
+            'dropout_rate': self.dropout_rate,
+            'enable_dropout_on_latent': self.enable_dropout_on_latent,
+            'enable_dropout_on_decoder': self.enable_dropout_on_decoder,
+            'training_mode': self.training,
+            'dropout_active': self.training and self.dropout_rate > 0.0
         }
 
 # ------------------------- loss helpers ------------------------------ #

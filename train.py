@@ -14,7 +14,7 @@ from pathlib import Path
 import sys
 from tqdm import tqdm
 import pickle
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Callable
 import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
@@ -23,6 +23,7 @@ import re  # Add regex import for status line parsing
 import json
 import logging
 from datetime import datetime
+from torch.optim.lr_scheduler import ConstantLR, ExponentialLR, SequentialLR
 warnings.filterwarnings('ignore')
 
 # Weights & Biases integration
@@ -767,177 +768,7 @@ class BLStatsAdapter:
         
         return blstats
 
-
-class NetHackVAE(nn.Module):
-    
-    def __init__(self, latent_dim: int = 128, hidden_dim: int = 512):
-        super(NetHackVAE, self).__init__()
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        
-        # Encoder
-        self.encoder = nn.Sequential(
-            # Input: (2, 24, 80)
-            nn.Conv2d(2, 32, kernel_size=4, stride=2, padding=1),  # (32, 12, 40)
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), # (64, 6, 20)
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), # (128, 3, 10)
-            nn.ReLU(),
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1), # (256, 3, 10)
-            nn.ReLU(),
-        )
-        
-        # Calculate flattened size after convolutions
-        self.encoder_output_size = 256 * 3 * 10  # 7680
-        
-        # Latent space
-        self.fc_mu = nn.Linear(self.encoder_output_size, latent_dim)
-        self.fc_logvar = nn.Linear(self.encoder_output_size, latent_dim)
-        
-        # Decoder
-        self.fc_decode = nn.Linear(latent_dim, self.encoder_output_size)
-        
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=1, padding=1), # (128, 3, 10)
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # (64, 6, 20)
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),   # (32, 12, 40)
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 2, kernel_size=4, stride=2, padding=1),    # (2, 24, 80)
-        )
-    
-    def encode(self, x):
-        """Encode input to latent space"""
-        h = self.encoder(x)
-        h = h.view(h.size(0), -1)  # Flatten
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar
-    
-    def reparameterize(self, mu, logvar):
-        """Reparameterization trick"""
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-    
-    def decode(self, z):
-        """Decode from latent space"""
-        h = self.fc_decode(z)
-        h = h.view(h.size(0), 256, 3, 10)  # Reshape for conv transpose
-        h = self.decoder(h)
-        return h
-    
-    def forward(self, x):
-        """Forward pass through VAE"""
-        # Normalize input to [0, 1] range
-        x_chars = x[:, 0:1] / 255.0  # Normalize chars
-        x_colors = x[:, 1:2] / 15.0  # Normalize colors (assuming max 15)
-        x_norm = torch.cat([x_chars, x_colors], dim=1)
-        
-        # Encode
-        mu, logvar = self.encode(x_norm)
-        
-        # Reparameterize
-        z = self.reparameterize(mu, logvar)
-        
-        # Decode
-        x_recon = self.decode(z)
-        
-        return x_recon, mu, logvar, z
-
-
-def vae_loss_function(recon_x, x, mu, logvar, beta: float = 1.0):
-    """
-    VAE loss function: Reconstruction + KL divergence
-    
-    Args:
-        recon_x: Reconstructed input
-        x: Original input  
-        mu: Mean of latent distribution
-        logvar: Log variance of latent distribution
-        beta: Weight for KL divergence term
-    """
-    # Normalize inputs for comparison
-    x_chars = x[:, 0:1] / 255.0
-    x_colors = x[:, 1:2] / 15.0
-    x_norm = torch.cat([x_chars, x_colors], dim=1)
-    
-    # Reconstruction loss (MSE)
-    recon_loss = F.mse_loss(recon_x, x_norm, reduction='sum')
-    
-    # KL divergence loss
-    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    
-    # Total loss
-    total_loss = recon_loss + beta * kl_loss
-    
-    return total_loss, recon_loss, kl_loss
-
-
-def train_vae_epoch(model, train_loader, optimizer, device, beta=1.0):
-    """Train VAE for one epoch"""
-    model.train()
-    total_loss = 0
-    total_recon_loss = 0
-    total_kl_loss = 0
-    
-    for batch_idx, batch in enumerate(train_loader):
-        optimizer.zero_grad()
-        
-        # Get data
-        data = batch['input'].to(device)  # (batch_size, 2, 24, 80)
-        
-        # Forward pass
-        recon_data, mu, logvar, z = model(data)
-        
-        # Calculate loss
-        loss, recon_loss, kl_loss = vae_loss_function(recon_data, data, mu, logvar, beta)
-        
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-        
-        # Accumulate losses
-        total_loss += loss.item()
-        total_recon_loss += recon_loss.item()
-        total_kl_loss += kl_loss.item()
-    
-    num_batches = len(train_loader)
-    return (total_loss / num_batches, 
-            total_recon_loss / num_batches, 
-            total_kl_loss / num_batches)
-
-
-def evaluate_vae(model, test_loader, device, beta=1.0):
-    """Evaluate VAE on test set"""
-    model.eval()
-    total_loss = 0
-    total_recon_loss = 0
-    total_kl_loss = 0
-    
-    with torch.no_grad():
-        for batch in test_loader:
-            data = batch['input'].to(device)
-            
-            # Forward pass
-            recon_data, mu, logvar, z = model(data)
-            
-            # Calculate loss
-            loss, recon_loss, kl_loss = vae_loss_function(recon_data, data, mu, logvar, beta)
-            
-            total_loss += loss.item()
-            total_recon_loss += recon_loss.item()
-            total_kl_loss += kl_loss.item()
-    
-    num_batches = len(test_loader)
-    return (total_loss / num_batches,
-            total_recon_loss / num_batches,
-            total_kl_loss / num_batches)
-
-
-def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress: float, rate: float = 10.0, centre: float = 0.5) -> float:
+def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress: float, rate: float = 10.0, centre: float = 0.5, f: Optional[Callable[[float, float, float], float]] = None) -> float:
     """
     Calculate ramped weight based on specified shape and progress
     
@@ -948,6 +779,7 @@ def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress
         progress: Progress from 0.0 to 1.0
         rate: Rate of change (used for 'sigmoid' and 'exponential' shapes)
         centre: Centre point (used for 'sigmoid' shape)
+        f: Custom function for 'custom' shape, should accept (initial_weight, final_weight, progress)
 
     Returns:
         Ramped weight value
@@ -962,8 +794,14 @@ def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress
         return initial_weight + (final_weight - initial_weight) * (0.5 * (1 - np.cos(np.pi * progress)))
     elif shape == 'exponential':
         return initial_weight + (final_weight - initial_weight) * (1 - np.exp(-rate * progress))
+    elif shape == 'constant':
+        assert initial_weight == final_weight, "For constant shape, initial and final weights must be equal."
+        return initial_weight
+    elif shape == 'custom':
+        assert f is not None, "For custom shape, a function must be provided."
+        return f(initial_weight, final_weight, progress)
     else:
-        raise ValueError(f"Unknown shape: {shape}. Supported shapes: linear, cubic, sigmoid, cosine, exponential.")
+        raise ValueError(f"Unknown shape: {shape}. Supported shapes: linear, cubic, sigmoid, cosine, exponential, constant, custom.")
 
 
 def save_checkpoint(
@@ -1190,18 +1028,25 @@ def train_multimodalhack_vae(
     logger: logging.Logger = None,
     data_cache_dir: str = "data_cache",
     force_recollect: bool = False,
+    shuffle_batches: bool = True,
     
     # Adaptive loss weighting parameters
     initial_weight_emb: float = 1.5,
-    final_weight_emb: float = 1.0,
+    final_weight_emb: float = 0.5,
     weight_emb_shape: str = 'cubic',
     initial_weight_raw: float = 0.2,
-    final_weight_raw: float = 1.0,
+    final_weight_raw: float = 2.0,
     weight_raw_shape: str = 'linear',
     initial_kl_beta: float = 0.0001,
     final_kl_beta: float = 1.0,
     kl_beta_shape: str = 'cosine',
+    custom_kl_beta_function: Optional[Callable[[float, float, float], float]] = None,
     warmup_epoch_ratio: float = 0.3,
+    
+    # Dropout and regularization parameters
+    dropout_rate: float = 0.0,
+    enable_dropout_on_latent: bool = True,
+    enable_dropout_on_decoder: bool = True,
     
     # Model saving and checkpointing parameters
     save_path: str = "models/nethack-vae.pth",
@@ -1251,6 +1096,7 @@ def train_multimodalhack_vae(
         include_inventory: Whether to include inventory processing
         data_cache_dir: Directory to cache processed data
         force_recollect: Force data recollection even if cache exists
+        shuffle_batches: Whether to shuffle training batches at the start of each epoch
         initial_weight_emb: Starting weight for embedding losses (high for warm-up)
         final_weight_emb: Final weight for embedding losses (stable after warm-up)
         weight_emb_shape: Shape of embedding weight curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
@@ -1261,6 +1107,9 @@ def train_multimodalhack_vae(
         final_kl_beta: Final KL divergence weight
         kl_beta_shape: Shape of KL beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
         warmup_epoch_ratio: Ratio of epochs for warm-up phase
+        dropout_rate: Dropout rate (0.0-1.0) for regularization. 0.0 disables dropout
+        enable_dropout_on_latent: Whether to apply dropout to encoder fusion layers
+        enable_dropout_on_decoder: Whether to apply dropout to decoder layers
 
     Returns:
         Tuple of (trained_model, train_losses, test_losses)
@@ -1292,6 +1141,7 @@ def train_multimodalhack_vae(
             "testing_batches": testing_batches,
             "device": str(device),
             "include_inventory": include_inventory,
+            "shuffle_batches": shuffle_batches,
             "adaptive_weighting": {
                 "initial_weight_emb": initial_weight_emb,
                 "final_weight_emb": final_weight_emb,
@@ -1303,6 +1153,11 @@ def train_multimodalhack_vae(
                 "final_kl_beta": final_kl_beta,
                 "kl_beta_shape": kl_beta_shape,
                 "warmup_epoch_ratio": warmup_epoch_ratio
+            },
+            "regularization": {
+                "dropout_rate": dropout_rate,
+                "enable_dropout_on_latent": enable_dropout_on_latent,
+                "enable_dropout_on_decoder": enable_dropout_on_decoder
             },
             "checkpointing": {
                 "save_checkpoints": save_checkpoints,
@@ -1334,37 +1189,45 @@ def train_multimodalhack_vae(
     logger.info(f"   Device: {device}")
     logger.info(f"   Include inventory: {include_inventory}")
     logger.info(f"   Data cache: {data_cache_dir}")
+    logger.info(f"   Shuffle batches: {shuffle_batches}")
+    logger.info(f"   Dropout Configuration:")
+    logger.info(f"     - Dropout rate: {dropout_rate}")
+    logger.info(f"     - Enable dropout on latent: {enable_dropout_on_latent}")
+    logger.info(f"     - Enable dropout on decoder: {enable_dropout_on_decoder}")
     logger.info(f"   Adaptive Loss Weighting:")
     logger.info(f"     - Embedding weights: {initial_weight_emb:.3f} → {final_weight_emb:.3f}")
     logger.info(f"     - Raw weights: {initial_weight_raw:.3f} → {final_weight_raw:.3f}")
     logger.info(f"     - KL beta: {initial_kl_beta:.3f} → {final_kl_beta:.3f}")
     logger.info(f"     - Warmup epochs: {int(warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
-    
-    def get_adaptive_weights(epoch: int, total_epochs: int) -> Tuple[float, float, float]:
+
+    def get_adaptive_weights(epoch: int, total_epochs: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current epoch"""
         # Linear interpolation for smooth transitions
-        progress = min(epoch / total_epochs, 1.0)
-        warmup_progress = min(epoch / int(warmup_epoch_ratio * total_epochs), 1.0) if warmup_epoch_ratio > 0 else 1.0
+        progress = min((epoch + 1) / total_epochs, 1.0)
+        warmup_progress = min((epoch + 1) / int(warmup_epoch_ratio * total_epochs), 1.0) if warmup_epoch_ratio > 0 else 1.0
 
         # Embedding weight: high initially, then decrease
         weight_emb = ramp_weight(initial_weight=initial_weight_emb, 
             final_weight=final_weight_emb, 
             shape=weight_emb_shape, 
-            progress=warmup_progress
+            progress=warmup_progress,
+            f=f
         )
         
         # Raw weight: low initially, then increase  
         weight_raw = ramp_weight(initial_weight=initial_weight_raw, 
             final_weight=final_weight_raw, 
             shape=weight_raw_shape, 
-            progress=progress
+            progress=progress,
+            f=f
         )
         
         # KL beta: very small initially, then gradually increase (beta annealing)
         kl_beta = ramp_weight(initial_weight=initial_kl_beta, 
             final_weight=final_kl_beta, 
             shape=kl_beta_shape, 
-            progress=progress
+            progress=progress,
+            f=f
         )
         
         # Log the adaptive weights
@@ -1411,12 +1274,27 @@ def train_multimodalhack_vae(
     )
     test_dataset = test_dataset[:testing_batches] if len(test_dataset) > testing_batches else test_dataset
 
-    # Initialize model
-    model = MultiModalHackVAE(bInclude_inventory=include_inventory, logger=logger)
+    # Initialize model with dropout configuration
+    # dropout_rate: 0.0 = no dropout, 0.1-0.3 = mild regularization, 0.5+ = strong regularization
+    # Dropout is applied to encoder fusion layers and decoder layers when enabled
+    model = MultiModalHackVAE(
+        bInclude_inventory=include_inventory, 
+        dropout_rate=dropout_rate,
+        enable_dropout_on_latent=enable_dropout_on_latent,
+        enable_dropout_on_decoder=enable_dropout_on_decoder,
+        logger=logger
+    )
     model = model.to(device)
     
     # Initialize optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    hold_epochs = int(warmup_epoch_ratio * epochs) if warmup_epoch_ratio > 0 else 0
+    gamma = 0.9
+    
+    sched_const = ConstantLR(optimizer, factor=1.0, total_iters=hold_epochs)
+    sched_decay = ExponentialLR(optimizer, gamma=gamma)
+    
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[sched_const, sched_decay], milestones=[hold_epochs])
     
     # Log model architecture to wandb if requested
     if use_wandb and WANDB_AVAILABLE and log_model_architecture:
@@ -1439,17 +1317,12 @@ def train_multimodalhack_vae(
     
     for epoch in range(start_epoch, epochs):
         # Calculate adaptive weights for this epoch
-        weight_emb, weight_raw, kl_beta = get_adaptive_weights(epoch, epochs)
+        weight_emb, weight_raw, kl_beta = get_adaptive_weights(epoch, epochs, custom_kl_beta_function)
         
         logger.info(f"🎯 Epoch {epoch+1}/{epochs} - Adaptive weights: emb={weight_emb:.3f}, raw={weight_raw:.3f}, kl_beta={kl_beta:.3f}")
         
-        # Log adaptive weights to wandb
         if use_wandb and WANDB_AVAILABLE:
             wandb.log({
-                "epoch": epoch + 1,
-                "adaptive_weights/embedding": weight_emb,
-                "adaptive_weights/raw": weight_raw,
-                "adaptive_weights/kl_beta": kl_beta,
                 "progress/overall": epoch / epochs,
                 "progress/warmup": min(epoch / int(warmup_epoch_ratio * epochs), 1.0) if warmup_epoch_ratio > 0 else 1.0
             })
@@ -1459,7 +1332,15 @@ def train_multimodalhack_vae(
         epoch_train_loss = 0.0
         batch_count = 0
         
-        with tqdm(train_dataset, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
+        # Shuffle training batches for this epoch (if enabled)
+        if shuffle_batches:
+            shuffled_train_dataset = train_dataset.copy()
+            random.shuffle(shuffled_train_dataset)
+            logger.debug(f"Shuffled {len(shuffled_train_dataset)} training batches for epoch {epoch+1}")
+        else:
+            shuffled_train_dataset = train_dataset
+        
+        with tqdm(shuffled_train_dataset, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
             for batch in pbar:
                 optimizer.zero_grad()
                 
@@ -1528,6 +1409,7 @@ def train_multimodalhack_vae(
                         "train/loss": train_loss.item(),
                         "train/batch": batch_count,
                         "train/epoch": epoch + 1,
+                        "train/learning_rate": optimizer.param_groups[0]['lr'],
                         
                         # Loss components
                         "train/raw_loss/total": train_loss_dict['total_raw_loss'].item(),
@@ -1549,19 +1431,33 @@ def train_multimodalhack_vae(
                         "adaptive_weights/raw_weight": weight_raw,
                         "adaptive_weights/kl_beta": kl_beta,
                         
+                        # Dropout status
+                        "dropout/rate": model.dropout_rate,
+                        "dropout/active": model.training and model.dropout_rate > 0.0,
+                        "dropout/training_mode": model.training,
+                        
                         # Model diagnostics
                         "model/mu_var": mu.var(dim=0),
+                        "model/mu_var_max": mu.var(dim=0).max().item(),
+                        "model/mu_var_min": mu.var(dim=0).min().item(),
+                        "model/mu_var_exceed_0.1": mu.var(dim=0).gt(0.1).sum().item() / mu.var(dim=0).numel(),
                         "model/diag_var": diag_var,
+                        "model/diag_var_max": diag_var.max().item(),
+                        "model/diag_var_min": diag_var.min().item(),
                         "model/approx_per_dim_kl": approx_per_dim_kl,
+                        "model/approx_per_dim_kl_max": approx_per_dim_kl.max().item(),
+                        "model/approx_per_dim_kl_min": approx_per_dim_kl.min().item(),
                         "model/var_explained_median": median_ratio,
                         "model/var_explained_90_percentile": ninety_percentile_ratio,
                         "model/eigenval_max": eigvals[0].item(),
                         "model/eigenval_min": eigvals[-1].item(),
                         "model/eigenval_ratio": (eigvals[0] / eigvals[-1]).item(),
                         "model/eigenval": eigvals,
+                        "model/eigenval_exceed_2": (eigvals > 2).sum().item() / eigvals.numel(),
                         "model/kl_eigenval": kl_eig,
                         "model/kl_eigenval_max": kl_eig.max().item(),
-                        "model/kl_eigenval_min": kl_eig.min().item()
+                        "model/kl_eigenval_min": kl_eig.min().item(),
+                        "model/kl_eigenval_exceed_0.2": (kl_eig > 0.2).sum().item() / kl_eig.numel(),
                     }
                     wandb.log(wandb_log_dict)
 
@@ -1572,6 +1468,8 @@ def train_multimodalhack_vae(
                     'total_emb': f"{train_loss_dict['total_emb_loss'].item():.2f}",
                     'kl': f"{train_loss_dict['kl_loss'].item():.2f}",
                 })
+                
+            scheduler.step()
         
         avg_train_loss = epoch_train_loss / batch_count
         train_losses.append(avg_train_loss)
@@ -1621,6 +1519,27 @@ def train_multimodalhack_vae(
                 test_loss = test_loss_dict['total_loss']
                 epoch_test_loss += test_loss.item()
                 test_batch_count += 1
+                
+                if use_wandb and WANDB_AVAILABLE and test_batch_count % log_every_n_steps == 0:
+                    wandb_log_dict = {
+                        "test/loss": test_loss.item(),
+                        
+                        # Loss components
+                        "test/raw_loss/total": test_loss_dict['total_raw_loss'].item(),
+                        "test/raw_loss/glyph_chars": test_loss_dict['raw_losses']['char'].item(),
+                        "test/raw_loss/glyph_colors": test_loss_dict['raw_losses']['color'].item(),
+                        "test/raw_loss/blstats": test_loss_dict['raw_losses']['stats'].item(),
+                        "test/raw_loss/message": test_loss_dict['raw_losses']['msg'].item(),
+
+                        "test/emb_loss/total": test_loss_dict['total_emb_loss'].item(),
+                        "test/emb_loss/glyph_chars": test_loss_dict['emb_losses']['char_emb'].item(),
+                        "test/emb_loss/glyph_colors": test_loss_dict['emb_losses']['color_emb'].item(),
+                        "test/emb_loss/blstats": test_loss_dict['emb_losses']['stats_emb'].item(),
+                        "test/emb_loss/message": test_loss_dict['emb_losses']['msg_emb'].item(),
+
+                        "test/kl_loss": test_loss_dict['kl_loss'].item(),
+                    }
+                    wandb.log(wandb_log_dict)
         
         avg_test_loss = epoch_test_loss / test_batch_count if test_batch_count > 0 else 0.0
         test_losses.append(avg_test_loss)
@@ -2552,7 +2471,7 @@ if __name__ == "__main__":
         epochs=10,          
         batch_size=batch_size,
         sequence_size=sequence_size,    
-        learning_rate=1e-3,
+        learning_rate=5e-4,
         training_batches=max_training_batches,
         testing_batches=max_testing_batches,
         max_training_batches=max_training_batches,
@@ -2562,6 +2481,16 @@ if __name__ == "__main__":
         include_inventory=False,
         data_cache_dir="data_cache",
         force_recollect=False,  # Use the data we just collected
+        shuffle_batches=True,  # Shuffle training batches each epoch for better training
+        initial_kl_beta = 0.0001,
+        final_kl_beta = 0.4,
+        kl_beta_shape = 'cosine',
+        custom_kl_beta_function = lambda init, end, progress: init + (end - init) * progress**10, 
+        
+        # Dropout and regularization settings
+        dropout_rate=0.1,  # Set to 0.1 for mild regularization
+        enable_dropout_on_latent=True,
+        enable_dropout_on_decoder=True,
         
         # Enable checkpointing
         save_checkpoints=True,
