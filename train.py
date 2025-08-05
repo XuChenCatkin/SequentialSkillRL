@@ -1203,8 +1203,8 @@ def train_multimodalhack_vae(
     def get_adaptive_weights(epoch: int, total_epochs: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current epoch"""
         # Linear interpolation for smooth transitions
-        progress = min((epoch + 1) / total_epochs, 1.0)
-        warmup_progress = min((epoch + 1) / int(warmup_epoch_ratio * total_epochs), 1.0) if warmup_epoch_ratio > 0 else 1.0
+        progress = min(epoch / (total_epochs - 1), 1.0)
+        warmup_progress = min(epoch / (int(warmup_epoch_ratio * total_epochs) - 1), 1.0) if warmup_epoch_ratio > 0 else 1.0
 
         # Embedding weight: high initially, then decrease
         weight_emb = ramp_weight(initial_weight=initial_weight_emb, 
