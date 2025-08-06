@@ -1386,7 +1386,8 @@ def train_multimodalhack_vae(
                     valid_screen=batch_device['valid_screen'],
                     weight_emb=weight_emb,
                     weight_raw=weight_raw,
-                    kl_beta=kl_beta
+                    kl_beta=kl_beta,
+                    total_correlation_beta_multiplier=total_correlation_beta_multiplier
                 )
 
                 train_loss = train_loss_dict['total_loss']
@@ -1523,7 +1524,8 @@ def train_multimodalhack_vae(
                     valid_screen=batch_device['valid_screen'],
                     weight_emb=weight_emb,
                     weight_raw=weight_raw,
-                    kl_beta=kl_beta
+                    kl_beta=kl_beta,
+                    total_correlation_beta_multiplier=total_correlation_beta_multiplier
                 )
 
                 test_loss = test_loss_dict['total_loss']
