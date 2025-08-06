@@ -1,0 +1,6 @@
+[submodule "minihack"]
+	path = minihack
+	url = https://github.com/XuChenCatkin/minihack.git
+[submodule "nle"]
+	path = nle
+	url = git@github.com:XuChenCatkin/nle.git

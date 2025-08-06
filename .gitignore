@@ -192,3 +192,17 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+#  NLE data directory, used by the NetHack Learning Environment (NLE) for
+#  storing game data, logs, and other related files.
+nle_data/
+
+# ignore .vscode
+.vscode/
+
+*.whl
+
+data/
+data_cache/
+checkpoints/
+models/
