@@ -1019,7 +1019,8 @@ def vae_loss(
     emb_modality_weights={'char_emb': 0.1, 'color_emb': 0.1, 'stats_emb': 5.0, 'msg_emb': 0.1, 'inv_oclasses_emb': 1.0, 'inv_strs_emb': 1.0},
     weight_emb=1.0, 
     weight_raw=0.1, 
-    kl_beta=1.0):
+    kl_beta=1.0,
+    total_correlation_beta_multiplier=1.0):
     """
     VAE loss with separate embedding and raw reconstruction losses.
     
@@ -1030,15 +1031,18 @@ def vae_loss(
                      sum over spatial/sequence dimensions, average over valid samples
     
     valid_screen: [B] boolean tensor indicating which samples are valid for loss calculation
-    
+    total_correlation_beta_multiplier: Multiplier for total correlation loss over kl beta
+
     This ensures reconstruction and KL losses are on the same scale, preventing
     training collapse from KL domination.
     """
     
     # Extract outputs from model
-    mu = model_output['mu']
-    logvar = model_output['logvar']
+    mu = model_output['mu'][valid_screen]  # [valid_B, LATENT_DIM]
+    logvar = model_output['logvar'][valid_screen]
     lowrank_factors = model_output['lowrank_factors']
+    if lowrank_factors is not None:
+        lowrank_factors = lowrank_factors[valid_screen]  # [valid_B, LATENT_DIM, LOW_RANK]
     
     # Raw reconstruction logits
     char_logits = model_output['char_logits']  # [B, 256, 21, 79]
@@ -1252,13 +1256,55 @@ def vae_loss(
     sign, logabsdet = torch.linalg.slogdet(Sigma_q)  # log(det(Sigma_q))
     if not torch.all(sign > 0):
         raise ValueError("Covariance matrix Sigma_q is not positive definite.")
-    log_det_Sigma_q = logabsdet  # log(det(Sigma_q)) [B,]
+    log_det_Sigma_q = logabsdet  # log(det(Sigma_q)) [valid_B,]
+
+    Sigma_q_bar = Sigma_q.mean(dim=0)  # Average covariance matrix over batch
+    assert Sigma_q_bar.shape == (d, d), f"Covariance matrix shape mismatch: {Sigma_q_bar.shape} != {(d, d)}"
+    mu_bar = mu.mean(dim=0)  # Average mean vector over batch
+    mu_c = mu - mu_bar
+    S_mu = (mu_c.T @ mu_c) / valid_B  # Covariance matrix of the posterior distribution
+    assert S_mu.shape == (d, d), f"Covariance matrix of mu shape mismatch: {S_mu.shape} != {(d, d)}"
+    total_S = Sigma_q_bar + S_mu  # Total covariance matrix of the posterior distribution
+    # Ensure the covariance matrix is symmetric
+    total_S = (total_S + total_S.T) / 2
+    
+    # Compute the eigenvalues and eigenvectors
+    eigenvalues, eigenvectors = torch.linalg.eigh(total_S)
+    
+    diag_S_bar = torch.diag(total_S)  # Diagonal of the covariance matrix
+    
+    dwkl_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())
+    dwkl = dwkl_per_dim.sum()  # Sum over dimensions
+    
+    inv_sqrt = torch.diag(diag_S_bar.sqrt().reciprocal())  # Inverse square root of diagonal covariance
+    R = inv_sqrt @ total_S @ inv_sqrt  # R = inv_sqrt * total_S * inv_sqrt
+    sign, logabsdet_R = torch.linalg.slogdet(R)  # log(det(R))
+    
+    if not torch.all(sign > 0):
+        raise ValueError("Covariance matrix R is not positive definite.")
+    
+    total_correlation = 0.5 * (R.trace() - d - logabsdet_R)  # Total correlation term
+    
     kl_loss = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
     kl_loss = kl_loss.mean()  # Average over batch
+    
+    mutual_information = kl_loss - total_correlation - dwkl  # Mutual information term
+    
+    kl_diagnosis = {
+        'mutual_info': mutual_information.item(),
+        'total_correlation': total_correlation.item(),
+        'dimension_wise_kl': dwkl_per_dim,
+        'dimension_wise_kl_sum': dwkl.item(),
+        'eigenvalues': eigenvalues,
+        'eigenvectors': eigenvectors
+    }
+    
     # Total weighted loss
     total_loss = (weight_raw * total_raw_loss + 
                   weight_emb * total_emb_loss + 
-                  kl_beta * kl_loss)
+                  kl_beta * mutual_information + 
+                  kl_beta * total_correlation_beta_multiplier * total_correlation +
+                  kl_beta * dwkl)
     
     return {
         'total_loss': total_loss,
@@ -1268,32 +1314,5 @@ def vae_loss(
         'raw_losses': raw_losses,
         'emb_losses': emb_losses,
         'raw_stats_losses': stat_raw_losses,
+        'kl_diagnosis': kl_diagnosis
     }
-
-def calc_eigen_values(mu: torch.Tensor, logvar: torch.Tensor, lowrank_factors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Calculate the eigenvalues and eigenvectors of the approximate posterior distribution.
-
-    Args:
-        mu: The mean of the latent distribution (B, latent_dim)
-        logvar: The log variance of the latent distribution (B, latent_dim)
-        lowrank_factors: The low-rank factors for the latent distribution (B, latent_dim, rank)
-
-    Returns:
-        A tuple containing the eigenvalues and eigenvectors.
-    """
-    B, D = mu.shape
-    r = lowrank_factors.shape[-1]
-    # Compute the covariance matrix
-    cov = torch.bmm(lowrank_factors, lowrank_factors.transpose(1, 2)) + torch.diag_embed(torch.exp(logvar))
-    cov = cov.mean(0)  # Average over batch dimension
-    assert cov.shape == (D, D), f"Covariance matrix shape mismatch: {cov.shape} != {(D, D)}"
-    mu_bar = mu.mean(0)
-    mu_c = mu - mu_bar
-    S_mu = (mu_c.T @ mu_c) / B
-    S = cov + S_mu  # Covariance matrix of the posterior distribution
-    # Ensure the covariance matrix is symmetric
-    S = (S + S.T) / 2
-    # Compute the eigenvalues and eigenvectors
-    eigenvalues, eigenvectors = torch.linalg.eigh(S)
-    return eigenvalues, eigenvectors

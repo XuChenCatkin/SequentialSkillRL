@@ -49,7 +49,7 @@ import env_utils
 
 # Add src to path for importing the existing MultiModalHackVAE
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from model import MultiModalHackVAE, vae_loss, calc_eigen_values
+from model import MultiModalHackVAE, vae_loss
 import torch.optim as optim
 import sqlite3
 import random
@@ -1041,6 +1041,7 @@ def train_multimodalhack_vae(
     final_kl_beta: float = 1.0,
     kl_beta_shape: str = 'cosine',
     custom_kl_beta_function: Optional[Callable[[float, float, float], float]] = None,
+    total_correlation_beta_multiplier: float = 1.0,
     warmup_epoch_ratio: float = 0.3,
     
     # Dropout and regularization parameters
@@ -1106,6 +1107,8 @@ def train_multimodalhack_vae(
         initial_kl_beta: Starting KL divergence weight (very small initially)
         final_kl_beta: Final KL divergence weight
         kl_beta_shape: Shape of KL beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
+        custom_kl_beta_function: Custom function for KL beta ramping
+        total_correlation_beta_multiplier: Multiplier for total correlation KL loss
         warmup_epoch_ratio: Ratio of epochs for warm-up phase
         dropout_rate: Dropout rate (0.0-1.0) for regularization. 0.0 disables dropout
         enable_dropout_on_latent: Whether to apply dropout to encoder fusion layers
@@ -1157,7 +1160,8 @@ def train_multimodalhack_vae(
             "regularization": {
                 "dropout_rate": dropout_rate,
                 "enable_dropout_on_latent": enable_dropout_on_latent,
-                "enable_dropout_on_decoder": enable_dropout_on_decoder
+                "enable_dropout_on_decoder": enable_dropout_on_decoder,
+                "total_correlation_beta_multiplier": total_correlation_beta_multiplier
             },
             "checkpointing": {
                 "save_checkpoints": save_checkpoints,
@@ -1199,6 +1203,7 @@ def train_multimodalhack_vae(
     logger.info(f"     - Raw weights: {initial_weight_raw:.3f} → {final_weight_raw:.3f}")
     logger.info(f"     - KL beta: {initial_kl_beta:.3f} → {final_kl_beta:.3f}")
     logger.info(f"     - Warmup epochs: {int(warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
+    logger.info(f"   Total correlation beta multiplier: {total_correlation_beta_multiplier}")
 
     def get_adaptive_weights(epoch: int, total_epochs: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current epoch"""
@@ -1294,7 +1299,7 @@ def train_multimodalhack_vae(
     sched_const = ConstantLR(optimizer, factor=1.0, total_iters=hold_epochs)
     sched_decay = ExponentialLR(optimizer, gamma=gamma)
     
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[sched_const, sched_decay], milestones=[hold_epochs])
+    scheduler = SequentialLR(optimizer, schedulers=[sched_const, sched_decay], milestones=[hold_epochs])
     
     # Log model architecture to wandb if requested
     if use_wandb and WANDB_AVAILABLE and log_model_architecture:
@@ -1386,13 +1391,14 @@ def train_multimodalhack_vae(
 
                 train_loss = train_loss_dict['total_loss']
                 mu = model_output['mu'].detach()
-                logvar = model_output['logvar'].detach()
-                lowrank_factors = model_output['lowrank_factors'].detach()
-                approx_per_dim_kl = 0.5 * (torch.exp(logvar) + mu.pow(2) - 1 - logvar).mean(dim=0)
-                eigvals, _ = calc_eigen_values(mu, logvar, lowrank_factors)
+                kl_diagnosis = train_loss_dict['kl_diagnosis'].detach()
+                per_dim_kl = kl_diagnosis['dimension_wise_kl'].detach()
+                dim_kl = kl_diagnosis['dimension_wise_kl_sum'].detach()
+                mutual_info = kl_diagnosis['mutual_info'].detach()
+                total_correlation = kl_diagnosis['total_correlation'].detach()
+                eigvals = kl_diagnosis['eigenvalues'].detach()
                 eigvals = eigvals.flip(0)  # Sort in descending order
                 kl_eig = 0.5 * (eigvals - eigvals.log() - 1)
-                diag_var = torch.exp(logvar).mean(dim=0)
                 var_explained = eigvals.cumsum(dim=0) / eigvals.sum(dim=0)
                 median_idx = (var_explained >= 0.5).nonzero(as_tuple=True)[0][0]
                 median_ratio = (median_idx + 1) / len(var_explained)
@@ -1429,6 +1435,9 @@ def train_multimodalhack_vae(
                         "train/emb_loss/message": train_loss_dict['emb_losses']['msg_emb'].item(),
 
                         "train/kl_loss": train_loss_dict['kl_loss'].item(),
+                        "train/kl_loss/dimension_wise": dim_kl.item(),
+                        "train/kl_loss/mutual_info": mutual_info.item(),
+                        "train/kl_loss/total_correlation": total_correlation.item(),
                         
                         # Adaptive weights
                         "adaptive_weights/emb_weight": weight_emb,
@@ -1445,12 +1454,9 @@ def train_multimodalhack_vae(
                         "model/mu_var_max": mu.var(dim=0).max().item(),
                         "model/mu_var_min": mu.var(dim=0).min().item(),
                         "model/mu_var_exceed_0.1": mu.var(dim=0).gt(0.1).sum().item() / mu.var(dim=0).numel(),
-                        "model/diag_var": diag_var,
-                        "model/diag_var_max": diag_var.max().item(),
-                        "model/diag_var_min": diag_var.min().item(),
-                        "model/approx_per_dim_kl": approx_per_dim_kl,
-                        "model/approx_per_dim_kl_max": approx_per_dim_kl.max().item(),
-                        "model/approx_per_dim_kl_min": approx_per_dim_kl.min().item(),
+                        "model/per_dim_kl": per_dim_kl,
+                        "model/per_dim_kl_max": per_dim_kl.max().item(),
+                        "model/per_dim_kl_min": per_dim_kl.min().item(),
                         "model/var_explained_median": median_ratio,
                         "model/var_explained_90_percentile": ninety_percentile_ratio,
                         "model/eigenval_max": eigvals[0].item(),
@@ -2487,10 +2493,11 @@ if __name__ == "__main__":
         force_recollect=False,  # Use the data we just collected
         shuffle_batches=True,  # Shuffle training batches each epoch for better training
         initial_kl_beta = 0.0001,
-        final_kl_beta = 0.5,
+        final_kl_beta = 0.7,
         kl_beta_shape = 'cosine',
         custom_kl_beta_function = lambda init, end, progress: init + (end - init) * progress**10, 
         warmup_epoch_ratio = 0.4,
+        total_correlation_beta_multiplier=5.0,
         
         # Dropout and regularization settings
         dropout_rate=0.1,  # Set to 0.1 for mild regularization
