@@ -1392,7 +1392,7 @@ def train_multimodalhack_vae(
 
                 train_loss = train_loss_dict['total_loss']
                 mu = model_output['mu'].detach()
-                kl_diagnosis = train_loss_dict['kl_diagnosis'].detach()
+                kl_diagnosis = train_loss_dict['kl_diagnosis']
                 per_dim_kl = kl_diagnosis['dimension_wise_kl'].detach()
                 dim_kl = kl_diagnosis['dimension_wise_kl_sum'].detach()
                 mutual_info = kl_diagnosis['mutual_info'].detach()
