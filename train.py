@@ -1032,10 +1032,10 @@ def train_multimodalhack_vae(
     
     # Adaptive loss weighting parameters
     initial_weight_emb: float = 1.5,
-    final_weight_emb: float = 0.5,
+    final_weight_emb: float = 0.0,
     weight_emb_shape: str = 'cubic',
-    initial_weight_raw: float = 0.2,
-    final_weight_raw: float = 2.0,
+    initial_weight_raw: float = 0.4,
+    final_weight_raw: float = 1.0,
     weight_raw_shape: str = 'linear',
     initial_kl_beta: float = 0.0001,
     final_kl_beta: float = 1.0,
@@ -1337,8 +1337,12 @@ def train_multimodalhack_vae(
             shuffled_train_dataset = train_dataset.copy()
             random.shuffle(shuffled_train_dataset)
             logger.debug(f"Shuffled {len(shuffled_train_dataset)} training batches for epoch {epoch+1}")
+            shuffled_test_dataset = test_dataset.copy()
+            random.shuffle(shuffled_test_dataset)
+            logger.debug(f"Shuffled {len(shuffled_test_dataset)} testing batches for epoch {epoch+1}")
         else:
             shuffled_train_dataset = train_dataset
+            shuffled_test_dataset = test_dataset
         
         with tqdm(shuffled_train_dataset, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
             for batch in pbar:
@@ -1480,7 +1484,7 @@ def train_multimodalhack_vae(
         test_batch_count = 0
         
         with torch.no_grad():
-            for batch in test_dataset:
+            for batch in shuffled_test_dataset:
                 # Move batch to device
                 batch_device = {}
                 for key, value in batch.items():
@@ -2468,7 +2472,7 @@ if __name__ == "__main__":
     model, train_losses, test_losses = train_multimodalhack_vae(
         train_file=train_file,
         test_file=test_file,
-        epochs=10,          
+        epochs=15,          
         batch_size=batch_size,
         sequence_size=sequence_size,    
         learning_rate=5e-4,
@@ -2483,9 +2487,10 @@ if __name__ == "__main__":
         force_recollect=False,  # Use the data we just collected
         shuffle_batches=True,  # Shuffle training batches each epoch for better training
         initial_kl_beta = 0.0001,
-        final_kl_beta = 0.4,
+        final_kl_beta = 0.5,
         kl_beta_shape = 'cosine',
         custom_kl_beta_function = lambda init, end, progress: init + (end - init) * progress**10, 
+        warmup_epoch_ratio = 0.4,
         
         # Dropout and regularization settings
         dropout_rate=0.1,  # Set to 0.1 for mild regularization

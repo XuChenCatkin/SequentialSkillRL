@@ -1015,12 +1015,25 @@ def vae_loss(
     valid_screen,
     inv_oclasses=None, 
     inv_strs=None, 
-    raw_modality_weights={'char': 10.0, 'color': 10.0, 'stats': 1.0, 'msg': 0.5, 'inv_oclass': 1.0, 'inv_str': 1.0},
-    emb_modality_weights={'char_emb': 10.0, 'color_emb': 10.0, 'stats_emb': 1.0, 'msg_emb': 0.5, 'inv_oclasses_emb': 1.0, 'inv_strs_emb': 1.0},
+    raw_modality_weights={'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0, 'inv_oclass': 1.0, 'inv_str': 1.0},
+    emb_modality_weights={'char_emb': 0.1, 'color_emb': 0.1, 'stats_emb': 5.0, 'msg_emb': 0.1, 'inv_oclasses_emb': 1.0, 'inv_strs_emb': 1.0},
     weight_emb=1.0, 
     weight_raw=0.1, 
     kl_beta=1.0):
-    """VAE loss with separate embedding and raw reconstruction losses."""
+    """
+    VAE loss with separate embedding and raw reconstruction losses.
+    
+    IMPORTANT: For proper VAE training, losses are computed as:
+    
+    Raw losses: Sum over spatial/sequence dimensions for each sample, average over valid samples
+    Embedding losses: Calculate L2 norm ||emb - target||^2 for each spatial/sequence location,
+                     sum over spatial/sequence dimensions, average over valid samples
+    
+    valid_screen: [B] boolean tensor indicating which samples are valid for loss calculation
+    
+    This ensures reconstruction and KL losses are on the same scale, preventing
+    training collapse from KL domination.
+    """
     
     # Extract outputs from model
     mu = model_output['mu']
@@ -1037,13 +1050,28 @@ def vae_loss(
     stats_emb_decoded = model_output['stats_emb_decoded']  # [B, 43]
     msg_emb_decoded = model_output['msg_emb_decoded']  # [B, 256, emb_dim]
     
+    valid_B = valid_screen.sum().item()  # Number of valid samples
+    
+    assert valid_B > 0, "No valid samples for loss calculation. Check valid_screen mask."
+    
     # ============= Raw Reconstruction Losses =============
     raw_losses = {}
     
     # Glyph reconstruction (chars + colors)
     glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Ensure valid range for chars
-    raw_losses['char'] = F.cross_entropy(char_logits[valid_screen], glyph_chars[valid_screen], reduction='mean')
-    raw_losses['color'] = F.cross_entropy(color_logits[valid_screen], glyph_colors[valid_screen], reduction='mean')
+    
+    # Sum over spatial dimensions for each sample, then average over valid samples
+    # char_logits: [B, CHAR_DIM, H, W], glyph_chars: [B, H, W]
+    char_loss_per_sample = F.cross_entropy(char_logits, glyph_chars, reduction='none')  # [B, H, W]
+    color_loss_per_sample = F.cross_entropy(color_logits, glyph_colors, reduction='none')  # [B, H, W]
+    
+    # Sum over spatial dimensions for each sample
+    char_loss_per_sample = char_loss_per_sample.sum(dim=[1, 2])  # [B] - sum over H, W
+    color_loss_per_sample = color_loss_per_sample.sum(dim=[1, 2])  # [B] - sum over H, W
+    
+    # Average over valid samples only
+    raw_losses['char'] = char_loss_per_sample[valid_screen].mean()
+    raw_losses['color'] = color_loss_per_sample[valid_screen].mean()
 
     # Stats reconstruction - separate losses for continuous and discrete components
     # Extract model outputs
@@ -1101,14 +1129,23 @@ def vae_loss(
     keep_indices = [i for i in range(continuous_targets_processed.size(1)) if i not in [11, 15]]
     continuous_targets_final = continuous_targets_processed[:, keep_indices]  # [B, 19]
     
-    # Calculate losses - stats_continuous should match the processed targets (after inversion)
-    # Apply valid_screen mask to stats losses
+    # Calculate losses - sum over feature dimensions for each sample, average over valid samples
     stat_raw_losses = {}
-    stat_raw_losses['stats_continuous'] = F.mse_loss(stats_continuous[valid_screen], continuous_targets_final[valid_screen], reduction='mean')
+    
+    # Continuous stats: sum over features for each sample
+    stats_continuous_loss = F.mse_loss(stats_continuous, continuous_targets_final, reduction='none')  # [B, 19]
+    stats_continuous_loss = stats_continuous_loss.sum(dim=1)  # [B] - sum over features
+    stat_raw_losses['stats_continuous'] = stats_continuous_loss[valid_screen].mean()
+    
+    # Discrete stats: already scalar per sample, just average over valid samples
     stat_raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], discrete_targets[0][valid_screen], reduction='mean')
     stat_raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], discrete_targets[1][valid_screen], reduction='mean')
     stat_raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], discrete_targets[2][valid_screen], reduction='mean')
-    stat_raw_losses['stats_condition'] = F.binary_cross_entropy_with_logits(condition_mask_logits[valid_screen], condition_target_vector[valid_screen], reduction='mean')
+    
+    # Condition mask: sum over condition bits for each sample
+    condition_loss = F.binary_cross_entropy_with_logits(condition_mask_logits, condition_target_vector, reduction='none')  # [B, 13]
+    condition_loss = condition_loss.sum(dim=1)  # [B] - sum over condition bits
+    stat_raw_losses['stats_condition'] = condition_loss[valid_screen].mean()
 
     # Total stats loss
     raw_losses['stats'] = (stat_raw_losses['stats_continuous'] + 
@@ -1117,40 +1154,48 @@ def vae_loss(
                           stat_raw_losses['stats_level'] + 
                           stat_raw_losses['stats_condition'])
 
-    # Message reconstruction - apply valid_screen mask
+    # Message reconstruction - sum over sequence length for each sample, average over valid samples
     msg_lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
     msg_tokens_with_eos = msg_tokens.clone()
     # Add EOS tokens where there's space
     mask = msg_lengths < msg_tokens.size(1)
     msg_tokens_with_eos[mask, msg_lengths[mask]] = MSG_VOCAB + 1  # EOS token
     
-    # Apply valid_screen mask to message loss
-    raw_losses['msg'] = F.cross_entropy(
-        msg_logits[valid_screen].view(-1, msg_logits.size(-1)), 
-        msg_tokens_with_eos[valid_screen].view(-1), 
-        reduction='mean', 
+    # Calculate loss for each sample, sum over sequence length
+    msg_loss_per_token = F.cross_entropy(
+        msg_logits.view(-1, msg_logits.size(-1)), 
+        msg_tokens_with_eos.view(-1), 
+        reduction='none', 
         ignore_index=0
-    )
+    )  # [B*seq_len]
     
-    # Inventory reconstruction (optional) - apply valid_screen mask
+    # Reshape and sum over sequence length for each sample
+    msg_loss_per_sample = msg_loss_per_token.view(msg_logits.size(0), -1).sum(dim=1)  # [B] - sum over seq_len
+    raw_losses['msg'] = msg_loss_per_sample[valid_screen].mean()  # Average over valid samples
+    
+    # Inventory reconstruction (optional) - sum over inventory dimensions for each sample, average over valid samples
     inv_oclasses_logits = model_output['inv_oclasses_logits']
     inv_strs_logits = model_output['inv_strs_logits']
     if inv_oclasses_logits is not None and inv_strs_logits is not None and inv_oclasses is not None and inv_strs is not None:
-        # Object class reconstruction
-        raw_losses['inv_oclasses'] = F.cross_entropy(
-            inv_oclasses_logits[valid_screen].view(-1, INV_OCLASS_DIM), 
-            inv_oclasses[valid_screen].view(-1), 
-            reduction='mean', 
+        # Object class reconstruction - sum over inventory slots for each sample
+        inv_oclass_loss_per_token = F.cross_entropy(
+            inv_oclasses_logits.view(-1, INV_OCLASS_DIM), 
+            inv_oclasses.view(-1), 
+            reduction='none', 
             ignore_index=18  # Padding index
-        )
+        )  # [B*inv_slots]
+        inv_oclass_loss_per_sample = inv_oclass_loss_per_token.view(inv_oclasses_logits.size(0), -1).sum(dim=1)  # [B] - sum over inv_slots
+        raw_losses['inv_oclasses'] = inv_oclass_loss_per_sample[valid_screen].mean()
         
-        # String reconstruction
-        raw_losses['inv_strs'] = F.cross_entropy(
-            inv_strs_logits[valid_screen].view(-1, MSG_VOCAB + 2), 
-            inv_strs[valid_screen].view(-1), 
-            reduction='mean', 
+        # String reconstruction - sum over inventory slots and string length for each sample
+        inv_str_loss_per_token = F.cross_entropy(
+            inv_strs_logits.view(-1, MSG_VOCAB + 2), 
+            inv_strs.view(-1), 
+            reduction='none', 
             ignore_index=0  # Padding index
-        )
+        )  # [B*inv_slots*str_len]
+        inv_str_loss_per_sample = inv_str_loss_per_token.view(inv_strs_logits.size(0), -1).sum(dim=1)  # [B] - sum over inv_slots*str_len
+        raw_losses['inv_strs'] = inv_str_loss_per_sample[valid_screen].mean()
     
     # ============= Embedding Reconstruction Losses =============
     emb_losses = {}
@@ -1161,26 +1206,26 @@ def vae_loss(
     target_stats_emb = model_output['target_stats_emb']  # [B, emb_dim] 
     target_msg_emb = model_output['target_msg_emb']  # [B, 256, emb_dim]
     
-    # Embedding reconstruction losses - apply valid_screen mask
+    # Embedding reconstruction losses - calculate L2 norm for each location, sum over spatial dims, average over valid samples
     # Split glyph embeddings back to char/color
     char_emb_recon, color_emb_recon = torch.split(glyph_emb_decoded, [CHAR_EMB, COLOR_EMB], dim=1)  # Split into char and color embeddings
     
-    emb_losses['char_emb'] = F.mse_loss(char_emb_recon[valid_screen], target_char_emb[valid_screen].detach(), reduction='mean')
-    emb_losses['color_emb'] = F.mse_loss(color_emb_recon[valid_screen], target_color_emb[valid_screen].detach(), reduction='mean')
-    
+    emb_losses['char_emb'] = F.mse_loss(char_emb_recon[valid_screen], target_char_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
+    emb_losses['color_emb'] = F.mse_loss(color_emb_recon[valid_screen], target_color_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
+
     # Stats embedding loss
     # stats_emb_decoded is [B, 45], target_stats_emb is [B, 45]
-    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded[valid_screen], target_stats_emb[valid_screen].detach(), reduction='mean')
+    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded[valid_screen], target_stats_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
     
     # Message embedding loss
-    emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded[valid_screen], target_msg_emb[valid_screen].detach(), reduction='mean')
+    emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded[valid_screen], target_msg_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
     
     # Inventory embedding loss (optional)
     inv_oclasses_emb_decoded = model_output['inv_oclasses_emb_decoded'] # [B, 55, CHAR_EMB]
     inv_str_emb_decoded = model_output['inv_str_emb_decoded'] # [B, 55, 80, str_emb]
     if inv_oclasses_emb_decoded is not None and inv_str_emb_decoded is not None:
-        emb_losses['inv_oclasses_emb'] = F.mse_loss(inv_oclasses_emb_decoded[valid_screen], model_output['target_inv_oclassess_emb'][valid_screen].detach(), reduction='mean')
-        emb_losses['inv_strs_emb'] = F.mse_loss(inv_str_emb_decoded[valid_screen], model_output['target_inv_strs_emb'][valid_screen].detach(), reduction='mean')
+        emb_losses['inv_oclasses_emb'] = F.mse_loss(inv_oclasses_emb_decoded[valid_screen], model_output['target_inv_oclassess_emb'][valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
+        emb_losses['inv_strs_emb'] = F.mse_loss(inv_str_emb_decoded[valid_screen], model_output['target_inv_strs_emb'][valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
     
     # ============= Combine Losses =============
     
