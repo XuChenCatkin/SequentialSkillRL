@@ -1394,9 +1394,9 @@ def train_multimodalhack_vae(
                 mu = model_output['mu'].detach()
                 kl_diagnosis = train_loss_dict['kl_diagnosis']
                 per_dim_kl = kl_diagnosis['dimension_wise_kl'].detach()
-                dim_kl = kl_diagnosis['dimension_wise_kl_sum'].detach()
-                mutual_info = kl_diagnosis['mutual_info'].detach()
-                total_correlation = kl_diagnosis['total_correlation'].detach()
+                dim_kl = kl_diagnosis['dimension_wise_kl_sum']
+                mutual_info = kl_diagnosis['mutual_info']
+                total_correlation = kl_diagnosis['total_correlation']
                 eigvals = kl_diagnosis['eigenvalues'].detach()
                 eigvals = eigvals.flip(0)  # Sort in descending order
                 kl_eig = 0.5 * (eigvals - eigvals.log() - 1)
@@ -1436,10 +1436,10 @@ def train_multimodalhack_vae(
                         "train/emb_loss/message": train_loss_dict['emb_losses']['msg_emb'].item(),
 
                         "train/kl_loss": train_loss_dict['kl_loss'].item(),
-                        "train/kl_loss/dimension_wise": dim_kl.item(),
-                        "train/kl_loss/mutual_info": mutual_info.item(),
-                        "train/kl_loss/total_correlation": total_correlation.item(),
-                        
+                        "train/kl_loss/dimension_wise": dim_kl,
+                        "train/kl_loss/mutual_info": mutual_info,
+                        "train/kl_loss/total_correlation": total_correlation,
+
                         # Adaptive weights
                         "adaptive_weights/emb_weight": weight_emb,
                         "adaptive_weights/raw_weight": weight_raw,
@@ -1579,10 +1579,9 @@ def train_multimodalhack_vae(
         logger.info(f"  Emb Losses: {emb_loss_str}")
 
         logger.info(f"Variance of model output (mu): {', '.join(f'{v:.4f}' for v in mu.var(dim=0).tolist())}")
-        logger.info(f"Approximate per-dim KL: {', '.join(f'{v:.4f}' for v in approx_per_dim_kl.tolist())}")
+        logger.info(f"Per-dim KL: {', '.join(f'{v:.4f}' for v in per_dim_kl.tolist())}")
         logger.info(f"Eigenvalues of latent space: {', '.join(f'{v:.4f}' for v in eigvals.tolist())}")
         logger.info(f"KL Eigenvalues: {', '.join(f'{v:.4f}' for v in kl_eig.tolist())}")
-        logger.info(f"Diagonal var: {', '.join(f'{v:.4f}' for v in diag_var.tolist())}")
         logger.info(f"Variance explained by eigenvalues: {', '.join(f'{v:.4f}' for v in var_explained.tolist())}")
 
         logger.info("=" * 50)
