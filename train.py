@@ -810,6 +810,7 @@ def save_checkpoint(
     epoch: int,
     train_losses: List[float],
     test_losses: List[float],
+    scheduler: torch.optim.lr_scheduler._LRScheduler = None,
     checkpoint_dir: str = "checkpoints",
     keep_last_n: int = 3,
     upload_to_hf: bool = False,
@@ -825,6 +826,7 @@ def save_checkpoint(
         epoch: Current epoch number
         train_losses: Training loss history
         test_losses: Test loss history
+        scheduler: Learning rate scheduler to save (optional)
         checkpoint_dir: Directory to save checkpoints
         keep_last_n: Number of recent checkpoints to keep (older ones are deleted)
         upload_to_hf: Whether to upload checkpoint to HuggingFace
@@ -849,13 +851,22 @@ def save_checkpoint(
         'train_losses': train_losses,
         'test_losses': test_losses,
         'model_config': {
-            'bInclude_inventory': getattr(model, 'bInclude_inventory', False),
-            'latent_dim': getattr(model, 'latent_dim', 256),
+            # All MultiModalHackVAE constructor parameters
+            'bInclude_inventory': getattr(model, 'include_inventory', False),
+            'bInclude_glyph_bag': getattr(model, 'include_glyph_bag', True),
+            'bInclude_hero': getattr(model, 'include_hero', True),
+            'dropout_rate': getattr(model, 'dropout_rate', 0.0),
+            'enable_dropout_on_latent': getattr(model, 'enable_dropout_on_latent', False),
+            'enable_dropout_on_decoder': getattr(model, 'enable_dropout_on_decoder', False),
         },
         'checkpoint_timestamp': datetime.now().isoformat(),
         'final_train_loss': train_losses[-1] if train_losses else None,
         'final_test_loss': test_losses[-1] if test_losses else None,
     }
+    
+    # Add scheduler state if available
+    if scheduler is not None:
+        checkpoint_data['scheduler_state_dict'] = scheduler.state_dict()
     
     # Save checkpoint
     torch.save(checkpoint_data, checkpoint_path)
@@ -924,91 +935,6 @@ def cleanup_old_checkpoints(checkpoint_dir: str, keep_last_n: int) -> None:
     except Exception as e:
         print(f"⚠️  Error cleaning up checkpoints: {e}")
 
-
-def load_checkpoint(
-    checkpoint_path: str,
-    model: MultiModalHackVAE = None,
-    optimizer: torch.optim.Optimizer = None,
-    device: str = "cpu"
-) -> Dict:
-    """
-    Load training checkpoint
-    
-    Args:
-        checkpoint_path: Path to checkpoint file
-        model: Model to load state into (optional)
-        optimizer: Optimizer to load state into (optional)
-        device: Device to load tensors on
-        
-    Returns:
-        Dictionary with checkpoint data
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    if model is not None:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    print(f"✅ Checkpoint loaded from: {checkpoint_path}")
-    print(f"   Epoch: {checkpoint['epoch'] + 1}")
-    print(f"   Train loss: {checkpoint['final_train_loss']:.4f}")
-    print(f"   Test loss: {checkpoint['final_test_loss']:.4f}")
-    
-    return checkpoint
-
-
-def resume_training_from_checkpoint(
-    checkpoint_path: str,
-    train_file: str,
-    test_file: str,
-    **training_kwargs
-) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
-    """
-    Resume training from a saved checkpoint
-    
-    Args:
-        checkpoint_path: Path to checkpoint file
-        train_file: Training data file
-        test_file: Test data file
-        **training_kwargs: Additional arguments for train_multimodalhack_vae
-        
-    Returns:
-        Tuple of (model, train_losses, test_losses)
-    """
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    
-    # Extract configuration from checkpoint
-    start_epoch = checkpoint['epoch'] + 1
-    previous_train_losses = checkpoint['train_losses']
-    previous_test_losses = checkpoint['test_losses']
-    model_config = checkpoint['model_config']
-    
-    print(f"🔄 Resuming training from epoch {start_epoch}")
-    print(f"   Previous train loss: {previous_train_losses[-1]:.4f}")
-    print(f"   Previous test loss: {previous_test_losses[-1]:.4f}")
-    
-    # Update training kwargs with checkpoint config
-    training_kwargs.update({
-        'include_inventory': model_config.get('bInclude_inventory', False),
-        'resume_from_epoch': start_epoch,
-        'previous_train_losses': previous_train_losses,
-        'previous_test_losses': previous_test_losses,
-        'resume_checkpoint_path': checkpoint_path
-    })
-    
-    # Continue training
-    model, train_losses, test_losses = train_multimodalhack_vae(
-        train_file=train_file,
-        test_file=test_file,
-        **training_kwargs
-    )
-    
-    return model, train_losses, test_losses
-
-
 def train_multimodalhack_vae(
     train_file: str, 
     test_file: str,                     
@@ -1067,9 +993,6 @@ def train_multimodalhack_vae(
     hf_model_card_data: Dict = None,
     
     # Resume training parameters
-    resume_from_epoch: int = 0,
-    previous_train_losses: List[float] = None,
-    previous_test_losses: List[float] = None,
     resume_checkpoint_path: str = None,
     
     # Weights & Biases monitoring parameters
@@ -1279,44 +1202,76 @@ def train_multimodalhack_vae(
     )
     test_dataset = test_dataset[:testing_batches] if len(test_dataset) > testing_batches else test_dataset
 
-    # Initialize model with dropout configuration
-    # dropout_rate: 0.0 = no dropout, 0.1-0.3 = mild regularization, 0.5+ = strong regularization
-    # Dropout is applied to encoder fusion layers and decoder layers when enabled
-    model = MultiModalHackVAE(
-        bInclude_inventory=include_inventory, 
-        dropout_rate=dropout_rate,
-        enable_dropout_on_latent=enable_dropout_on_latent,
-        enable_dropout_on_decoder=enable_dropout_on_decoder,
-        logger=logger
-    )
-    model = model.to(device)
-    
-    # Initialize optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    hold_epochs = int(warmup_epoch_ratio * epochs) if warmup_epoch_ratio > 0 else 0
-    gamma = 0.9
-    
-    sched_const = ConstantLR(optimizer, factor=1.0, total_iters=hold_epochs)
-    sched_decay = ExponentialLR(optimizer, gamma=gamma)
-    
-    scheduler = SequentialLR(optimizer, schedulers=[sched_const, sched_decay], milestones=[hold_epochs])
-    
-    # Log model architecture to wandb if requested
-    if use_wandb and WANDB_AVAILABLE and log_model_architecture:
-        wandb.watch(model, log_freq=log_every_n_steps, log_graph=True, log="all" if log_gradients else None)
-    
-    # Initialize loss tracking
-    train_losses = previous_train_losses[:] if previous_train_losses else []
-    test_losses = previous_test_losses[:] if previous_test_losses else []
-    
     # Resume from checkpoint if specified
     if resume_checkpoint_path and os.path.exists(resume_checkpoint_path):
         logger.info(f"🔄 Resuming from checkpoint: {resume_checkpoint_path}")
-        checkpoint = load_checkpoint(resume_checkpoint_path, model, optimizer, device)
-        start_epoch = resume_from_epoch
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        start_epoch = checkpoint['epoch']
+        train_losses = checkpoint['train_losses']
+        test_losses = checkpoint['test_losses']
         logger.info(f"   Resuming from epoch {start_epoch}/{epochs}")
+        logger.info(f"   Previous train loss: {checkpoint['final_train_loss']:.4f}")
+        logger.info(f"   Previous test loss: {checkpoint['final_test_loss']:.4f}")
+        include_glyph_bag = checkpoint['model_config'].get('bInclude_glyph_bag', True)
+        include_hero = checkpoint['model_config'].get('bInclude_hero', True)
+        include_inventory = checkpoint['model_config'].get('bInclude_inventory', False)
+        dropout_rate = checkpoint['model_config'].get('dropout_rate', dropout_rate)
+        enable_dropout_on_latent = checkpoint['model_config'].get('enable_dropout_on_latent', enable_dropout_on_latent)
+        enable_dropout_on_decoder = checkpoint['model_config'].get('enable_dropout_on_decoder', enable_dropout_on_decoder)
+        model = MultiModalHackVAE(
+            bInclude_inventory=include_inventory, 
+            bInclude_glyph_bag=include_glyph_bag,
+            bInclude_hero=include_hero,
+            dropout_rate=dropout_rate,
+            enable_dropout_on_latent=enable_dropout_on_latent,
+            enable_dropout_on_decoder=enable_dropout_on_decoder,
+            logger=logger
+        )
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(device)
+        
+        # Initialize optimizer
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        hold_epochs = int(warmup_epoch_ratio * epochs) if warmup_epoch_ratio > 0 else 0
+        gamma = 0.9
+        
+        sched_const = ConstantLR(optimizer, factor=1.0, total_iters=hold_epochs)
+        sched_decay = ExponentialLR(optimizer, gamma=gamma)
+        
+        scheduler = SequentialLR(optimizer, schedulers=[sched_const, sched_decay], milestones=[hold_epochs])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict']) if 'scheduler_state_dict' in checkpoint else None
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict']) if 'optimizer_state_dict' in checkpoint else None
     else:
         start_epoch = 0
+        # Initialize model with dropout configuration
+        # dropout_rate: 0.0 = no dropout, 0.1-0.3 = mild regularization, 0.5+ = strong regularization
+        # Dropout is applied to encoder fusion layers and decoder layers when enabled
+        model = MultiModalHackVAE(
+            bInclude_inventory=include_inventory, 
+            dropout_rate=dropout_rate,
+            enable_dropout_on_latent=enable_dropout_on_latent,
+            enable_dropout_on_decoder=enable_dropout_on_decoder,
+            logger=logger
+        )
+        model = model.to(device)
+        
+        # Initialize optimizer
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        hold_epochs = int(warmup_epoch_ratio * epochs) if warmup_epoch_ratio > 0 else 0
+        gamma = 0.9
+        
+        sched_const = ConstantLR(optimizer, factor=1.0, total_iters=hold_epochs)
+        sched_decay = ExponentialLR(optimizer, gamma=gamma)
+        
+        scheduler = SequentialLR(optimizer, schedulers=[sched_const, sched_decay], milestones=[hold_epochs])
+        
+        # Initialize loss tracking
+        train_losses = []
+        test_losses = []
+
+    # Log model architecture to wandb if requested
+    if use_wandb and WANDB_AVAILABLE and log_model_architecture:
+        wandb.watch(model, log_freq=log_every_n_steps, log_graph=True, log="all" if log_gradients else None)
         
     logger.info(f"🎯 Starting training for {epochs} epochs (starting from epoch {start_epoch})...")
     
@@ -1614,6 +1569,7 @@ def train_multimodalhack_vae(
                 epoch=epoch,
                 train_losses=train_losses,
                 test_losses=test_losses,
+                scheduler=scheduler,
                 checkpoint_dir=checkpoint_dir,
                 keep_last_n=keep_last_n_checkpoints,
                 upload_to_hf=hf_upload_checkpoints and upload_to_hf,

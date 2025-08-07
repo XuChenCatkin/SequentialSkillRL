@@ -626,7 +626,7 @@ class MultiModalHackVAE(nn.Module):
     def __init__(self, 
                  bInclude_glyph_bag=True, 
                  bInclude_hero=True,
-                 bInclude_inventory=True,
+                 bInclude_inventory=False,
                  dropout_rate=0.0,
                  enable_dropout_on_latent=True,
                  enable_dropout_on_decoder=True,
