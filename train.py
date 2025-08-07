@@ -1205,8 +1205,8 @@ def train_multimodalhack_vae(
     # Resume from checkpoint if specified
     if resume_checkpoint_path and os.path.exists(resume_checkpoint_path):
         logger.info(f"🔄 Resuming from checkpoint: {resume_checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        start_epoch = checkpoint['epoch']
+        checkpoint = torch.load(resume_checkpoint_path, map_location=device, weights_only=False)
+        start_epoch = checkpoint['epoch'] + 1
         train_losses = checkpoint['train_losses']
         test_losses = checkpoint['test_losses']
         logger.info(f"   Resuming from epoch {start_epoch}/{epochs}")
@@ -2450,11 +2450,11 @@ if __name__ == "__main__":
         force_recollect=False,  # Use the data we just collected
         shuffle_batches=True,  # Shuffle training batches each epoch for better training
         initial_kl_beta = 0.0001,
-        final_kl_beta = 0.7,
+        final_kl_beta = 0.5,
         kl_beta_shape = 'cosine',
         custom_kl_beta_function = lambda init, end, progress: init + (end - init) * progress**10, 
         warmup_epoch_ratio = 0.4,
-        total_correlation_beta_multiplier=5.0,
+        total_correlation_beta_multiplier=1.0,
         
         # Dropout and regularization settings
         dropout_rate=0.1,  # Set to 0.1 for mild regularization

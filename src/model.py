@@ -68,12 +68,12 @@ CHAR_EMB = 16      # char‑id embedding dim (0-15)
 COLOR_DIM = 16      # colour id space for colours
 COLOR_EMB = 4       # colour‑id embedding dim
 GLYPH_EMB = CHAR_EMB + COLOR_EMB  # glyph embedding dim
-LATENT_DIM = 64     # z‑dim for VAE
+LATENT_DIM = 96     # z‑dim for VAE
 BLSTATS_DIM = 27   # raw scalar stats (hp, gold, …)
 MSG_VOCAB = 128     # Nethack takes 32-127 byte for char of messages
 GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
 PADDING_IDX = [CHAR_DIM, COLOR_DIM]  # padding index for glyphs
-LOW_RANK = 4      # low-rank factorisation rank for covariance
+LOW_RANK = 0      # low-rank factorisation rank for covariance
 # NetHack map dimensions (from NetHack source: include/config.h)
 MAP_HEIGHT = 21     # ROWNO - number of rows in the map
 MAP_WIDTH = 79      # COLNO-1 - playable columns (COLNO=80, but rightmost is UI)
@@ -671,7 +671,7 @@ class MultiModalHackVAE(nn.Module):
         self.latent_dim = LATENT_DIM
         self.mu_head     = nn.Linear(256, LATENT_DIM)
         self.logvar_diag_head = nn.Linear(256, LATENT_DIM)  # diagonal part
-        self.lowrank_factor_head = nn.Linear(256, LATENT_DIM * LOW_RANK)  # low-rank factors
+        self.lowrank_factor_head = nn.Linear(256, LATENT_DIM * LOW_RANK) if LOW_RANK else None # low-rank factors
 
         # We will have 3 categories of decoder heads:
         # 1. For reconstruction of observations:
@@ -875,7 +875,7 @@ class MultiModalHackVAE(nn.Module):
         h = self.to_latent(fused)
         mu = self.mu_head(h)
         logvar_diag = self.logvar_diag_head(h)
-        lowrank_factors = self.lowrank_factor_head(h).view(B, LATENT_DIM, LOW_RANK)
+        lowrank_factors = self.lowrank_factor_head(h).view(B, LATENT_DIM, LOW_RANK) if self.lowrank_factor_head is not None else None
         z = self._reparameterise(mu, logvar_diag, lowrank_factors)
 
         # Decode
