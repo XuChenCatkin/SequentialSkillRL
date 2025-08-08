@@ -661,12 +661,14 @@ class MultiModalHackVAE(nn.Module):
                 nn.LayerNorm(fusion_in),
                 nn.Dropout(self.dropout_rate),
                 nn.Linear(fusion_in, 256), nn.ReLU(),
+                nn.LayerNorm(256),
                 nn.Dropout(self.dropout_rate),
             )
         else:
             self.to_latent = nn.Sequential(
                 nn.LayerNorm(fusion_in),
                 nn.Linear(fusion_in, 256), nn.ReLU(),
+                nn.LayerNorm(256),
             )
         self.latent_dim = LATENT_DIM
         self.mu_head     = nn.Linear(256, LATENT_DIM)
@@ -1020,7 +1022,8 @@ def vae_loss(
     weight_emb=1.0, 
     weight_raw=0.1, 
     kl_beta=1.0,
-    total_correlation_beta_multiplier=1.0):
+    total_correlation_beta_multiplier=1.0,
+    free_bits=0.0):
     """
     VAE loss with separate embedding and raw reconstruction losses.
     
@@ -1032,6 +1035,7 @@ def vae_loss(
     
     valid_screen: [B] boolean tensor indicating which samples are valid for loss calculation
     total_correlation_beta_multiplier: Multiplier for total correlation loss over kl beta
+    free_bits: Minimum KL divergence value to prevent collapse (default 0.0)
 
     This ensures reconstruction and KL losses are on the same scale, preventing
     training collapse from KL domination.
@@ -1304,7 +1308,7 @@ def vae_loss(
                   weight_emb * total_emb_loss + 
                   kl_beta * mutual_information + 
                   kl_beta * total_correlation_beta_multiplier * total_correlation +
-                  kl_beta * dwkl)
+                  kl_beta * torch.clamp(dwkl_per_dim - free_bits, min=0).sum())  # Free bits regularization
     
     return {
         'total_loss': total_loss,

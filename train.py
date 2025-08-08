@@ -968,6 +968,7 @@ def train_multimodalhack_vae(
     kl_beta_shape: str = 'cosine',
     custom_kl_beta_function: Optional[Callable[[float, float, float], float]] = None,
     total_correlation_beta_multiplier: float = 1.0,
+    free_bits: float = 0.0,
     warmup_epoch_ratio: float = 0.3,
     
     # Dropout and regularization parameters
@@ -1032,6 +1033,7 @@ def train_multimodalhack_vae(
         kl_beta_shape: Shape of KL beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
         custom_kl_beta_function: Custom function for KL beta ramping
         total_correlation_beta_multiplier: Multiplier for total correlation KL loss
+        free_bits: Target free bits for KL loss (0.0 disables)
         warmup_epoch_ratio: Ratio of epochs for warm-up phase
         dropout_rate: Dropout rate (0.0-1.0) for regularization. 0.0 disables dropout
         enable_dropout_on_latent: Whether to apply dropout to encoder fusion layers
@@ -1084,7 +1086,8 @@ def train_multimodalhack_vae(
                 "dropout_rate": dropout_rate,
                 "enable_dropout_on_latent": enable_dropout_on_latent,
                 "enable_dropout_on_decoder": enable_dropout_on_decoder,
-                "total_correlation_beta_multiplier": total_correlation_beta_multiplier
+                "total_correlation_beta_multiplier": total_correlation_beta_multiplier,
+                "free_bits": free_bits
             },
             "checkpointing": {
                 "save_checkpoints": save_checkpoints,
@@ -1127,6 +1130,7 @@ def train_multimodalhack_vae(
     logger.info(f"     - KL beta: {initial_kl_beta:.3f} → {final_kl_beta:.3f}")
     logger.info(f"     - Warmup epochs: {int(warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
     logger.info(f"   Total correlation beta multiplier: {total_correlation_beta_multiplier}")
+    logger.info(f"   Free bits: {free_bits}")
 
     def get_adaptive_weights(epoch: int, total_epochs: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current epoch"""
@@ -1342,7 +1346,8 @@ def train_multimodalhack_vae(
                     weight_emb=weight_emb,
                     weight_raw=weight_raw,
                     kl_beta=kl_beta,
-                    total_correlation_beta_multiplier=total_correlation_beta_multiplier
+                    total_correlation_beta_multiplier=total_correlation_beta_multiplier,
+                    free_bits=free_bits
                 )
 
                 train_loss = train_loss_dict['total_loss']
@@ -1480,7 +1485,8 @@ def train_multimodalhack_vae(
                     weight_emb=weight_emb,
                     weight_raw=weight_raw,
                     kl_beta=kl_beta,
-                    total_correlation_beta_multiplier=total_correlation_beta_multiplier
+                    total_correlation_beta_multiplier=total_correlation_beta_multiplier,
+                    free_bits=free_bits
                 )
 
                 test_loss = test_loss_dict['total_loss']
@@ -2454,8 +2460,9 @@ if __name__ == "__main__":
         kl_beta_shape = 'cosine',
         custom_kl_beta_function = lambda init, end, progress: init + (end - init) * progress**10, 
         warmup_epoch_ratio = 0.4,
-        total_correlation_beta_multiplier=1.0,
-        
+        total_correlation_beta_multiplier=10.0,
+        free_bits=0.15,
+
         # Dropout and regularization settings
         dropout_rate=0.1,  # Set to 0.1 for mild regularization
         enable_dropout_on_latent=True,
