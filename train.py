@@ -23,6 +23,7 @@ import re  # Add regex import for status line parsing
 import json
 import logging
 from datetime import datetime
+import tempfile  # Add tempfile import
 from torch.optim.lr_scheduler import ConstantLR, ExponentialLR, SequentialLR
 warnings.filterwarnings('ignore')
 
@@ -852,7 +853,6 @@ def save_checkpoint(
         'test_losses': test_losses,
         'model_config': {
             # All MultiModalHackVAE constructor parameters
-            'bInclude_inventory': getattr(model, 'include_inventory', False),
             'bInclude_glyph_bag': getattr(model, 'include_glyph_bag', True),
             'bInclude_hero': getattr(model, 'include_hero', True),
             'dropout_rate': getattr(model, 'dropout_rate', 0.0),
@@ -950,7 +950,6 @@ def train_multimodalhack_vae(
     testing_game_ids: List[int] | None = None,
     learning_rate: float = 1e-3,
     device: str = None, 
-    include_inventory: bool = False,
     logger: logging.Logger = None,
     data_cache_dir: str = "data_cache",
     force_recollect: bool = False,
@@ -1018,7 +1017,6 @@ def train_multimodalhack_vae(
         batch_size: Training batch size
         learning_rate: Learning rate for optimizer
         device: Device to use ('cuda' or 'cpu')
-        include_inventory: Whether to include inventory processing
         data_cache_dir: Directory to cache processed data
         force_recollect: Force data recollection even if cache exists
         shuffle_batches: Whether to shuffle training batches at the start of each epoch
@@ -1068,7 +1066,6 @@ def train_multimodalhack_vae(
             "training_batches": training_batches,
             "testing_batches": testing_batches,
             "device": str(device),
-            "include_inventory": include_inventory,
             "shuffle_batches": shuffle_batches,
             "adaptive_weighting": {
                 "initial_weight_emb": initial_weight_emb,
@@ -1117,7 +1114,6 @@ def train_multimodalhack_vae(
     logger.info(f"   Batch size: {batch_size}")
     logger.info(f"   Sequence size: {sequence_size}")
     logger.info(f"   Device: {device}")
-    logger.info(f"   Include inventory: {include_inventory}")
     logger.info(f"   Data cache: {data_cache_dir}")
     logger.info(f"   Shuffle batches: {shuffle_batches}")
     logger.info(f"   Dropout Configuration:")
@@ -1218,12 +1214,10 @@ def train_multimodalhack_vae(
         logger.info(f"   Previous test loss: {checkpoint['final_test_loss']:.4f}")
         include_glyph_bag = checkpoint['model_config'].get('bInclude_glyph_bag', True)
         include_hero = checkpoint['model_config'].get('bInclude_hero', True)
-        include_inventory = checkpoint['model_config'].get('bInclude_inventory', False)
         dropout_rate = checkpoint['model_config'].get('dropout_rate', dropout_rate)
         enable_dropout_on_latent = checkpoint['model_config'].get('enable_dropout_on_latent', enable_dropout_on_latent)
         enable_dropout_on_decoder = checkpoint['model_config'].get('enable_dropout_on_decoder', enable_dropout_on_decoder)
         model = MultiModalHackVAE(
-            bInclude_inventory=include_inventory, 
             bInclude_glyph_bag=include_glyph_bag,
             bInclude_hero=include_hero,
             dropout_rate=dropout_rate,
@@ -1251,7 +1245,6 @@ def train_multimodalhack_vae(
         # dropout_rate: 0.0 = no dropout, 0.1-0.3 = mild regularization, 0.5+ = strong regularization
         # Dropout is applied to encoder fusion layers and decoder layers when enabled
         model = MultiModalHackVAE(
-            bInclude_inventory=include_inventory, 
             dropout_rate=dropout_rate,
             enable_dropout_on_latent=enable_dropout_on_latent,
             enable_dropout_on_decoder=enable_dropout_on_decoder,
@@ -1276,7 +1269,8 @@ def train_multimodalhack_vae(
     # Log model architecture to wandb if requested
     if use_wandb and WANDB_AVAILABLE and log_model_architecture:
         wandb.watch(model, log_freq=log_every_n_steps, log_graph=True, log="all" if log_gradients else None)
-        
+
+    logger.info(f"Model has latent dimension: {model.latent_dim} and low-rank dimension: {model.lowrank_dim}")
     logger.info(f"🎯 Starting training for {epochs} epochs (starting from epoch {start_epoch})...")
     
     for epoch in range(start_epoch, epochs):
@@ -1471,7 +1465,8 @@ def train_multimodalhack_vae(
                     glyph_colors=batch_device['game_colors'], 
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['message_chars'],
-                    hero_info=batch_device['hero_info']
+                    hero_info=batch_device['hero_info'],
+                    training_mode=False
                 )
                 
                 # Calculate loss
@@ -1607,7 +1602,6 @@ def train_multimodalhack_vae(
                 "batch_size": batch_size,
                 "learning_rate": learning_rate,
                 "sequence_size": sequence_size,
-                "include_inventory": include_inventory,
                 "adaptive_weighting": {
                     "initial_weight_emb": initial_weight_emb,
                     "final_weight_emb": final_weight_emb,
@@ -1619,7 +1613,9 @@ def train_multimodalhack_vae(
                     "final_kl_beta": final_kl_beta,
                     "kl_beta_shape": kl_beta_shape,
                     "warmup_epoch_ratio": warmup_epoch_ratio
-                }
+                },
+                "total_correlation_beta_multiplier": total_correlation_beta_multiplier,
+                "free_bits": free_bits,
             }
             
             # Merge with user-provided model card data
@@ -1654,8 +1650,8 @@ def train_multimodalhack_vae(
                     'final_train_loss': train_losses[-1],
                     'final_test_loss': test_losses[-1],
                     'model_config': {
-                        'bInclude_inventory': include_inventory,
                         'latent_dim': getattr(model, 'latent_dim', 256),
+                        'lowrank_dim': getattr(model, 'lowrank_dim', 4),
                     },
                     'training_timestamp': datetime.now().isoformat(),
                 }, save_path)
@@ -1736,8 +1732,8 @@ def train_multimodalhack_vae(
             'final_train_loss': train_losses[-1],
             'final_test_loss': test_losses[-1],
             'model_config': {
-                'bInclude_inventory': include_inventory,
                 'latent_dim': getattr(model, 'latent_dim', 256),
+                'lowrank_dim': getattr(model, 'lowrank_dim', 4),
             },
             'training_timestamp': datetime.now().isoformat(),
         }, save_path)
@@ -1761,94 +1757,380 @@ def train_multimodalhack_vae(
     return model, train_losses, test_losses
 
 
-def visualize_reconstructions(model, test_dataset, device, num_samples=4, save_path="reconstructions.png"):
-    """Visualize VAE reconstructions"""
-    model.eval()
+def visualize_reconstructions(model, test_dataset, device, num_samples=4, save_path="vae_analysis/reconstructions.txt"):
+    """
+    Visualize VAE reconstructions for NetHack game states using tty_render
     
-    # Get a few test samples
-    test_loader = test_dataset[:num_samples]
+    Args:
+        model: Trained MultiModalHackVAE model
+        test_dataset: List of test batches (from NetHackDataCollector)
+        device: Device to run inference on
+        num_samples: Number of samples to visualize
+        save_path: Path to save the visualization
+    """
+    model.eval()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    reconstructions = []
+    originals = []
+    output_lines = []
+    output_lines.append("NetHack VAE Reconstructions")
+    output_lines.append("=" * 80)
+    output_lines.append("")
     
     with torch.no_grad():
-        batch = next(iter(test_loader))
-        data = batch['input'].to(device)
-        
-        # Get reconstructions
-        recon_data, mu, logvar, z = model(data)
-        
-        # Convert back to CPU for plotting
-        original = data.cpu().numpy()
-        reconstructed = recon_data.cpu().numpy()
-        
-        # Plot comparisons
-        fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4*num_samples))
-        
-        for i in range(num_samples):
-            # Original chars
-            axes[i, 0].imshow(original[i, 0], cmap='gray')
-            axes[i, 0].set_title(f'Original Chars {i+1}')
-            axes[i, 0].axis('off')
+        for i, batch in enumerate(test_dataset):
+                
+            # Move batch to device and reshape like in training
+            batch_device = {}
+            for key, value in batch.items():
+                if value is not None and isinstance(value, torch.Tensor):
+                    value_device = value.to(device)
+                    # Reshape tensors from [B, T, ...] to [B*T, ...]
+                    B, T = value_device.shape[:2]
+                    remaining_dims = value_device.shape[2:]
+                    batch_device[key] = value_device.view(B * T, *remaining_dims)
+                else:
+                    batch_device[key] = value
             
-            # Original colors  
-            axes[i, 1].imshow(original[i, 1], cmap='viridis')
-            axes[i, 1].set_title(f'Original Colors {i+1}')
-            axes[i, 1].axis('off')
+            valid_screen = batch_device['valid_screen'].cpu()  # [B*T, H, W]
             
-            # Reconstructed chars
-            axes[i, 2].imshow(reconstructed[i, 0], cmap='gray')
-            axes[i, 2].set_title(f'Recon Chars {i+1}')
-            axes[i, 2].axis('off')
+            # Get model output
+            model_output = model(
+                glyph_chars=batch_device['game_chars'][valid_screen][:max(0, num_samples - len(reconstructions))],
+                glyph_colors=batch_device['game_colors'][valid_screen][:max(0, num_samples - len(reconstructions))],
+                blstats=batch_device['blstats'][valid_screen][:max(0, num_samples - len(reconstructions))],
+                msg_tokens=batch_device['message_chars'][valid_screen][:max(0, num_samples - len(reconstructions))],
+                hero_info=batch_device['hero_info'][valid_screen][:max(0, num_samples - len(reconstructions))],
+                training_mode=False,
+                temperature=1.0,
+                top_k=5,
+                top_p=0.9
+            )
             
-            # Reconstructed colors
-            axes[i, 3].imshow(reconstructed[i, 1], cmap='viridis')
-            axes[i, 3].set_title(f'Recon Colors {i+1}')
-            axes[i, 3].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.show()
-        
-    print(f"Reconstructions saved to {save_path}")
+            # Get most likely character and color for each cell
+            char_recon = model_output['generated_chars'][0].cpu()  # [H, W]
+            color_recon = model_output['generated_colors'][0].cpu()  # [H, W]
 
-
-def analyze_latent_space(model, samples, device, save_path="latent_analysis.png"):
-    """Analyze the learned latent space"""
-    model.eval()
+            # Get original data (take first sample from batch)
+            char_orig = batch_device['game_chars'][0].cpu()  # [H, W]
+            color_orig = batch_device['game_colors'][0].cpu()  # [H, W]
+            
+            reconstructions.append((char_recon, color_recon))
+            originals.append((char_orig, color_orig))
+            
+            if len(reconstructions) >= num_samples:
+                break
     
+    for i, ((char_orig, color_orig), (char_recon, color_recon)) in enumerate(zip(originals, reconstructions)):
+        output_lines.append(f"\nSample {i+1}:")
+        output_lines.append("-" * 40)
+
+        # Original game state
+        output_lines.append(f"ORIGINAL:")
+        try:
+            # Convert to numpy arrays for tty_render
+            chars_np = char_orig.numpy().astype(np.uint8)
+            colors_np = color_orig.numpy().astype(np.uint8)
+            
+            # Use tty_render to display the original game state
+            rendered_orig = tty_render(chars_np, colors_np, cursors=(0, 0))
+            output_lines.extend(rendered_orig.split('\n'))
+        except Exception as e:
+            output_lines.append(f"   Error rendering original: {e}")
+            output_lines.append(f"   Char shape: {char_orig.shape}, Color shape: {color_orig.shape}")
+
+        output_lines.append(f"\nRECONSTRUCTED:")
+        try:
+            # Convert reconstructions to numpy arrays for tty_render
+            chars_recon_np = char_recon.numpy().astype(np.uint8)
+            colors_recon_np = color_recon.numpy().astype(np.uint8)
+            
+            # Use tty_render to display the reconstructed game state
+            rendered_recon = tty_render(chars_recon_np, colors_recon_np, cursors=(0, 0))
+            output_lines.extend(rendered_recon.split('\n'))
+        except Exception as e:
+            output_lines.append(f"   Error rendering reconstruction: {e}")
+            output_lines.append(f"   Char shape: {char_recon.shape}, Color shape: {color_recon.shape}")
+
+        # Calculate and display accuracy for this sample
+        char_matches = (char_orig == char_recon).float()
+        color_matches = (color_orig == color_recon).float()
+        char_accuracy = char_matches.mean().item()
+        color_accuracy = color_matches.mean().item()
+
+        output_lines.append(f"\n Sample {i+1} Accuracy:")
+        output_lines.append(f"   Character accuracy: {char_accuracy:.3f} ({char_matches.sum().int()}/{char_matches.numel()} cells)")
+        output_lines.append(f"   Color accuracy: {color_accuracy:.3f} ({color_matches.sum().int()}/{color_matches.numel()} cells)")
+
+        if i < len(reconstructions) - 1:
+            output_lines.append("\n" + "=" * 80)
+    
+    # Overall statistics
+    output_lines.append(f"\n📈 Overall Reconstruction Statistics:")
+    char_accuracy = sum((orig[0] == recon[0]).float().mean().item() for orig, recon in zip(originals, reconstructions)) / len(originals)
+    color_accuracy = sum((orig[1] == recon[1]).float().mean().item() for orig, recon in zip(originals, reconstructions)) / len(originals)
+
+    output_lines.append(f"   Average Character Reconstruction Accuracy: {char_accuracy:.3f}")
+    output_lines.append(f"   Average Color Reconstruction Accuracy: {color_accuracy:.3f}")
+
+    output_lines.append(f"\n✅ Reconstruction analysis complete!")
+    output_lines.append(f"🎮 TTY-rendered NetHack states displayed above")
+    
+    with open(save_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(output_lines))
+    
+    print(f"💾 Reconstructions saved to: {save_path}")
+
+    return {
+        'char_accuracy': char_accuracy,
+        'color_accuracy': color_accuracy,
+        'num_samples': len(reconstructions),
+        'originals': originals,
+        'reconstructions': reconstructions,
+        'save_path': save_path
+    }
+
+def analyze_latent_space(model, test_dataset, device, save_path="vae_analysis/latent_analysis.png", max_samples=100):
+    """
+    Analyze the learned latent space of the VAE
+    
+    Args:
+        model: Trained MultiModalHackVAE model
+        test_dataset: List of test batches (from NetHackDataCollector)
+        device: Device to run inference on
+        save_path: Path to save the analysis plots
+        max_samples: Maximum number of samples to analyze
+    """
+    model.eval()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     latent_vectors = []
-    game_ids = []
-    messages = []
+    batch_indices = []
+    sample_info = []
+    
+    sample_count = 0
     
     with torch.no_grad():
-        for batch in samples:
-            data = batch['input'].to(device)
-            mu, logvar = model.encode(data)
+        for batch_idx, batch in enumerate(test_dataset):
+            if sample_count >= max_samples:
+                break
+                
+            # Move batch to device and reshape like in training
+            batch_device = {}
+            for key, value in batch.items():
+                if value is not None and isinstance(value, torch.Tensor):
+                    value_device = value.to(device)
+                    # Reshape tensors from [B, T, ...] to [B*T, ...]
+                    B, T = value_device.shape[:2]
+                    remaining_dims = value_device.shape[2:]
+                    batch_device[key] = value_device.view(B * T, *remaining_dims)
+                else:
+                    batch_device[key] = value
+                    
+            valid_screen = batch_device['valid_screen'].cpu()  # [B*T, H, W]
             
+            # Get model output (includes mu, logvar, lowrank_factors)
+            model_output = model(
+                glyph_chars=batch_device['game_chars'][valid_screen][:max(0, max_samples - sample_count)],
+                glyph_colors=batch_device['game_colors'][valid_screen][:max(0, max_samples - sample_count)],
+                blstats=batch_device['blstats'][valid_screen][:max(0, max_samples - sample_count)],
+                msg_tokens=batch_device['message_chars'][valid_screen][:max(0, max_samples - sample_count)],
+                hero_info=batch_device['hero_info'][valid_screen][:max(0, max_samples - sample_count)]
+            )
+            
+            mu = model_output['mu']  # [B*T, latent_dim]
+            
+            # Store latent representations
             latent_vectors.append(mu.cpu().numpy())
-            game_ids.extend(batch['metadata']['gameid'])
-            messages.extend(batch['metadata']['current_message'])
+            
+            # Store batch information
+            batch_size = mu.shape[0]
+            batch_indices.extend([batch_idx] * batch_size)
+            
+            # Store some sample info if available
+            for i in range(batch_size):
+                sample_info.append({
+                    'batch_idx': batch_idx,
+                    'sample_idx': i,
+                    'valid_screen': batch_device['valid_screen'][i].item() if 'valid_screen' in batch_device else True
+                })
+            
+            sample_count += batch_size
     
     # Combine all latent vectors
     latent_vectors = np.vstack(latent_vectors)
+    latent_vectors = latent_vectors[:max_samples]  # Trim to max_samples
+    batch_indices = batch_indices[:max_samples]
+    sample_info = sample_info[:max_samples]
     
     print(f"📊 Latent Space Analysis:")
-    print(f"  - Latent vectors shape: {latent_vectors.shape}")
-    print(f"  - Mean latent values: {np.mean(latent_vectors, axis=0)[:5]}...")
-    print(f"  - Std latent values: {np.std(latent_vectors, axis=0)[:5]}...")
+    print(f"  - Total samples analyzed: {len(latent_vectors)}")
+    print(f"  - Latent dimensionality: {latent_vectors.shape[1]}")
+    print(f"  - Latent mean: {np.mean(latent_vectors, axis=0)[:5]}...")
+    print(f"  - Latent std: {np.std(latent_vectors, axis=0)[:5]}...")
+    print(f"  - Min latent values: {np.min(latent_vectors, axis=0)[:5]}...")
+    print(f"  - Max latent values: {np.max(latent_vectors, axis=0)[:5]}...")
     
-    # Simple 2D visualization using first two dimensions
-    plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(latent_vectors[:, 0], latent_vectors[:, 1], 
-                         c=game_ids, cmap='tab10', alpha=0.6)
-    plt.colorbar(scatter, label='Game ID')
-    plt.xlabel('Latent Dimension 0')
-    plt.ylabel('Latent Dimension 1')
-    plt.title('Latent Space Visualization (First 2 Dimensions)')
+    # Create comprehensive visualization
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # 1. First two latent dimensions colored by batch
+    axes[0, 0].scatter(latent_vectors[:, 0], latent_vectors[:, 1], 
+                      c=batch_indices, cmap='tab10', alpha=0.6, s=20)
+    axes[0, 0].set_xlabel('Latent Dimension 0')
+    axes[0, 0].set_ylabel('Latent Dimension 1')
+    axes[0, 0].set_title('Latent Space (Dims 0-1, colored by batch)')
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 2. Latent dimension variances
+    latent_vars = np.var(latent_vectors, axis=0)
+    axes[0, 1].bar(range(len(latent_vars)), latent_vars)
+    axes[0, 1].set_xlabel('Latent Dimension')
+    axes[0, 1].set_ylabel('Variance')
+    axes[0, 1].set_title('Variance per Latent Dimension')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 3. Latent means
+    latent_means = np.mean(latent_vectors, axis=0)
+    axes[0, 2].bar(range(len(latent_means)), latent_means)
+    axes[0, 2].set_xlabel('Latent Dimension')
+    axes[0, 2].set_ylabel('Mean')
+    axes[0, 2].set_title('Mean per Latent Dimension')
+    axes[0, 2].grid(True, alpha=0.3)
+    
+    # 4. Distribution of first latent dimension
+    axes[1, 0].hist(latent_vectors[:, 0], bins=50, alpha=0.7, density=True)
+    axes[1, 0].axvline(0, color='red', linestyle='--', alpha=0.7, label='N(0,1) mean')
+    axes[1, 0].set_xlabel('Latent Value')
+    axes[1, 0].set_ylabel('Density')
+    axes[1, 0].set_title('Distribution of Latent Dim 0')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 5. Pairwise correlations (first 10 dimensions)
+    n_dims_to_show = min(10, latent_vectors.shape[1])
+    corr_matrix = np.corrcoef(latent_vectors[:, :n_dims_to_show].T)
+    im = axes[1, 1].imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+    axes[1, 1].set_xlabel('Latent Dimension')
+    axes[1, 1].set_ylabel('Latent Dimension')
+    axes[1, 1].set_title(f'Correlation Matrix (first {n_dims_to_show} dims)')
+    plt.colorbar(im, ax=axes[1, 1])
+    
+    # 6. Principal components analysis
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=2)
+    latent_pca = pca.fit_transform(latent_vectors)
+    
+    axes[1, 2].scatter(latent_pca[:, 0], latent_pca[:, 1], 
+                      c=batch_indices, cmap='tab10', alpha=0.6, s=20)
+    axes[1, 2].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+    axes[1, 2].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+    axes[1, 2].set_title('PCA of Latent Space')
+    axes[1, 2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
     
-    print(f"Latent space visualization saved to {save_path}")
+    # 7. Create standalone TTY visualization figure (15x15 grid = 225 samples)
+    print(f"\n🎮 Generating TTY visualization grid...")
+    W = torch.linalg.svd(torch.tensor(latent_vectors, dtype=torch.float32)).Vh[:2]
+    points = torch.distributions.Normal(0,1).icdf(torch.linspace(0.01, 0.99, 15))  # 15x15 grid = 225 samples
+    XX, YY = torch.meshgrid(points, points, indexing='ij')
+    XXYY = torch.stack((XX, YY)).reshape(2, -1).T
+    latent_grid = XXYY @ W
     
-    return latent_vectors, game_ids, messages
+    with torch.no_grad():
+        decode_output = model.decode(latent_grid.to(device))
+        chars = decode_output['generated_chars'].cpu()  # [225, 21, 79]
+        colors = decode_output['generated_colors'].cpu()  # [225, 21, 79]
+    
+    # Create giant figure for TTY renders
+    tty_fig, tty_axes = plt.subplots(15, 15, figsize=(30, 30))
+    tty_fig.suptitle('Generated NetHack States from Latent Space Grid (15x15)', fontsize=20, y=0.98)
+    
+    # Generate and display TTY renders in grid
+    print(f"🎨 Rendering 225 NetHack states...")
+    for i in range(15):
+        for j in range(15):
+            idx = i * 15 + j
+            ax = tty_axes[i, j]
+            
+            try:
+                # Convert to numpy arrays for tty_render
+                chars_np = chars[idx].numpy().astype(np.uint8)
+                colors_np = colors[idx].numpy().astype(np.uint8)
+                
+                # Use tty_render to get ASCII representation
+                tty_output = tty_render(chars_np, colors_np)
+                
+                # Display TTY output as text in subplot
+                ax.text(0.02, 0.98, tty_output, 
+                       transform=ax.transAxes, 
+                       fontsize=2,  # Very small font to fit
+                       fontfamily='monospace',
+                       verticalalignment='top',
+                       horizontalalignment='left')
+                
+                # Set title with grid coordinates
+                ax.set_title(f'({XX[i,j]:.1f}, {YY[i,j]:.1f})', fontsize=6)
+                
+            except Exception as e:
+                ax.text(0.5, 0.5, f'Error\n{str(e)[:20]}...', 
+                       transform=ax.transAxes, 
+                       ha='center', va='center', fontsize=4)
+                ax.set_title(f'Error ({i},{j})', fontsize=6)
+            
+            ax.axis('off')  # Remove axes for cleaner look
+    
+    # Save the TTY visualization
+    tty_save_path = save_path.replace('.png', '_tty_grid.png')
+    plt.figure(tty_fig.number)  # Make sure we're working with the TTY figure
+    plt.tight_layout()
+    plt.savefig(tty_save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # Also save TTY outputs to text file for easier inspection
+    tty_text_path = save_path.replace('.png', '_tty_grid.txt')
+    with open(tty_text_path, 'w', encoding='utf-8') as f:
+        f.write("NetHack VAE - Generated States from Latent Space Grid (15x15)\n")
+        f.write("=" * 80 + "\n\n")
+        
+        for i in range(15):
+            for j in range(15):
+                idx = i * 15 + j
+                f.write(f"Position ({i},{j}) - Latent coords: ({XX[i,j]:.3f}, {YY[i,j]:.3f})\n")
+                f.write("-" * 60 + "\n")
+                
+                try:
+                    chars_np = chars[idx].numpy().astype(np.uint8)
+                    colors_np = colors[idx].numpy().astype(np.uint8)
+                    tty_output = tty_render(chars_np, colors_np, cursors=(0, 0))
+                    f.write(tty_output + "\n\n")
+                except Exception as e:
+                    f.write(f"Error generating TTY output: {e}\n\n")
+    
+    print(f"💾 TTY grid visualization saved to: {tty_save_path}")
+    print(f"📄 TTY grid text file saved to: {tty_text_path}")
+    print(f"🎮 Generated {15*15} NetHack states across latent space!")
+    
+    print(f"Latent space analysis saved to {save_path}")
+    
+    # Additional statistics
+    print(f"\n📈 Additional Statistics:")
+    print(f"  - Effective dimensionality (dims with var > 0.01): {np.sum(latent_vars > 0.01)}")
+    print(f"  - High variance dimensions (var > 0.1): {np.sum(latent_vars > 0.1)}")
+    print(f"  - Dimensions close to N(0,1): {np.sum((np.abs(latent_means) < 0.1) & (np.abs(latent_vars - 1.0) < 0.2))}")
+    print(f"  - PCA explained variance (first 2 components): {pca.explained_variance_ratio_[:2].sum():.2%}")
+    
+    return {
+        'latent_vectors': latent_vectors,
+        'batch_indices': batch_indices, 
+        'sample_info': sample_info,
+        'latent_means': latent_means,
+        'latent_vars': latent_vars,
+        'pca_components': latent_pca,
+        'pca_explained_variance': pca.explained_variance_ratio_
+    }
 
 
 def save_model_to_huggingface(
@@ -1910,8 +2192,8 @@ def save_model_to_huggingface(
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'model_config': {
-                    'bInclude_inventory': getattr(model, 'bInclude_inventory', False),
-                    'latent_dim': getattr(model, 'latent_dim', 256),
+                    'latent_dim': getattr(model, 'latent_dim', 96),
+                    'lowrank_dim': getattr(model, 'lowrank_dim', 0),
                 },
                 'upload_timestamp': datetime.now().isoformat(),
             }, model_save_path)
@@ -1926,7 +2208,12 @@ def save_model_to_huggingface(
             "task": "representation-learning",
             "dataset": "NetHack Learning Dataset",
             "latent_dim": getattr(model, 'latent_dim', 'unknown'),
-            "include_inventory": getattr(model, 'bInclude_inventory', False),
+            "lowrank_dim": getattr(model, 'lowrank_dim', 'unknown'),
+            'bInclude_glyph_bag': getattr(model, 'include_glyph_bag', True),
+            'bInclude_hero': getattr(model, 'include_hero', True),
+            'dropout_rate': getattr(model, 'dropout_rate', 0.1),
+            'enable_dropout_on_latent': getattr(model, 'enable_dropout_on_latent', True),
+            'enable_dropout_on_decoder': getattr(model, 'enable_dropout_on_decoder', True),
             "architecture": "Multi-modal Variational Autoencoder for NetHack game states"
         }
         
@@ -1967,7 +2254,7 @@ This model is a MultiModalHackVAE that learns compact representations of NetHack
 - **Framework**: PyTorch
 - **Dataset**: NetHack Learning Dataset
 - **Latent Dimensions**: {model_info.get('latent_dim', 'unknown')}
-- **Include Inventory**: {model_info.get('include_inventory', False)}
+- **Low-rank Dimensions**: {model_info.get('lowrank_dim', 'unknown')}
 
 ## Usage
 
@@ -2095,6 +2382,7 @@ If you use this model, please consider citing:
 
 def load_model_from_huggingface(
     repo_name: str,
+    revision_name: Optional[str] = None,
     token: Optional[str] = None,
     device: str = "cpu",
     **model_kwargs
@@ -2104,9 +2392,10 @@ def load_model_from_huggingface(
     
     Args:
         repo_name: HuggingFace repository name (e.g., "username/nethack-vae")
+        revision_name: Specific revision to load (default is latest)
         token: HuggingFace token (if needed for private repos)
         device: Device to load the model on
-        **model_kwargs: Additional arguments for model initialization
+        **model_kwargs: Additional arguments for model initialization (override config)
         
     Returns:
         Loaded MultiModalHackVAE model
@@ -2122,48 +2411,131 @@ def load_model_from_huggingface(
     
     try:
         # Download config
+        print(f"📥 Downloading model config from {repo_name}...")
         config_path = api.hf_hub_download(
             repo_id=repo_name,
             filename="config.json",
-            repo_type="model"
+            repo_type="model",
+            revision=revision_name
         )
         
         with open(config_path, "r") as f:
             config = json.load(f)
         
+        print(f"📋 Model config loaded: {config}")
+        
         # Download model file
+        print(f"📥 Downloading model weights from {repo_name}...")
         model_path = api.hf_hub_download(
             repo_id=repo_name,
             filename="pytorch_model.bin",
-            repo_type="model"
+            repo_type="model",
+            revision=revision_name
         )
         
-        # Initialize model with config
+        # Initialize model with config (allow kwargs to override)
         model_config = {
-            "bInclude_inventory": config.get("include_inventory", False),
-            **model_kwargs
+            "bInclude_glyph_bag": config.get("bInclude_glyph_bag", True),
+            "bInclude_hero": config.get("bInclude_hero", True),
+            "dropout_rate": config.get("dropout_rate", 0.1),
+            "enable_dropout_on_latent": config.get("enable_dropout_on_latent", True),
+            "enable_dropout_on_decoder": config.get("enable_dropout_on_decoder", True),
         }
         
+        # Override with any provided kwargs
+        model_config.update(model_kwargs)
+        
+        print(f"🏗️  Initializing model with config: {model_config}")
         model = MultiModalHackVAE(**model_config)
         
         # Load state dict
+        print(f"⚡ Loading model weights...")
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         
         # Handle different checkpoint formats
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✅ Loaded model state dict from checkpoint")
+            if 'final_train_loss' in checkpoint:
+                print(f"📊 Final training loss: {checkpoint['final_train_loss']:.4f}")
+            if 'final_test_loss' in checkpoint:
+                print(f"📊 Final test loss: {checkpoint['final_test_loss']:.4f}")
         else:
             model.load_state_dict(checkpoint)
+            print(f"✅ Loaded model state dict directly")
         
         model = model.to(device)
         model.eval()
         
-        print(f"✅ Model loaded from HuggingFace: {repo_name}")
+        print(f"✅ Model loaded successfully from HuggingFace: {repo_name}")
+        print(f"🎯 Model on device: {device}")
+        print(f"🎯 Model in evaluation mode")
+        
         return model
         
     except Exception as e:
         print(f"❌ Error loading from HuggingFace: {e}")
         raise
+
+
+def create_visualization_demo(
+    repo_name: str,
+    test_dataset: List[Dict],
+    revision_name: Optional[str] = None,
+    token: Optional[str] = None,
+    device: str = "cpu",
+    num_samples: int = 4,
+    max_latent_samples: int = 100,
+    save_dir: str = "vae_analysis"
+) -> Dict:
+    """
+    Complete demo function that loads a model from HuggingFace and creates visualizations
+    
+    Args:
+        repo_name: HuggingFace repository name
+        test_dataset: Test dataset from NetHackDataCollector
+        token: HuggingFace token (optional)
+        device: Device to run on
+        num_samples: Number of reconstruction samples
+        max_latent_samples: Maximum samples for latent analysis
+        save_dir: Directory to save results
+        
+    Returns:
+        Dictionary with analysis results
+    """
+    # Create save directory
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"🚀 Starting VAE Analysis Demo")
+    print(f"📦 Repository: {repo_name}")
+    print(f"🎯 Device: {device}")
+    print(f"📁 Save directory: {save_dir}")
+    
+    # Load model from HuggingFace
+    print(f"\n1️⃣ Loading model from HuggingFace...")
+    model = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
+
+    # Create TTY reconstructions
+    print(f"\n2️⃣ Creating TTY reconstruction visualizations...")
+    recon_path = os.path.join(save_dir, "reconstructions_tty.txt")
+    visualize_reconstructions(model, test_dataset, device, num_samples=num_samples, save_path=recon_path)
+    
+    # Analyze latent space
+    print(f"\n3️⃣ Analyzing latent space...")
+    latent_path = os.path.join(save_dir, "latent_analysis.png")
+    latent_analysis = analyze_latent_space(model, test_dataset, device, save_path=latent_path, max_samples=max_latent_samples)
+    
+    print(f"\n✅ Analysis complete! Results saved to: {save_dir}")
+    print(f"📄 TTY reconstructions: {recon_path}")
+    print(f"📊 Latent analysis plot: {latent_path}")
+    
+    return {
+        'model': model,
+        'reconstruction_path': recon_path,
+        'latent_analysis_path': latent_path,
+        'latent_analysis': latent_analysis,
+        'save_dir': save_dir
+    }
 
 
 def upload_training_artifacts_to_huggingface(
@@ -2385,7 +2757,7 @@ def create_model_demo_notebook(repo_name: str, save_path: str = "demo_notebook.i
 
 
 if __name__ == "__main__":
-    # Example usage
+    
     train_file = "nld-aa-training"
     test_file = "nld-aa-testing"
     data_cache_dir = "data_cache"
@@ -2396,104 +2768,143 @@ if __name__ == "__main__":
     train_cache_file = os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}.pt")
     test_cache_file = os.path.join(data_cache_dir, f"{test_file}_b{batch_size}_s{sequence_size}_m{max_testing_batches}.pt")
     
-    # # test collecting and saving data
-    # collector = NetHackDataCollector('ttyrecs.db')
-    # adapter = BLStatsAdapter()
-    # train_dataset = collector.collect_or_load_data(
-    #     dataset_name=train_file,
-    #     adapter=adapter,
-    #     save_path=train_cache_file,
-    #     max_batches=max_training_batches,
-    #     batch_size=batch_size,
-    #     seq_length=sequence_size,
-    #     force_recollect=True
-    # )
-    # test_dataset = collector.collect_or_load_data(
-    #     dataset_name=test_file,
-    #     adapter=adapter,
-    #     save_path=test_cache_file,
-    #     max_batches=max_testing_batches,
-    #     batch_size=batch_size,
-    #     seq_length=sequence_size,
-    #     force_recollect=True
-    # )
     
-    # print(f"✅ Data collection completed!")
-    # print(f"   📊 Train batches: {len(train_dataset)}")
-    # print(f"   📊 Test batches: {len(test_dataset)}")
+    if len(sys.argv) > 1 and sys.argv[1] == "vae_analysis":
+        # Demo mode: python train.py demo <repo_name>
+        repo_name = sys.argv[2] if len(sys.argv) > 2 else "CatkinChen/nethack-vae"
+        revision_name = sys.argv[3] if len(sys.argv) > 3 else None
+        
+        print(f"🚀 Running VAE Analysis Demo")
+        print(f"📦 Repository: {repo_name}")
+        
+        # Create some test data (you would replace this with your actual test dataset)
+        print(f"📊 Preparing test data...")
+        
+        collector = NetHackDataCollector('ttyrecs.db')
+        adapter = BLStatsAdapter()
+        test_dataset = collector.collect_or_load_data(
+            dataset_name=test_file,
+            adapter=adapter,
+            save_path=test_cache_file,
+            max_batches=max_testing_batches,
+            batch_size=batch_size,
+            seq_length=sequence_size,
+            force_recollect=False
+        )
+        
+        # Run the complete analysis
+        try:
+            results = create_visualization_demo(
+                repo_name=repo_name,
+                test_dataset=test_dataset,
+                revision_name=revision_name,
+                device="cpu",  # Use CPU for demo
+                num_samples=4,
+                max_latent_samples=50,
+                save_dir="vae_analysis"
+            )
+            print(f"✅ Demo completed successfully!")
+            print(f"📁 Results saved to: {results['save_dir']}")
+            print(f"📊 Test dataset created: {len(test_dataset)} batches")
+        except Exception as e:
+            print(f"❌ Demo failed: {e}")
+            print(f"💡 Make sure the repository exists and is accessible")
+            print(f"💡 You can create synthetic data for testing by setting repo_name to a local path")
     
-    hf_model_card_data = {
-        "author": "Xu Chen",
-        "description": "Advanced NetHack VAE",
-        "tags": ["nethack", "reinforcement-learning", "multimodal", "world-modeling", "vae"],
-        "use_cases": [
-            "Game state representation learning",
-            "RL agent state abstraction",
-            "NetHack gameplay analysis"
-        ],
-        "metrics": {
-            "reconstruction_quality": "High",
-            "latent_dim": 64
+    elif len(sys.argv) > 1 and sys.argv[1] == "collect_data":
+        # test collecting and saving data
+        collector = NetHackDataCollector('ttyrecs.db')
+        adapter = BLStatsAdapter()
+        train_dataset = collector.collect_or_load_data(
+            dataset_name=train_file,
+            adapter=adapter,
+            save_path=train_cache_file,
+            max_batches=max_training_batches,
+            batch_size=batch_size,
+            seq_length=sequence_size,
+            force_recollect=True
+        )
+        test_dataset = collector.collect_or_load_data(
+            dataset_name=test_file,
+            adapter=adapter,
+            save_path=test_cache_file,
+            max_batches=max_testing_batches,
+            batch_size=batch_size,
+            seq_length=sequence_size,
+            force_recollect=True
+        )
+        
+        print(f"✅ Data collection completed!")
+        print(f"   📊 Train batches: {len(train_dataset)}")
+        print(f"   📊 Test batches: {len(test_dataset)}")
+    elif len(sys.argv) > 1 and sys.argv[1] == "train":
+        hf_model_card_data = {
+            "author": "Xu Chen",
+            "description": "Advanced NetHack VAE",
+            "tags": ["nethack", "reinforcement-learning", "multimodal", "world-modeling", "vae"],
+            "use_cases": [
+                "Game state representation learning",
+                "RL agent state abstraction",
+                "NetHack gameplay analysis"
+            ],
         }
-    }
-    
-    print(f"\n🧪 Starting mini test of train_multimodalhack_vae...")
-    model, train_losses, test_losses = train_multimodalhack_vae(
-        train_file=train_file,
-        test_file=test_file,
-        epochs=15,          
-        batch_size=batch_size,
-        sequence_size=sequence_size,    
-        learning_rate=5e-4,
-        training_batches=max_training_batches,
-        testing_batches=max_testing_batches,
-        max_training_batches=max_training_batches,
-        max_testing_batches=max_testing_batches,
-        save_path="models/nethack-vae.pth",
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        include_inventory=False,
-        data_cache_dir="data_cache",
-        force_recollect=False,  # Use the data we just collected
-        shuffle_batches=True,  # Shuffle training batches each epoch for better training
-        initial_kl_beta = 0.0001,
-        final_kl_beta = 0.5,
-        kl_beta_shape = 'cosine',
-        custom_kl_beta_function = lambda init, end, progress: init + (end - init) * progress**10, 
-        warmup_epoch_ratio = 0.4,
-        total_correlation_beta_multiplier=10.0,
-        free_bits=0.15,
+        
+        print(f"\n🧪 Starting train_multimodalhack_vae...")
+        model, train_losses, test_losses = train_multimodalhack_vae(
+            train_file=train_file,
+            test_file=test_file,
+            epochs=15,          
+            batch_size=batch_size,
+            sequence_size=sequence_size,    
+            learning_rate=5e-4,
+            training_batches=max_training_batches,
+            testing_batches=max_testing_batches,
+            max_training_batches=max_training_batches,
+            max_testing_batches=max_testing_batches,
+            save_path="models/nethack-vae.pth",
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            data_cache_dir="data_cache",
+            force_recollect=False,  # Use the data we just collected
+            shuffle_batches=True,  # Shuffle training batches each epoch for better training
+            initial_kl_beta = 0.0001,
+            final_kl_beta = 0.4,
+            kl_beta_shape = 'cosine',
+            custom_kl_beta_function = lambda init, end, progress: init + (end - init) * progress**10, 
+            warmup_epoch_ratio = 0.4,
+            total_correlation_beta_multiplier=15.0,
+            free_bits=0.15,
 
-        # Dropout and regularization settings
-        dropout_rate=0.1,  # Set to 0.1 for mild regularization
-        enable_dropout_on_latent=True,
-        enable_dropout_on_decoder=True,
-        
-        # Enable checkpointing
-        save_checkpoints=True,
-        checkpoint_dir="checkpoints",
-        save_every_n_epochs=1,
-        keep_last_n_checkpoints=2,
-        
-        # Wandb integration example
-        use_wandb=True,
-        wandb_project="nethack-vae",
-        wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
-        wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-        wandb_tags=["nethack", "vae"],
-        wandb_notes="Full VAE training run",
-        log_every_n_steps=10,  # Log every 10 steps
-        log_model_architecture=True,
-        log_gradients=True,
-        log_model_weights=True,
-        
-        # HuggingFace integration example
-        upload_to_hf=True,
-        hf_repo_name="CatkinChen/nethack-vae",
-        hf_upload_directly=True,  # Upload directly without extra local save
-        hf_upload_checkpoints=True,  # Also upload checkpoints
-        hf_model_card_data=hf_model_card_data
-    )
+            # Dropout and regularization settings
+            dropout_rate=0.1,  # Set to 0.1 for mild regularization
+            enable_dropout_on_latent=True,
+            enable_dropout_on_decoder=True,
+            
+            # Enable checkpointing
+            save_checkpoints=True,
+            checkpoint_dir="checkpoints",
+            save_every_n_epochs=1,
+            keep_last_n_checkpoints=2,
+            
+            # Wandb integration example
+            use_wandb=True,
+            wandb_project="nethack-vae",
+            wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
+            wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+            wandb_tags=["nethack", "vae"],
+            wandb_notes="Full VAE training run",
+            log_every_n_steps=10,  # Log every 10 steps
+            log_model_architecture=True,
+            log_gradients=True,
+            log_model_weights=True,
+            
+            # HuggingFace integration example
+            upload_to_hf=True,
+            hf_repo_name="CatkinChen/nethack-vae",
+            hf_upload_directly=True,  # Upload directly without extra local save
+            hf_upload_checkpoints=True,  # Also upload checkpoints
+            hf_model_card_data=hf_model_card_data
+        )
 
-    print(f"\n🎉 Full VAE training run completed successfully!")
-    print(f"   📈 Train losses: {train_losses}")
-    print(f"   📈 Test losses: {test_losses}")
+        print(f"\n🎉 Full VAE training run completed successfully!")
+        print(f"   📈 Train losses: {train_losses}")
+        print(f"   📈 Test losses: {test_losses}")

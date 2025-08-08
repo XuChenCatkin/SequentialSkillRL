@@ -189,7 +189,49 @@ class GlyphCNN(nn.Module):
         x = self.net(glyph_emb)
         feature = x.view(x.size(0), -1)  # [B,64]
         return feature, char_embedding, color_embedding
-    
+
+    def sample_from_logits(self, glyph_logits: torch.Tensor, color_logits: torch.Tensor, temperature: float = 1.0, top_k: int = 5, top_p: float = 0.9) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample glyphs from logits."""
+        # Sample from categorical distributions
+        # Apply temperature scaling and top-k/top-p filtering if needed
+        if temperature <= 0:
+            raise ValueError("Temperature must be positive.")
+        else:
+            glyph_logits = glyph_logits / temperature
+            color_logits = color_logits / temperature
+
+        # Apply top-k and top-p filtering if needed
+        if top_k > 0:
+            # Top-k filtering
+            top_k_glyph_values, top_k_glyph_indices = torch.topk(glyph_logits, top_k, dim=-1)
+            glyph_logits = torch.zeros_like(glyph_logits).scatter_(-1, top_k_glyph_indices, top_k_glyph_values)
+            top_k_color_values, top_k_color_indices = torch.topk(color_logits, top_k, dim=-1)
+            color_logits = torch.zeros_like(color_logits).scatter_(-1, top_k_color_indices, top_k_color_values)
+
+        if top_p < 1.0:
+            # Top-p filtering (nucleus sampling)
+            sorted_glyph_logits, sorted_indices = torch.sort(glyph_logits, descending=True)
+            cumulative_glyph_probs = torch.cumsum(F.softmax(sorted_glyph_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_glyph_probs > top_p
+            if sorted_indices_to_remove[..., 1:].sum() > 0:
+                sorted_indices_to_remove[..., 1:] = 0
+                glyph_logits = glyph_logits.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+
+            sorted_color_logits, sorted_indices = torch.sort(color_logits, descending=True)
+            cumulative_color_probs = torch.cumsum(F.softmax(sorted_color_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_color_probs > top_p
+            if sorted_indices_to_remove[..., 1:].sum() > 0:
+                sorted_indices_to_remove[..., 1:] = 0
+                color_logits = color_logits.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+        
+        # Sample from the filtered logits
+        glyph_samples = torch.multinomial(F.softmax(glyph_logits, dim=-1), 1).squeeze(-1)  # [B, H, W]
+        color_samples = torch.multinomial(F.softmax(color_logits, dim=-1), 1).squeeze(-1)  # [B, H, W]
+        
+        # Convert samples back to original range
+        glyph_samples = glyph_samples + 32  # Shift back to [32, 127]
+        return glyph_samples, color_samples
+
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
         return 64
@@ -465,7 +507,32 @@ class MessageGRU(nn.Module):
         # Get embeddings for shifted tokens
         shifted_embeddings = self.emb(shifted_tokens)  # [B, 256, emb_dim]
         return shifted_tokens, shifted_embeddings  # return shifted tokens and embeddings
-        
+
+    def sample_from_logits(self, logits: torch.Tensor, temperature: float = 1.0, top_k: int = 5, top_p: float = 0.9) -> torch.Tensor:
+        """
+        Sample from the output logits using temperature, top-k, and top-p sampling.
+        """
+        # Apply temperature
+        logits = logits / temperature
+
+        # Top-k sampling
+        if top_k is not None:
+            top_k_values, top_k_indices = torch.topk(logits, top_k)
+            logits = torch.zeros_like(logits).scatter_(1, top_k_indices, top_k_values)
+
+        # Top-p sampling
+        if top_p is not None:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            logits = logits.masked_fill(sorted_indices_to_remove, float('-inf'))
+
+        # Sample from the final logits
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
     def get_output_channels(self) -> int:
         """Returns the number of output channels."""
         return self.hid_dim
@@ -501,132 +568,11 @@ class HeroEmbedding(nn.Module):
     def get_output_channels(self) -> int:
         """Returns the number of output channels for hero embedding."""
         return ROLE_EMB + RACE_EMB + GEND_EMB + ALIGN_EMB  # 16
-    
-
-class InventoryEncoder(nn.Module):
-    """
-    Encodes inventory using object classes (inv_oclasses) and string descriptions (inv_strs).
-    We use char embeddings from GlyphCNN for object classes.
-    
-    Architecture:
-    - Object classes: [B, 55] -> [B, hid] using a simple RNN
-    - String descriptions: [B, 55, 80] -> [B, hid * 2] using a bidirectional GRU
-    - Fusion: Concatenate object class and string embeddings, then pass through a linear layer to output [B, output_dim].
-    
-    This approach avoids using inv_glyphs which can be inconsistent and instead uses
-    semantic object class information and natural language descriptions.
-    """
-    def __init__(self, vocab: int=MSG_VOCAB + 2, str_emb: int=16, hid: int=16, output_dim: int=24):
-        super().__init__()
-        self.output_dim = output_dim
-        self.vocab = vocab
-        self.str_emb_dim = str_emb
-        self.hid_dim = hid
-        self.sos = MSG_VOCAB  # start-of-sequence token for strings
-        self.eos = MSG_VOCAB + 1  # end-of-sequence token
-        
-        self.oclass_net = nn.RNN(CHAR_EMB, hid, batch_first=True)  # simple RNN for object class encoding
-        
-        # Simple character-level processing
-        self.char_emb = nn.Embedding(vocab, str_emb, padding_idx=0)
-        self.str_gru = nn.GRU(str_emb, hid, batch_first=True, bidirectional=True)
-        
-        # Fusion layer
-        self.fusion = nn.Sequential(
-            nn.Linear(hid * 3, hid),
-            nn.ReLU(),
-            nn.Linear(hid, output_dim)
-        )
-        
-    def forward(self, glyph_encoder: GlyphCNN, inv_oclasses: torch.Tensor, inv_strs: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            inv_oclasses: [B, 55] - object class indices
-            inv_strs: [B, 55, 80] - string descriptions (character codes)
-        Returns:
-            inv_features: [B, output_dim] - encoded inventory features
-        """
-        B = inv_oclasses.size(0)
-        # map inv_oclasses to char
-        inv_class = map(lambda x: INV_OCLASS_MAP.get(x, 128), inv_oclasses.view(-1).tolist())  # flatten and map
-        inv_class = torch.tensor(list(inv_class), dtype=torch.long, device=inv_oclasses.device).view(B, INV_MAX_SIZE)  # [B, 55]
-        
-        # Process object classes
-        inv_class_emb = glyph_encoder.char_emb(inv_class)  # [B, 55] -> [B, 55, CHAR_EMB]
-        packed_inv_class_emb = nn.utils.rnn.pack_padded_sequence(
-            inv_class_emb, (inv_oclasses != 18).sum(dim=1).cpu(),
-            batch_first=True, enforce_sorted=False
-        )  # Pack the sequences for RNN
-        _, h_class_n = self.oclass_net(packed_inv_class_emb)  # h_class_n: [1, B, hid]
-        h_class = h_class_n.squeeze(0)  # [B, hid]
-        
-        # Process string descriptions
-        inv_strs_with_eos = inv_strs.clone().view(B * INV_MAX_SIZE, INV_STR_LEN)  # Flatten to [B*55, 80]
-        lengths = (inv_strs_with_eos != 0).sum(dim=-1)  # [B*55,] - count non-padding characters
-        bHasSpace = (lengths < INV_STR_LEN)  # check if there is space for EOS
-        inv_strs_with_eos[bHasSpace, lengths[bHasSpace]] = self.eos  # set end-of-sequence token at the end of each string
-        str_emb = self.char_emb(inv_strs_with_eos)  # [B*55, 80, str_emb]
-        packed_str_emb = nn.utils.rnn.pack_padded_sequence(
-            str_emb, lengths.cpu(), batch_first=True, enforce_sorted=False
-        )  # Pack the sequences for GRU
-        
-        # GRU over characters
-        packed_out, h_n = self.gru(packed_str_emb)  # hidden: [2, B*55, hid]
-        # Use final hidden state (concat forward and backward)
-        str_final = torch.cat([h_n[0], h_n[1]], dim=1)  # [B*55, hid * 2]
-        str_final = str_final.view(B, INV_MAX_SIZE, self.hid_dim * 2)  # [B, 55, hid * 2]
-        
-        # Average pool over inventory slots (mask out empty slots)
-        str_mask = (inv_strs.sum(dim=-1) > 0).float().unsqueeze(-1)  # [B, 55, 1]
-        str_masked = str_final * str_mask  # [B, 55, hid * 2]
-        str_pooled = str_masked.sum(dim=1) / (str_mask.sum(dim=1) + 1e-8)  # [B, hid * 2]
-        
-        # Fusion
-        combined = torch.cat([h_class, str_pooled], dim=-1)  # [B, hid] + [B, hid * 2] -> [B, hid * 3]
-        inv_features = self.fusion(combined)  # [B, output_dim]
-        
-        return inv_features, inv_class_emb, str_emb  # return features, class embeddings, string embeddings
-        # inv_class_emb: [B, 55, CHAR_EMB], str_emb: [B, 55, 80, str_emb]
-        
-    def teacher_forcing_decorator(self, glyph_encoder: GlyphCNN, inv_oclasses: torch.Tensor, inv_strs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            inv_oclasses: [B, 55] - object class indices
-            inv_strs: [B, 55, 80] - string descriptions (character codes)
-        Returns:
-            shifted_oclasses: [B, 55] - shifted object class indices with sos/eos
-            shifted_strs: [B, 55, 80] - shifted string descriptions with sos/eos
-            shifted_oclass_emb: [B, 55, CHAR_EMB] - shifted object class embeddings
-            shifted_str_emb: [B, 55, 80, str_emb] - shifted string embeddings
-        """
-        B = inv_oclasses.size(0)
-        # Shift object classes
-        shifted_oclasses = torch.zeros_like(inv_oclasses)
-        shifted_oclasses[:, 0] = self.sos  # set start-of-sequence token
-        shifted_oclasses[:, 1:] = inv_oclasses[:, :-1]  # shift right by 1
-        lengths_oclasses = (inv_oclasses != 18).sum(dim=1)  # count non-padding object classes
-        bHasSpace = lengths_oclasses < INV_MAX_SIZE - 1  # check if there is space for EOS
-        shifted_oclasses[bHasSpace, lengths_oclasses[bHasSpace] + 1] = self.eos  # set end-of-sequence token at the end of each object class sequence
-        # Shift string descriptions
-        flat_inv_strs = inv_strs.view(B * INV_MAX_SIZE, INV_STR_LEN)  # Flatten to [B*55, 80]
-        shifted_strs = flat_inv_strs.clone()
-        shifted_strs[:, 0] = self.sos  # set start-of-sequence token
-        shifted_strs[:, 1:] = flat_inv_strs[:, :-1]  # shift right by 1
-        # Get embeddings for shifted object classes and strings
-        shifted_oclass_emb = glyph_encoder.char_emb(shifted_oclasses)  # [B, 55] -> [B, 55, CHAR_EMB]
-        shifted_str_emb = self.char_emb(shifted_strs)  # [B*55, 80] -> [B*55, 80, str_emb]
-        shifted_str_emb = shifted_str_emb.view(B, INV_MAX_SIZE, INV_STR_LEN, self.str_emb_dim)
-        return shifted_oclasses, shifted_strs, shifted_oclass_emb, shifted_str_emb  # return shifted object classes and strings, and their embeddings
-    
-    def get_output_channels(self) -> int:
-        """Returns the number of output channels."""
-        return self.output_dim
 
 class MultiModalHackVAE(nn.Module):
     def __init__(self, 
                  bInclude_glyph_bag=True, 
                  bInclude_hero=True,
-                 bInclude_inventory=False,
                  dropout_rate=0.0,
                  enable_dropout_on_latent=True,
                  enable_dropout_on_decoder=True,
@@ -642,18 +588,15 @@ class MultiModalHackVAE(nn.Module):
         self.stats_mlp = StatsMLP()
         self.msg_gru   = MessageGRU()
         self.hero_emb = HeroEmbedding()  # for hero embedding
-        self.inv_encoder = InventoryEncoder()  # for inventory encoding
         
         self.include_glyph_bag = bInclude_glyph_bag
         self.include_hero = bInclude_hero
-        self.include_inventory = bInclude_inventory
 
         fusion_in = self.glyph_cnn.get_output_channels() + \
                     self.stats_mlp.get_output_channels() + \
                     self.msg_gru.get_output_channels() + \
                     (self.glyph_bag.get_output_channels() if bInclude_glyph_bag else 0) + \
-                    (self.hero_emb.get_output_channels() if bInclude_hero else 0) + \
-                    (self.inv_encoder.get_output_channels() if bInclude_inventory else 0)  # cnn + stats + msg + bag of glyphs + hero embedding + inventory
+                    (self.hero_emb.get_output_channels() if bInclude_hero else 0) # cnn + stats + msg + bag of glyphs + hero embedding + inventory
         
         # Add dropout to the encoder fusion layer if enabled
         if self.dropout_rate > 0.0 and self.enable_dropout_on_latent:
@@ -671,6 +614,7 @@ class MultiModalHackVAE(nn.Module):
                 nn.LayerNorm(256),
             )
         self.latent_dim = LATENT_DIM
+        self.lowrank_dim = LOW_RANK
         self.mu_head     = nn.Linear(256, LATENT_DIM)
         self.logvar_diag_head = nn.Linear(256, LATENT_DIM)  # diagonal part
         self.lowrank_factor_head = nn.Linear(256, LATENT_DIM * LOW_RANK) if LOW_RANK else None # low-rank factors
@@ -736,16 +680,6 @@ class MultiModalHackVAE(nn.Module):
         self.decode_msg_gru = nn.GRU(self.msg_gru.emb_dim, self.msg_gru.hid_dim, batch_first=True)  # [B, T, emb_dim] -> [B, T, hid_dim]
         self.decode_msg_hidden2emb = nn.Linear(self.msg_gru.hid_dim, self.msg_gru.emb_dim)  # [B, T, hid_dim] -> [B, T, emb_dim]
         
-        # Inventory embedding decoder
-        self.decode_inv_latent2hidden = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, self.inv_encoder.hid_dim * 3)  # [B, 256] -> [B, hid_dim * 3] (for oclass + str)
-        )
-        self.decode_inv_class_rnn_emb = nn.RNN(CHAR_EMB, self.inv_encoder.hid_dim, batch_first=True)  # RNN for object class decoding, [B, 55, CHAR_EMB] -> [B, 55, hid_dim]
-        self.decode_inv_class_hidden2emb = nn.Linear(self.inv_encoder.hid_dim, self.glyph_cnn.char_emb.embedding_dim)  # [B, 55, hid_dim] -> [B, 55, CHAR_EMB]
-        self.decode_inv_str_gru_emb = nn.GRU(self.inv_encoder.str_emb_dim, self.inv_encoder.hid_dim, batch_first=True, bidirectional=True)  # GRU for string decoding, [B*55, 80, emb_dim] -> [B*55, 80, hid_dim * 2]
-        self.decode_inv_str_hidden2emb = nn.Linear(self.inv_encoder.hid_dim * 2, self.inv_encoder.str_emb_dim)  # [B*55, 80, hid_dim * 2] -> [B*55, 80, str_emb]
-        
         # ------------- Decode logits ----------------
         # These will take the embedding as starting point
         
@@ -794,29 +728,28 @@ class MultiModalHackVAE(nn.Module):
         # messages - use extended vocabulary to include SOS/EOS tokens
         self.decode_msg = nn.Linear(self.msg_gru.emb_dim, self.msg_gru.vocab)  # [B, T, emb_dim] -> [B, T, vocab_size]
         
-        self.decode_inv_class = nn.Linear(self.glyph_cnn.char_emb.embedding_dim, INV_OCLASS_DIM)  # [B, 55, CHAR_EMB] -> [B, 55, INV_OCLASS_DIM]
-        self.decode_inv_str = nn.Linear(self.inv_encoder.str_emb_dim, self.inv_encoder.vocab)  # [B, 55, 80, str_emb] -> [B, 55, 80, MSG_VOCAB + 2]
-        
         # Dynamic prediction heads
         # It takes latent z, action a, HDP HMM state h and hero info c
         # TODO: Implement dynamic prediction heads
         
 
+    def encode(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None):
+        """
+        Encodes the input features into a latent space.
         
-
-    def _reparameterise(self, mu, logvar, lowrank_factors=None):
-        diag_std = torch.exp(0.5*logvar)
-        eps1 = torch.randn_like(diag_std)
-        z = mu + diag_std*eps1
-        if lowrank_factors is not None:
-            # If low-rank factors are provided, combine them with the diagonal std
-            eps2 = torch.randn((lowrank_factors.size(0), lowrank_factors.size(2)), device=lowrank_factors.device)  # [B, RANK]
-            # Assuming lowrank_factors is [B, LATENT_DIM, RANK]
-            lowrank_std = torch.bmm(lowrank_factors, eps2.unsqueeze(-1)).squeeze(-1)  # [B, LATENT_DIM]
-            z += lowrank_std
-        return z    # [B, LATENT_DIM]
-
-    def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None, inv_oclasses=None, inv_strs=None):
+        Args:
+            glyph_chars: [B, 20, 21, 79] - character glyphs
+            glyph_colors: [B, 4, 21, 79] - color glyphs
+            blstats: [B, BLSTATS_DIM] - baseline stats
+            msg_tokens: [B, 256] - message tokens (padded)
+            hero_info: [B, 4] - hero information
+                    
+        Returns:
+            mu: [B, LATENT_DIM] - mean of the latent distribution
+            logvar_diag: [B, LATENT_DIM] - diagonal log variance of the latent distribution  
+            lowrank_factors: [B, LATENT_DIM, LOW_RANK] - low-rank factors if applicable
+        """
+        
         # glyphs
         if glyph_chars.size(0) != glyph_colors.size(0):
             raise ValueError("glyph_chars and glyph_colors must have the same batch size.")
@@ -857,20 +790,6 @@ class MultiModalHackVAE(nn.Module):
         else:
             hero_emb_dict = None
         
-        # Inventory encoding (optional)
-        if self.include_inventory and inv_oclasses is not None and inv_strs is not None:
-            inv_features, inv_oclasses_emb_no_shift, inv_str_emb_no_shift = self.inv_encoder(self.glyph_cnn, inv_oclasses, inv_strs)  # [B, output_dim]
-            features.append(inv_features)
-            inv_oclasses_shift, inv_strs_shift, inv_oclasses_emb_shift, inv_strs_emb_shift = self.inv_encoder.teacher_forcing_decorator(self.glyph_cnn, inv_oclasses, inv_strs)  # [B, 55], [B, 55, 80], [B, 55, CHAR_EMB], [B, 55, 80, str_emb]
-        else:
-            inv_features = None
-            inv_oclasses_emb_no_shift = None
-            inv_str_emb_no_shift = None
-            inv_oclasses_shift = None
-            inv_strs_shift = None
-            inv_oclasses_emb_shift = None
-            inv_strs_emb_shift = None
-        
         fused = torch.cat(features, dim=-1)
         
         # Encode to latent space
@@ -878,8 +797,58 @@ class MultiModalHackVAE(nn.Module):
         mu = self.mu_head(h)
         logvar_diag = self.logvar_diag_head(h)
         lowrank_factors = self.lowrank_factor_head(h).view(B, LATENT_DIM, LOW_RANK) if self.lowrank_factor_head is not None else None
-        z = self._reparameterise(mu, logvar_diag, lowrank_factors)
+        
+        return {
+            'mu': mu,  # [B, LATENT_DIM]
+            'logvar_diag': logvar_diag,  # [B, LATENT_DIM]
+            'lowrank_factors': lowrank_factors,  # [B, LATENT_DIM, LOW_RANK] or None
+            'target_char_emb': char_emb,  # [B, 16, 21, 79]
+            'target_color_emb': color_emb,  # [B, 4, 21, 79]
+            'target_glyph_bag_emb': glyph_bag_emb,  # [B, max_len, 20] or None
+            'target_stats_emb': stats_emb,  # [B, 43]
+            'target_msg_emb': msg_emb_no_shift,  # [B, T, emb_dim]
+            'target_glyph_bag': glyph_bag,  # [B, max_len, 2]
+            'target_hero_emb': hero_emb_dict,  # dict of hero embeddings or None
+            
+            'msg_token_shift': msg_token_shift,  # [B, 256]
+            'msg_emb_shift': msg_emb_shift,  # [B, 256, emb_dim]
+        }
+          
+    def _reparameterise(self, mu, logvar, lowrank_factors=None):
+        diag_std = torch.exp(0.5*logvar)
+        eps1 = torch.randn_like(diag_std)
+        z = mu + diag_std*eps1
+        if lowrank_factors is not None:
+            # If low-rank factors are provided, combine them with the diagonal std
+            eps2 = torch.randn((lowrank_factors.size(0), lowrank_factors.size(2)), device=lowrank_factors.device)  # [B, RANK]
+            # Assuming lowrank_factors is [B, LATENT_DIM, RANK]
+            lowrank_std = torch.bmm(lowrank_factors, eps2.unsqueeze(-1)).squeeze(-1)  # [B, LATENT_DIM]
+            z += lowrank_std
+        return z    # [B, LATENT_DIM]
 
+    def decode(self, z, msg_token_shift=None, msg_emb_shift=None, training_mode=False, max_length=256, temperature=1.0,
+               top_k=5, top_p=0.9):
+        """
+        Decodes the latent variable z into observations.
+        
+        Args:
+            z: [B, LATENT_DIM] - latent variable
+            msg_token_shift: [B, 256] - shifted message tokens (optional, for teacher forcing)
+            msg_emb_shift: [B, 256, emb_dim] - shifted message embeddings (optional, for teacher forcing)
+            training_mode: bool - whether to use training mode (True for training, False for generation)
+            max_length: int - maximum sequence length for autoregressive generation
+            temperature: float - temperature for sampling (default 1.0)
+            top_k: int - top-k sampling (default 5)
+            top_p: float - top-p sampling (default 0.9)
+        
+        Returns:
+            dict with decoded observations and embeddings
+        """
+        
+        # Get batch size and device
+        B = z.size(0)
+        device = z.device
+        
         # Decode
         shared_features = self.decode_shared(z)  # [B, 256]
         
@@ -887,54 +856,82 @@ class MultiModalHackVAE(nn.Module):
         glyph_emb_decoded = self.decode_glyph_emb(shared_features)  # [B, 20, 21, 79]
         stats_emb_decoded = self.decode_stats_emb(shared_features)  # [B, 43]
         
-        # Message decoding - autoregressive GRU decoding with proper hidden state
+        # Message decoding - support both teacher forcing and autoregressive generation
         msg_hidden_init = self.decode_msg_latent2hidden(shared_features)  # [B, 256] -> [B, hid_dim]
-        # Use teacher forcing - pass the shifted embeddings through GRU
-        msg_lengths = (msg_token_shift != 0).sum(dim=1)  # [B,] - count non-padding tokens
-        packed_msg_emb_shift = nn.utils.rnn.pack_padded_sequence(
-            msg_emb_shift, lengths=msg_lengths.cpu(),
-            batch_first=True, enforce_sorted=False
-        )
-        # Decode messages using GRU
-        packed_msg_hidden_decoded, _ = self.decode_msg_gru(packed_msg_emb_shift, msg_hidden_init.unsqueeze(0))  # hidden: [1, B, hid_dim]
-        # Unpack the output - pad back to original length (256)
-        msg_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(packed_msg_hidden_decoded, batch_first=True, total_length=msg_emb_shift.size(1))
-        # Convert hidden states back to embeddings
-        msg_emb_decoded = self.decode_msg_hidden2emb(msg_hidden_decoded)  # [B, 256, hid_dim] -> [B, 256, emb_dim]
         
-        if self.include_inventory and inv_oclasses is not None and inv_strs is not None:
-            # Decode inventory embeddings
-            inv_hidden = self.decode_inv_latent2hidden(shared_features)  # [B, 256] -> [B, hid_dim * 3]
-            # Decode object classes using RNN
-            inv_oclass_lengths = (inv_oclasses_shift != 18).sum(dim=1)  # [B,] - count non-padding object classes
-            packed_inv_oclass_emb_shift = nn.utils.rnn.pack_padded_sequence(
-                inv_oclasses_emb_shift, lengths=inv_oclass_lengths.cpu(),
+        if training_mode and msg_emb_shift is not None:
+            # TRAINING MODE: Use teacher forcing with ground truth shifted sequences
+            msg_lengths = (msg_token_shift != 0).sum(dim=1)  # [B,] - count non-padding tokens
+            packed_msg_emb_shift = nn.utils.rnn.pack_padded_sequence(
+                msg_emb_shift, lengths=msg_lengths.cpu(),
                 batch_first=True, enforce_sorted=False
             )
-            packed_inv_oclass_decoded, _ = self.decode_inv_class_rnn_emb(packed_inv_oclass_emb_shift, inv_hidden[:, :self.inv_encoder.hid_dim].unsqueeze(0))  # hidden: [1, B, hid_dim]
-            inv_oclasses_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(packed_inv_oclass_decoded, batch_first=True)  # [B, 55, hid_dim]
-            inv_oclasses_emb_decoded = self.decode_inv_class_hidden2emb(inv_oclasses_hidden_decoded)  # [B, 55, hid_dim] -> [B, 55, CHAR_EMB]
+            # Decode messages using GRU
+            packed_msg_hidden_decoded, _ = self.decode_msg_gru(packed_msg_emb_shift, msg_hidden_init.unsqueeze(0))
+            # Unpack the output - pad back to original length
+            msg_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(
+                packed_msg_hidden_decoded, batch_first=True, total_length=msg_emb_shift.size(1)
+            )
+            # Convert hidden states back to embeddings
+            msg_emb_decoded = self.decode_msg_hidden2emb(msg_hidden_decoded)  # [B, 256, hid_dim] -> [B, 256, emb_dim]
+            # Message decoding - GRU approach with proper teacher forcing
+            msg_logits = self.decode_msg(msg_emb_decoded)  # [B, 256, emb_dim] -> [B, 256, MSG_VOCAB]
+            generated_tokens = None  # Not generated in teacher forcing mode
             
-            inv_str_lengths = (inv_strs_shift.view(B * INV_MAX_SIZE, -1) != 0).sum(dim=-1)  # [B*55, ] - count non-padding characters
-            packed_inv_str_emb_shift = nn.utils.rnn.pack_padded_sequence(
-                inv_strs_emb_shift.view(B * INV_MAX_SIZE, INV_STR_LEN, self.inv_encoder.str_emb_dim), 
-                lengths=inv_str_lengths.cpu(),
-                batch_first=True, enforce_sorted=False
-            )
-            packed_inv_str_decoded, _ = self.decode_inv_str_gru_emb(packed_inv_str_emb_shift, inv_hidden[:, self.inv_encoder.hid_dim:].unsqueeze(0))  # hidden: [1, B*55, hid_dim * 2]
-            inv_str_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(packed_inv_str_decoded, batch_first=True)  # [B*55, 80, hid_dim * 2]
-            inv_str_emb_decoded = self.decode_inv_str_hidden2emb(inv_str_hidden_decoded)  # [B*55, 80, hid_dim * 2] -> [B, 55, 80, str_emb]
-            inv_str_emb_decoded = inv_str_emb_decoded.view(B, INV_MAX_SIZE, INV_STR_LEN, self.inv_encoder.str_emb_dim)
         else:
-            inv_oclasses_emb_decoded = None
-            inv_str_emb_decoded = None
+            # GENERATION MODE: Autoregressive generation without teacher forcing
+            generated_tokens = torch.zeros(B, max_length, dtype=torch.long, device=device)
+            # Assume we have a start-of-sequence token (index 1) and end-of-sequence token (index 2)
+            generated_tokens[:, 0] = self.msg_gru.sos_token  # Start with SOS token
+
+            msg_emb_decoded = torch.zeros(B, max_length, self.msg_gru.emb_dim, device=device)
+            msg_logits = torch.zeros(B, max_length, self.msg_gru.vocab, device=device)  # [B, T, vocab_size]
+            # Initialize hidden state
+            hidden = msg_hidden_init.unsqueeze(0)  # [1, B, hid_dim] for GRU
             
-        
+            # Generate step by step
+            for t in range(max_length - 1):
+                # Get embedding for current token
+                current_token = generated_tokens[:, t]  # [B]
+                current_emb = self.msg_gru.emb(current_token).unsqueeze(1)  # [B, 1, emb_dim]
+                
+                # Run GRU for one step
+                gru_out, hidden = self.decode_msg_gru(current_emb, hidden)  # gru_out: [B, 1, hid_dim]
+                
+                # Convert hidden to embedding
+                step_emb = self.decode_msg_hidden2emb(gru_out.squeeze(1))  # [B, emb_dim]
+                msg_emb_decoded[:, t] = step_emb
+                
+                # Get logits and sample next token
+                step_logits = self.decode_msg(step_emb.unsqueeze(1))  # [B, 1, vocab_size]
+                msg_logits[:, t] = step_logits.squeeze(1)  # [B, vocab_size]
+                
+                # sampling
+                next_token = self.msg_gru.sample_from_logits(
+                    step_logits.squeeze(1), 
+                    temperature=temperature, 
+                    top_k=top_k, 
+                    top_p=top_p
+                )  # [B]
+                
+                generated_tokens[:, t + 1] = next_token
+                
+                # Early stopping if all sequences have generated EOS
+                if torch.all(next_token == self.msg_gru.eos_token):
+                    break
+            
         # logits
         # char logits takes first 16 channels of glyph_emb_decoded
         # color logits takes last 4 channels of glyph_emb_decoded
         char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 96, 21, 79]
         color_logits = self.decode_colors(glyph_emb_decoded[:, CHAR_EMB:, :, :])  # [B, 4, 21, 79] -> [B, 16, 21, 79]
+        generated_chars, generated_colors = self.glyph_cnn.sample_from_logits(
+            char_logits, 
+            color_logits, 
+            temperature=temperature, 
+            top_k=top_k, 
+            top_p=top_p
+        )
         
         # Decode stats - separate into continuous and discrete components
         stats_continuous_normalized = self.decode_stats_continuous(stats_emb_decoded)  # [B, 19]
@@ -949,24 +946,11 @@ class MultiModalHackVAE(nn.Module):
         dungeon_number_logits = self.decode_dungeon_number(stats_emb_decoded)  # [B, 11]
         level_number_logits = self.decode_level_number(stats_emb_decoded)      # [B, 51]
         condition_mask_logits = self.decode_condition_mask(stats_emb_decoded)  # [B, 13]
-        
-        # Message decoding - GRU approach with proper teacher forcing
-        msg_logits = self.decode_msg(msg_emb_decoded)  # [B, 256, emb_dim] -> [B, 256, MSG_VOCAB]
-        
-        if self.include_inventory and inv_oclasses is not None and inv_strs is not None:
-            # Decode inventory logits
-            inv_oclasses_logits = self.decode_inv_class(inv_oclasses_emb_decoded)  # [B, 55, CHAR_EMB] -> [B, 55, INV_OCLASS_DIM]
-            inv_strs_logits = self.decode_inv_str(inv_str_emb_decoded)  # [B, 55, 80, str_emb] -> [B, 55, 80, MSG_VOCAB + 2]
-        else:
-            inv_oclasses_logits = None
-            inv_strs_logits = None
 
         return {
             'glyph_emb_decoded': glyph_emb_decoded,  # [B, 20, 21, 79]
             'stats_emb_decoded': stats_emb_decoded,  # [B, 43]
             'msg_emb_decoded': msg_emb_decoded,  # [B, 256, emb_dim]
-            'inv_oclasses_emb_decoded': inv_oclasses_emb_decoded,  # [B, 55, CHAR_EMB]
-            'inv_str_emb_decoded': inv_str_emb_decoded,  # [B, 55, 80, str_emb]
             'char_logits': char_logits, # [B, 256, 21, 79]
             'color_logits': color_logits,  # [B, 16, 21, 79]
             'stats_continuous': stats_continuous,  # [B, 19]
@@ -975,22 +959,40 @@ class MultiModalHackVAE(nn.Module):
             'level_number_logits': level_number_logits,  # [B, 51]
             'condition_mask_logits': condition_mask_logits,  # [B, 13]
             'msg_logits': msg_logits, # [B, 256, MSG_VOCAB]
-            'inv_oclasses_logits': inv_oclasses_logits,  # [B, 55, INV_OCLASS_DIM]
-            'inv_strs_logits': inv_strs_logits,  # [B, 55, 80, MSG_VOCAB + 2]
-            'target_char_emb': char_emb,  # [B, 16, H, W]
-            'target_color_emb': color_emb,  # [B, 4, H, W]  
-            'target_stats_emb': stats_emb,  # [B, emb_dim]
-            'target_msg_emb': msg_emb_no_shift,  # [B, T, emb_dim]
-            'target_glyph_bag_emb': glyph_bag_emb,  # [B, max_len, 20]
-            'target_glyph_bag': glyph_bag,  # [B, max_len, 2] - for glyph bag reconstruction loss
-            'target_hero_emb': hero_emb_dict,  # dict of embeddings
-            'target_inv_oclassess_emb': inv_oclasses_emb_no_shift,  # [B, 55, CHAR_EMB]
-            'target_inv_strs_emb': inv_str_emb_no_shift,  # [B, 55, 80, str_emb]
-            'mu': mu, # [B, LATENT_DIM]
-            'logvar': logvar_diag, # [B, LATENT_DIM]
-            'lowrank_factors': lowrank_factors # [B, LATENT_DIM, LOW_RANK]
+            'generated_chars': generated_chars,  # [B, 21, 79]
+            'generated_colors': generated_colors,  # [B, 21, 79]
+            'generated_tokens': generated_tokens,  # [B, max_length] or None if teacher forcing
         }
 
+    def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None, training_mode=True, temperature=1.0, top_k=5, top_p=0.9):
+        
+        encoded_vars = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
+        
+        mu = encoded_vars['mu']  # [B, LATENT_DIM]
+        logvar_diag = encoded_vars['logvar_diag']  # [B, LATENT_DIM]
+        lowrank_factors = encoded_vars['lowrank_factors']
+        
+        msg_token_shift = encoded_vars['msg_token_shift']  # [B, 256]
+        msg_emb_shift = encoded_vars['msg_emb_shift']  # [B, 256, emb_dim]
+        
+        z = self._reparameterise(mu, logvar_diag, lowrank_factors)
+        
+        # Decode with teacher forcing (training mode)
+        decoded_vars = self.decode(
+            z, 
+            msg_token_shift=msg_token_shift,
+            msg_emb_shift=msg_emb_shift,
+            training_mode=training_mode,  # Use teacher forcing during training
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p
+        )
+
+        return {
+            **encoded_vars,  # Contains mu, logvar, embeddings, etc.
+            **decoded_vars   # Contains all decoded outputs including generated_tokens
+        }
+        
     def get_dropout_config(self):
         """
         Get dropout configuration for logging and debugging
@@ -1015,8 +1017,6 @@ def vae_loss(
     blstats, 
     msg_tokens,
     valid_screen,
-    inv_oclasses=None, 
-    inv_strs=None, 
     raw_modality_weights={'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0, 'inv_oclass': 1.0, 'inv_str': 1.0},
     emb_modality_weights={'char_emb': 0.1, 'color_emb': 0.1, 'stats_emb': 5.0, 'msg_emb': 0.1, 'inv_oclasses_emb': 1.0, 'inv_strs_emb': 1.0},
     weight_emb=1.0, 
@@ -1181,30 +1181,6 @@ def vae_loss(
     msg_loss_per_sample = msg_loss_per_token.view(msg_logits.size(0), -1).sum(dim=1)  # [B] - sum over seq_len
     raw_losses['msg'] = msg_loss_per_sample[valid_screen].mean()  # Average over valid samples
     
-    # Inventory reconstruction (optional) - sum over inventory dimensions for each sample, average over valid samples
-    inv_oclasses_logits = model_output['inv_oclasses_logits']
-    inv_strs_logits = model_output['inv_strs_logits']
-    if inv_oclasses_logits is not None and inv_strs_logits is not None and inv_oclasses is not None and inv_strs is not None:
-        # Object class reconstruction - sum over inventory slots for each sample
-        inv_oclass_loss_per_token = F.cross_entropy(
-            inv_oclasses_logits.view(-1, INV_OCLASS_DIM), 
-            inv_oclasses.view(-1), 
-            reduction='none', 
-            ignore_index=18  # Padding index
-        )  # [B*inv_slots]
-        inv_oclass_loss_per_sample = inv_oclass_loss_per_token.view(inv_oclasses_logits.size(0), -1).sum(dim=1)  # [B] - sum over inv_slots
-        raw_losses['inv_oclasses'] = inv_oclass_loss_per_sample[valid_screen].mean()
-        
-        # String reconstruction - sum over inventory slots and string length for each sample
-        inv_str_loss_per_token = F.cross_entropy(
-            inv_strs_logits.view(-1, MSG_VOCAB + 2), 
-            inv_strs.view(-1), 
-            reduction='none', 
-            ignore_index=0  # Padding index
-        )  # [B*inv_slots*str_len]
-        inv_str_loss_per_sample = inv_str_loss_per_token.view(inv_strs_logits.size(0), -1).sum(dim=1)  # [B] - sum over inv_slots*str_len
-        raw_losses['inv_strs'] = inv_str_loss_per_sample[valid_screen].mean()
-    
     # ============= Embedding Reconstruction Losses =============
     emb_losses = {}
     
@@ -1227,13 +1203,6 @@ def vae_loss(
     
     # Message embedding loss
     emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded[valid_screen], target_msg_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-    
-    # Inventory embedding loss (optional)
-    inv_oclasses_emb_decoded = model_output['inv_oclasses_emb_decoded'] # [B, 55, CHAR_EMB]
-    inv_str_emb_decoded = model_output['inv_str_emb_decoded'] # [B, 55, 80, str_emb]
-    if inv_oclasses_emb_decoded is not None and inv_str_emb_decoded is not None:
-        emb_losses['inv_oclasses_emb'] = F.mse_loss(inv_oclasses_emb_decoded[valid_screen], model_output['target_inv_oclassess_emb'][valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-        emb_losses['inv_strs_emb'] = F.mse_loss(inv_str_emb_decoded[valid_screen], model_output['target_inv_strs_emb'][valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
     
     # ============= Combine Losses =============
     
