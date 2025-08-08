@@ -604,14 +604,12 @@ class MultiModalHackVAE(nn.Module):
                 nn.LayerNorm(fusion_in),
                 nn.Dropout(self.dropout_rate),
                 nn.Linear(fusion_in, 256), nn.ReLU(),
-                nn.LayerNorm(256),
                 nn.Dropout(self.dropout_rate),
             )
         else:
             self.to_latent = nn.Sequential(
                 nn.LayerNorm(fusion_in),
                 nn.Linear(fusion_in, 256), nn.ReLU(),
-                nn.LayerNorm(256),
             )
         self.latent_dim = LATENT_DIM
         self.lowrank_dim = LOW_RANK
