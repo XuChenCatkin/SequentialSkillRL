@@ -189,6 +189,52 @@ class GlyphCNN(nn.Module):
         x = self.net(glyph_emb)
         feature = x.view(x.size(0), -1)  # [B,64]
         return feature, char_embedding, color_embedding
+    
+    def _filter_topk_topp(self, logits: torch.Tensor, top_k: int, top_p: float):
+        # logits: [B, C, H, W]
+        B, C, H, W = logits.shape
+
+        # ---- top-k ----
+        if top_k > 0 and top_k < C:
+            # kth value per pixel; keep anything >= kth (ties kept)
+            kth_vals = torch.topk(logits, top_k, dim=1).values[:, -1:, :, :]  # [B,1,H,W]
+            logits = logits.masked_fill(logits < kth_vals, float('-inf'))
+
+        # ---- top-p (nucleus) ----
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, dim=1, descending=True)  # [B,C,H,W]
+            probs = F.softmax(sorted_logits, dim=1)
+            cumprobs = probs.cumsum(dim=1)
+
+            remove = cumprobs > top_p                      # remove those past nucleus
+            remove[:, 1:, :, :] = remove[:, :-1, :, :].clone()  # keep at least the first
+            remove[:, 0, :, :] = False
+
+            # also keep anything that was already -inf masked
+            remove = remove | torch.isneginf(sorted_logits)
+
+            to_remove = torch.zeros_like(logits, dtype=torch.bool)
+            to_remove.scatter_(1, sorted_idx, remove)
+            logits = logits.masked_fill(to_remove, float('-inf'))
+
+        return logits
+
+    def _sample_per_pixel(self, logits: torch.Tensor):
+        # logits: [B, C, H, W]
+        B, C, H, W = logits.shape
+        probs = F.softmax(logits, dim=1)
+
+        # Guard: if a row sums to 0 (all -inf -> NaNs), fall back to argmax one-hot
+        probs = torch.nan_to_num(probs, nan=0.0)
+        zero_row = probs.sum(dim=1, keepdim=True) == 0
+        if zero_row.any():
+            argmax = logits.argmax(dim=1, keepdim=True)  # [B,1,H,W]
+            one_hot = torch.zeros_like(probs).scatter_(1, argmax, 1.0)
+            probs = torch.where(zero_row, one_hot, probs)
+
+        flat = probs.permute(0, 2, 3, 1).contiguous().view(-1, C)  # [B*H*W, C]
+        idx = torch.multinomial(flat, 1).squeeze(-1)               # [B*H*W]
+        return idx.view(B, H, W)                                   # [B,H,W]
 
     def sample_from_logits(self, glyph_logits: torch.Tensor, color_logits: torch.Tensor, temperature: float = 1.0, top_k: int = 5, top_p: float = 0.9) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample glyphs from logits.
@@ -207,65 +253,13 @@ class GlyphCNN(nn.Module):
             glyph_logits = glyph_logits / temperature
             color_logits = color_logits / temperature
 
-        # Apply top-k and top-p filtering if needed
-        if top_k > 0:
-            # Top-k filtering - set everything outside top-k to -inf
-            # For [B, C, H, W] tensors, we need to work along the channel dimension (dim=1)
-            top_k_glyph_values, top_k_glyph_indices = torch.topk(glyph_logits, min(top_k, glyph_logits.size(1)), dim=1)
-            glyph_mask = torch.zeros_like(glyph_logits, dtype=torch.bool)
-            glyph_mask.scatter_(1, top_k_glyph_indices, True)
-            glyph_logits = glyph_logits.masked_fill(~glyph_mask, float('-inf'))
-
-            top_k_color_values, top_k_color_indices = torch.topk(color_logits, min(top_k, color_logits.size(1)), dim=1)
-            color_mask = torch.zeros_like(color_logits, dtype=torch.bool)
-            color_mask.scatter_(1, top_k_color_indices, True)
-            color_logits = color_logits.masked_fill(~color_mask, float('-inf'))
-
-        if top_p < 1.0:
-            # Top-p filtering (nucleus sampling)
-            # For [B, C, H, W] tensors, we need to work along the channel dimension (dim=1)
-            # Glyph logits
-            sorted_glyph_logits, sorted_glyph_indices = torch.sort(glyph_logits, descending=True, dim=1)
-            cumulative_glyph_probs = torch.cumsum(F.softmax(sorted_glyph_logits, dim=1), dim=1)
-            sorted_indices_to_remove = cumulative_glyph_probs > top_p
-            # Shift right to keep at least the first (most likely) token
-            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-            sorted_indices_to_remove[:, 0] = False
-            # Convert back to original indices and mask
-            indices_to_remove = torch.zeros_like(glyph_logits, dtype=torch.bool)
-            indices_to_remove.scatter_(1, sorted_glyph_indices, sorted_indices_to_remove)
-            glyph_logits = glyph_logits.masked_fill(indices_to_remove, float('-inf'))
-
-            # Color logits
-            sorted_color_logits, sorted_color_indices = torch.sort(color_logits, descending=True, dim=1)
-            cumulative_color_probs = torch.cumsum(F.softmax(sorted_color_logits, dim=1), dim=1)
-            sorted_indices_to_remove = cumulative_color_probs > top_p
-            # Shift right to keep at least the first (most likely) token
-            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-            sorted_indices_to_remove[:, 0] = False
-            # Convert back to original indices and mask
-            indices_to_remove = torch.zeros_like(color_logits, dtype=torch.bool)
-            indices_to_remove.scatter_(1, sorted_color_indices, sorted_indices_to_remove)
-            color_logits = color_logits.masked_fill(indices_to_remove, float('-inf'))
+        filtered_glyph_logits = self._filter_topk_topp(glyph_logits, top_k, top_p)
+        filtered_color_logits = self._filter_topk_topp(color_logits, top_k, top_p)
         
         # Sample from the filtered logits
-        # For [B, C, H, W] tensors, we apply softmax along the channel dimension
-        glyph_probs = F.softmax(glyph_logits, dim=1)  # [B, CHAR_DIM, H, W]
-        color_probs = F.softmax(color_logits, dim=1)  # [B, COLOR_DIM, H, W]
-        
-        # Reshape for multinomial sampling: [B, C, H, W] -> [B*H*W, C]
-        B, C_glyph, H, W = glyph_logits.shape
-        _, C_color, _, _ = color_logits.shape
-        
-        glyph_probs_flat = glyph_probs.permute(0, 2, 3, 1).contiguous().view(-1, C_glyph)  # [B*H*W, CHAR_DIM]
-        color_probs_flat = color_probs.permute(0, 2, 3, 1).contiguous().view(-1, C_color)  # [B*H*W, COLOR_DIM]
-        
-        glyph_samples_flat = torch.multinomial(glyph_probs_flat, 1).squeeze(-1)  # [B*H*W]
-        color_samples_flat = torch.multinomial(color_probs_flat, 1).squeeze(-1)  # [B*H*W]
-        
-        glyph_samples = glyph_samples_flat.view(B, H, W)  # [B, H, W]
-        color_samples = color_samples_flat.view(B, H, W)  # [B, H, W]
-        
+        glyph_samples = self._sample_per_pixel(filtered_glyph_logits)
+        color_samples = self._sample_per_pixel(filtered_color_logits)
+
         # Convert samples back to original range
         glyph_samples = glyph_samples + 32  # Shift back to [32, 127]
         return glyph_samples, color_samples
