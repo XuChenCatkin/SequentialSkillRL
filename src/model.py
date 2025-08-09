@@ -191,7 +191,14 @@ class GlyphCNN(nn.Module):
         return feature, char_embedding, color_embedding
 
     def sample_from_logits(self, glyph_logits: torch.Tensor, color_logits: torch.Tensor, temperature: float = 1.0, top_k: int = 5, top_p: float = 0.9) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample glyphs from logits."""
+        """Sample glyphs from logits.
+        Args:
+            glyph_logits (torch.Tensor): Logits for glyph characters, [B, CHAR_DIM, H, W].
+            color_logits (torch.Tensor): Logits for glyph colors, [B, COLOR_DIM, H, W].
+            temperature (float): Temperature for sampling.
+            top_k (int): Top-k filtering.
+            top_p (float): Top-p (nucleus) filtering.
+        """
         # Sample from categorical distributions
         # Apply temperature scaling and top-k/top-p filtering if needed
         if temperature <= 0:
@@ -202,31 +209,62 @@ class GlyphCNN(nn.Module):
 
         # Apply top-k and top-p filtering if needed
         if top_k > 0:
-            # Top-k filtering
-            top_k_glyph_values, top_k_glyph_indices = torch.topk(glyph_logits, top_k, dim=-1)
-            glyph_logits = torch.zeros_like(glyph_logits).scatter_(-1, top_k_glyph_indices, top_k_glyph_values)
-            top_k_color_values, top_k_color_indices = torch.topk(color_logits, top_k, dim=-1)
-            color_logits = torch.zeros_like(color_logits).scatter_(-1, top_k_color_indices, top_k_color_values)
+            # Top-k filtering - set everything outside top-k to -inf
+            # For [B, C, H, W] tensors, we need to work along the channel dimension (dim=1)
+            top_k_glyph_values, top_k_glyph_indices = torch.topk(glyph_logits, min(top_k, glyph_logits.size(1)), dim=1)
+            glyph_mask = torch.zeros_like(glyph_logits, dtype=torch.bool)
+            glyph_mask.scatter_(1, top_k_glyph_indices, True)
+            glyph_logits = glyph_logits.masked_fill(~glyph_mask, float('-inf'))
+
+            top_k_color_values, top_k_color_indices = torch.topk(color_logits, min(top_k, color_logits.size(1)), dim=1)
+            color_mask = torch.zeros_like(color_logits, dtype=torch.bool)
+            color_mask.scatter_(1, top_k_color_indices, True)
+            color_logits = color_logits.masked_fill(~color_mask, float('-inf'))
 
         if top_p < 1.0:
             # Top-p filtering (nucleus sampling)
-            sorted_glyph_logits, sorted_indices = torch.sort(glyph_logits, descending=True)
-            cumulative_glyph_probs = torch.cumsum(F.softmax(sorted_glyph_logits, dim=-1), dim=-1)
+            # For [B, C, H, W] tensors, we need to work along the channel dimension (dim=1)
+            # Glyph logits
+            sorted_glyph_logits, sorted_glyph_indices = torch.sort(glyph_logits, descending=True, dim=1)
+            cumulative_glyph_probs = torch.cumsum(F.softmax(sorted_glyph_logits, dim=1), dim=1)
             sorted_indices_to_remove = cumulative_glyph_probs > top_p
-            if sorted_indices_to_remove[..., 1:].sum() > 0:
-                sorted_indices_to_remove[..., 1:] = 0
-                glyph_logits = glyph_logits.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+            # Shift right to keep at least the first (most likely) token
+            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+            sorted_indices_to_remove[:, 0] = False
+            # Convert back to original indices and mask
+            indices_to_remove = torch.zeros_like(glyph_logits, dtype=torch.bool)
+            indices_to_remove.scatter_(1, sorted_glyph_indices, sorted_indices_to_remove)
+            glyph_logits = glyph_logits.masked_fill(indices_to_remove, float('-inf'))
 
-            sorted_color_logits, sorted_indices = torch.sort(color_logits, descending=True)
-            cumulative_color_probs = torch.cumsum(F.softmax(sorted_color_logits, dim=-1), dim=-1)
+            # Color logits
+            sorted_color_logits, sorted_color_indices = torch.sort(color_logits, descending=True, dim=1)
+            cumulative_color_probs = torch.cumsum(F.softmax(sorted_color_logits, dim=1), dim=1)
             sorted_indices_to_remove = cumulative_color_probs > top_p
-            if sorted_indices_to_remove[..., 1:].sum() > 0:
-                sorted_indices_to_remove[..., 1:] = 0
-                color_logits = color_logits.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+            # Shift right to keep at least the first (most likely) token
+            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+            sorted_indices_to_remove[:, 0] = False
+            # Convert back to original indices and mask
+            indices_to_remove = torch.zeros_like(color_logits, dtype=torch.bool)
+            indices_to_remove.scatter_(1, sorted_color_indices, sorted_indices_to_remove)
+            color_logits = color_logits.masked_fill(indices_to_remove, float('-inf'))
         
         # Sample from the filtered logits
-        glyph_samples = torch.multinomial(F.softmax(glyph_logits, dim=-1), 1).squeeze(-1)  # [B, H, W]
-        color_samples = torch.multinomial(F.softmax(color_logits, dim=-1), 1).squeeze(-1)  # [B, H, W]
+        # For [B, C, H, W] tensors, we apply softmax along the channel dimension
+        glyph_probs = F.softmax(glyph_logits, dim=1)  # [B, CHAR_DIM, H, W]
+        color_probs = F.softmax(color_logits, dim=1)  # [B, COLOR_DIM, H, W]
+        
+        # Reshape for multinomial sampling: [B, C, H, W] -> [B*H*W, C]
+        B, C_glyph, H, W = glyph_logits.shape
+        _, C_color, _, _ = color_logits.shape
+        
+        glyph_probs_flat = glyph_probs.permute(0, 2, 3, 1).contiguous().view(-1, C_glyph)  # [B*H*W, CHAR_DIM]
+        color_probs_flat = color_probs.permute(0, 2, 3, 1).contiguous().view(-1, C_color)  # [B*H*W, COLOR_DIM]
+        
+        glyph_samples_flat = torch.multinomial(glyph_probs_flat, 1).squeeze(-1)  # [B*H*W]
+        color_samples_flat = torch.multinomial(color_probs_flat, 1).squeeze(-1)  # [B*H*W]
+        
+        glyph_samples = glyph_samples_flat.view(B, H, W)  # [B, H, W]
+        color_samples = color_samples_flat.view(B, H, W)  # [B, H, W]
         
         # Convert samples back to original range
         glyph_samples = glyph_samples + 32  # Shift back to [32, 127]
@@ -516,18 +554,23 @@ class MessageGRU(nn.Module):
         logits = logits / temperature
 
         # Top-k sampling
-        if top_k is not None:
-            top_k_values, top_k_indices = torch.topk(logits, top_k)
-            logits = torch.zeros_like(logits).scatter_(1, top_k_indices, top_k_values)
+        if top_k is not None and top_k > 0:
+            top_k_values, top_k_indices = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
+            mask = torch.zeros_like(logits, dtype=torch.bool)
+            mask.scatter_(-1, top_k_indices, True)
+            logits = logits.masked_fill(~mask, float('-inf'))
 
         # Top-p sampling
-        if top_p is not None:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
             cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            logits = logits.masked_fill(sorted_indices_to_remove, float('-inf'))
+            sorted_indices_to_remove[..., 0] = False
+            # Convert back to original indices and mask
+            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+            indices_to_remove.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+            logits = logits.masked_fill(indices_to_remove, float('-inf'))
 
         # Sample from the final logits
         probs = torch.softmax(logits, dim=-1)
@@ -798,7 +841,7 @@ class MultiModalHackVAE(nn.Module):
         
         return {
             'mu': mu,  # [B, LATENT_DIM]
-            'logvar_diag': logvar_diag,  # [B, LATENT_DIM]
+            'logvar': logvar_diag,  # [B, LATENT_DIM]
             'lowrank_factors': lowrank_factors,  # [B, LATENT_DIM, LOW_RANK] or None
             'target_char_emb': char_emb,  # [B, 16, 21, 79]
             'target_color_emb': color_emb,  # [B, 4, 21, 79]
@@ -880,7 +923,7 @@ class MultiModalHackVAE(nn.Module):
             # GENERATION MODE: Autoregressive generation without teacher forcing
             generated_tokens = torch.zeros(B, max_length, dtype=torch.long, device=device)
             # Assume we have a start-of-sequence token (index 1) and end-of-sequence token (index 2)
-            generated_tokens[:, 0] = self.msg_gru.sos_token  # Start with SOS token
+            generated_tokens[:, 0] = self.msg_gru.sos  # Start with SOS token
 
             msg_emb_decoded = torch.zeros(B, max_length, self.msg_gru.emb_dim, device=device)
             msg_logits = torch.zeros(B, max_length, self.msg_gru.vocab, device=device)  # [B, T, vocab_size]
@@ -910,12 +953,12 @@ class MultiModalHackVAE(nn.Module):
                     temperature=temperature, 
                     top_k=top_k, 
                     top_p=top_p
-                )  # [B]
+                ).squeeze(-1)  # [B, 1] -> [B]
                 
                 generated_tokens[:, t + 1] = next_token
                 
                 # Early stopping if all sequences have generated EOS
-                if torch.all(next_token == self.msg_gru.eos_token):
+                if torch.all(next_token == self.msg_gru.eos):
                     break
             
         # logits
@@ -923,13 +966,19 @@ class MultiModalHackVAE(nn.Module):
         # color logits takes last 4 channels of glyph_emb_decoded
         char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 96, 21, 79]
         color_logits = self.decode_colors(glyph_emb_decoded[:, CHAR_EMB:, :, :])  # [B, 4, 21, 79] -> [B, 16, 21, 79]
-        generated_chars, generated_colors = self.glyph_cnn.sample_from_logits(
-            char_logits, 
-            color_logits, 
-            temperature=temperature, 
-            top_k=top_k, 
-            top_p=top_p
-        )
+        if training_mode:
+            # During training, we return logits directly
+            generated_chars = None
+            generated_colors = None
+        else:
+            # During generation, sample from logits
+            generated_chars, generated_colors = self.glyph_cnn.sample_from_logits(
+                char_logits, 
+                color_logits, 
+                temperature=temperature, 
+                top_k=top_k, 
+                top_p=top_p
+            )
         
         # Decode stats - separate into continuous and discrete components
         stats_continuous_normalized = self.decode_stats_continuous(stats_emb_decoded)  # [B, 19]
@@ -967,13 +1016,13 @@ class MultiModalHackVAE(nn.Module):
         encoded_vars = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
         
         mu = encoded_vars['mu']  # [B, LATENT_DIM]
-        logvar_diag = encoded_vars['logvar_diag']  # [B, LATENT_DIM]
+        logvar = encoded_vars['logvar']  # [B, LATENT_DIM]
         lowrank_factors = encoded_vars['lowrank_factors']
         
         msg_token_shift = encoded_vars['msg_token_shift']  # [B, 256]
         msg_emb_shift = encoded_vars['msg_emb_shift']  # [B, 256, emb_dim]
         
-        z = self._reparameterise(mu, logvar_diag, lowrank_factors)
+        z = self._reparameterise(mu, logvar, lowrank_factors)
         
         # Decode with teacher forcing (training mode)
         decoded_vars = self.decode(
