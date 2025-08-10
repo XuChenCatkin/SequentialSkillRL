@@ -855,16 +855,16 @@ class MultiModalHackVAE(nn.Module):
         # Separate heads for char and color reconstruction
         # these will return logits for each pixel
         self.decode_occupy = nn.Sequential(
-            nn.Linear(CHAR_EMB, 8), nn.ReLU(),  # [B, 16, 21, 79] -> [B, 8, 21, 79]
-            nn.Linear(8, 1)  # [B, 8, 21, 79] -> [B, 1, 21, 79] (occupy logits)
+            nn.Linear(CHAR_EMB, 8), nn.ReLU(),  # [B, 21, 79, 16] -> [B, 21, 79, 8]
+            nn.Linear(8, 1)  # [B, 21, 79, 8] -> [B, 21, 79, 1] (occupy logits)
         )
         self.decode_chars = nn.Sequential(
-            nn.Linear(CHAR_EMB, 32), nn.ReLU(),  # [B, 16, 21, 79] -> [B, 32, 21, 79]
-            nn.Linear(32, CHAR_DIM)  # [B, 32, 21, 79] -> [B, CHAR_DIM, 21, 79] (char logits)
+            nn.Linear(CHAR_EMB, 32), nn.ReLU(),  # [B, 21, 79, 16] -> [B, 21, 79, 32]
+            nn.Linear(32, CHAR_DIM)  # [B, 21, 79, 32] -> [B, 21, 79, CHAR_DIM] (char logits)
         )
         self.decode_colors = nn.Sequential(
-            nn.Linear(COLOR_EMB, 8), nn.ReLU(),  # [B, 4, 21, 79] -> [B, 8, 21, 79]
-            nn.Linear(8, COLOR_DIM)  # [B, 8, 21, 79] -> [B, COLOR_DIM, 21, 79] (color logits)
+            nn.Linear(COLOR_EMB, 8), nn.ReLU(),  # [B, 21, 79, 4] -> [B, 21, 79, 8]
+            nn.Linear(8, COLOR_DIM)  # [B, 21, 79, 8] -> [B, 21, 79, COLOR_DIM] (color logits)
         )
 
         # Note: glyph bag reconstruction is derived from char/color logits
@@ -1102,9 +1102,9 @@ class MultiModalHackVAE(nn.Module):
         # logits
         # char logits takes first 16 channels of glyph_emb_decoded
         # color logits takes last 4 channels of glyph_emb_decoded
-        occupy_logits = self.decode_occupy(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 1, 21, 79]
-        char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 96, 21, 79]
-        color_logits = self.decode_colors(glyph_emb_decoded[:, CHAR_EMB:, :, :])  # [B, 4, 21, 79] -> [B, 16, 21, 79]
+        occupy_logits = self.decode_occupy(glyph_emb_decoded[:, :CHAR_EMB, :, :].permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # [B, 16, 21, 79] -> [B, 1, 21, 79]
+        char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :].permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # [B, 16, 21, 79] -> [B, 96, 21, 79]
+        color_logits = self.decode_colors(glyph_emb_decoded[:, CHAR_EMB:, :, :].permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # [B, 4, 21, 79] -> [B, 16, 21, 79]
         if training_mode:
             # During training, we return logits directly
             generated_occupy = None
