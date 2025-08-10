@@ -15,7 +15,7 @@ poetry install
 
 In terminal, run
 ```
-eval $(poetry env activate)
+source $(poetry env info --path)/bin/activate
 ```
 to activate the venv created by poetry.
 
