@@ -970,6 +970,8 @@ def train_multimodalhack_vae(
     total_correlation_beta_multiplier: float = 1.0,
     free_bits: float = 0.0,
     warmup_epoch_ratio: float = 0.3,
+    focal_loss_alpha: float = 0.75,
+    focal_loss_gamma: float = 2.0,
     
     # Dropout and regularization parameters
     dropout_rate: float = 0.0,
@@ -1034,9 +1036,36 @@ def train_multimodalhack_vae(
         total_correlation_beta_multiplier: Multiplier for total correlation KL loss
         free_bits: Target free bits for KL loss (0.0 disables)
         warmup_epoch_ratio: Ratio of epochs for warm-up phase
+        focal_loss_alpha: Alpha parameter for focal loss (0.0 disables)
+        focal_loss_gamma: Gamma parameter for focal loss (0.0 disables)
         dropout_rate: Dropout rate (0.0-1.0) for regularization. 0.0 disables dropout
         enable_dropout_on_latent: Whether to apply dropout to encoder fusion layers
         enable_dropout_on_decoder: Whether to apply dropout to decoder layers
+        save_path: Path to save the trained model
+        save_checkpoints: Whether to save checkpoints during training
+        checkpoint_dir: Directory to save checkpoints
+        save_every_n_epochs: Save checkpoint every N epochs
+        keep_last_n_checkpoints: Keep only last N checkpoints, delete older ones
+        upload_to_hf: Whether to upload model to HuggingFace Hub
+        hf_repo_name: HuggingFace repository name for uploading
+        hf_token: HuggingFace authentication token
+        hf_private: Whether to make the uploaded model private
+        hf_upload_artifacts: Whether to upload artifacts (e.g. datasets)
+        hf_upload_directly: Whether to upload model directly or via artifacts
+        hf_upload_checkpoints: Whether to upload checkpoints to HuggingFace
+        hf_model_card_data: Additional metadata for HuggingFace model card
+        resume_checkpoint_path: Path to resume training from
+        use_wandb: Whether to use Weights & Biases for monitoring
+        wandb_project: Weights & Biases project name
+        wandb_entity: Weights & Biases entity (team/user)
+        wandb_run_name: Name for the Weights & Biases run
+        wandb_tags: Tags for the Weights & Biases run
+        wandb_notes: Notes for the Weights & Biases run
+        log_every_n_steps: Log metrics every N steps
+        log_model_architecture: Whether to log model architecture to Weights & Biases
+        log_gradients: Whether to log gradients to Weights & Biases
+        log_model_weights: Whether to log model weights to Weights & Biases
+        
 
     Returns:
         Tuple of (trained_model, train_losses, test_losses)
@@ -1085,7 +1114,9 @@ def train_multimodalhack_vae(
                 "enable_dropout_on_latent": enable_dropout_on_latent,
                 "enable_dropout_on_decoder": enable_dropout_on_decoder,
                 "total_correlation_beta_multiplier": total_correlation_beta_multiplier,
-                "free_bits": free_bits
+                "free_bits": free_bits,
+                "focal_loss_alpha": focal_loss_alpha,
+                "focal_loss_gamma": focal_loss_gamma
             },
             "checkpointing": {
                 "save_checkpoints": save_checkpoints,
@@ -1128,6 +1159,7 @@ def train_multimodalhack_vae(
     logger.info(f"     - Warmup epochs: {int(warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
     logger.info(f"   Total correlation beta multiplier: {total_correlation_beta_multiplier}")
     logger.info(f"   Free bits: {free_bits}")
+    logger.info(f"   Focal loss: alpha={focal_loss_alpha}, gamma={focal_loss_gamma}")
 
     def get_adaptive_weights(epoch: int, total_epochs: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current epoch"""
@@ -1342,7 +1374,9 @@ def train_multimodalhack_vae(
                     weight_raw=weight_raw,
                     kl_beta=kl_beta,
                     total_correlation_beta_multiplier=total_correlation_beta_multiplier,
-                    free_bits=free_bits
+                    free_bits=free_bits,
+                    focal_loss_alpha=focal_loss_alpha,
+                    focal_loss_gamma=focal_loss_gamma
                 )
 
                 train_loss = train_loss_dict['total_loss']
@@ -1379,6 +1413,7 @@ def train_multimodalhack_vae(
                         
                         # Loss components
                         "train/raw_loss/total": train_loss_dict['total_raw_loss'].item(),
+                        "train/raw_loss/occupancy": train_loss_dict['raw_losses']['occupy'].item(),
                         "train/raw_loss/glyph_chars": train_loss_dict['raw_losses']['char'].item(),
                         "train/raw_loss/glyph_colors": train_loss_dict['raw_losses']['color'].item(),
                         "train/raw_loss/blstats": train_loss_dict['raw_losses']['stats'].item(),
@@ -1482,7 +1517,9 @@ def train_multimodalhack_vae(
                     weight_raw=weight_raw,
                     kl_beta=kl_beta,
                     total_correlation_beta_multiplier=total_correlation_beta_multiplier,
-                    free_bits=free_bits
+                    free_bits=free_bits,
+                    focal_loss_alpha=focal_loss_alpha,
+                    focal_loss_gamma=focal_loss_gamma
                 )
 
                 test_loss = test_loss_dict['total_loss']
@@ -1495,6 +1532,7 @@ def train_multimodalhack_vae(
                         
                         # Loss components
                         "test/raw_loss/total": test_loss_dict['total_raw_loss'].item(),
+                        "test/raw_loss/occupancy": test_loss_dict['raw_losses']['occupy'].item(),
                         "test/raw_loss/glyph_chars": test_loss_dict['raw_losses']['char'].item(),
                         "test/raw_loss/glyph_colors": test_loss_dict['raw_losses']['color'].item(),
                         "test/raw_loss/blstats": test_loss_dict['raw_losses']['stats'].item(),
@@ -1617,6 +1655,11 @@ def train_multimodalhack_vae(
                 },
                 "total_correlation_beta_multiplier": total_correlation_beta_multiplier,
                 "free_bits": free_bits,
+                "focal_loss_alpha": focal_loss_alpha,
+                "focal_loss_gamma": focal_loss_gamma,
+                "dropout_rate": dropout_rate,
+                "enable_dropout_on_latent": enable_dropout_on_latent,
+                "enable_dropout_on_decoder": enable_dropout_on_decoder,
             }
             
             # Merge with user-provided model card data
@@ -1651,8 +1694,8 @@ def train_multimodalhack_vae(
                     'final_train_loss': train_losses[-1],
                     'final_test_loss': test_losses[-1],
                     'model_config': {
-                        'latent_dim': getattr(model, 'latent_dim', 256),
-                        'lowrank_dim': getattr(model, 'lowrank_dim', 4),
+                        'latent_dim': getattr(model, 'latent_dim', 96),
+                        'lowrank_dim': getattr(model, 'lowrank_dim', 0),
                     },
                     'training_timestamp': datetime.now().isoformat(),
                 }, save_path)
@@ -1733,8 +1776,8 @@ def train_multimodalhack_vae(
             'final_train_loss': train_losses[-1],
             'final_test_loss': test_losses[-1],
             'model_config': {
-                'latent_dim': getattr(model, 'latent_dim', 256),
-                'lowrank_dim': getattr(model, 'lowrank_dim', 4),
+                'latent_dim': getattr(model, 'latent_dim', 96),
+                'lowrank_dim': getattr(model, 'lowrank_dim', 0),
             },
             'training_timestamp': datetime.now().isoformat(),
         }, save_path)
@@ -2110,6 +2153,9 @@ def create_visualization_demo(
     device: str = "cpu",
     num_samples: int = 4,
     max_latent_samples: int = 100,
+    sample_temperature: float = 1.0,
+    sample_top_k: int = 5,
+    sample_top_p: float = 0.9,
     save_dir: str = "vae_analysis"
 ) -> Dict:
     """
@@ -2142,7 +2188,7 @@ def create_visualization_demo(
     # Create TTY reconstructions
     print(f"\n2️⃣ Creating TTY reconstruction visualizations...")
     save_path="recon_comparison.md"
-    visualize_reconstructions(model, test_dataset, device, num_samples=num_samples, out_dir=save_dir, save_path=save_path)
+    visualize_reconstructions(model, test_dataset, device, num_samples=num_samples, temperature=sample_temperature, top_k=sample_top_k, top_p=sample_top_p, out_dir=save_dir, save_path=save_path)
 
     # Analyze latent space
     print(f"\n3️⃣ Analyzing latent space...")
@@ -2425,6 +2471,9 @@ if __name__ == "__main__":
                 device="cpu",  # Use CPU for demo
                 num_samples=4,
                 max_latent_samples=50,
+                sample_temperature=1.0,
+                sample_top_k=1,
+                sample_top_p=1.0,
                 save_dir="vae_analysis"
             )
             print(f"✅ Demo completed successfully!")
@@ -2497,6 +2546,8 @@ if __name__ == "__main__":
             warmup_epoch_ratio = 0.4,
             total_correlation_beta_multiplier=15.0,
             free_bits=0.15,
+            focal_loss_alpha=0.75,
+            focal_loss_gamma=2.0,
 
             # Dropout and regularization settings
             dropout_rate=0.1,  # Set to 0.1 for mild regularization

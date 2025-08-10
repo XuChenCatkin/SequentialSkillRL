@@ -120,7 +120,7 @@ def save_maps_and_markdown(
 
     print(f"Wrote Markdown: {md_path}")
 
-def visualize_reconstructions(model, test_dataset, device, num_samples=4, out_dir="vae_analysis", save_path="recon_comparison.md"):
+def visualize_reconstructions(model, test_dataset, device, num_samples=4, temperature=1.0, top_k=5, top_p=0.9, out_dir="vae_analysis", save_path="recon_comparison.md"):
     """
     Visualize VAE reconstructions for NetHack game states using tty_render
     
@@ -164,9 +164,9 @@ def visualize_reconstructions(model, test_dataset, device, num_samples=4, out_di
                 msg_tokens=batch_device['message_chars'][valid_screen][:max(0, num_samples - len(reconstructions))],
                 hero_info=batch_device['hero_info'][valid_screen][:max(0, num_samples - len(reconstructions))],
                 training_mode=False,
-                temperature=1.0,
-                top_k=5,
-                top_p=0.9
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p
             )
             
             # Get most likely character and color for each cell

@@ -1,6 +1,6 @@
 # VAE Reconstruction Comparison
 
-_Generated: 2025-08-09T16:08:48_
+_Generated: 2025-08-09T23:01:07_
 
 ## Sample 0
 
@@ -9,8 +9,8 @@ _Generated: 2025-08-09T16:08:48_
 | ![orig 0](images/sample_000_orig.png) | ![recon 0](images/sample_000_recon.png) |
 
 
- Sample 1 Accuracy:   Character accuracy: 0.882 (1464/1659 cells)
-   Color accuracy: 0.887 (1471/1659 cells)
+ Sample 1 Accuracy:   Character accuracy: 0.894 (1483/1659 cells)
+   Color accuracy: 0.911 (1511/1659 cells)
 
 ================================================================================
 ## Sample 1
@@ -20,8 +20,8 @@ _Generated: 2025-08-09T16:08:48_
 | ![orig 1](images/sample_001_orig.png) | ![recon 1](images/sample_001_recon.png) |
 
 
- Sample 2 Accuracy:   Character accuracy: 0.887 (1471/1659 cells)
-   Color accuracy: 0.898 (1490/1659 cells)
+ Sample 2 Accuracy:   Character accuracy: 0.910 (1510/1659 cells)
+   Color accuracy: 0.918 (1523/1659 cells)
 
 ================================================================================
 ## Sample 2
@@ -31,8 +31,8 @@ _Generated: 2025-08-09T16:08:48_
 | ![orig 2](images/sample_002_orig.png) | ![recon 2](images/sample_002_recon.png) |
 
 
- Sample 3 Accuracy:   Character accuracy: 0.900 (1493/1659 cells)
-   Color accuracy: 0.898 (1490/1659 cells)
+ Sample 3 Accuracy:   Character accuracy: 0.905 (1502/1659 cells)
+   Color accuracy: 0.918 (1523/1659 cells)
 
 ================================================================================
 ## Sample 3
@@ -42,8 +42,8 @@ _Generated: 2025-08-09T16:08:48_
 | ![orig 3](images/sample_003_orig.png) | ![recon 3](images/sample_003_recon.png) |
 
 
- Sample 4 Accuracy:   Character accuracy: 0.881 (1461/1659 cells)
-   Color accuracy: 0.893 (1481/1659 cells)
+ Sample 4 Accuracy:   Character accuracy: 0.907 (1505/1659 cells)
+   Color accuracy: 0.923 (1532/1659 cells)
 
-📈 Overall Reconstruction Statistics:   Average Character Reconstruction Accuracy: 0.887
-   Average Color Reconstruction Accuracy: 0.894
+📈 Overall Reconstruction Statistics:   Average Character Reconstruction Accuracy: 0.904
+   Average Color Reconstruction Accuracy: 0.918

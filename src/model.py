@@ -164,31 +164,154 @@ INV_OCLASS_MAP = {
     18: 128      # MAXOCLASSES, used for padding, use same as PADDING_IDX
 }
 
-class GlyphCNN(nn.Module):
-    """3-layer conv on [B, C= (char_emb+color_emb), H, W]."""
-    def __init__(self):
+def _gn_groups(c: int) -> int:
+    """Pick a sensible GroupNorm group count that divides c."""
+    for g in (32, 16, 8, 4, 2, 1):
+        if c % g == 0:
+            return g
+    return 1
+
+class ConvBlock(nn.Module):
+    """
+    Conv -> GroupNorm -> ReLU -> Dropout.
+    Supports anisotropic kernel/dilation and correct padding.
+    """
+    def __init__(self, c_in, c_out, k=3, dilation=1, drop=0.0):
         super().__init__()
-        self.char_emb = nn.Embedding(CHAR_DIM + 1, CHAR_EMB)
-        self.col_emb  = nn.Embedding(COLOR_DIM + 1, COLOR_EMB)
+        # normalize args to tuples
+        if isinstance(k, int): kh, kw = k, k
+        else: kh, kw = k
+        if isinstance(dilation, int): dh, dw = dilation, dilation
+        else: dh, dw = dilation
+
+        pad_h = dh * (kh // 2)
+        pad_w = dw * (kw // 2)
+
         self.net = nn.Sequential(
-            nn.Conv2d(GLYPH_EMB, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)  # -> [B,64,1,1]
+            nn.Conv2d(c_in, c_out, kernel_size=(kh, kw), padding=(pad_h, pad_w), dilation=(dh, dw)),
+            nn.GroupNorm(num_groups=_gn_groups(c_out), num_channels=c_out),
+            nn.ReLU(),
+            nn.Dropout2d(drop) if drop and drop > 0 else nn.Identity()
         )
+
+    def forward(self, x):
+        res = self.net(x)
+        return res
+    
+class AttnPool(nn.Module):
+    """
+    Masked attention pooling with K learnable queries.
+    Returns either concatenated [B, K*C]
+    """
+    def __init__(self, C: int, K: int = 1):
+        super().__init__()
+        self.Q = nn.Parameter(torch.randn(K, C))
+        self.proj = nn.Linear(C, C, bias=False)
+        # Fallback for fully blank frames (per head)
+        self.empty_vec = nn.Parameter(torch.zeros(C))
+
+    def forward(self, feats: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        feats: [B, C, H, W]
+        mask : [B, 1, H, W] in {0,1}; 1 = keep, 0 = blank
+        """
+        B, C, H, W = feats.shape
+        X = feats.view(B, C, H * W).transpose(1, 2)     # [B, HW, C]
+        X = self.proj(X)                                # [B, HW, C]
+        Q = self.Q                                      # [K, C]
+
+        # scores: [B, K, HW]
+        scores = torch.einsum('bhc,kc->bkh', X, Q)
+        mflat = mask.view(B, 1, H * W)                  # [B, 1, HW]
+        scores = scores.masked_fill(mflat == 0, float('-inf'))
+
+        # identify heads with all -inf (no valid locations)
+        bad = torch.isinf(scores).all(dim=-1)           # [B, K]
+        # safe softmax
+        attn = torch.softmax(scores, dim=-1)            # [B, K, HW]
+        attn = torch.nan_to_num(attn, nan=0.0)
+
+        # pooled per head: [B, K, C]
+        Z = torch.einsum('bkh,bhc->bkc', attn, X)
+
+        if bad.any():
+            # replace bad heads with learnable empty vector
+            Z[bad] = self.empty_vec
+
+        return Z.reshape(B, -1)                     # [B, K*C]
+
+class GlyphCNN(nn.Module):
+    """
+    NetHack map encoder:
+      - char & color embeddings (space can be true padding)
+      - +1 foreground mask channel
+      - +2 CoordConv channels (x,y in [-1,1])
+      - Conv backbone mixing standard & anisotropic dilated convs
+      - Masked attention pooling (K queries) or masked mean
+
+    Forward returns a vector suitable for a VAE encoder MLP or heads.
+    """
+    def __init__(self, dropout=0.0, attn_queries=4, feat_channels=16):
+        super().__init__()
+        self.char_emb = nn.Embedding(CHAR_DIM, CHAR_EMB, padding_idx=0)
+        self.col_emb  = nn.Embedding(COLOR_DIM, COLOR_EMB, padding_idx=0)
+        in_ch = CHAR_EMB + COLOR_EMB + 1  # + foreground mask
+        in_ch += 2 # +2 for CoordConv (x,y in [-1,1])
+
+        # Stem
+        self.stem = ConvBlock(in_ch, 64, k=3, dilation=1, drop=dropout)
+
+        # Body: mix normal and width-focused dilations (map is 21x79)
+        self.body = nn.Sequential(
+            ConvBlock(64, 64, k=3, dilation=1,        drop=dropout),      # local
+            ConvBlock(64, 64, k=3, dilation=(1, 3),   drop=dropout),      # widen RF (width)
+            ConvBlock(64, 64, k=3, dilation=1,        drop=dropout),
+            ConvBlock(64, 96, k=3, dilation=(1, 9),   drop=dropout),
+            ConvBlock(96, feat_channels, k=3, dilation=1, drop=dropout),
+        )
+
+        # Pooling
+        self.pool = AttnPool(C=feat_channels, K=attn_queries)
+        pooled_dim = feat_channels * attn_queries
+
+        # Learnable fallback for fully blank frames (for masked mean path)
+        self.register_parameter('empty_vec', nn.Parameter(torch.zeros(pooled_dim)))
+
+        # Tiny head you can keep or replace downstream
+        self.out_dim = pooled_dim
+        self.norm_out = nn.LayerNorm(self.out_dim)
+
+        nn.init.zeros_(self.empty_vec)  # Initialize empty vector to zero
+        
+    @staticmethod
+    def _coords(B, H, W, device, dtype):
+        yy = torch.linspace(-1, 1, H, device=device, dtype=dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+        xx = torch.linspace(-1, 1, W, device=device, dtype=dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        return yy, xx
 
     def forward(self, glyph_chars: torch.IntTensor, glyph_colors: torch.IntTensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # glyph_chars are in the range of [32, 127] (ASCII codes)
         # shift to [0, 95] for model indices before embedding
         glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Normalize to [0, 95]
+        B, H, W = glyph_chars.shape
+        device = glyph_chars.device
+        fg_mask = (glyph_chars != 0)
+        fg_mask = fg_mask.to(device=device).unsqueeze(1).float()  # [B, 1, H, W]
         char_embedding = self.char_emb(glyph_chars)  # [B, H, W] -> [B, H, W, 16]
         char_embedding = char_embedding.permute(0, 3, 1, 2)  # [B, H, W, 16] -> [B, 16, H, W]
         color_embedding = self.col_emb(glyph_colors)  # [B, H, W] -> [B, H, W, 4]
         color_embedding = color_embedding.permute(0, 3, 1, 2)  # [B, H, W, 4] -> [B, 4, H, W]
-        glyph_emb = torch.cat([char_embedding, color_embedding], dim=1)  # [B, 20, H, W]
-        x = self.net(glyph_emb)
-        feature = x.view(x.size(0), -1)  # [B,64]
-        return feature, char_embedding, color_embedding
+        glyph_emb = torch.cat([char_embedding, color_embedding], dim=1).contiguous()  # [B, 20, H, W]
+        masked_glyph_emb = glyph_emb * fg_mask  # Apply foreground mask, [B, 20, H, W]
+        feats = [masked_glyph_emb, fg_mask]
+        cy, cx = self._coords(B, H, W, device, masked_glyph_emb.dtype)
+        feats += [cy, cx]
+        complete_glyph_emb = torch.cat(feats, dim=1)  # [B, 20+1+2, H, W]
+        x = self.stem(complete_glyph_emb)  # [B, 64, H, W]
+        x = self.body(x)  # [B, C, H, W]
+        x = self.pool(x, fg_mask)  # [B, K*C] - pooled features
+        x = self.norm_out(x)
+        return x, char_embedding, color_embedding
     
     def _filter_topk_topp(self, logits: torch.Tensor, top_k: int, top_p: float):
         # logits: [B, C, H, W]
@@ -236,9 +359,10 @@ class GlyphCNN(nn.Module):
         idx = torch.multinomial(flat, 1).squeeze(-1)               # [B*H*W]
         return idx.view(B, H, W)                                   # [B,H,W]
 
-    def sample_from_logits(self, glyph_logits: torch.Tensor, color_logits: torch.Tensor, temperature: float = 1.0, top_k: int = 5, top_p: float = 0.9) -> tuple[torch.Tensor, torch.Tensor]:
+    def sample_from_logits(self, occupy_logits: torch.Tensor, glyph_logits: torch.Tensor, color_logits: torch.Tensor, temperature: float = 1.0, top_k: int = 5, top_p: float = 0.9) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample glyphs from logits.
         Args:
+            occupy_logits (torch.Tensor): Logits for occupied pixels, [B, 1, H, W].
             glyph_logits (torch.Tensor): Logits for glyph characters, [B, CHAR_DIM, H, W].
             color_logits (torch.Tensor): Logits for glyph colors, [B, COLOR_DIM, H, W].
             temperature (float): Temperature for sampling.
@@ -252,6 +376,12 @@ class GlyphCNN(nn.Module):
         else:
             glyph_logits = glyph_logits / temperature
             color_logits = color_logits / temperature
+        
+        device = glyph_logits.device
+        B, _, H, W = occupy_logits.shape
+        
+        occ_p = torch.sigmoid(occupy_logits).squeeze(1)  # [B,H,W]
+        fg_mask = torch.bernoulli(occ_p.clamp(1e-6, 1-1e-6)).bool()
 
         filtered_glyph_logits = self._filter_topk_topp(glyph_logits, top_k, top_p)
         filtered_color_logits = self._filter_topk_topp(color_logits, top_k, top_p)
@@ -262,11 +392,15 @@ class GlyphCNN(nn.Module):
 
         # Convert samples back to original range
         glyph_samples = glyph_samples + 32  # Shift back to [32, 127]
-        return glyph_samples, color_samples
+        chars_out  = torch.full((B, H, W), 32, dtype=torch.long, device=device)
+        colors_out = torch.full((B, H, W), 0, dtype=torch.long, device=device)
+        chars_out[fg_mask]  = glyph_samples[fg_mask]
+        colors_out[fg_mask] = color_samples[fg_mask]
+        return chars_out, colors_out
 
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
-        return 64
+        return self.out_dim
     
 class GlyphBag(nn.Module):
     """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
@@ -620,7 +754,7 @@ class MultiModalHackVAE(nn.Module):
         self.enable_dropout_on_latent = enable_dropout_on_latent
         self.enable_dropout_on_decoder = enable_dropout_on_decoder
         
-        self.glyph_cnn = GlyphCNN()
+        self.glyph_cnn = GlyphCNN(dropout=self.dropout_rate)
         self.glyph_bag = GlyphBag(logger=self.logger)  # for bag of glyphs
         self.stats_mlp = StatsMLP()
         self.msg_gru   = MessageGRU()
@@ -720,9 +854,19 @@ class MultiModalHackVAE(nn.Module):
         
         # Separate heads for char and color reconstruction
         # these will return logits for each pixel
-        self.decode_chars = nn.Conv2d(CHAR_EMB, CHAR_DIM, kernel_size=1)  # [B, 16, 21, 79] -> [B, 256, 21, 79]
-        self.decode_colors = nn.Conv2d(COLOR_EMB, COLOR_DIM, kernel_size=1)  # [B, 4, 21, 79] -> [B, 16, 21, 79]
-        
+        self.decode_occupy = nn.Sequential(
+            nn.Linear(CHAR_EMB, 8), nn.ReLU(),  # [B, 16, 21, 79] -> [B, 8, 21, 79]
+            nn.Linear(8, 1)  # [B, 8, 21, 79] -> [B, 1, 21, 79] (occupy logits)
+        )
+        self.decode_chars = nn.Sequential(
+            nn.Linear(CHAR_EMB, 32), nn.ReLU(),  # [B, 16, 21, 79] -> [B, 32, 21, 79]
+            nn.Linear(32, CHAR_DIM)  # [B, 32, 21, 79] -> [B, CHAR_DIM, 21, 79] (char logits)
+        )
+        self.decode_colors = nn.Sequential(
+            nn.Linear(COLOR_EMB, 8), nn.ReLU(),  # [B, 4, 21, 79] -> [B, 8, 21, 79]
+            nn.Linear(8, COLOR_DIM)  # [B, 8, 21, 79] -> [B, COLOR_DIM, 21, 79] (color logits)
+        )
+
         # Note: glyph bag reconstruction is derived from char/color logits
         # No separate head needed since glyph bag is just unique combinations of char+color
         
@@ -958,19 +1102,22 @@ class MultiModalHackVAE(nn.Module):
         # logits
         # char logits takes first 16 channels of glyph_emb_decoded
         # color logits takes last 4 channels of glyph_emb_decoded
+        occupy_logits = self.decode_occupy(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 1, 21, 79]
         char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 96, 21, 79]
         color_logits = self.decode_colors(glyph_emb_decoded[:, CHAR_EMB:, :, :])  # [B, 4, 21, 79] -> [B, 16, 21, 79]
         if training_mode:
             # During training, we return logits directly
+            generated_occupy = None
             generated_chars = None
             generated_colors = None
         else:
             # During generation, sample from logits
-            generated_chars, generated_colors = self.glyph_cnn.sample_from_logits(
-                char_logits, 
-                color_logits, 
-                temperature=temperature, 
-                top_k=top_k, 
+            generated_occupy, generated_chars, generated_colors = self.glyph_cnn.sample_from_logits(
+                occupy_logits,
+                char_logits,
+                color_logits,
+                temperature=temperature,
+                top_k=top_k,
                 top_p=top_p
             )
         
@@ -992,6 +1139,7 @@ class MultiModalHackVAE(nn.Module):
             'glyph_emb_decoded': glyph_emb_decoded,  # [B, 20, 21, 79]
             'stats_emb_decoded': stats_emb_decoded,  # [B, 43]
             'msg_emb_decoded': msg_emb_decoded,  # [B, 256, emb_dim]
+            'occupy_logits': occupy_logits,  # [B, 1, 21, 79]
             'char_logits': char_logits, # [B, 256, 21, 79]
             'color_logits': color_logits,  # [B, 16, 21, 79]
             'stats_continuous': stats_continuous,  # [B, 19]
@@ -1000,6 +1148,7 @@ class MultiModalHackVAE(nn.Module):
             'level_number_logits': level_number_logits,  # [B, 51]
             'condition_mask_logits': condition_mask_logits,  # [B, 13]
             'msg_logits': msg_logits, # [B, 256, MSG_VOCAB]
+            'generated_occupy': generated_occupy,  # [B, 21, 79]
             'generated_chars': generated_chars,  # [B, 21, 79]
             'generated_colors': generated_colors,  # [B, 21, 79]
             'generated_tokens': generated_tokens,  # [B, max_length] or None if teacher forcing
@@ -1058,8 +1207,10 @@ def vae_loss(
     blstats, 
     msg_tokens,
     valid_screen,
-    raw_modality_weights={'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0, 'inv_oclass': 1.0, 'inv_str': 1.0},
+    raw_modality_weights={'occupy': 1.0, 'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0, 'inv_oclass': 1.0, 'inv_str': 1.0},
     emb_modality_weights={'char_emb': 0.1, 'color_emb': 0.1, 'stats_emb': 5.0, 'msg_emb': 0.1, 'inv_oclasses_emb': 1.0, 'inv_strs_emb': 1.0},
+    focal_loss_alpha=0.75,
+    focal_loss_gamma=2.0,
     weight_emb=1.0, 
     weight_raw=0.1, 
     kl_beta=1.0,
@@ -1090,6 +1241,7 @@ def vae_loss(
         lowrank_factors = lowrank_factors[valid_screen]  # [valid_B, LATENT_DIM, LOW_RANK]
     
     # Raw reconstruction logits
+    occupy_logits = model_output['occupy_logits']  # [B, 1, 21, 79]
     char_logits = model_output['char_logits']  # [B, 256, 21, 79]
     color_logits = model_output['color_logits']  # [B, 16, 21, 79]
     msg_logits = model_output['msg_logits']  # [B, 256, MSG_VOCAB+2]
@@ -1107,20 +1259,34 @@ def vae_loss(
     raw_losses = {}
     
     # Glyph reconstruction (chars + colors)
+    H, W = glyph_chars.shape[1], glyph_chars.shape[2]
+    fg_mask = (glyph_chars != ord(' ')) # [B, H, W] - foreground mask for valid pixels (non-space characters)
+    ooc_t = fg_mask.float().unsqueeze(1)  # [B, 1, H, W] - foreground mask for occupy logits
     glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Ensure valid range for chars
     
+    occ_p = torch.sigmoid(occupy_logits)  # [B, 1, H, W] - sigmoid for occupy logits
+    occ_ce = F.binary_cross_entropy(occ_p, ooc_t, reduction='none')  # [B, H, W]
+    assert occ_ce.shape == glyph_chars.shape, "occupy logits and glyph chars must have the same shape. But got {} vs {}".format(occ_ce.shape, glyph_chars.shape)
+    p_t = occ_p * ooc_t + (1 - occ_p) * (1 - ooc_t)  # [B, H, W] - probability of foreground
+    alpha_t = focal_loss_alpha * ooc_t + (1-focal_loss_alpha) * (1 - ooc_t)  # [B, H, W]
+    focal_loss_per_sample = (alpha_t * (1 - p_t)**focal_loss_gamma * occ_ce).sum(dim=[1, 2])  # [B] - sum over H, W
+
     # Sum over spatial dimensions for each sample, then average over valid samples
     # char_logits: [B, CHAR_DIM, H, W], glyph_chars: [B, H, W]
     char_loss_per_sample = F.cross_entropy(char_logits, glyph_chars, reduction='none')  # [B, H, W]
+    masked_char_loss_per_sample = char_loss_per_sample * fg_mask.float()  # Apply foreground mask
     color_loss_per_sample = F.cross_entropy(color_logits, glyph_colors, reduction='none')  # [B, H, W]
-    
+    masked_color_loss_per_sample = color_loss_per_sample * fg_mask.float()  # Apply foreground mask
+    masked_num = fg_mask.sum(dim=[1, 2]).clamp(min=1)  # [B] - number of foreground pixels per sample
+
     # Sum over spatial dimensions for each sample
-    char_loss_per_sample = char_loss_per_sample.sum(dim=[1, 2])  # [B] - sum over H, W
-    color_loss_per_sample = color_loss_per_sample.sum(dim=[1, 2])  # [B] - sum over H, W
-    
+    masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2]) / masked_num * H * W  # [B] - sum over H, W
+    masked_color_loss_per_sample = masked_color_loss_per_sample.sum(dim=[1, 2]) / masked_num * H * W  # [B] - sum over H, W
+
     # Average over valid samples only
-    raw_losses['char'] = char_loss_per_sample[valid_screen].mean()
-    raw_losses['color'] = color_loss_per_sample[valid_screen].mean()
+    raw_losses['occupy'] = focal_loss_per_sample[valid_screen].mean()  # Average over valid samples
+    raw_losses['char'] = masked_char_loss_per_sample[valid_screen].mean()
+    raw_losses['color'] = masked_color_loss_per_sample[valid_screen].mean()
 
     # Stats reconstruction - separate losses for continuous and discrete components
     # Extract model outputs
