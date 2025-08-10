@@ -253,8 +253,8 @@ class GlyphCNN(nn.Module):
     """
     def __init__(self, dropout=0.0, attn_queries=4, feat_channels=16):
         super().__init__()
-        self.char_emb = nn.Embedding(CHAR_DIM, CHAR_EMB, padding_idx=0)
-        self.col_emb  = nn.Embedding(COLOR_DIM, COLOR_EMB, padding_idx=0)
+        self.char_emb = nn.Embedding(CHAR_DIM + 1, CHAR_EMB, padding_idx=0)
+        self.col_emb  = nn.Embedding(COLOR_DIM + 1, COLOR_EMB, padding_idx=0)
         in_ch = CHAR_EMB + COLOR_EMB + 1  # + foreground mask
         in_ch += 2 # +2 for CoordConv (x,y in [-1,1])
 
