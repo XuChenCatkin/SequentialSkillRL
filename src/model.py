@@ -184,11 +184,11 @@ class ConvBlock(nn.Module):
         if isinstance(dilation, int): dh, dw = dilation, dilation
         else: dh, dw = dilation
 
-        pad_h = dh * (kh // 2)
-        pad_w = dw * (kw // 2)
+        pad_h, pad_w = dh, dw
 
         self.net = nn.Sequential(
-            nn.Conv2d(c_in, c_out, kernel_size=(kh, kw), padding=(pad_h, pad_w), dilation=(dh, dw)),
+            nn.Conv2d(c_in, c_in, kernel_size=3, padding=(pad_h, pad_w), dilation=(dh, dw), groups=c_in, bias=False),
+            nn.Conv2d(c_in, c_out, kernel_size=1, bias=False),
             nn.GroupNorm(num_groups=_gn_groups(c_out), num_channels=c_out),
             nn.ReLU(),
             nn.Dropout2d(drop) if drop and drop > 0 else nn.Identity()
@@ -206,7 +206,6 @@ class AttnPool(nn.Module):
     def __init__(self, C: int, K: int = 1):
         super().__init__()
         self.Q = nn.Parameter(torch.randn(K, C))
-        self.proj = nn.Linear(C, C, bias=False)
         # Fallback for fully blank frames (per head)
         self.empty_vec = nn.Parameter(torch.zeros(C))
 
@@ -217,7 +216,6 @@ class AttnPool(nn.Module):
         """
         B, C, H, W = feats.shape
         X = feats.view(B, C, H * W).transpose(1, 2)     # [B, HW, C]
-        X = self.proj(X)                                # [B, HW, C]
         Q = self.Q                                      # [K, C]
 
         # scores: [B, K, HW]
@@ -259,29 +257,25 @@ class GlyphCNN(nn.Module):
         in_ch += 2 # +2 for CoordConv (x,y in [-1,1])
 
         # Stem
-        self.stem = ConvBlock(in_ch, 64, k=3, dilation=1, drop=dropout)
-
-        # Body: mix normal and width-focused dilations (map is 21x79)
-        self.body = nn.Sequential(
-            ConvBlock(64, 64, k=3, dilation=1,        drop=dropout),      # local
-            ConvBlock(64, 64, k=3, dilation=(1, 3),   drop=dropout),      # widen RF (width)
-            ConvBlock(64, 64, k=3, dilation=1,        drop=dropout),
-            ConvBlock(64, 96, k=3, dilation=(1, 9),   drop=dropout),
-            ConvBlock(96, feat_channels, k=3, dilation=1, drop=dropout),
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, 48, kernel_size=1, bias=False),
+            nn.GroupNorm(_gn_groups(48), 48),
+            nn.ReLU(),
         )
+
+        # 3 DSConv blocks; mix width-focused dilations
+        self.block1 = ConvBlock(48, 64,  dilation=(1, 3), drop=dropout)
+        self.block2 = ConvBlock(64, 80,  dilation=(1, 9), drop=dropout)
+        self.block3 = ConvBlock(80, feat_channels, dilation=(1, 27), drop=dropout)
 
         # Pooling
         self.pool = AttnPool(C=feat_channels, K=attn_queries)
         pooled_dim = feat_channels * attn_queries
 
-        # Learnable fallback for fully blank frames (for masked mean path)
-        self.register_parameter('empty_vec', nn.Parameter(torch.zeros(pooled_dim)))
-
         # Tiny head you can keep or replace downstream
         self.out_dim = pooled_dim
         self.norm_out = nn.LayerNorm(self.out_dim)
 
-        nn.init.zeros_(self.empty_vec)  # Initialize empty vector to zero
         
     @staticmethod
     def _coords(B, H, W, device, dtype):
@@ -308,7 +302,9 @@ class GlyphCNN(nn.Module):
         feats += [cy, cx]
         complete_glyph_emb = torch.cat(feats, dim=1)  # [B, 20+1+2, H, W]
         x = self.stem(complete_glyph_emb)  # [B, 64, H, W]
-        x = self.body(x)  # [B, C, H, W]
+        x = self.block1(x)  # [B, 64, H, W]
+        x = self.block2(x)  # [B, 80, H, W]
+        x = self.block3(x)  # [B, feat_channels, H, W]
         x = self.pool(x, fg_mask)  # [B, K*C] - pooled features
         x = self.norm_out(x)
         return x, char_embedding, color_embedding
@@ -396,7 +392,7 @@ class GlyphCNN(nn.Module):
         colors_out = torch.full((B, H, W), 0, dtype=torch.long, device=device)
         chars_out[fg_mask]  = glyph_samples[fg_mask]
         colors_out[fg_mask] = color_samples[fg_mask]
-        return chars_out, colors_out
+        return fg_mask, chars_out, colors_out
 
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
@@ -1264,24 +1260,33 @@ def vae_loss(
     ooc_t = fg_mask.float().unsqueeze(1)  # [B, 1, H, W] - foreground mask for occupy logits
     glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Ensure valid range for chars
     
-    occ_p = torch.sigmoid(occupy_logits)  # [B, 1, H, W] - sigmoid for occupy logits
-    occ_ce = F.binary_cross_entropy(occ_p, ooc_t, reduction='none')  # [B, H, W]
-    assert occ_ce.shape == glyph_chars.shape, "occupy logits and glyph chars must have the same shape. But got {} vs {}".format(occ_ce.shape, glyph_chars.shape)
-    p_t = occ_p * ooc_t + (1 - occ_p) * (1 - ooc_t)  # [B, H, W] - probability of foreground
-    alpha_t = focal_loss_alpha * ooc_t + (1-focal_loss_alpha) * (1 - ooc_t)  # [B, H, W]
-    focal_loss_per_sample = (alpha_t * (1 - p_t)**focal_loss_gamma * occ_ce).sum(dim=[1, 2])  # [B] - sum over H, W
+    # Occupancy focal loss (memory efficient, correct dims)
+    # Use BCE with logits to avoid extra sigmoid memory and improve numerical stability
+    occ_bce = F.binary_cross_entropy_with_logits(occupy_logits, ooc_t, reduction='none').squeeze(1)  # [B, H, W]
+    # Probability for focal weighting
+    p = torch.sigmoid(occupy_logits).squeeze(1)  # [B, H, W]
+    ooc_hw = ooc_t.squeeze(1)  # [B, H, W]
+    # p_t and alpha_t on [B, H, W]
+    p_t = torch.where(ooc_hw > 0.5, p, 1.0 - p)
+    alpha_pos = torch.as_tensor(focal_loss_alpha, device=occupy_logits.device, dtype=occupy_logits.dtype)
+    alpha_neg = torch.as_tensor(1.0 - focal_loss_alpha, device=occupy_logits.device, dtype=occupy_logits.dtype)
+    alpha_t = torch.where(ooc_hw > 0.5, alpha_pos, alpha_neg)
+    focal_weight = alpha_t * (1.0 - p_t).pow(focal_loss_gamma)
+    focal_loss_per_sample = (focal_weight * occ_bce).sum(dim=(1, 2))  # [B]
 
     # Sum over spatial dimensions for each sample, then average over valid samples
     # char_logits: [B, CHAR_DIM, H, W], glyph_chars: [B, H, W]
     char_loss_per_sample = F.cross_entropy(char_logits, glyph_chars, reduction='none')  # [B, H, W]
+    assert char_loss_per_sample.shape == glyph_chars.shape, "char logits and glyph chars must have the same shape. But got {} vs {}".format(char_loss_per_sample.shape, glyph_chars.shape)
     masked_char_loss_per_sample = char_loss_per_sample * fg_mask.float()  # Apply foreground mask
     color_loss_per_sample = F.cross_entropy(color_logits, glyph_colors, reduction='none')  # [B, H, W]
+    assert color_loss_per_sample.shape == glyph_colors.shape, "color logits and glyph colors must have the same shape. But got {} vs {}".format(color_loss_per_sample.shape, glyph_colors.shape)
     masked_color_loss_per_sample = color_loss_per_sample * fg_mask.float()  # Apply foreground mask
     masked_num = fg_mask.sum(dim=[1, 2]).clamp(min=1)  # [B] - number of foreground pixels per sample
 
     # Sum over spatial dimensions for each sample
-    masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2]) / masked_num * H * W  # [B] - sum over H, W
-    masked_color_loss_per_sample = masked_color_loss_per_sample.sum(dim=[1, 2]) / masked_num * H * W  # [B] - sum over H, W
+    masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2]) / masked_num * H * W  # [B]
+    masked_color_loss_per_sample = masked_color_loss_per_sample.sum(dim=[1, 2]) / masked_num * H * W  # [B]
 
     # Average over valid samples only
     raw_losses['occupy'] = focal_loss_per_sample[valid_screen].mean()  # Average over valid samples

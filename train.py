@@ -2540,11 +2540,11 @@ if __name__ == "__main__":
             force_recollect=False,  # Use the data we just collected
             shuffle_batches=True,  # Shuffle training batches each epoch for better training
             initial_kl_beta = 0.0001,
-            final_kl_beta = 0.4,
+            final_kl_beta = 0.6,
             kl_beta_shape = 'cosine',
             custom_kl_beta_function = lambda init, end, progress: init + (end - init) * progress**10, 
             warmup_epoch_ratio = 0.4,
-            total_correlation_beta_multiplier=15.0,
+            total_correlation_beta_multiplier=10.0,
             free_bits=0.15,
             focal_loss_alpha=0.75,
             focal_loss_gamma=2.0,
@@ -2561,7 +2561,7 @@ if __name__ == "__main__":
             keep_last_n_checkpoints=2,
             
             # Wandb integration example
-            use_wandb=True,
+            use_wandb=False,
             wandb_project="nethack-vae",
             wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
             wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
@@ -2573,7 +2573,7 @@ if __name__ == "__main__":
             log_model_weights=True,
             
             # HuggingFace integration example
-            upload_to_hf=True,
+            upload_to_hf=False, 
             hf_repo_name="CatkinChen/nethack-vae",
             hf_upload_directly=True,  # Upload directly without extra local save
             hf_upload_checkpoints=True,  # Also upload checkpoints
