@@ -2550,7 +2550,7 @@ if __name__ == "__main__":
             focal_loss_gamma=2.0,
 
             # Dropout and regularization settings
-            dropout_rate=0.1,  # Set to 0.1 for mild regularization
+            dropout_rate=0.2,  # Set to 0.2 for mild regularization
             enable_dropout_on_latent=True,
             enable_dropout_on_decoder=True,
             
@@ -2567,7 +2567,7 @@ if __name__ == "__main__":
             wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
             wandb_tags=["nethack", "vae"],
             wandb_notes="Full VAE training run",
-            log_every_n_steps=10,  # Log every 10 steps
+            log_every_n_steps=5,  # Log every 5 steps
             log_model_architecture=True,
             log_gradients=True,
             log_model_weights=True,

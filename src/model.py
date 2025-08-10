@@ -184,11 +184,11 @@ class ConvBlock(nn.Module):
         if isinstance(dilation, int): dh, dw = dilation, dilation
         else: dh, dw = dilation
 
-        pad_h, pad_w = dh, dw
+        pad_h = dh * (kh // 2)
+        pad_w = dw * (kw // 2)
 
         self.net = nn.Sequential(
-            nn.Conv2d(c_in, c_in, kernel_size=3, padding=(pad_h, pad_w), dilation=(dh, dw), groups=c_in, bias=False),
-            nn.Conv2d(c_in, c_out, kernel_size=1, bias=False),
+            nn.Conv2d(c_in, c_out, kernel_size=(kh, kw), padding=(pad_h, pad_w), dilation=(dh, dw)),
             nn.GroupNorm(num_groups=_gn_groups(c_out), num_channels=c_out),
             nn.ReLU(),
             nn.Dropout2d(drop) if drop and drop > 0 else nn.Identity()
@@ -206,6 +206,7 @@ class AttnPool(nn.Module):
     def __init__(self, C: int, K: int = 1):
         super().__init__()
         self.Q = nn.Parameter(torch.randn(K, C))
+        self.proj = nn.Linear(C, C, bias=False)
         # Fallback for fully blank frames (per head)
         self.empty_vec = nn.Parameter(torch.zeros(C))
 
@@ -216,6 +217,7 @@ class AttnPool(nn.Module):
         """
         B, C, H, W = feats.shape
         X = feats.view(B, C, H * W).transpose(1, 2)     # [B, HW, C]
+        X = self.proj(X)                                # [B, HW, C]
         Q = self.Q                                      # [K, C]
 
         # scores: [B, K, HW]
@@ -249,7 +251,7 @@ class GlyphCNN(nn.Module):
 
     Forward returns a vector suitable for a VAE encoder MLP or heads.
     """
-    def __init__(self, dropout=0.0, attn_queries=4, feat_channels=16):
+    def __init__(self, dropout=0.0, attn_queries=4, feat_channels=96):
         super().__init__()
         self.char_emb = nn.Embedding(CHAR_DIM + 1, CHAR_EMB, padding_idx=0)
         self.col_emb  = nn.Embedding(COLOR_DIM + 1, COLOR_EMB, padding_idx=0)
@@ -257,16 +259,16 @@ class GlyphCNN(nn.Module):
         in_ch += 2 # +2 for CoordConv (x,y in [-1,1])
 
         # Stem
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, 48, kernel_size=1, bias=False),
-            nn.GroupNorm(_gn_groups(48), 48),
-            nn.ReLU(),
-        )
+        self.stem = ConvBlock(in_ch, 64, k=3, dilation=1, drop=dropout)
 
-        # 3 DSConv blocks; mix width-focused dilations
-        self.block1 = ConvBlock(48, 64,  dilation=(1, 3), drop=dropout)
-        self.block2 = ConvBlock(64, 80,  dilation=(1, 9), drop=dropout)
-        self.block3 = ConvBlock(80, feat_channels, dilation=(1, 27), drop=dropout)
+        # Body: mix normal and width-focused dilations (map is 21x79)
+        self.body = nn.Sequential(
+            ConvBlock(64, 64, k=3, dilation=1,        drop=dropout),      # local
+            ConvBlock(64, 64, k=3, dilation=(1, 3),   drop=dropout),      # widen RF (width)
+            ConvBlock(64, 64, k=3, dilation=1,        drop=dropout),
+            ConvBlock(64, 96, k=3, dilation=(1, 9),   drop=dropout),
+            ConvBlock(96, feat_channels, k=3, dilation=1, drop=dropout),
+        )
 
         # Pooling
         self.pool = AttnPool(C=feat_channels, K=attn_queries)
@@ -302,9 +304,7 @@ class GlyphCNN(nn.Module):
         feats += [cy, cx]
         complete_glyph_emb = torch.cat(feats, dim=1)  # [B, 20+1+2, H, W]
         x = self.stem(complete_glyph_emb)  # [B, 64, H, W]
-        x = self.block1(x)  # [B, 64, H, W]
-        x = self.block2(x)  # [B, 80, H, W]
-        x = self.block3(x)  # [B, feat_channels, H, W]
+        x = self.body(x)  # [B, C, H, W]
         x = self.pool(x, fg_mask)  # [B, K*C] - pooled features
         x = self.norm_out(x)
         return x, char_embedding, color_embedding
@@ -1120,12 +1120,6 @@ class MultiModalHackVAE(nn.Module):
         # Decode stats - separate into continuous and discrete components
         stats_continuous_normalized = self.decode_stats_continuous(stats_emb_decoded)  # [B, 19]
         
-        # Invert BatchNorm transformation: output = normalized * std + mean
-        # Need to access the BatchNorm from the preprocessor to get running statistics
-        running_var = self.stats_mlp.preprocessor.batch_norm.running_var
-        running_mean = self.stats_mlp.preprocessor.batch_norm.running_mean
-        stats_continuous = stats_continuous_normalized * running_var.sqrt() + running_mean
-        
         hunger_state_logits = self.decode_hunger_state(stats_emb_decoded)      # [B, 7]
         dungeon_number_logits = self.decode_dungeon_number(stats_emb_decoded)  # [B, 11]
         level_number_logits = self.decode_level_number(stats_emb_decoded)      # [B, 51]
@@ -1138,7 +1132,7 @@ class MultiModalHackVAE(nn.Module):
             'occupy_logits': occupy_logits,  # [B, 1, 21, 79]
             'char_logits': char_logits, # [B, 256, 21, 79]
             'color_logits': color_logits,  # [B, 16, 21, 79]
-            'stats_continuous': stats_continuous,  # [B, 19]
+            'stats_continuous_normalized': stats_continuous_normalized,  # [B, 19]
             'hunger_state_logits': hunger_state_logits,  # [B, 7]
             'dungeon_number_logits': dungeon_number_logits,  # [B, 11]
             'level_number_logits': level_number_logits,  # [B, 51]
@@ -1213,22 +1207,8 @@ def vae_loss(
     total_correlation_beta_multiplier=1.0,
     free_bits=0.0):
     """
-    VAE loss with separate embedding and raw reconstruction losses.
-    
-    IMPORTANT: For proper VAE training, losses are computed as:
-    
-    Raw losses: Sum over spatial/sequence dimensions for each sample, average over valid samples
-    Embedding losses: Calculate L2 norm ||emb - target||^2 for each spatial/sequence location,
-                     sum over spatial/sequence dimensions, average over valid samples
-    
-    valid_screen: [B] boolean tensor indicating which samples are valid for loss calculation
-    total_correlation_beta_multiplier: Multiplier for total correlation loss over kl beta
-    free_bits: Minimum KL divergence value to prevent collapse (default 0.0)
-
-    This ensures reconstruction and KL losses are on the same scale, preventing
-    training collapse from KL domination.
+    VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
     """
-    
     # Extract outputs from model
     mu = model_output['mu'][valid_screen]  # [valid_B, LATENT_DIM]
     logvar = model_output['logvar'][valid_screen]
@@ -1238,8 +1218,8 @@ def vae_loss(
     
     # Raw reconstruction logits
     occupy_logits = model_output['occupy_logits']  # [B, 1, 21, 79]
-    char_logits = model_output['char_logits']  # [B, 256, 21, 79]
-    color_logits = model_output['color_logits']  # [B, 16, 21, 79]
+    char_logits = model_output['char_logits']  # [B, CHAR_DIM, 21, 79]
+    color_logits = model_output['color_logits']  # [B, COLOR_DIM, 21, 79]
     msg_logits = model_output['msg_logits']  # [B, 256, MSG_VOCAB+2]
     
     # Embedding reconstructions (continuous targets)
@@ -1248,7 +1228,6 @@ def vae_loss(
     msg_emb_decoded = model_output['msg_emb_decoded']  # [B, 256, emb_dim]
     
     valid_B = valid_screen.sum().item()  # Number of valid samples
-    
     assert valid_B > 0, "No valid samples for loss calculation. Check valid_screen mask."
     
     # ============= Raw Reconstruction Losses =============
@@ -1256,17 +1235,14 @@ def vae_loss(
     
     # Glyph reconstruction (chars + colors)
     H, W = glyph_chars.shape[1], glyph_chars.shape[2]
-    fg_mask = (glyph_chars != ord(' ')) # [B, H, W] - foreground mask for valid pixels (non-space characters)
-    ooc_t = fg_mask.float().unsqueeze(1)  # [B, 1, H, W] - foreground mask for occupy logits
-    glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Ensure valid range for chars
+    fg_mask = (glyph_chars != ord(' '))  # [B, H, W]
+    ooc_t = fg_mask.float().unsqueeze(1)  # [B, 1, H, W]
+    glyph_chars_ce = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # CE targets
     
-    # Occupancy focal loss (memory efficient, correct dims)
-    # Use BCE with logits to avoid extra sigmoid memory and improve numerical stability
+    # Occupancy focal loss
     occ_bce = F.binary_cross_entropy_with_logits(occupy_logits, ooc_t, reduction='none').squeeze(1)  # [B, H, W]
-    # Probability for focal weighting
-    p = torch.sigmoid(occupy_logits).squeeze(1)  # [B, H, W]
-    ooc_hw = ooc_t.squeeze(1)  # [B, H, W]
-    # p_t and alpha_t on [B, H, W]
+    p = torch.sigmoid(occupy_logits).squeeze(1)
+    ooc_hw = ooc_t.squeeze(1)
     p_t = torch.where(ooc_hw > 0.5, p, 1.0 - p)
     alpha_pos = torch.as_tensor(focal_loss_alpha, device=occupy_logits.device, dtype=occupy_logits.dtype)
     alpha_neg = torch.as_tensor(1.0 - focal_loss_alpha, device=occupy_logits.device, dtype=occupy_logits.dtype)
@@ -1274,15 +1250,12 @@ def vae_loss(
     focal_weight = alpha_t * (1.0 - p_t).pow(focal_loss_gamma)
     focal_loss_per_sample = (focal_weight * occ_bce).sum(dim=(1, 2))  # [B]
 
-    # Sum over spatial dimensions for each sample, then average over valid samples
-    # char_logits: [B, CHAR_DIM, H, W], glyph_chars: [B, H, W]
-    char_loss_per_sample = F.cross_entropy(char_logits, glyph_chars, reduction='none')  # [B, H, W]
-    assert char_loss_per_sample.shape == glyph_chars.shape, "char logits and glyph chars must have the same shape. But got {} vs {}".format(char_loss_per_sample.shape, glyph_chars.shape)
-    masked_char_loss_per_sample = char_loss_per_sample * fg_mask.float()  # Apply foreground mask
+    # CE losses (masked by foreground)
+    char_loss_per_sample = F.cross_entropy(char_logits, glyph_chars_ce, reduction='none')  # [B, H, W]
+    masked_char_loss_per_sample = char_loss_per_sample * fg_mask.float()
     color_loss_per_sample = F.cross_entropy(color_logits, glyph_colors, reduction='none')  # [B, H, W]
-    assert color_loss_per_sample.shape == glyph_colors.shape, "color logits and glyph colors must have the same shape. But got {} vs {}".format(color_loss_per_sample.shape, glyph_colors.shape)
-    masked_color_loss_per_sample = color_loss_per_sample * fg_mask.float()  # Apply foreground mask
-    masked_num = fg_mask.sum(dim=[1, 2]).clamp(min=1)  # [B] - number of foreground pixels per sample
+    masked_color_loss_per_sample = color_loss_per_sample * fg_mask.float()
+    masked_num = fg_mask.sum(dim=[1, 2]).clamp(min=1)
 
     # Sum over spatial dimensions for each sample
     masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2]) / masked_num * H * W  # [B]
@@ -1293,99 +1266,54 @@ def vae_loss(
     raw_losses['char'] = masked_char_loss_per_sample[valid_screen].mean()
     raw_losses['color'] = masked_color_loss_per_sample[valid_screen].mean()
 
-    # Stats reconstruction - separate losses for continuous and discrete components
-    # Extract model outputs
-    stats_continuous = model_output['stats_continuous']  # [B, 19] - already inverted to original scale
+    # Stats reconstruction
+    stats_continuous_normalized = model_output['stats_continuous_normalized']  # [B, 19]
     hunger_state_logits = model_output['hunger_state_logits']
     dungeon_number_logits = model_output['dungeon_number_logits']
     level_number_logits = model_output['level_number_logits']
-    condition_mask_logits = model_output['condition_mask_logits']  # [B, 13]
-    
-    # Extract relevant targets (24 dimensions, excluding time and unknowns)
-    relevant_indices = [i for i in range(27) if i not in [20, 26]]  # Exclude time and unknowns
-    target_stats = blstats[:, relevant_indices]  # [B, 24]
-    
-    # Separate continuous and discrete targets
-    discrete_indices = [21, 23, 24]  # hunger_state, dungeon_number, level_number (in original indexing)
-    continuous_indices = [i for i in relevant_indices if i not in discrete_indices + [25]]  # 21 indices
-    
-    # Map discrete indices to the relevant_indices space
-    discrete_targets = []
-    discrete_targets.append(blstats[:, 21].long())  # hunger_state
-    discrete_targets.append(blstats[:, 23].long())  # dungeon_number  
-    discrete_targets.append(blstats[:, 24].long())  # level_number
-    
-    # Prepare condition mask target - convert bitfield to binary vector (same as encoder)
-    condition_mask_target = blstats[:, 25].long()  # [B] - condition mask bitfield
+    condition_mask_logits = model_output['condition_mask_logits']
+
+    # Discrete targets (clamped)
+    hunger_target = torch.clamp(blstats[:, 21].long(), 0, 6)
+    dungeon_target = torch.clamp(blstats[:, 23].long(), 0, 10)
+    level_target = torch.clamp(blstats[:, 24].long(), 0, 50)
+
+    # Condition mask target vector
+    condition_mask_target = blstats[:, 25].long()
     condition_target_vector = []
     for bit_value in CONDITION_BITS:
         is_condition_active = ((condition_mask_target & bit_value) > 0).float()  # [B]
         condition_target_vector.append(is_condition_active)
     condition_target_vector = torch.stack(condition_target_vector, dim=1)  # [B, 13]
-    
-    # For continuous targets, we need to prepare them the same way as preprocessor does
-    # The decoder outputs stats_continuous on the original scale, so we need to prepare the targets
-    continuous_targets_raw = blstats[:, continuous_indices]  # [B, 21]
-    
-    # Process continuous targets the same way as preprocessor (coordinate normalization, log1p, ratios)
-    # but we need to prepare the targets to match what the decoder should output
-    continuous_targets_processed = continuous_targets_raw.clone()
-    continuous_targets_processed[:, 0] = continuous_targets_processed[:, 0] / MAX_X_COORD  # x coordinate
-    continuous_targets_processed[:, 1] = continuous_targets_processed[:, 1] / MAX_Y_COORD  # y coordinate
-    
-    # Apply log1p to skewed features
-    skewed_indices = [9, 13, 19]  # Based on preprocessor
-    continuous_targets_processed[:, skewed_indices] = torch.log1p(continuous_targets_processed[:, skewed_indices])
-    
-    # Create health and energy ratios
-    hp_ratio = continuous_targets_processed[:, 10] / torch.clamp(continuous_targets_processed[:, 11], min=1)
-    energy_ratio = continuous_targets_processed[:, 14] / torch.clamp(continuous_targets_processed[:, 15], min=1)
-    
-    # Replace health and energy stats with ratios and remove max health/energy
-    continuous_targets_processed[:, 10] = hp_ratio
-    continuous_targets_processed[:, 14] = energy_ratio
-    
-    # Remove max health and max energy columns (indices 11 and 15)
-    keep_indices = [i for i in range(continuous_targets_processed.size(1)) if i not in [11, 15]]
-    continuous_targets_final = continuous_targets_processed[:, keep_indices]  # [B, 19]
-    
-    # Calculate losses - sum over feature dimensions for each sample, average over valid samples
+
+    # Continuous targets in BN-normalized space: first 19 dims of target_stats_emb
+    target_stats_emb = model_output['target_stats_emb']  # [B, 43]
+    continuous_targets_bn = target_stats_emb[:, :19]
+
     stat_raw_losses = {}
-    
-    # Continuous stats: sum over features for each sample
-    stats_continuous_loss = F.mse_loss(stats_continuous, continuous_targets_final, reduction='none')  # [B, 19]
-    stats_continuous_loss = stats_continuous_loss.sum(dim=1)  # [B] - sum over features
+    stats_continuous_loss = F.mse_loss(stats_continuous_normalized, continuous_targets_bn, reduction='none').sum(dim=1)
     stat_raw_losses['stats_continuous'] = stats_continuous_loss[valid_screen].mean()
-    
-    # Discrete stats: already scalar per sample, just average over valid samples
-    stat_raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], discrete_targets[0][valid_screen], reduction='mean')
-    stat_raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], discrete_targets[1][valid_screen], reduction='mean')
-    stat_raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], discrete_targets[2][valid_screen], reduction='mean')
-    
-    # Condition mask: sum over condition bits for each sample
-    condition_loss = F.binary_cross_entropy_with_logits(condition_mask_logits, condition_target_vector, reduction='none')  # [B, 13]
-    condition_loss = condition_loss.sum(dim=1)  # [B] - sum over condition bits
+    stat_raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], hunger_target[valid_screen], reduction='mean')
+    stat_raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], dungeon_target[valid_screen], reduction='mean')
+    stat_raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], level_target[valid_screen], reduction='mean')
+    condition_loss = F.binary_cross_entropy_with_logits(condition_mask_logits, condition_target_vector, reduction='none').sum(dim=1)
     stat_raw_losses['stats_condition'] = condition_loss[valid_screen].mean()
 
-    # Total stats loss
-    raw_losses['stats'] = (stat_raw_losses['stats_continuous'] + 
-                          stat_raw_losses['stats_hunger'] + 
-                          stat_raw_losses['stats_dungeon'] + 
-                          stat_raw_losses['stats_level'] + 
-                          stat_raw_losses['stats_condition'])
+    raw_losses['stats'] = (stat_raw_losses['stats_continuous'] +
+                           stat_raw_losses['stats_hunger'] +
+                           stat_raw_losses['stats_dungeon'] +
+                           stat_raw_losses['stats_level'] +
+                           stat_raw_losses['stats_condition'])
 
-    # Message reconstruction - sum over sequence length for each sample, average over valid samples
-    msg_lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
+    # Message reconstruction (token CE with EOS injection as before)
+    msg_lengths = (msg_tokens != 0).sum(dim=1)
     msg_tokens_with_eos = msg_tokens.clone()
-    # Add EOS tokens where there's space
-    mask = msg_lengths < msg_tokens.size(1)
-    msg_tokens_with_eos[mask, msg_lengths[mask]] = MSG_VOCAB + 1  # EOS token
-    
-    # Calculate loss for each sample, sum over sequence length
+    mask_has_space = msg_lengths < msg_tokens.size(1)
+    msg_tokens_with_eos[mask_has_space, msg_lengths[mask_has_space]] = MSG_VOCAB + 1
     msg_loss_per_token = F.cross_entropy(
-        msg_logits.view(-1, msg_logits.size(-1)), 
-        msg_tokens_with_eos.view(-1), 
-        reduction='none', 
+        msg_logits.view(-1, msg_logits.size(-1)),
+        msg_tokens_with_eos.view(-1),
+        reduction='none',
         ignore_index=0
     )  # [B*seq_len]
     
@@ -1395,27 +1323,26 @@ def vae_loss(
     
     # ============= Embedding Reconstruction Losses =============
     emb_losses = {}
-    
-    # Target embeddings (from encoder)
-    target_char_emb = model_output['target_char_emb']  # [B, 16, H, W]
-    target_color_emb = model_output['target_color_emb']  # [B, 4, H, W]
-    target_stats_emb = model_output['target_stats_emb']  # [B, emb_dim] 
-    target_msg_emb = model_output['target_msg_emb']  # [B, 256, emb_dim]
-    
-    # Embedding reconstruction losses - calculate L2 norm for each location, sum over spatial dims, average over valid samples
-    # Split glyph embeddings back to char/color
-    char_emb_recon, color_emb_recon = torch.split(glyph_emb_decoded, [CHAR_EMB, COLOR_EMB], dim=1)  # Split into char and color embeddings
-    
-    emb_losses['char_emb'] = F.mse_loss(char_emb_recon[valid_screen], target_char_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-    emb_losses['color_emb'] = F.mse_loss(color_emb_recon[valid_screen], target_color_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
+    target_char_emb = model_output['target_char_emb']  # [B, 16, 21, 79]
+    target_color_emb = model_output['target_color_emb']  # [B, 4, 21, 79]
+    target_stats_emb = model_output['target_stats_emb']  # [B, 43]
+    msg_token_shift = model_output['msg_token_shift']  # [B, T]
+    target_msg_emb_shift = model_output['msg_emb_shift']  # [B, T, emb_dim]
 
-    # Stats embedding loss
-    # stats_emb_decoded is [B, 45], target_stats_emb is [B, 45]
-    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded[valid_screen], target_stats_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-    
-    # Message embedding loss
-    emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded[valid_screen], target_msg_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-    
+    char_emb_recon, color_emb_recon = torch.split(glyph_emb_decoded, [CHAR_EMB, COLOR_EMB], dim=1)
+    emb_losses['char_emb'] = F.mse_loss(char_emb_recon[valid_screen], target_char_emb[valid_screen].detach(), reduction='sum') / valid_B
+    emb_losses['color_emb'] = F.mse_loss(color_emb_recon[valid_screen], target_color_emb[valid_screen].detach(), reduction='sum') / valid_B
+    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded[valid_screen], target_stats_emb[valid_screen].detach(), reduction='sum') / valid_B
+
+    # Message embedding loss with mask on shifted tokens (exclude padding)
+    # Use non-shifted embeddings with EOS as targets to align with next-token prediction
+    target_msg_emb = model_output['target_msg_emb']  # [B, T, emb_dim]
+    msg_mask = (msg_tokens_with_eos != 0).float()  # [B, T]
+    diff_sq = (msg_emb_decoded - target_msg_emb.detach()).pow(2).sum(dim=2)  # [B, T]
+    diff_sq = diff_sq * msg_mask  # mask padding (including positions beyond EOS)
+    diff_sq_valid = diff_sq[valid_screen]
+    emb_losses['msg_emb'] = diff_sq_valid.sum() / valid_B
+
     # ============= Combine Losses =============
     
     # Sum raw reconstruction losses
@@ -1427,69 +1354,80 @@ def vae_loss(
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
     # KL divergence for low-rank approximation
+    eps = 1e-6
+    var = torch.exp(logvar).clamp_min(eps)  # [valid_B, LATENT_DIM]
+    mu2 = mu.square().sum(dim=1)  # mu^T * mu # [valid_B,]
+    d = mu.size(1)
     if lowrank_factors is not None:
-        Sigma_q = torch.bmm(lowrank_factors, lowrank_factors.transpose(1, 2)) + torch.diag_embed(torch.exp(logvar))
+        U = lowrank_factors  # [valid_B, LATENT_DIM, LOW_RANK]
+        UUT_bar = torch.zeros(d, d, device=mu.device, dtype=mu.dtype)  # [LATENT_DIM, LATENT_DIM]
+        UUT_bar += torch.einsum('bik,bjk->ij', U, U) / valid_B # [LATENT_DIM, LATENT_DIM]
+        Sigma_q_bar = UUT_bar + torch.diag(var.mean(dim=0))  # [LATENT_DIM, LATENT_DIM]
+        tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))  # Trace of Sigma_q
+        Dinvu = U / var.unsqueeze(-1)  # [valid_B, LATENT_DIM, LOW_RANK]
+        I_plus = torch.malmul(U.transpose(1, 2), Dinvu)  # [valid_B, LATENT_DIM, LATENT_DIM]
+        eye_d = torch.eye(d, device=mu.device, dtype=mu.dtype).unsqueeze(0)  # [1, LATENT_DIM, LATENT_DIM]
+        I_plus = I_plus + eye_d  # [valid_B, LATENT_DIM, LATENT_DIM]
+        sign2, logdet_small = torch.linalg.slogdet(I_plus)  # log(det(I + U^T * diag(1/var) * U))
+        if not torch.all(sign2 > 0):
+            raise ValueError("Matrix I + U^T * diag(1/var) * U is not positive definite.")
+        log_det_Sigma_q = logdet_small + logvar.sum(dim=1)  # log(det(Sigma_q)) [valid_B,]
     else:
         # If no low-rank factors, just use diagonal covariance
-        Sigma_q = torch.diag_embed(torch.exp(logvar))
+        Sigma_q_bar = torch.diag(var.mean(dim=0))  # [LATENT_DIM, LATENT_DIM]
+        tr_Sigma_q = var.sum(dim=1)  # Trace of Sigma_q
+        log_det_Sigma_q = logvar.sum(dim=1)  # log(det(Sigma_q)) [valid_B,]
     # KL divergence: D_KL(q(z|x) || p(z)) =
     # 0.5 * (tr(Sigma_q) + mu^T * mu - d - log(det(Sigma_q)))
     # where d is the dimensionality of the latent space (LATENT_DIM)
-    d = mu.size(1)
-    tr_Sigma_q = torch.einsum('bii->b', Sigma_q)  # Trace of Sigma_q
-    mu2 = mu.square().sum(dim=1)  # mu^T * mu
-    sign, logabsdet = torch.linalg.slogdet(Sigma_q)  # log(det(Sigma_q))
-    if not torch.all(sign > 0):
-        raise ValueError("Covariance matrix Sigma_q is not positive definite.")
-    log_det_Sigma_q = logabsdet  # log(det(Sigma_q)) [valid_B,]
+    
+    kl_per_sample = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)  # [valid_B,]
+    kl_loss = kl_per_sample.mean()  # Average over batch
 
-    Sigma_q_bar = Sigma_q.mean(dim=0)  # Average covariance matrix over batch
-    assert Sigma_q_bar.shape == (d, d), f"Covariance matrix shape mismatch: {Sigma_q_bar.shape} != {(d, d)}"
+    # Cov(mu) = E[mu * mu^T] - E[mu] * E[mu]^T
     mu_bar = mu.mean(dim=0)  # Average mean vector over batch
     mu_c = mu - mu_bar
-    S_mu = (mu_c.T @ mu_c) / valid_B  # Covariance matrix of the posterior distribution
+    S_mu = (mu_c.t() @ mu_c) / valid_B  # Covariance matrix of the posterior distribution
     assert S_mu.shape == (d, d), f"Covariance matrix of mu shape mismatch: {S_mu.shape} != {(d, d)}"
     total_S = Sigma_q_bar + S_mu  # Total covariance matrix of the posterior distribution
     # Ensure the covariance matrix is symmetric
-    total_S = (total_S + total_S.T) / 2
+    total_S = (total_S + total_S.T) / 2 # [LATENT_DIM, LATENT_DIM]
     
-    # Compute the eigenvalues and eigenvectors
-    eigenvalues, eigenvectors = torch.linalg.eigh(total_S)
-    
-    diag_S_bar = torch.diag(total_S)  # Diagonal of the covariance matrix
-    
-    dwkl_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())
+    # Dimension-wise KL divergence with free bits regularization
+    diag_S_bar = torch.diag(total_S).clamp_min(eps)  # Diagonal of the covariance matrix, [LATENT_DIM]
+    dwkl_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())  # [LATENT_DIM]
+    dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - free_bits, min=0)  # Free bits regularization
     dwkl = dwkl_per_dim.sum()  # Sum over dimensions
+    dwkl_fb = dwkl_fb_per_dim.sum()  # Free bits regularization sum
     
+    # total correlation term
     inv_sqrt = torch.diag(diag_S_bar.sqrt().reciprocal())  # Inverse square root of diagonal covariance
     R = inv_sqrt @ total_S @ inv_sqrt  # R = inv_sqrt * total_S * inv_sqrt
+    R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=mu.dtype)  # Ensure symmetry and positive definiteness
     sign, logabsdet_R = torch.linalg.slogdet(R)  # log(det(R))
-    
     if not torch.all(sign > 0):
         raise ValueError("Covariance matrix R is not positive definite.")
-    
-    total_correlation = 0.5 * (R.trace() - d - logabsdet_R)  # Total correlation term
-    
-    kl_loss = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
-    kl_loss = kl_loss.mean()  # Average over batch
+    total_correlation = -0.5 * logabsdet_R  # Total correlation term
     
     mutual_information = kl_loss - total_correlation - dwkl  # Mutual information term
     
-    kl_diagnosis = {
-        'mutual_info': mutual_information.item(),
-        'total_correlation': total_correlation.item(),
-        'dimension_wise_kl': dwkl_per_dim,
-        'dimension_wise_kl_sum': dwkl.item(),
-        'eigenvalues': eigenvalues,
-        'eigenvectors': eigenvectors
-    }
+    with torch.no_grad():
+        # Compute the eigenvalues and eigenvectors
+        eigenvalues = torch.linalg.eigvalsh(total_S)
+        kl_diagnosis = {
+            'mutual_info': float(mutual_information.item()),
+            'total_correlation': float(total_correlation.item()),
+            'dimension_wise_kl': dwkl_per_dim,
+            'dimension_wise_kl_sum': float(dwkl.item()),
+            'eigenvalues': eigenvalues
+        }
     
     # Total weighted loss
     total_loss = (weight_raw * total_raw_loss + 
                   weight_emb * total_emb_loss + 
                   kl_beta * mutual_information + 
                   kl_beta * total_correlation_beta_multiplier * total_correlation +
-                  kl_beta * torch.clamp(dwkl_per_dim - free_bits, min=0).sum())  # Free bits regularization
+                  kl_beta * dwkl_fb)  # Free bits regularization
     
     return {
         'total_loss': total_loss,
