@@ -14,11 +14,13 @@ pipx ensurepath
 Then relaunch the terminal and run
 ```bash
 pipx install poetry
-poetry install
+# If poetry command is not found, use the full path:
+/root/.local/bin/poetry install
 ```
 
 In terminal, run
 ```bash
-source $(poetry env info --path)/bin/activate
+# Get the environment path and activate it
+source $(/root/.local/bin/poetry env info --path)/bin/activate
 ```
 to activate the venv created by poetry.
