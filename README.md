@@ -6,10 +6,12 @@ cd SequentialSkillRL
 git submodule update --init --recursive
 sudo apt-get update
 sudo apt-get install -y build-essential libboost-context-dev python3-dev libsdl2-dev libx11-dev build-essential cmake bison flex pkg-config
-sudo apt install pipx
+sudo apt install -y pipx
 pipx ensurepath
+```
+Then relaunch the terminal and run
+```
 pipx install poetry
-pipx ensurepath
 poetry install
 ```
 

@@ -2818,7 +2818,6 @@ if __name__ == "__main__":
             log_every_n_steps=5,  # Log every 5 steps
             log_model_architecture=True,
             log_gradients=True,
-            log_model_weights=True,
             
             # HuggingFace integration example
             upload_to_hf=True, 
