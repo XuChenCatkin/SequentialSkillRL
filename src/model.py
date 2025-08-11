@@ -1203,8 +1203,9 @@ def vae_loss(
     focal_loss_gamma=2.0,
     weight_emb=1.0, 
     weight_raw=0.1, 
-    kl_beta=1.0,
-    total_correlation_beta_multiplier=1.0,
+    mi_beta=1.0,
+    tc_beta=1.0,
+    dw_beta=1.0,
     free_bits=0.0):
     """
     VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
@@ -1425,9 +1426,9 @@ def vae_loss(
     # Total weighted loss
     total_loss = (weight_raw * total_raw_loss + 
                   weight_emb * total_emb_loss + 
-                  kl_beta * mutual_information + 
-                  kl_beta * total_correlation_beta_multiplier * total_correlation +
-                  kl_beta * dwkl_fb)  # Free bits regularization
+                  mi_beta * mutual_information + 
+                  tc_beta * total_correlation +
+                  dw_beta * dwkl_fb)  # Free bits regularization
     
     return {
         'total_loss': total_loss,
