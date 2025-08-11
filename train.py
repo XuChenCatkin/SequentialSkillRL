@@ -2788,7 +2788,6 @@ if __name__ == "__main__":
             dw_beta_shape='custom',
             custom_kl_beta_function = lambda init, end, progress: init + (end - init) * min(progress, 0.2) * 5.0, 
             warmup_epoch_ratio = 0.2,
-            total_correlation_beta_multiplier=10.0,
             free_bits=0.15,
             focal_loss_alpha=0.75,
             focal_loss_gamma=2.0,
