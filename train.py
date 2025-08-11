@@ -2805,7 +2805,7 @@ if __name__ == "__main__":
                 sample_top_p=1.0,
                 save_dir="vae_analysis",
                 random_sampling=True,  # Enable random sampling
-                random_seed=42  # For reproducible results
+                random_seed=100  # For reproducible results
             )
             print(f"✅ Demo completed successfully!")
             print(f"📁 Results saved to: {results['save_dir']}")

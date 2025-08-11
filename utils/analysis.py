@@ -96,7 +96,7 @@ def save_maps_and_markdown(
             img_r.save(img_dir / fn_r)
 
             # Markdown section with a 2-col table
-            md.write(f"## Sample {i}\n\n")
+            md.write(f"## Sample {i+1}\n\n")
             md.write("| Original | Reconstruction |\n")
             md.write("|---|---|\n")
             md.write(f"| ![orig {i}](images/{fn_o}) | ![recon {i}](images/{fn_r}) |\n\n")

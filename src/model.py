@@ -1243,7 +1243,7 @@ def vae_loss(
     blstats, 
     msg_tokens,
     valid_screen,
-    raw_modality_weights={'occupy': 3.0, 'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0},
+    raw_modality_weights={'occupy': 10.0, 'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0},
     emb_modality_weights={'char_emb': 0.05, 'color_emb': 0.05, 'stats_emb': 1.0, 'msg_emb': 0.1},
     focal_loss_alpha=0.75,
     focal_loss_gamma=2.0,
@@ -1296,7 +1296,7 @@ def vae_loss(
     alpha_neg = torch.as_tensor(1.0 - focal_loss_alpha, device=occupy_logits.device, dtype=occupy_logits.dtype)
     alpha_t = torch.where(ooc_hw > 0.5, alpha_pos, alpha_neg)
     focal_weight = alpha_t * (1.0 - p_t).pow(focal_loss_gamma)
-    focal_loss_per_sample = (focal_weight * occ_bce).mean(dim=(1, 2)) # [B]
+    focal_loss_per_sample = (focal_weight * occ_bce).sum(dim=(1, 2)) # [B]
 
     # CE losses (masked by foreground)
     char_loss_per_sample = F.cross_entropy(char_logits, glyph_chars_ce, reduction='none')  # [B, H, W]
@@ -1305,8 +1305,8 @@ def vae_loss(
     masked_color_loss_per_sample = color_loss_per_sample * fg_mask.float()
 
     # Sum over spatial dimensions for each sample
-    masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2]) / masked_num  # [B]
-    masked_color_loss_per_sample = masked_color_loss_per_sample.sum(dim=[1, 2]) / masked_num  # [B]
+    masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2])  # [B]
+    masked_color_loss_per_sample = masked_color_loss_per_sample.sum(dim=[1, 2])  # [B]
 
     # Average over valid samples only
     raw_losses['occupy'] = focal_loss_per_sample[valid_screen].mean()  # Average over valid samples
