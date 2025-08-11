@@ -72,7 +72,7 @@ LATENT_DIM = 96     # z‑dim for VAE
 BLSTATS_DIM = 27   # raw scalar stats (hp, gold, …)
 MSG_VOCAB = 128     # Nethack takes 32-127 byte for char of messages
 GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
-PADDING_IDX = [CHAR_DIM, COLOR_DIM]  # padding index for glyphs
+PADDING_IDX = [32, 0]  # padding index for glyphs (blank space char, black color)
 LOW_RANK = 0      # low-rank factorisation rank for covariance
 # NetHack map dimensions (from NetHack source: include/config.h)
 MAP_HEIGHT = 21     # ROWNO - number of rows in the map
@@ -377,7 +377,7 @@ class GlyphCNN(nn.Module):
         B, _, H, W = occupy_logits.shape
         
         occ_p = torch.sigmoid(occupy_logits).squeeze(1)  # [B,H,W]
-        fg_mask = torch.bernoulli(occ_p.clamp(1e-6, 1-1e-6)).bool()
+        fg_mask = (occ_p > 0.5)  # foreground mask, [B,H,W]
 
         filtered_glyph_logits = self._filter_topk_topp(glyph_logits, top_k, top_p)
         filtered_color_logits = self._filter_topk_topp(color_logits, top_k, top_p)
@@ -425,23 +425,42 @@ class GlyphBag(nn.Module):
         for b in range(B):
             # g_ids[b] has shape [2, H*W], find unique glyph pairs along dim=1
             unique_glyphs, counts = torch.unique(g_ids[b], return_counts=True, dim=1)
+            
+            # Filter out blank space (32, 0) from unique_glyphs
+            blank_space_mask = (unique_glyphs[0] == 32) & (unique_glyphs[1] == 0)
+            non_blank_mask = ~blank_space_mask
+            if non_blank_mask.any():
+                unique_glyphs = unique_glyphs[:, non_blank_mask]
+                counts = counts[non_blank_mask]
+            else:
+                # If all glyphs are blank space, keep empty tensors
+                unique_glyphs = torch.empty((2, 0), dtype=unique_glyphs.dtype, device=unique_glyphs.device)
+                counts = torch.empty((0,), dtype=counts.dtype, device=counts.device)
+            
             # Sort by the glyph pairs - need to sort by both char and color
             # First sort by character (row 0), then by color (row 1) for ties
-            sorted_indices = torch.arange(unique_glyphs.size(1), device=unique_glyphs.device)
-            perm_sec = torch.argsort(unique_glyphs[1], stable=True)  # sort by color
-            sorted_indices = sorted_indices[perm_sec]  # apply color sort
-            perm_pri = torch.argsort(unique_glyphs[0][sorted_indices], stable=True)  # sort by char
-            sorted_indices = sorted_indices[perm_pri]  # apply char sort
-            sorted_glyphs = unique_glyphs[:, sorted_indices]
-            sorted_counts = counts[sorted_indices]
+            if unique_glyphs.size(1) > 0:
+                sorted_indices = torch.arange(unique_glyphs.size(1), device=unique_glyphs.device)
+                perm_sec = torch.argsort(unique_glyphs[1], stable=True)  # sort by color
+                sorted_indices = sorted_indices[perm_sec]  # apply color sort
+                perm_pri = torch.argsort(unique_glyphs[0][sorted_indices], stable=True)  # sort by char
+                sorted_indices = sorted_indices[perm_pri]  # apply char sort
+                sorted_glyphs = unique_glyphs[:, sorted_indices]
+                sorted_counts = counts[sorted_indices]
+            else:
+                # No non-blank glyphs found
+                sorted_glyphs = unique_glyphs
+                sorted_counts = counts
             if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Batch {b}: unique glyphs {unique_glyphs.size(0)}, counts {counts.size(0)}")
+                self.logger.debug(f"Batch {b}: unique glyphs {unique_glyphs.size(1)}, counts {counts.size(0)}")
                 self.logger.debug(f"Batch {b}: sorted glyphs {sorted_glyphs}, counts {sorted_counts}")
-            if len(sorted_glyphs) > self.max_len:
-                self.logger.warning(f"Batch {b}: Too many unique glyphs ({len(sorted_glyphs)}), truncating to {self.max_len}.")
+            if sorted_glyphs.size(1) > self.max_len:
+                self.logger.warning(f"Batch {b}: Too many unique glyphs ({sorted_glyphs.size(1)}), truncating to {self.max_len}.")
             # Fill the bag with glyph ids (up to max_len)
-            bag[b, :min(sorted_glyphs.size(1), self.max_len)] = sorted_glyphs[:self.max_len].t()
-            bag[b, min(sorted_glyphs.size(1), self.max_len):] = torch.IntTensor(PADDING_IDX)  # pad the rest
+            num_glyphs = min(sorted_glyphs.size(1), self.max_len)
+            if num_glyphs > 0:
+                bag[b, :num_glyphs] = sorted_glyphs[:, :num_glyphs].t()
+            bag[b, num_glyphs:] = torch.tensor(PADDING_IDX, dtype=torch.long, device=bag.device)  # pad the rest
         return bag  # [B, max_len, 2] of glyph ids
 
     def forward(self, glyph_encoder: GlyphCNN, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -454,11 +473,32 @@ class GlyphBag(nn.Module):
         color_emb = glyph_encoder.col_emb(color_bag)  # [B, max_len] -> [B, max_len, COLOR_EMB]
         emb = torch.cat([char_emb, color_emb], dim=2)  # [B, max_len, GLYPH_EMB]
         # Use RNN to encode the bag into a fixed-size vector
-        padding_indices = torch.IntTensor(PADDING_IDX).to(bag.device)  # [2]
-        packed_emb = nn.utils.rnn.pack_padded_sequence(emb, lengths=(bag != padding_indices).all(dim=-1).sum(dim=1).cpu(), batch_first=True, enforce_sorted=False)
-        _, h = self.net(packed_emb)  # h: [1,B,32]
-        features = h.squeeze(0)  # [B,32]
-        return features, emb, bag # [B, max_len, GLYPH_EMB], [B, max_len, 2]
+        padding_indices = torch.tensor(PADDING_IDX, dtype=torch.long, device=bag.device)  # [2]
+        lengths = (bag != padding_indices).all(dim=-1).sum(dim=1).cpu()  # [B] - count non-padding glyphs
+        
+        # Initialize features tensor
+        B = emb.size(0)
+        features = torch.zeros(B, 32, device=emb.device)  # [B, 32] - output size of RNN
+        
+        # Find samples with non-zero lengths
+        valid_mask = lengths > 0
+        
+        if valid_mask.any():
+            # Extract embeddings and lengths for valid samples
+            valid_emb = emb[valid_mask]  # [valid_B, max_len, GLYPH_EMB]
+            valid_lengths = lengths[valid_mask]  # [valid_B]
+            
+            # Process valid embeddings through RNN
+            packed_emb = nn.utils.rnn.pack_padded_sequence(valid_emb, lengths=valid_lengths, batch_first=True, enforce_sorted=False)
+            _, h = self.net(packed_emb)  # h: [1, valid_B, 32]
+            valid_features = h.squeeze(0)  # [valid_B, 32]
+            
+            # Assign valid features back to the full tensor
+            features[valid_mask] = valid_features
+        
+        # Features for samples with lengths == 0 remain as zeros (already initialized)
+        
+        return features, emb, bag # [B, 32], [B, max_len, GLYPH_EMB], [B, max_len, 2]
         
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
@@ -1146,6 +1186,12 @@ class MultiModalHackVAE(nn.Module):
 
     def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None, training_mode=True, temperature=1.0, top_k=5, top_p=0.9):
         
+        fg = glyph_chars != ord(' ')  # foreground mask for glyphs
+        bad = (glyph_colors == 0) & fg  # bad pixels where color is 0 and glyph is not space
+        if bad.any():
+            i = bad.nonzero()[0].tolist()
+            raise RuntimeError(f"Found color==0 on non-space at index {i} — cannot use 0 as padding_idx.")
+        
         encoded_vars = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
         
         mu = encoded_vars['mu']  # [B, LATENT_DIM]
@@ -1197,8 +1243,8 @@ def vae_loss(
     blstats, 
     msg_tokens,
     valid_screen,
-    raw_modality_weights={'occupy': 1.0, 'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0, 'inv_oclass': 1.0, 'inv_str': 1.0},
-    emb_modality_weights={'char_emb': 0.1, 'color_emb': 0.1, 'stats_emb': 5.0, 'msg_emb': 0.1, 'inv_oclasses_emb': 1.0, 'inv_strs_emb': 1.0},
+    raw_modality_weights={'occupy': 3.0, 'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0},
+    emb_modality_weights={'char_emb': 0.05, 'color_emb': 0.05, 'stats_emb': 1.0, 'msg_emb': 0.1},
     focal_loss_alpha=0.75,
     focal_loss_gamma=2.0,
     weight_emb=1.0, 
@@ -1327,12 +1373,14 @@ def vae_loss(
     target_char_emb = model_output['target_char_emb']  # [B, 16, 21, 79]
     target_color_emb = model_output['target_color_emb']  # [B, 4, 21, 79]
     target_stats_emb = model_output['target_stats_emb']  # [B, 43]
-    msg_token_shift = model_output['msg_token_shift']  # [B, T]
-    target_msg_emb_shift = model_output['msg_emb_shift']  # [B, T, emb_dim]
 
     char_emb_recon, color_emb_recon = torch.split(glyph_emb_decoded, [CHAR_EMB, COLOR_EMB], dim=1)
-    emb_losses['char_emb'] = F.mse_loss(char_emb_recon[valid_screen], target_char_emb[valid_screen].detach(), reduction='sum') / valid_B
-    emb_losses['color_emb'] = F.mse_loss(color_emb_recon[valid_screen], target_color_emb[valid_screen].detach(), reduction='sum') / valid_B
+    char_diff = (char_emb_recon[valid_screen] - target_char_emb[valid_screen].detach()).pow(2).sum(dim=1)  # [valid_B, 21, 79]
+    color_diff = (color_emb_recon[valid_screen] - target_color_emb[valid_screen].detach()).pow(2).sum(dim=1) # [valid_B, 21, 79]
+    w = 1.0 * fg_mask[valid_screen].float() + 0.05 * (1.0 - fg_mask[valid_screen].float())  # [valid_B, 21, 79]
+
+    emb_losses['char_emb'] = (char_diff * w).sum() / valid_B  # Average over valid samples
+    emb_losses['color_emb'] = (color_diff * w).sum() / valid_B  # Average over valid samples
     emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded[valid_screen], target_stats_emb[valid_screen].detach(), reduction='sum') / valid_B
 
     # Message embedding loss with mask on shifted tokens (exclude padding)

@@ -2883,6 +2883,12 @@ if __name__ == "__main__":
             force_recollect=False,  # Use the data we just collected
             shuffle_batches=True,  # Shuffle training batches each epoch for better training
             shuffle_within_batch=True,  # Shuffle within each batch for more variety
+            initial_weight_emb = 0.0,
+            final_weight_emb = 0.0,
+            weight_emb_shape = 'constant',
+            initial_weight_raw = 1.0,
+            final_weight_raw = 1.0,
+            weight_raw_shape = 'constant',
             initial_mi_beta=0.0,
             final_mi_beta=0.0,
             mi_beta_shape='constant',
@@ -2904,7 +2910,7 @@ if __name__ == "__main__":
             enable_dropout_on_decoder=True,
             
             # Early stopping settings
-            early_stopping = True,
+            early_stopping = False,
             early_stopping_patience = 3,
             early_stopping_min_delta = 0.01,
 
