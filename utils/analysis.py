@@ -8,6 +8,7 @@ import datetime as dt
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 import random
 
 # xterm-ish 16-color palette (0–7 normal, 8–15 bright)
@@ -449,7 +450,7 @@ def analyze_latent_space(
     # Create dataset color mapping
     unique_datasets = list(set([info['dataset'] for info in sample_info]))
     dataset_colors = {}
-    colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
+    colors = ['turquoise', 'lightcoral', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
     for i, dataset in enumerate(unique_datasets):
         dataset_colors[dataset] = colors[i % len(colors)]
     
@@ -470,88 +471,114 @@ def analyze_latent_space(
     print(f"  - Latent mean: {np.mean(latent_vectors, axis=0)[:5]}...")
     print(f"  - Latent std: {np.std(latent_vectors, axis=0)[:5]}...")
     
+    # Compute PCA and t-SNE first for use in multiple plots
+    pca = PCA(n_components=min(10, latent_vectors.shape[1]))
+    latent_pca = pca.fit_transform(latent_vectors)
+    pca_explained_variance = pca.explained_variance_ratio_
+        
+    print("🔄 Computing t-SNE embedding (this may take a moment)...")
+    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(latent_vectors)//4))
+    latent_tsne = tsne.fit_transform(latent_vectors)
+    
+    # Compute statistics for plots
+    latent_vars = np.var(latent_vectors, axis=0)
+    latent_means = np.mean(latent_vectors, axis=0)
+    
     # Create comprehensive visualization
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
-    # 1. First two latent dimensions colored by dataset
-    for dataset in unique_datasets:
-        mask = [info['dataset'] == dataset for info in sample_info]
-        if any(mask):
-            dataset_latents = latent_vectors[mask]
-            axes[0, 0].scatter(dataset_latents[:, 0], dataset_latents[:, 1], 
-                              c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
-    
-    axes[0, 0].set_xlabel('Latent Dimension 0')
-    axes[0, 0].set_ylabel('Latent Dimension 1')
-    axes[0, 0].set_title('Latent Space (Dims 0-1, colored by dataset)')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # 2. Latent dimension variances
-    latent_vars = np.var(latent_vectors, axis=0)
-    axes[0, 1].bar(range(len(latent_vars)), latent_vars)
-    axes[0, 1].set_xlabel('Latent Dimension')
-    axes[0, 1].set_ylabel('Variance')
-    axes[0, 1].set_title('Variance per Latent Dimension')
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # 3. Latent means
-    latent_means = np.mean(latent_vectors, axis=0)
-    axes[0, 2].bar(range(len(latent_means)), latent_means)
-    axes[0, 2].set_xlabel('Latent Dimension')
-    axes[0, 2].set_ylabel('Mean')
-    axes[0, 2].set_title('Mean per Latent Dimension')
-    axes[0, 2].grid(True, alpha=0.3)
-    
-    # 4. Distribution comparison between datasets
-    dataset_latent_values = []
-    for dataset in unique_datasets:
-        mask = [info['dataset'] == dataset for info in sample_info]
-        if any(mask):
-            dataset_latents = latent_vectors[mask, 0]  # Get first dimension values for this dataset
-            dataset_latent_values.append(dataset_latents)
-        else:
-            dataset_latent_values.append(np.array([]))  # Empty array if no samples
-    
-    # Only plot non-empty datasets
-    non_empty_datasets = [ds for ds, vals in zip(unique_datasets, dataset_latent_values) if len(vals) > 0]
-    non_empty_values = [vals for vals in dataset_latent_values if len(vals) > 0]
-    
-    if non_empty_values:
-        axes[1, 0].hist(non_empty_values, bins=30, alpha=0.7, label=non_empty_datasets, density=True)
-    
-    axes[1, 0].axvline(0, color='black', linestyle='--', alpha=0.7, label='N(0,1) mean')
-    axes[1, 0].set_xlabel('Latent Value (Dimension 0)')
-    axes[1, 0].set_ylabel('Density')
-    axes[1, 0].set_title('Latent Dim 0 Distribution by Dataset')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # 5. Pairwise correlations (first 10 dimensions)
-    n_dims_to_show = min(10, latent_vectors.shape[1])
-    corr_matrix = np.corrcoef(latent_vectors[:, :n_dims_to_show].T)
-    im = axes[1, 1].imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
-    axes[1, 1].set_xlabel('Latent Dimension')
-    axes[1, 1].set_ylabel('Latent Dimension')
-    axes[1, 1].set_title(f'Correlation Matrix (first {n_dims_to_show} dims)')
-    plt.colorbar(im, ax=axes[1, 1])
-    
-    # 6. Principal components analysis colored by dataset
-    pca = PCA(n_components=2)
-    latent_pca = pca.fit_transform(latent_vectors)
-    
+    # 1. PCA of latent space colored by dataset (moved to first position)
     for dataset in unique_datasets:
         mask = [info['dataset'] == dataset for info in sample_info]
         if any(mask):
             dataset_pca = latent_pca[mask]
-            axes[1, 2].scatter(dataset_pca[:, 0], dataset_pca[:, 1], 
+            axes[0, 0].scatter(dataset_pca[:, 0], dataset_pca[:, 1], 
                                 c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
     
-    axes[1, 2].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-    axes[1, 2].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-    axes[1, 2].set_title('PCA of Latent Space')
-    axes[1, 2].legend()
-    axes[1, 2].grid(True, alpha=0.3)
+    axes[0, 0].set_xlabel(f'PC1 ({pca_explained_variance[0]:.2%} variance)')
+    axes[0, 0].set_ylabel(f'PC2 ({pca_explained_variance[1]:.2%} variance)')
+    axes[0, 0].set_title('PCA of Latent Space (colored by dataset)')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 2. t-SNE of latent space colored by dataset
+    if latent_tsne is not None:
+        for dataset in unique_datasets:
+            mask = [info['dataset'] == dataset for info in sample_info]
+            if any(mask):
+                dataset_tsne = latent_tsne[mask]
+                axes[0, 1].scatter(dataset_tsne[:, 0], dataset_tsne[:, 1], 
+                                    c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
+        
+        axes[0, 1].set_xlabel('t-SNE Dimension 1')
+        axes[0, 1].set_ylabel('t-SNE Dimension 2')
+        axes[0, 1].set_title('t-SNE of Latent Space (colored by dataset)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+    else:
+        # Fallback: show first two latent dimensions
+        for dataset in unique_datasets:
+            mask = [info['dataset'] == dataset for info in sample_info]
+            if any(mask):
+                dataset_latents = latent_vectors[mask]
+                axes[0, 1].scatter(dataset_latents[:, 0], dataset_latents[:, 1], 
+                                  c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
+        
+        axes[0, 1].set_xlabel('Latent Dimension 0')
+        axes[0, 1].set_ylabel('Latent Dimension 1')
+        axes[0, 1].set_title('Raw Latent Space (t-SNE unavailable)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+    
+    # 3. Variance per latent dimension
+    axes[0, 2].bar(range(len(latent_vars)), latent_vars)
+    axes[0, 2].set_xlabel('Latent Dimension')
+    axes[0, 2].set_ylabel('Variance')
+    axes[0, 2].set_title('Variance per Latent Dimension')
+    axes[0, 2].grid(True, alpha=0.3)
+    
+    # 4. Mean per latent dimension
+    axes[1, 0].bar(range(len(latent_means)), latent_means)
+    axes[1, 0].set_xlabel('Latent Dimension')
+    axes[1, 0].set_ylabel('Mean')
+    axes[1, 0].set_title('Mean per Latent Dimension')
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 5. PC1 distribution by dataset (instead of first latent dimension)
+    dataset_pc1_values = []
+    for dataset in unique_datasets:
+        mask = [info['dataset'] == dataset for info in sample_info]
+        if any(mask):
+            dataset_pc1 = latent_pca[mask, 0]  # Get PC1 values for this dataset
+            dataset_pc1_values.append(dataset_pc1)
+        else:
+            dataset_pc1_values.append(np.array([]))  # Empty array if no samples
+    
+    # Only plot non-empty datasets
+    non_empty_datasets = [ds for ds, vals in zip(unique_datasets, dataset_pc1_values) if len(vals) > 0]
+    non_empty_values = [vals for vals in dataset_pc1_values if len(vals) > 0]
+    
+    if non_empty_values:
+        axes[1, 1].hist(non_empty_values, bins=30, alpha=0.7, label=non_empty_datasets, density=True)
+    
+    axes[1, 1].axvline(0, color='black', linestyle='--', alpha=0.7, label='Zero mean')
+    axes[1, 1].set_xlabel(f'PC1 Value ({pca_explained_variance[0]:.2%} variance)')
+    axes[1, 1].set_ylabel('Density')
+    axes[1, 1].set_title('PC1 Distribution by Dataset')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    # 6. Correlation matrix of first 10 raw latent dimensions
+    n_dims_to_show = min(10, latent_vectors.shape[1])
+    corr_matrix = np.corrcoef(latent_vectors[:, :n_dims_to_show].T)
+    im = axes[1, 2].imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+    axes[1, 2].set_xlabel('Latent Dimension')
+    axes[1, 2].set_ylabel('Latent Dimension')
+    axes[1, 2].set_title(f'Raw Latent Correlation Matrix (first {n_dims_to_show} dims)')
+    
+    # Add correlation colorbar
+    cbar = plt.colorbar(im, ax=axes[1, 2])
+    cbar.set_label('Correlation')
     
     pca_explained_variance = pca.explained_variance_ratio_
     
@@ -559,14 +586,20 @@ def analyze_latent_space(
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
     
-    # Generate TTY visualization grid (same as before)
-    print(f"\n🎮 Generating TTY visualization grid...")
-    W = torch.linalg.svd(torch.tensor(latent_vectors, dtype=torch.float32)).Vh[:2]
+    # Generate TTY visualization grid using PCA components
+    print(f"\n🎮 Generating TTY visualization grid using PCA space...")
+    # Use first 2 PCA components for the grid
+    W = pca.components_[:2]  # [2, latent_dim] - first 2 principal components
     num_per_axis = 5
     points = torch.distributions.Normal(0,1).icdf(torch.linspace(0.01, 0.99, num_per_axis))
     XX, YY = torch.meshgrid(points, points, indexing='ij')
-    XXYY = torch.stack((XX, YY)).reshape(2, -1).T
-    latent_grid = XXYY @ W
+    XXYY = torch.stack((XX, YY)).reshape(2, -1).T  # [25, 2]
+    
+    # Transform from PCA space back to latent space
+    pca_grid = XXYY.numpy()  # [25, 2] in PCA space
+    # To go from PCA space to latent space: latent = pca_coords @ components + mean
+    latent_grid = pca_grid @ W + latent_means[np.newaxis, :]  # [25, latent_dim]
+    latent_grid = torch.tensor(latent_grid, dtype=torch.float32)
     
     with torch.no_grad():
         decode_output = model.decode(latent_grid.to(device))
@@ -576,7 +609,7 @@ def analyze_latent_space(
     # Create TTY grid visualization
     from utils.analysis import _render_map_image
     tty_fig, tty_axes = plt.subplots(num_per_axis, num_per_axis, figsize=(30, 10))
-    tty_fig.suptitle('Generated NetHack States from Latent Space Grid (5x5)', fontsize=20, y=0.98)
+    tty_fig.suptitle('Generated NetHack States from PCA Latent Space Grid (5x5)', fontsize=20, y=0.98)
 
     print(f"🎨 Rendering {num_per_axis * num_per_axis} NetHack states...")
     n = min(len(chars), num_per_axis * num_per_axis)
@@ -600,25 +633,34 @@ def analyze_latent_space(
     print(f"Enhanced latent space analysis saved to {save_path}")
     print(f"TTY grid visualization saved to {tty_save_path}")
     
-    # Enhanced statistics with balanced sampling info
-    print(f"\n📈 Enhanced Statistics (Balanced Sampling):")
+    # Enhanced statistics with PCA focus
+    print(f"\n📈 Enhanced Statistics (PCA-Focused Analysis):")
     print(f"  - Effective dimensionality (dims with var > 0.01): {np.sum(latent_vars > 0.01)}")
     print(f"  - High variance dimensions (var > 0.1): {np.sum(latent_vars > 0.1)}")
     print(f"  - Dimensions close to N(0,1): {np.sum((np.abs(latent_means) < 0.1) & (np.abs(latent_vars - 1.0) < 0.2))}")
-    print(f"  - PCA explained variance (first 2 components): {pca_explained_variance[:2].sum():.2%}")
+    print(f"  - PCA components computed: {len(pca_explained_variance)}")
+    print(f"  - PCA explained variance (first 5 components): {pca_explained_variance[:5]}")
+    print(f"  - PCA cumulative variance (first 5): {np.cumsum(pca_explained_variance[:5])}")
+    print(f"  - t-SNE computation: successful")
     
     print(f"\n🎯 Dataset Balance Analysis:")
     for dataset in unique_datasets:
         mask = [info['dataset'] == dataset for info in sample_info]
         dataset_latents = latent_vectors[mask]
         if len(dataset_latents) > 0:
+            # Analyze in both raw latent space and PCA space
+            dataset_pca = latent_pca[mask]
             dataset_mean_norm = np.linalg.norm(dataset_latents.mean(axis=0))
             dataset_std_norm = np.linalg.norm(dataset_latents.std(axis=0))
+            dataset_pc1_mean = dataset_pca[:, 0].mean()
+            dataset_pc1_std = dataset_pca[:, 0].std()
             print(f"  - {dataset} dataset:")
             print(f"    * Samples: {len(dataset_latents)}")
-            print(f"    * Mean norm: {dataset_mean_norm:.3f}")
-            print(f"    * Std norm: {dataset_std_norm:.3f}")
+            print(f"    * Raw latent mean norm: {dataset_mean_norm:.3f}")
+            print(f"    * Raw latent std norm: {dataset_std_norm:.3f}")
+            print(f"    * PC1 mean: {dataset_pc1_mean:.3f}, PC1 std: {dataset_pc1_std:.3f}")
             print(f"    * Latent range: [{dataset_latents.min():.3f}, {dataset_latents.max():.3f}]")
+            print(f"    * PC1 range: [{dataset_pca[:, 0].min():.3f}, {dataset_pca[:, 0].max():.3f}]")
     
     return {
         'latent_vectors': latent_vectors,
@@ -628,6 +670,8 @@ def analyze_latent_space(
         'latent_vars': latent_vars,
         'pca_components': latent_pca,
         'pca_explained_variance': pca_explained_variance,
+        'pca_model': pca,  # Include the fitted PCA model
+        'tsne_components': latent_tsne,
         'dataset_labels': unique_datasets,
         'tty_grid_path': tty_save_path
     }
