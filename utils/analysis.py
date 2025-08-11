@@ -7,6 +7,8 @@ import math
 import datetime as dt
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
+from sklearn.decomposition import PCA
+import random
 
 # xterm-ish 16-color palette (0–7 normal, 8–15 bright)
 ANSI_16_RGB = [
@@ -120,171 +122,369 @@ def save_maps_and_markdown(
 
     print(f"Wrote Markdown: {md_path}")
 
-def visualize_reconstructions(model, test_dataset, device, num_samples=4, temperature=1.0, top_k=5, top_p=0.9, out_dir="vae_analysis", save_path="recon_comparison.md"):
+def visualize_reconstructions(
+    model, dataset, device, 
+    num_samples=4, temperature=1.0, top_k=5, top_p=0.9, 
+    out_dir="vae_analysis", save_path="recon_comparison.md",
+    random_sampling=True, dataset_name="Dataset"
+):
     """
-    Visualize VAE reconstructions for NetHack game states using tty_render
+    Enhanced version of visualize_reconstructions with random sampling support
     
     Args:
         model: Trained MultiModalHackVAE model
-        test_dataset: List of test batches (from NetHackDataCollector)
+        dataset: List of batches (from NetHackDataCollector)
         device: Device to run inference on
         num_samples: Number of samples to visualize
-        save_path: Path to save the visualization
+        random_sampling: Whether to randomly sample or use sequential sampling
+        dataset_name: Name of the dataset for labeling
     """
+    
     model.eval()
     
     reconstructions = []
     originals = []
     output_lines = []
-    output_lines.append("NetHack VAE Reconstructions")
+    output_lines.append(f"NetHack VAE Reconstructions - {dataset_name} Dataset")
     output_lines.append("=" * 80)
     output_lines.append("")
     
-    with torch.no_grad():
-        for i, batch in enumerate(test_dataset):  
-            # Move batch to device and reshape like in training
-            batch_device = {}
-            for key, value in batch.items():
-                if value is not None and isinstance(value, torch.Tensor):
-                    value_device = value.to(device)
-                    # Reshape tensors from [B, T, ...] to [B*T, ...]
-                    B, T = value_device.shape[:2]
-                    remaining_dims = value_device.shape[2:]
-                    batch_device[key] = value_device.view(B * T, *remaining_dims)
-                else:
-                    batch_device[key] = value
+    if random_sampling:
+        output_lines.append(f"🎲 Using random sampling from {len(dataset)} batches")
+    else:
+        output_lines.append(f"📄 Using sequential sampling from {len(dataset)} batches")
+    output_lines.append("")
+    
+    # Collect all valid samples from the dataset
+    all_samples = []
+    
+    print(f"🔍 Collecting valid samples from {dataset_name.lower()} dataset...")
+    for batch_idx, batch in enumerate(dataset):
+        # Move batch to device and reshape like in training
+        batch_device = {}
+        for key, value in batch.items():
+            if value is not None and isinstance(value, torch.Tensor):
+                value_device = value.to(device)
+                # Reshape tensors from [B, T, ...] to [B*T, ...]
+                B, T = value_device.shape[:2]
+                remaining_dims = value_device.shape[2:]
+                batch_device[key] = value_device.view(B * T, *remaining_dims)
+            else:
+                batch_device[key] = value
+        
+        if 'valid_screen' in batch_device:
+            valid_mask = batch_device['valid_screen'].cpu()  # [B*T]
+            valid_indices = torch.where(valid_mask)[0]
+        else:
+            # If no valid_screen mask, assume all are valid
+            valid_indices = torch.arange(batch_device['game_chars'].shape[0])
+        
+        # Store valid samples with their batch information
+        for idx in valid_indices:
+            sample_data = {}
+            for key in ['game_chars', 'game_colors', 'blstats', 'message_chars', 'hero_info']:
+                if key in batch_device and batch_device[key] is not None:
+                    sample_data[key] = batch_device[key][idx]
             
-            valid_screen = batch_device['valid_screen'].cpu()  # [B*T, H, W]
+            sample_data['batch_idx'] = batch_idx
+            sample_data['sample_idx'] = idx.item()
+            all_samples.append(sample_data)
+    
+    print(f"📊 Found {len(all_samples)} valid samples in {dataset_name.lower()} dataset")
+    
+    if len(all_samples) == 0:
+        print(f"⚠️ No valid samples found in {dataset_name.lower()} dataset!")
+        return {'num_samples': 0, 'originals': [], 'reconstructions': [], 'save_path': save_path}
+    
+    # Sample the requested number of samples
+    if random_sampling:
+        if len(all_samples) >= num_samples:
+            selected_samples = random.sample(all_samples, num_samples)
+        else:
+            selected_samples = all_samples
+            print(f"⚠️ Requested {num_samples} samples but only {len(all_samples)} available")
+    else:
+        selected_samples = all_samples[:num_samples]
+    
+    print(f"🎯 Processing {len(selected_samples)} samples for reconstruction...")
+    
+    with torch.no_grad():
+        for i, sample in enumerate(selected_samples):
+            print(f"  Processing sample {i+1}/{len(selected_samples)} (batch {sample['batch_idx']}, sample {sample['sample_idx']})")
+            
+            # Prepare input tensors (add batch dimension)
+            model_inputs = {}
+            for key in ['game_chars', 'game_colors', 'blstats', 'message_chars', 'hero_info']:
+                if key in sample and sample[key] is not None:
+                    model_inputs[key.replace('message_chars', 'msg_tokens')] = sample[key].unsqueeze(0)
             
             # Get model output
             model_output = model(
-                glyph_chars=batch_device['game_chars'][valid_screen][:max(0, num_samples - len(reconstructions))],
-                glyph_colors=batch_device['game_colors'][valid_screen][:max(0, num_samples - len(reconstructions))],
-                blstats=batch_device['blstats'][valid_screen][:max(0, num_samples - len(reconstructions))],
-                msg_tokens=batch_device['message_chars'][valid_screen][:max(0, num_samples - len(reconstructions))],
-                hero_info=batch_device['hero_info'][valid_screen][:max(0, num_samples - len(reconstructions))],
+                glyph_chars=model_inputs.get('game_chars'),
+                glyph_colors=model_inputs.get('game_colors'),
+                blstats=model_inputs.get('blstats'),
+                msg_tokens=model_inputs.get('msg_tokens'),
+                hero_info=model_inputs.get('hero_info'),
                 training_mode=False,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p
             )
             
-            # Get most likely character and color for each cell
+            # Get reconstructed characters and colors
             char_recon = model_output['generated_chars'][0].cpu()  # [H, W]
             color_recon = model_output['generated_colors'][0].cpu()  # [H, W]
-
-            # Get original data (take first sample from batch)
-            char_orig = batch_device['game_chars'][0].cpu()  # [H, W]
-            color_orig = batch_device['game_colors'][0].cpu()  # [H, W]
+            
+            # Get original data
+            char_orig = sample['game_chars'].cpu()  # [H, W]
+            color_orig = sample['game_colors'].cpu()  # [H, W]
             
             reconstructions.append((char_recon, color_recon))
             originals.append((char_orig, color_orig))
-            
-            if len(reconstructions) >= num_samples:
-                break
     
     save_maps_and_markdown(originals, reconstructions,
                             out_dir=out_dir,
                             md_filename=save_path,
                             font_path="DejaVuSansMono.ttf",  # optional
                             font_size=18)
+    
+    print(f"✅ {dataset_name} reconstruction visualization saved to {out_dir}/{save_path}")
 
     return {
         'num_samples': len(reconstructions),
         'originals': originals,
         'reconstructions': reconstructions,
-        'save_path': save_path
+        'save_path': save_path,
+        'dataset_name': dataset_name,
+        'random_sampling': random_sampling
     }
 
-def analyze_latent_space(model, test_dataset, device, save_path="vae_analysis/latent_analysis.png", max_samples=100):
+
+def analyze_latent_space(
+    model, dataset, device, 
+    save_path="vae_analysis/latent_analysis.png", 
+    max_samples=100, 
+    dataset_labels=None
+):
     """
-    Analyze the learned latent space of the VAE
+    Enhanced version of analyze_latent_space with support for multiple datasets
+    Automatically balances samples between training and testing datasets
     
     Args:
         model: Trained MultiModalHackVAE model
-        test_dataset: List of test batches (from NetHackDataCollector)
+        dataset: List of batches from multiple datasets
         device: Device to run inference on
         save_path: Path to save the analysis plots
         max_samples: Maximum number of samples to analyze
+        dataset_labels: List of labels for each batch indicating which dataset it comes from
     """
     model.eval()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    if dataset_labels is None:
+        dataset_labels = ['unknown'] * len(dataset)
+    
+    # Separate datasets by type
+    train_batches = []
+    test_batches = []
+    train_labels = []
+    test_labels = []
+    
+    for batch, label in zip(dataset, dataset_labels):
+        if label == 'train':
+            train_batches.append(batch)
+            train_labels.append(label)
+        elif label == 'test':
+            test_batches.append(batch)
+            test_labels.append(label)
+        else:
+            # Unknown labels go to train by default
+            train_batches.append(batch)
+            train_labels.append('train')
+    
+    print(f"📊 Dataset composition: {len(train_batches)} train batches, {len(test_batches)} test batches")
+    
+    # Determine sample allocation
+    if len(train_batches) > 0 and len(test_batches) > 0:
+        # Both datasets available - split samples evenly
+        train_samples_target = max_samples // 2
+        test_samples_target = max_samples - train_samples_target
+        print(f"🎯 Target samples: {train_samples_target} train, {test_samples_target} test")
+    elif len(train_batches) > 0:
+        # Only training data available
+        train_samples_target = max_samples
+        test_samples_target = 0
+        print(f"🎯 Only training data available, using {train_samples_target} samples")
+    elif len(test_batches) > 0:
+        # Only testing data available  
+        train_samples_target = 0
+        test_samples_target = max_samples
+        print(f"🎯 Only testing data available, using {test_samples_target} samples")
+    else:
+        raise ValueError("No valid datasets provided")
+    
+    # Shuffle datasets for random sampling
+    if len(train_batches) > 0:
+        train_indices = list(range(len(train_batches)))
+        random.shuffle(train_indices)
+        train_batches = [train_batches[i] for i in train_indices]
+        train_labels = [train_labels[i] for i in train_indices]
+    
+    if len(test_batches) > 0:
+        test_indices = list(range(len(test_batches)))
+        random.shuffle(test_indices)
+        test_batches = [test_batches[i] for i in test_indices]
+        test_labels = [test_labels[i] for i in test_indices]
+    
     latent_vectors = []
     batch_indices = []
     sample_info = []
     
-    sample_count = 0
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(test_dataset):
-            if sample_count >= max_samples:
-                break
-                
-            # Move batch to device and reshape like in training
-            batch_device = {}
-            for key, value in batch.items():
-                if value is not None and isinstance(value, torch.Tensor):
-                    value_device = value.to(device)
-                    # Reshape tensors from [B, T, ...] to [B*T, ...]
-                    B, T = value_device.shape[:2]
-                    remaining_dims = value_device.shape[2:]
-                    batch_device[key] = value_device.view(B * T, *remaining_dims)
-                else:
-                    batch_device[key] = value
+    def extract_samples_from_batches(batches, labels, target_samples, dataset_type):
+        """Extract samples from a list of batches"""
+        local_latent_vectors = []
+        local_sample_info = []
+        sample_count = 0
+        
+        with torch.no_grad():
+            for batch_idx, (batch, label) in enumerate(zip(batches, labels)):
+                if sample_count >= target_samples:
+                    break
                     
-            valid_screen = batch_device['valid_screen'].cpu()  # [B*T, H, W]
-            
-            # Get model output (includes mu, logvar, lowrank_factors)
-            model_output = model(
-                glyph_chars=batch_device['game_chars'][valid_screen][:max(0, max_samples - sample_count)],
-                glyph_colors=batch_device['game_colors'][valid_screen][:max(0, max_samples - sample_count)],
-                blstats=batch_device['blstats'][valid_screen][:max(0, max_samples - sample_count)],
-                msg_tokens=batch_device['message_chars'][valid_screen][:max(0, max_samples - sample_count)],
-                hero_info=batch_device['hero_info'][valid_screen][:max(0, max_samples - sample_count)]
-            )
-            
-            mu = model_output['mu']  # [B*T, latent_dim]
-            
-            # Store latent representations
-            latent_vectors.append(mu.cpu().numpy())
-            
-            # Store batch information
-            batch_size = mu.shape[0]
-            batch_indices.extend([batch_idx] * batch_size)
-            
-            # Store some sample info if available
-            for i in range(batch_size):
-                sample_info.append({
-                    'batch_idx': batch_idx,
-                    'sample_idx': i,
-                    'valid_screen': batch_device['valid_screen'][i].item() if 'valid_screen' in batch_device else True
-                })
-            
-            sample_count += batch_size
+                # Move batch to device and reshape like in training
+                batch_device = {}
+                for key, value in batch.items():
+                    if value is not None and isinstance(value, torch.Tensor):
+                        value_device = value.to(device)
+                        # Reshape tensors from [B, T, ...] to [B*T, ...]
+                        B, T = value_device.shape[:2]
+                        remaining_dims = value_device.shape[2:]
+                        batch_device[key] = value_device.view(B * T, *remaining_dims)
+                    else:
+                        batch_device[key] = value
+                        
+                if 'valid_screen' in batch_device:
+                    valid_screen = batch_device['valid_screen'].cpu()  # [B*T]
+                else:
+                    valid_screen = torch.ones(batch_device['game_chars'].shape[0], dtype=torch.bool)
+                
+                # Get model output (includes mu, logvar, lowrank_factors)
+                samples_to_process = min(max(0, target_samples - sample_count), valid_screen.sum().item())
+                if samples_to_process == 0:
+                    continue
+                    
+                valid_indices = torch.where(valid_screen)[0]
+                
+                # Randomly shuffle valid indices for more diverse sampling
+                perm = torch.randperm(len(valid_indices))
+                valid_indices = valid_indices[perm][:samples_to_process]
+                
+                model_output = model(
+                    glyph_chars=batch_device['game_chars'][valid_indices],
+                    glyph_colors=batch_device['game_colors'][valid_indices],
+                    blstats=batch_device['blstats'][valid_indices],
+                    msg_tokens=batch_device['message_chars'][valid_indices],
+                    hero_info=batch_device['hero_info'][valid_indices]
+                )
+                
+                mu = model_output['mu']  # [samples_to_process, latent_dim]
+                
+                # Store latent representations
+                local_latent_vectors.append(mu.cpu().numpy())
+                
+                # Store sample info with dataset labels
+                batch_size = mu.shape[0]
+                for i in range(batch_size):
+                    local_sample_info.append({
+                        'batch_idx': batch_idx,
+                        'sample_idx': i,
+                        'dataset': dataset_type,
+                        'valid_screen': True,
+                        'global_batch_idx': len(sample_info) + len(local_sample_info)
+                    })
+                
+                sample_count += batch_size
+                
+                if sample_count % 50 == 0 or sample_count >= target_samples:
+                    print(f"  📈 Extracted {sample_count}/{target_samples} {dataset_type} samples...")
+        
+        return local_latent_vectors, local_sample_info
+    
+    # Extract samples from training dataset
+    if train_samples_target > 0:
+        print(f"🔄 Extracting samples from training dataset...")
+        train_latent_vectors, train_sample_info = extract_samples_from_batches(
+            train_batches, train_labels, train_samples_target, 'train'
+        )
+        latent_vectors.extend(train_latent_vectors)
+        sample_info.extend(train_sample_info)
+        print(f"✅ Extracted {len(train_sample_info)} training samples")
+    
+    # Extract samples from testing dataset
+    if test_samples_target > 0:
+        print(f"🔄 Extracting samples from testing dataset...")
+        test_latent_vectors, test_sample_info = extract_samples_from_batches(
+            test_batches, test_labels, test_samples_target, 'test'
+        )
+        latent_vectors.extend(test_latent_vectors)
+        sample_info.extend(test_sample_info)
+        print(f"✅ Extracted {len(test_sample_info)} testing samples")
     
     # Combine all latent vectors
-    latent_vectors = np.vstack(latent_vectors)
-    latent_vectors = latent_vectors[:max_samples]  # Trim to max_samples
-    batch_indices = batch_indices[:max_samples]
-    sample_info = sample_info[:max_samples]
+    if len(latent_vectors) == 0:
+        raise ValueError("No samples could be extracted from the datasets")
     
-    print(f"📊 Latent Space Analysis:")
+    latent_vectors = np.vstack(latent_vectors)
+    
+    # Create batch indices for backward compatibility
+    batch_indices = [info['global_batch_idx'] for info in sample_info]
+    
+    # Final shuffle for more uniform distribution in visualizations
+    sample_indices = list(range(len(latent_vectors)))
+    random.shuffle(sample_indices)
+    latent_vectors = latent_vectors[sample_indices]
+    sample_info = [sample_info[i] for i in sample_indices]
+    batch_indices = [batch_indices[i] for i in sample_indices]
+    
+    # Create dataset color mapping
+    unique_datasets = list(set([info['dataset'] for info in sample_info]))
+    dataset_colors = {}
+    colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
+    for i, dataset in enumerate(unique_datasets):
+        dataset_colors[dataset] = colors[i % len(colors)]
+    
+    dataset_color_values = [dataset_colors[info['dataset']] for info in sample_info]
+    
+    print(f"📊 Enhanced Latent Space Analysis (Balanced Sampling):")
     print(f"  - Total samples analyzed: {len(latent_vectors)}")
+    print(f"  - Datasets: {unique_datasets}")
+    
+    # Count samples per dataset after balancing
+    actual_counts = {}
+    for dataset in unique_datasets:
+        count = sum(1 for info in sample_info if info['dataset'] == dataset)
+        actual_counts[dataset] = count
+        print(f"  - {dataset} samples: {count}")
+    
     print(f"  - Latent dimensionality: {latent_vectors.shape[1]}")
     print(f"  - Latent mean: {np.mean(latent_vectors, axis=0)[:5]}...")
     print(f"  - Latent std: {np.std(latent_vectors, axis=0)[:5]}...")
-    print(f"  - Min latent values: {np.min(latent_vectors, axis=0)[:5]}...")
-    print(f"  - Max latent values: {np.max(latent_vectors, axis=0)[:5]}...")
     
     # Create comprehensive visualization
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
-    # 1. First two latent dimensions colored by batch
-    axes[0, 0].scatter(latent_vectors[:, 0], latent_vectors[:, 1], 
-                      c=batch_indices, cmap='tab10', alpha=0.6, s=20)
+    # 1. First two latent dimensions colored by dataset
+    for dataset in unique_datasets:
+        mask = [info['dataset'] == dataset for info in sample_info]
+        if any(mask):
+            dataset_latents = latent_vectors[mask]
+            axes[0, 0].scatter(dataset_latents[:, 0], dataset_latents[:, 1], 
+                              c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
+    
     axes[0, 0].set_xlabel('Latent Dimension 0')
     axes[0, 0].set_ylabel('Latent Dimension 1')
-    axes[0, 0].set_title('Latent Space (Dims 0-1, colored by batch)')
+    axes[0, 0].set_title('Latent Space (Dims 0-1, colored by dataset)')
+    axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
     # 2. Latent dimension variances
@@ -303,12 +503,27 @@ def analyze_latent_space(model, test_dataset, device, save_path="vae_analysis/la
     axes[0, 2].set_title('Mean per Latent Dimension')
     axes[0, 2].grid(True, alpha=0.3)
     
-    # 4. Distribution of first latent dimension
-    axes[1, 0].hist(latent_vectors[:, 0], bins=50, alpha=0.7, density=True)
-    axes[1, 0].axvline(0, color='red', linestyle='--', alpha=0.7, label='N(0,1) mean')
-    axes[1, 0].set_xlabel('Latent Value')
+    # 4. Distribution comparison between datasets
+    dataset_latent_values = []
+    for dataset in unique_datasets:
+        mask = [info['dataset'] == dataset for info in sample_info]
+        if any(mask):
+            dataset_latents = latent_vectors[mask, 0]  # Get first dimension values for this dataset
+            dataset_latent_values.append(dataset_latents)
+        else:
+            dataset_latent_values.append(np.array([]))  # Empty array if no samples
+    
+    # Only plot non-empty datasets
+    non_empty_datasets = [ds for ds, vals in zip(unique_datasets, dataset_latent_values) if len(vals) > 0]
+    non_empty_values = [vals for vals in dataset_latent_values if len(vals) > 0]
+    
+    if non_empty_values:
+        axes[1, 0].hist(non_empty_values, bins=30, alpha=0.7, label=non_empty_datasets, density=True)
+    
+    axes[1, 0].axvline(0, color='black', linestyle='--', alpha=0.7, label='N(0,1) mean')
+    axes[1, 0].set_xlabel('Latent Value (Dimension 0)')
     axes[1, 0].set_ylabel('Density')
-    axes[1, 0].set_title('Distribution of Latent Dim 0')
+    axes[1, 0].set_title('Latent Dim 0 Distribution by Dataset')
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
     
@@ -321,41 +536,48 @@ def analyze_latent_space(model, test_dataset, device, save_path="vae_analysis/la
     axes[1, 1].set_title(f'Correlation Matrix (first {n_dims_to_show} dims)')
     plt.colorbar(im, ax=axes[1, 1])
     
-    # 6. Principal components analysis
-    from sklearn.decomposition import PCA
+    # 6. Principal components analysis colored by dataset
     pca = PCA(n_components=2)
     latent_pca = pca.fit_transform(latent_vectors)
     
-    axes[1, 2].scatter(latent_pca[:, 0], latent_pca[:, 1], 
-                      c=batch_indices, cmap='tab10', alpha=0.6, s=20)
+    for dataset in unique_datasets:
+        mask = [info['dataset'] == dataset for info in sample_info]
+        if any(mask):
+            dataset_pca = latent_pca[mask]
+            axes[1, 2].scatter(dataset_pca[:, 0], dataset_pca[:, 1], 
+                                c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
+    
     axes[1, 2].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
     axes[1, 2].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
     axes[1, 2].set_title('PCA of Latent Space')
+    axes[1, 2].legend()
     axes[1, 2].grid(True, alpha=0.3)
+    
+    pca_explained_variance = pca.explained_variance_ratio_
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
     
-    # 7. Create standalone TTY visualization figure (15x15 grid = 225 samples)
+    # Generate TTY visualization grid (same as before)
     print(f"\n🎮 Generating TTY visualization grid...")
     W = torch.linalg.svd(torch.tensor(latent_vectors, dtype=torch.float32)).Vh[:2]
     num_per_axis = 5
-    points = torch.distributions.Normal(0,1).icdf(torch.linspace(0.01, 0.99, num_per_axis))  # 5x5 grid = 25 samples
+    points = torch.distributions.Normal(0,1).icdf(torch.linspace(0.01, 0.99, num_per_axis))
     XX, YY = torch.meshgrid(points, points, indexing='ij')
     XXYY = torch.stack((XX, YY)).reshape(2, -1).T
     latent_grid = XXYY @ W
     
     with torch.no_grad():
         decode_output = model.decode(latent_grid.to(device))
-        chars = decode_output['generated_chars'].cpu()  # [225, 21, 79]
-        colors = decode_output['generated_colors'].cpu()  # [225, 21, 79]
+        chars = decode_output['generated_chars'].cpu()
+        colors = decode_output['generated_colors'].cpu()
     
-    # Create giant figure for TTY renders
+    # Create TTY grid visualization
+    from utils.analysis import _render_map_image
     tty_fig, tty_axes = plt.subplots(num_per_axis, num_per_axis, figsize=(30, 10))
     tty_fig.suptitle('Generated NetHack States from Latent Space Grid (5x5)', fontsize=20, y=0.98)
 
-    # Generate and display TTY renders in grid
     print(f"🎨 Rendering {num_per_axis * num_per_axis} NetHack states...")
     n = min(len(chars), num_per_axis * num_per_axis)
     imgs = [
@@ -369,20 +591,34 @@ def analyze_latent_space(model, test_dataset, device, save_path="vae_analysis/la
         if i < n:
             ax.imshow(imgs[i], interpolation="nearest")
     plt.tight_layout()
-    # Save the TTY visualization
+    
     tty_save_path = save_path.replace('.png', '_tty_grid.png')
-    plt.figure(tty_fig.number)  # Make sure we're working with the TTY figure
+    plt.figure(tty_fig.number)
     plt.savefig(tty_save_path, dpi=200, bbox_inches='tight')
     plt.show()
     
-    print(f"Latent space analysis saved to {save_path}")
+    print(f"Enhanced latent space analysis saved to {save_path}")
+    print(f"TTY grid visualization saved to {tty_save_path}")
     
-    # Additional statistics
-    print(f"\n📈 Additional Statistics:")
+    # Enhanced statistics with balanced sampling info
+    print(f"\n📈 Enhanced Statistics (Balanced Sampling):")
     print(f"  - Effective dimensionality (dims with var > 0.01): {np.sum(latent_vars > 0.01)}")
     print(f"  - High variance dimensions (var > 0.1): {np.sum(latent_vars > 0.1)}")
     print(f"  - Dimensions close to N(0,1): {np.sum((np.abs(latent_means) < 0.1) & (np.abs(latent_vars - 1.0) < 0.2))}")
-    print(f"  - PCA explained variance (first 2 components): {pca.explained_variance_ratio_[:2].sum():.2%}")
+    print(f"  - PCA explained variance (first 2 components): {pca_explained_variance[:2].sum():.2%}")
+    
+    print(f"\n🎯 Dataset Balance Analysis:")
+    for dataset in unique_datasets:
+        mask = [info['dataset'] == dataset for info in sample_info]
+        dataset_latents = latent_vectors[mask]
+        if len(dataset_latents) > 0:
+            dataset_mean_norm = np.linalg.norm(dataset_latents.mean(axis=0))
+            dataset_std_norm = np.linalg.norm(dataset_latents.std(axis=0))
+            print(f"  - {dataset} dataset:")
+            print(f"    * Samples: {len(dataset_latents)}")
+            print(f"    * Mean norm: {dataset_mean_norm:.3f}")
+            print(f"    * Std norm: {dataset_std_norm:.3f}")
+            print(f"    * Latent range: [{dataset_latents.min():.3f}, {dataset_latents.max():.3f}]")
     
     return {
         'latent_vectors': latent_vectors,
@@ -391,5 +627,7 @@ def analyze_latent_space(model, test_dataset, device, save_path="vae_analysis/la
         'latent_means': latent_means,
         'latent_vars': latent_vars,
         'pca_components': latent_pca,
-        'pca_explained_variance': pca.explained_variance_ratio_
+        'pca_explained_variance': pca_explained_variance,
+        'dataset_labels': unique_datasets,
+        'tty_grid_path': tty_save_path
     }

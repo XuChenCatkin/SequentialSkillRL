@@ -44,6 +44,14 @@ except ImportError:
     print("⚠️  HuggingFace Hub not available. Install with: pip install huggingface_hub")
     HF_AVAILABLE = False
 
+# Scikit-learn availability check
+try:
+    from sklearn.decomposition import PCA
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    print("⚠️  scikit-learn not available. Install with: pip install scikit-learn")
+    SKLEARN_AVAILABLE = False
+
 # Add utils to path for importing env_utils
 sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
 import env_utils
@@ -2384,7 +2392,8 @@ def load_model_from_huggingface(
 
 def create_visualization_demo(
     repo_name: str,
-    test_dataset: List[Dict],
+    train_dataset: Optional[List[Dict]] = None,
+    test_dataset: Optional[List[Dict]] = None,
     revision_name: Optional[str] = None,
     token: Optional[str] = None,
     device: str = "cpu",
@@ -2393,23 +2402,38 @@ def create_visualization_demo(
     sample_temperature: float = 1.0,
     sample_top_k: int = 5,
     sample_top_p: float = 0.9,
-    save_dir: str = "vae_analysis"
+    save_dir: str = "vae_analysis",
+    random_sampling: bool = True,
+    random_seed: Optional[int] = None
 ) -> Dict:
     """
     Complete demo function that loads a model from HuggingFace and creates visualizations
     
     Args:
         repo_name: HuggingFace repository name
-        test_dataset: Test dataset from NetHackDataCollector
+        train_dataset: Training dataset from NetHackDataCollector (optional)
+        test_dataset: Test dataset from NetHackDataCollector (optional)
         token: HuggingFace token (optional)
         device: Device to run on
         num_samples: Number of reconstruction samples
         max_latent_samples: Maximum samples for latent analysis
         save_dir: Directory to save results
+        random_sampling: Whether to use random sampling for reconstruction visualization
+        random_seed: Random seed for reproducible sampling
         
     Returns:
         Dictionary with analysis results
     """
+    # Validate inputs
+    if train_dataset is None and test_dataset is None:
+        raise ValueError("At least one of train_dataset or test_dataset must be provided")
+    
+    # Set random seed if provided
+    if random_seed is not None:
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
+    
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
     
@@ -2417,33 +2441,85 @@ def create_visualization_demo(
     print(f"📦 Repository: {repo_name}")
     print(f"🎯 Device: {device}")
     print(f"📁 Save directory: {save_dir}")
+    print(f"🎲 Random sampling: {random_sampling}")
+    if random_seed is not None:
+        print(f"🌱 Random seed: {random_seed}")
     
     # Load model from HuggingFace
     print(f"\n1️⃣ Loading model from HuggingFace...")
     model = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
 
-    # Create TTY reconstructions
-    print(f"\n2️⃣ Creating TTY reconstruction visualizations...")
-    save_path="recon_comparison.md"
-    visualize_reconstructions(model, test_dataset, device, num_samples=num_samples, temperature=sample_temperature, top_k=sample_top_k, top_p=sample_top_p, out_dir=save_dir, save_path=save_path)
+    results = {'model': model, 'save_dir': save_dir}
+    
+    # Create TTY reconstructions for available datasets
+    if train_dataset is not None:
+        print(f"\n2️⃣ Creating TTY reconstruction visualizations for TRAINING dataset...")
+        train_save_path = "train_recon_comparison.md"
+        train_recon_results = visualize_reconstructions(
+            model, train_dataset, device, 
+            num_samples=num_samples, 
+            temperature=sample_temperature, 
+            top_k=sample_top_k, 
+            top_p=sample_top_p, 
+            out_dir=save_dir, 
+            save_path=train_save_path,
+            random_sampling=random_sampling,
+            dataset_name="Training"
+        )
+        results['train_reconstruction_path'] = os.path.join(save_dir, train_save_path)
+        results['train_reconstruction_results'] = train_recon_results
+    
+    if test_dataset is not None:
+        print(f"\n2️⃣ Creating TTY reconstruction visualizations for TESTING dataset...")
+        test_save_path = "test_recon_comparison.md"
+        test_recon_results = visualize_reconstructions(
+            model, test_dataset, device, 
+            num_samples=num_samples, 
+            temperature=sample_temperature, 
+            top_k=sample_top_k, 
+            top_p=sample_top_p, 
+            out_dir=save_dir, 
+            save_path=test_save_path,
+            random_sampling=random_sampling,
+            dataset_name="Testing"
+        )
+        results['test_reconstruction_path'] = os.path.join(save_dir, test_save_path)
+        results['test_reconstruction_results'] = test_recon_results
 
-    # Analyze latent space
+    # Analyze latent space (use combined dataset or available one)
     print(f"\n3️⃣ Analyzing latent space...")
+    
+    # Combine datasets for latent analysis or use what's available
+    analysis_datasets = []
+    dataset_labels = []
+    
+    if train_dataset is not None:
+        analysis_datasets.extend(train_dataset)
+        dataset_labels.extend(['train'] * len(train_dataset))
+    
+    if test_dataset is not None:
+        analysis_datasets.extend(test_dataset)
+        dataset_labels.extend(['test'] * len(test_dataset))
+    
     latent_path = os.path.join(save_dir, "latent_analysis.png")
-    latent_analysis = analyze_latent_space(model, test_dataset, device, save_path=latent_path, max_samples=max_latent_samples)
+    latent_analysis = analyze_latent_space(
+        model, analysis_datasets, device, 
+        save_path=latent_path, 
+        max_samples=max_latent_samples,
+        dataset_labels=dataset_labels
+    )
+    
+    results['latent_analysis_path'] = latent_path
+    results['latent_analysis'] = latent_analysis
     
     print(f"\n✅ Analysis complete! Results saved to: {save_dir}")
-    print(f"📄 TTY reconstructions: {save_dir}/{save_path}")
+    if train_dataset is not None:
+        print(f"📄 Training TTY reconstructions: {results['train_reconstruction_path']}")
+    if test_dataset is not None:
+        print(f"📄 Testing TTY reconstructions: {results['test_reconstruction_path']}")
     print(f"📊 Latent analysis plot: {latent_path}")
     
-    return {
-        'model': model,
-        'reconstruction_path': save_dir + '/' + save_path,
-        'latent_analysis_path': latent_path,
-        'latent_analysis': latent_analysis,
-        'save_dir': save_dir
-    }
-
+    return results
 
 def upload_training_artifacts_to_huggingface(
     repo_name: str,
@@ -2677,18 +2753,33 @@ if __name__ == "__main__":
     
     
     if len(sys.argv) > 1 and sys.argv[1] == "vae_analysis":
-        # Demo mode: python train.py demo <repo_name>
+        # Demo mode: python train.py vae_analysis <repo_name> [revision_name]
         repo_name = sys.argv[2] if len(sys.argv) > 2 else "CatkinChen/nethack-vae"
         revision_name = sys.argv[3] if len(sys.argv) > 3 else None
         
         print(f"🚀 Running VAE Analysis Demo")
         print(f"📦 Repository: {repo_name}")
         
-        # Create some test data (you would replace this with your actual test dataset)
-        print(f"📊 Preparing test data...")
+        # Create both training and test data
+        print(f"📊 Preparing training and test data...")
         
         collector = NetHackDataCollector('ttyrecs.db')
         adapter = BLStatsAdapter()
+        
+        # Load training dataset
+        print(f"📊 Loading training dataset...")
+        train_dataset = collector.collect_or_load_data(
+            dataset_name=train_file,
+            adapter=adapter,
+            save_path=train_cache_file,
+            max_batches=max_training_batches,
+            batch_size=batch_size,
+            seq_length=sequence_size,
+            force_recollect=False
+        )
+        
+        # Load test dataset  
+        print(f"📊 Loading test dataset...")
         test_dataset = collector.collect_or_load_data(
             dataset_name=test_file,
             adapter=adapter,
@@ -2699,25 +2790,40 @@ if __name__ == "__main__":
             force_recollect=False
         )
         
-        # Run the complete analysis
+        # Run the complete analysis on both datasets
         try:
             results = create_visualization_demo(
                 repo_name=repo_name,
+                train_dataset=train_dataset,
                 test_dataset=test_dataset,
                 revision_name=revision_name,
                 device="cpu",  # Use CPU for demo
-                num_samples=4,
-                max_latent_samples=50,
+                num_samples=10,
+                max_latent_samples=1000,  # More samples since we have both datasets
                 sample_temperature=1.0,
                 sample_top_k=1,
                 sample_top_p=1.0,
-                save_dir="vae_analysis"
+                save_dir="vae_analysis",
+                random_sampling=True,  # Enable random sampling
+                random_seed=42  # For reproducible results
             )
             print(f"✅ Demo completed successfully!")
             print(f"📁 Results saved to: {results['save_dir']}")
-            print(f"📊 Test dataset created: {len(test_dataset)} batches")
+            print(f"📊 Training dataset: {len(train_dataset)} batches")
+            print(f"📊 Test dataset: {len(test_dataset)} batches")
+            
+            # Print detailed results
+            if 'train_reconstruction_results' in results:
+                print(f"🎨 Training reconstructions: {results['train_reconstruction_results']['num_samples']} samples")
+            if 'test_reconstruction_results' in results:
+                print(f"🎨 Test reconstructions: {results['test_reconstruction_results']['num_samples']} samples")
+            if 'latent_analysis' in results:
+                print(f"🧠 Latent analysis: {len(results['latent_analysis']['latent_vectors'])} total samples analyzed")
+                
         except Exception as e:
             print(f"❌ Demo failed: {e}")
+            import traceback
+            traceback.print_exc()
             print(f"💡 Make sure the repository exists and is accessible")
             print(f"💡 You can create synthetic data for testing by setting repo_name to a local path")
     
