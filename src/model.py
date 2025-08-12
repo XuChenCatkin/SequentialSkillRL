@@ -1176,7 +1176,7 @@ def vae_loss(
     blstats, 
     msg_tokens,
     valid_screen,
-    raw_modality_weights={'occupy': 10.0, 'char': 1.0, 'color': 1.0, 'stats': 0.5, 'msg': 0.5},
+    raw_modality_weights={'occupy': 0.1, 'char': 1.0, 'color': 1.0, 'stats': 0.5, 'msg': 0.5},
     focal_loss_alpha=0.1,
     focal_loss_gamma=2.0,
     mi_beta=1.0,
@@ -1215,9 +1215,9 @@ def vae_loss(
 
     # occupancy focal BCE (mean over pixels)
     #occ_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), ooc_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
-    fg_rate = 0.05
+    fg_rate = 0.25
     pos_weight = torch.tensor([(1 - fg_rate) / max(fg_rate, 1e-6)], device=occupy_logits.device, dtype=occupy_logits.dtype) 
-    occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, ooc_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2])  # [valid_B]
+    occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, ooc_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2,3])  # [valid_B]
     assert occ_loss_per_sample.shape == (valid_B,), f"occupy loss shape mismatch: {occ_loss_per_sample.shape} != ({valid_B},)"
     p = torch.sigmoid(occupy_logits)          # [B,1,H,W]
     dx = p[..., :, 1:] - p[..., :, :-1]
@@ -1232,16 +1232,36 @@ def vae_loss(
 
     # CE losses (masked by foreground)
     if fg.any():
-        char_hist = torch.bincount(char_t.view(-1), minlength=CHAR_DIM)  # [CHAR_DIM]
-        color_hist = torch.bincount(col_t.view(-1), minlength=COLOR_DIM)  # [COLOR_DIM]
-        char_w = (char_hist.float().max() / char_hist.float().maximum(1))  # [CHAR_DIM]
-        color_w = (color_hist.float().max() / color_hist.float().maximum(1))  # [COLOR_DIM]
-        char_w = char_w.to(glyph_chars.device)  # Ensure same device
-        color_w = color_w.to(glyph_colors.device)
-        char_loss_per_sample = F.cross_entropy(char_logits, char_t, reduction='none', weight=char_w, label_smoothing=0.05)  # [valid_B, H, W]
-        masked_char_loss_per_sample = char_loss_per_sample * fg.float()
-        color_loss_per_sample = F.cross_entropy(color_logits, col_t, reduction='none', weight=color_w, label_smoothing=0.05)  # [valid_B, H, W]
-        masked_color_loss_per_sample = color_loss_per_sample * fg.float()
+        IGNORE = -100
+        char_t_mask = torch.where(fg, char_t, torch.full_like(char_t, IGNORE))
+        col_t_mask  = torch.where(fg, col_t,  torch.full_like(col_t,  IGNORE))
+
+        # foreground-only counts
+        fg_flat = fg.view(-1)
+        char_flat = char_t.view(-1)[fg_flat]
+        col_flat  = col_t.view(-1)[fg_flat]
+
+        def make_weights(counts, cap=5.0):
+            w = 1.0 / torch.log1p(counts).clamp_min(1.0)
+            w = w / w.mean()               # normalize so mean weight ≈ 1
+            w = w.clamp(max=cap)           # avoid extreme scaling
+            return w
+
+        char_cnt = torch.bincount(char_flat, minlength=CHAR_DIM).to(occupy_logits.device)
+        col_cnt  = torch.bincount(col_flat,  minlength=COLOR_DIM).to(occupy_logits.device)
+
+        char_w = make_weights(char_cnt)    # shape [CHAR_DIM], float
+        color_w = make_weights(col_cnt)    # shape [COLOR_DIM], float
+
+        # CE computed only on FG via ignore_index
+        masked_char_loss_per_sample = F.cross_entropy(
+            char_logits, char_t_mask, weight=char_w, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
+        )
+        assert masked_char_loss_per_sample.shape == (valid_B, H, W), f"masked_char_loss shape mismatch: {masked_char_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
+        masked_color_loss_per_sample = F.cross_entropy(
+            color_logits, col_t_mask, weight=color_w, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
+        )
+        assert masked_color_loss_per_sample.shape == (valid_B, H, W), f"masked_color_loss shape mismatch: {masked_color_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
 
         # Sum over spatial dimensions for each sample
         masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2])  # [valid_B]

@@ -1097,6 +1097,9 @@ def train_multimodalhack_vae(
     """
     if device is None:
         device = torch.device('cpu')  # Use CPU for debugging
+    else:
+        # Ensure device is a torch.device object, not a string
+        device = torch.device(device)
 
     # Setup logging
     if logger is None:
@@ -2915,7 +2918,7 @@ if __name__ == "__main__":
             max_testing_batches=max_testing_batches,
             save_path="models/nethack-vae.pth",
             device='cuda' if torch.cuda.is_available() else 'cpu',
-            use_bf16=True,  # Enable BF16 mixed precision training for memory efficiency
+            use_bf16=False,  # Temporarily disable BF16 due to model dtype compatibility
             data_cache_dir="data_cache",
             force_recollect=False,  # Use the data we just collected
             shuffle_batches=True,  # Shuffle training batches each epoch for better training

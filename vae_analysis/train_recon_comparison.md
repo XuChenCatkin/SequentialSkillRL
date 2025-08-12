@@ -1,6 +1,6 @@
 # VAE Reconstruction Comparison
 
-_Generated: 2025-08-12T15:19:36_
+_Generated: 2025-08-12T19:45:08_
 
 ## Sample 1
 
@@ -9,8 +9,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 0](images/sample_000_orig.png) | ![recon 0](images/sample_000_recon.png) |
 
 
- Sample 1 Accuracy:   Character accuracy: 0.958 (1589/1659 cells)
-   Color accuracy: 0.955 (1584/1659 cells)
+ Sample 1 Accuracy:   Character accuracy: 0.979 (1624/1659 cells)
+   Color accuracy: 0.978 (1623/1659 cells)
 
 ================================================================================
 ## Sample 2
@@ -20,8 +20,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 1](images/sample_001_orig.png) | ![recon 1](images/sample_001_recon.png) |
 
 
- Sample 2 Accuracy:   Character accuracy: 0.972 (1612/1659 cells)
-   Color accuracy: 0.971 (1611/1659 cells)
+ Sample 2 Accuracy:   Character accuracy: 0.975 (1618/1659 cells)
+   Color accuracy: 0.977 (1621/1659 cells)
 
 ================================================================================
 ## Sample 3
@@ -31,8 +31,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 2](images/sample_002_orig.png) | ![recon 2](images/sample_002_recon.png) |
 
 
- Sample 3 Accuracy:   Character accuracy: 0.929 (1541/1659 cells)
-   Color accuracy: 0.935 (1551/1659 cells)
+ Sample 3 Accuracy:   Character accuracy: 0.942 (1562/1659 cells)
+   Color accuracy: 0.950 (1576/1659 cells)
 
 ================================================================================
 ## Sample 4
@@ -42,8 +42,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 3](images/sample_003_orig.png) | ![recon 3](images/sample_003_recon.png) |
 
 
- Sample 4 Accuracy:   Character accuracy: 0.874 (1450/1659 cells)
-   Color accuracy: 0.928 (1539/1659 cells)
+ Sample 4 Accuracy:   Character accuracy: 0.891 (1478/1659 cells)
+   Color accuracy: 0.907 (1505/1659 cells)
 
 ================================================================================
 ## Sample 5
@@ -53,8 +53,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 4](images/sample_004_orig.png) | ![recon 4](images/sample_004_recon.png) |
 
 
- Sample 5 Accuracy:   Character accuracy: 0.960 (1592/1659 cells)
-   Color accuracy: 0.963 (1597/1659 cells)
+ Sample 5 Accuracy:   Character accuracy: 0.979 (1624/1659 cells)
+   Color accuracy: 0.981 (1628/1659 cells)
 
 ================================================================================
 ## Sample 6
@@ -64,8 +64,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 5](images/sample_005_orig.png) | ![recon 5](images/sample_005_recon.png) |
 
 
- Sample 6 Accuracy:   Character accuracy: 0.972 (1612/1659 cells)
-   Color accuracy: 0.966 (1602/1659 cells)
+ Sample 6 Accuracy:   Character accuracy: 0.610 (1012/1659 cells)
+   Color accuracy: 0.641 (1064/1659 cells)
 
 ================================================================================
 ## Sample 7
@@ -75,8 +75,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 6](images/sample_006_orig.png) | ![recon 6](images/sample_006_recon.png) |
 
 
- Sample 7 Accuracy:   Character accuracy: 0.973 (1615/1659 cells)
-   Color accuracy: 0.969 (1607/1659 cells)
+ Sample 7 Accuracy:   Character accuracy: 0.985 (1634/1659 cells)
+   Color accuracy: 0.984 (1632/1659 cells)
 
 ================================================================================
 ## Sample 8
@@ -86,8 +86,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 7](images/sample_007_orig.png) | ![recon 7](images/sample_007_recon.png) |
 
 
- Sample 8 Accuracy:   Character accuracy: 0.963 (1598/1659 cells)
-   Color accuracy: 0.969 (1607/1659 cells)
+ Sample 8 Accuracy:   Character accuracy: 0.973 (1615/1659 cells)
+   Color accuracy: 0.980 (1625/1659 cells)
 
 ================================================================================
 ## Sample 9
@@ -97,8 +97,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 8](images/sample_008_orig.png) | ![recon 8](images/sample_008_recon.png) |
 
 
- Sample 9 Accuracy:   Character accuracy: 0.957 (1587/1659 cells)
-   Color accuracy: 0.963 (1597/1659 cells)
+ Sample 9 Accuracy:   Character accuracy: 0.969 (1608/1659 cells)
+   Color accuracy: 0.976 (1620/1659 cells)
 
 ================================================================================
 ## Sample 10
@@ -108,8 +108,8 @@ _Generated: 2025-08-12T15:19:36_
 | ![orig 9](images/sample_009_orig.png) | ![recon 9](images/sample_009_recon.png) |
 
 
- Sample 10 Accuracy:   Character accuracy: 0.934 (1550/1659 cells)
-   Color accuracy: 0.910 (1509/1659 cells)
+ Sample 10 Accuracy:   Character accuracy: 0.951 (1577/1659 cells)
+   Color accuracy: 0.927 (1538/1659 cells)
 
-📈 Overall Reconstruction Statistics:   Average Character Reconstruction Accuracy: 0.949
-   Average Color Reconstruction Accuracy: 0.953
+📈 Overall Reconstruction Statistics:   Average Character Reconstruction Accuracy: 0.925
+   Average Color Reconstruction Accuracy: 0.930
