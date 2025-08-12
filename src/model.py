@@ -212,7 +212,8 @@ class AttnPool(nn.Module):
 
         if bad.any():
             # replace bad heads with learnable empty vector
-            Z[bad] = self.empty_vec
+            # Ensure dtype compatibility for mixed precision training
+            Z[bad] = self.empty_vec.to(Z.dtype)
 
         return Z.reshape(B, -1)                     # [B, K*C]
     
@@ -535,9 +536,9 @@ class GlyphBag(nn.Module):
         padding_indices = torch.tensor(PADDING_IDX, dtype=torch.long, device=bag.device)  # [2]
         lengths = (bag != padding_indices).all(dim=-1).sum(dim=1).cpu()  # [B] - count non-padding glyphs
         
-        # Initialize features tensor
+        # Initialize features tensor with dtype matching embeddings
         B = emb.size(0)
-        features = torch.zeros(B, 32, device=emb.device)  # [B, 32] - output size of RNN
+        features = torch.zeros(B, 32, device=emb.device, dtype=emb.dtype)  # [B, 32] - output size of RNN
         
         # Find samples with non-zero lengths
         valid_mask = lengths > 0
@@ -552,8 +553,8 @@ class GlyphBag(nn.Module):
             _, h = self.net(packed_emb)  # h: [1, valid_B, 32]
             valid_features = h.squeeze(0)  # [valid_B, 32]
             
-            # Assign valid features back to the full tensor
-            features[valid_mask] = valid_features
+            # Assign valid features back to the full tensor with dtype compatibility
+            features[valid_mask] = valid_features.to(features.dtype)
         
         # Features for samples with lengths == 0 remain as zeros (already initialized)
         
@@ -1222,13 +1223,13 @@ def vae_loss(
     p = torch.sigmoid(occupy_logits)          # [B,1,H,W]
     dx = p[..., :, 1:] - p[..., :, :-1]
     dy = p[..., 1:, :] - p[..., :-1, :]
-    tv = (dx.abs().mean() + dy.abs().mean())
+    tv = (dx.abs().mean() + dy.abs().mean()) * H * W
 
     # Dice (alternative or in addition; keep weight small)
     probs = p.squeeze(1); target = ooc_t.squeeze(1)
     inter = (probs * target).sum(dim=(1,2))
     dice = (2*inter + 1e-5) / (probs.sum(dim=(1,2)) + target.sum(dim=(1,2)) + 1e-5)
-    dice_loss = 1 - dice.mean()
+    dice_loss = (1 - dice.mean()) * H * W
 
     # CE losses (masked by foreground)
     if fg.any():
@@ -1357,20 +1358,29 @@ def vae_loss(
     dwkl = dwkl_per_dim.sum()  # Sum over dimensions
     dwkl_fb = dwkl_fb_per_dim.sum()  # Free bits regularization sum
     
-    # total correlation term
-    inv_sqrt = torch.diag(diag_S_bar.sqrt().reciprocal())  # Inverse square root of diagonal covariance
-    R = inv_sqrt @ total_S @ inv_sqrt  # R = inv_sqrt * total_S * inv_sqrt
-    R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=mu.dtype)  # Ensure symmetry and positive definiteness
-    sign, logabsdet_R = torch.linalg.slogdet(R)  # log(det(R))
-    if not torch.all(sign > 0):
-        raise ValueError("Covariance matrix R is not positive definite.")
-    total_correlation = -0.5 * logabsdet_R  # Total correlation term
+    # total correlation term - use FP32 for linear algebra operations
+    with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for numerical stability
+        # Convert to FP32 for linear algebra operations
+        diag_S_bar_fp32 = diag_S_bar.float()
+        total_S_fp32 = total_S.float()
+        
+        inv_sqrt = torch.diag(diag_S_bar_fp32.sqrt().reciprocal())  # Inverse square root of diagonal covariance
+        R = inv_sqrt @ total_S_fp32 @ inv_sqrt  # R = inv_sqrt * total_S * inv_sqrt
+        R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=torch.float32)  # Ensure symmetry and positive definiteness
+        sign, logabsdet_R = torch.linalg.slogdet(R)  # log(det(R))
+        if not torch.all(sign > 0):
+            raise ValueError("Covariance matrix R is not positive definite.")
+        total_correlation = -0.5 * logabsdet_R  # Total correlation term
+        
+        # Convert back to original dtype if needed
+        total_correlation = total_correlation.to(mu.dtype)
     
     mutual_information = kl_loss - total_correlation - dwkl  # Mutual information term
     
     with torch.no_grad():
-        # Compute the eigenvalues and eigenvectors
-        eigenvalues = torch.linalg.eigvalsh(total_S)
+        # Compute the eigenvalues and eigenvectors - use FP32 for numerical stability
+        with torch.amp.autocast('cuda', enabled=False):
+            eigenvalues = torch.linalg.eigvalsh(total_S.float())
         kl_diagnosis = {
             'mutual_info': float(mutual_information.item()),
             'total_correlation': float(total_correlation.item()),

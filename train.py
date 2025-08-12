@@ -1512,6 +1512,13 @@ def train_multimodalhack_vae(
 
                 # Log to wandb every N steps if enabled
                 if use_wandb and WANDB_AVAILABLE and global_step % log_every_n_steps == 0:
+                    # Helper function to safely convert tensors for wandb logging
+                    def safe_tensor_for_wandb(tensor):
+                        """Convert tensor to float32 for wandb compatibility"""
+                        if isinstance(tensor, torch.Tensor):
+                            return tensor.detach().float().cpu()
+                        return tensor
+                    
                     wandb_log_dict = {
                         # Training metrics
                         "train/loss": train_loss.item(),
@@ -1544,11 +1551,11 @@ def train_multimodalhack_vae(
                         "dropout/rate": model.dropout_rate,
                         
                         # Model diagnostics
-                        "model/mu_var": mu.var(dim=0),
+                        "model/mu_var": safe_tensor_for_wandb(mu.var(dim=0)),
                         "model/mu_var_max": mu.var(dim=0).max().item(),
                         "model/mu_var_min": mu.var(dim=0).min().item(),
                         "model/mu_var_exceed_0.1": mu.var(dim=0).gt(0.1).sum().item() / mu.var(dim=0).numel(),
-                        "model/per_dim_kl": per_dim_kl,
+                        "model/per_dim_kl": safe_tensor_for_wandb(per_dim_kl),
                         "model/per_dim_kl_max": per_dim_kl.max().item(),
                         "model/per_dim_kl_min": per_dim_kl.min().item(),
                         "model/var_explained_median": median_ratio,
@@ -1556,9 +1563,9 @@ def train_multimodalhack_vae(
                         "model/eigenval_max": eigvals[0].item(),
                         "model/eigenval_min": eigvals[-1].item(),
                         "model/eigenval_ratio": (eigvals[0] / eigvals[-1]).item(),
-                        "model/eigenval": eigvals,
+                        "model/eigenval": safe_tensor_for_wandb(eigvals),
                         "model/eigenval_exceed_2": (eigvals > 2).sum().item() / eigvals.numel(),
-                        "model/kl_eigenval": kl_eig,
+                        "model/kl_eigenval": safe_tensor_for_wandb(kl_eig),
                         "model/kl_eigenval_max": kl_eig.max().item(),
                         "model/kl_eigenval_min": kl_eig.min().item(),
                         "model/kl_eigenval_exceed_0.2": (kl_eig > 0.2).sum().item() / kl_eig.numel(),
@@ -2918,7 +2925,7 @@ if __name__ == "__main__":
             max_testing_batches=max_testing_batches,
             save_path="models/nethack-vae.pth",
             device='cuda' if torch.cuda.is_available() else 'cpu',
-            use_bf16=False,  # Temporarily disable BF16 due to model dtype compatibility
+            use_bf16=True,  # Enable BF16 mixed precision training
             data_cache_dir="data_cache",
             force_recollect=False,  # Use the data we just collected
             shuffle_batches=True,  # Shuffle training batches each epoch for better training
