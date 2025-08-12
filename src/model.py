@@ -15,8 +15,6 @@ Inputs (per time-step)
 * blstats     : FloatTensor[B,27] - game statistics (hp, gold, position, etc.) - processed to 43 dims
 * msg_tokens  : LongTensor[B,256] - tokenized message text (0-127 + SOS/EOS)
 * hero_info   : LongTensor[B,4] - hero attributes [role, race, gender, alignment]
-* inv_oclasses: LongTensor[B,55] - inventory object classes (0-18)
-* inv_strs    : LongTensor[B,55,80] - inventory string descriptions (0-127 per char)
 
 Outputs  
 -------
@@ -42,7 +40,6 @@ Architecture
     3. StatsMLP: [B,27] → [B,16] - preprocessed game statistics (43 processed dims)
     4. MessageGRU: [B,256] → [B,12] - bidirectional message encoding
     5. HeroEmb: [B,4] → [B,16] - hero attribute embeddings
-    6. InventoryEncoder: [B,55] & [B,55,80] → [B,24] - inventory features
 
 **Decoder**: Shared latent → specialized heads for each modality
     - Supports both discrete (logits) and continuous (embeddings) reconstruction
@@ -71,7 +68,12 @@ COLOR_EMB = 4       # colour‑id embedding dim
 GLYPH_EMB = CHAR_EMB + COLOR_EMB  # glyph embedding dim
 LATENT_DIM = 96     # z‑dim for VAE
 BLSTATS_DIM = 27   # raw scalar stats (hp, gold, …)
+MSG_PAD = 0  
 MSG_VOCAB = 128     # Nethack takes 32-127 byte for char of messages
+MSG_SOS = MSG_VOCAB  # start-of-sequence token id
+MSG_EOS = MSG_VOCAB + 1  # end-of-sequence token id
+MSG_VSIZE = MSG_VOCAB + 2  # vocab size including SOS/EOS
+MSG_MAXLEN = 256  # max length of message text (padded/truncated)
 GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
 PADDING_IDX = [32, 0]  # padding index for glyphs (blank space char, black color)
 LOW_RANK = 0      # low-rank factorisation rank for covariance
@@ -88,10 +90,6 @@ ROLE_EMB = 8      # role embedding dim
 RACE_EMB = 4      # race embedding dim
 GEND_EMB = 2      # gender embedding dim
 ALIGN_EMB = 2     # alignment embedding dim
-# Inventory constants 
-INV_MAX_SIZE = 55      # Maximum inventory size in NetHack
-INV_STR_LEN = 80       # Maximum string length for inventory descriptions
-INV_OCLASS_DIM = 19    # Object class cardinality (0-18)
 
 # Condition mask constants (blstats[25] bit field)
 CONDITION_BITS = [
@@ -141,29 +139,6 @@ BLSTATS_CAT = [
     "condition_mask",    # 25: Condition mask (bitfield)
     "alignment",         # 26: Alignment (-1 to 1, -1=chaotic, 0=neutral, 1=lawful)
 ]
-
-# Inventory object class mappings
-INV_OCLASS_MAP = {
-    # 0 random object, not appear in inventory
-    1:ord(']'), # Illegal object
-    2:ord(')'), # Weapon
-    3:ord('['), # Armor
-    4:ord('='), # Ring
-    5:ord('"'), # Amulet
-    6:ord('('), # Tool
-    7:ord('%'), # Food
-    8:ord('!'), # Potion
-    9:ord('?'), # Scroll
-    10:ord('+'), # Spellbook
-    11:ord('/'), # Wand
-    12:ord('$'), # Coin
-    13:ord('*'), # Gem
-    14:ord('`'), # Rock
-    15:ord('0'), # Iron Ball
-    16:ord('_'), # Chains
-    17:ord('.'), # Venom
-    18: 128      # MAXOCLASSES, used for padding, use same as PADDING_IDX
-}
 
 def _gn_groups(c: int) -> int:
     """Pick a sensible GroupNorm group count that divides c."""
@@ -276,9 +251,9 @@ class ResBlockFiLM(nn.Module):
         h = self.conv2(h); h = self.gn2(h); h = self.film2(h, z); h = self.act(h); h = self.drop(h)
         return h + self.skip(x)
 
-class GlyphCNN(nn.Module):
+class MapEncoder(nn.Module):
     """
-    NetHack map encoder and decoder:
+    NetHack map encoder:
       - char & color embeddings (space can be true padding)
       - +1 foreground mask channel
       - +2 CoordConv channels (x,y in [-1,1])
@@ -313,60 +288,6 @@ class GlyphCNN(nn.Module):
         # Tiny head you can keep or replace downstream
         self.out_dim = pooled_dim
         self.norm_out = nn.LayerNorm(self.out_dim)
-        
-        # decoder parts
-        self.H = MAP_HEIGHT
-        self.W = MAP_WIDTH
-        decode_yy = torch.linspace(-1, 1, self.H).view(1,1,self.H,1).expand(1,1,self.H,self.W)
-        decode_xx = torch.linspace(-1, 1, self.W).view(1,1,1,self.W).expand(1,1,self.H,self.W)
-        self.register_buffer("decode_coord_y", decode_yy)
-        self.register_buffer("decode_coord_x", decode_xx)
-        self.decode_base_ch = 256
-        self.decode_mid_ch = 512
-        
-        # Stem: mix z map + coords
-        decode_in_ch = self.decode_base_ch + 2  # + (y, x)
-        self.decode_stem = nn.Sequential(
-            nn.Conv2d(decode_in_ch, self.decode_mid_ch, 3, padding=1), 
-            nn.GroupNorm(_gn_groups(self.decode_mid_ch), self.decode_mid_ch), 
-            nn.ReLU()
-        )
-
-        # Body: widen horizontal receptive field
-        self.block1 = ResBlockFiLM(self.decode_mid_ch, self.decode_mid_ch, dilation=(1, 1),  drop=dropout, z_dim=self.decode_base_ch)
-        self.block2 = ResBlockFiLM(self.decode_mid_ch, self.decode_mid_ch, dilation=(1, 3),  drop=dropout, z_dim=self.decode_base_ch)
-        self.block3 = ResBlockFiLM(self.decode_mid_ch, self.decode_mid_ch, dilation=(1, 9),  drop=dropout, z_dim=self.decode_base_ch)
-        self.block4 = ResBlockFiLM(self.decode_mid_ch, self.decode_mid_ch, dilation=(1, 27), drop=dropout, z_dim=self.decode_base_ch)
-
-        # Local refinement (denoise / sharpen before heads)
-        self.decode_refine = nn.Sequential(
-            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch, 3, padding=1), 
-            nn.GroupNorm(_gn_groups(self.decode_mid_ch), self.decode_mid_ch), 
-            nn.ReLU(),
-            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch, 3, padding=1), 
-            nn.GroupNorm(_gn_groups(self.decode_mid_ch), self.decode_mid_ch), 
-            nn.ReLU(),
-        )
-
-        # Heads
-        self.head_occ = nn.Sequential(
-            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch//2, 1), nn.ReLU(),
-            nn.Conv2d(self.decode_mid_ch//2, 1, 1)
-        )
-        self.head_char = nn.Sequential(
-            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch//2, 1), nn.ReLU(),
-            nn.Conv2d(self.decode_mid_ch//2, CHAR_DIM, 1)
-        )
-        self.head_color = nn.Sequential(
-            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch//2, 1), nn.ReLU(),
-            nn.Conv2d(self.decode_mid_ch//2, COLOR_DIM, 1)
-        )
-
-        # Bias-init occupancy to background (low p for foreground)
-        with torch.no_grad():
-            b = math.log(max(0.03, 1e-6) / max(1 - 0.03, 1e-6))
-            # last conv of head_occ
-            self.head_occ[-1].bias.fill_(b)
 
         
     @staticmethod
@@ -376,144 +297,165 @@ class GlyphCNN(nn.Module):
         return yy, xx
 
     def forward(self, glyph_chars: torch.IntTensor, glyph_colors: torch.IntTensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # glyph_chars are in the range of [32, 127] (ASCII codes)
-        # shift to [0, 95] for model indices before embedding
-        glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Normalize to [0, 95]
-        B, H, W = glyph_chars.shape
-        device = glyph_chars.device
-        fg_mask = (glyph_chars != 0)
-        fg_mask = fg_mask.to(device=device).unsqueeze(1).float()  # [B, 1, H, W]
-        char_embedding = self.char_emb(glyph_chars)  # [B, H, W] -> [B, H, W, 16]
-        char_embedding = char_embedding.permute(0, 3, 1, 2)  # [B, H, W, 16] -> [B, 16, H, W]
-        color_embedding = self.col_emb(glyph_colors)  # [B, H, W] -> [B, H, W, 4]
-        color_embedding = color_embedding.permute(0, 3, 1, 2)  # [B, H, W, 4] -> [B, 4, H, W]
-        glyph_emb = torch.cat([char_embedding, color_embedding], dim=1).contiguous()  # [B, 20, H, W]
-        masked_glyph_emb = glyph_emb * fg_mask  # Apply foreground mask, [B, 20, H, W]
-        feats = [masked_glyph_emb, fg_mask]
-        cy, cx = self._coords(B, H, W, device, masked_glyph_emb.dtype)
-        feats += [cy, cx]
-        complete_glyph_emb = torch.cat(feats, dim=1)  # [B, 20+1+2, H, W]
-        x = self.stem(complete_glyph_emb)  # [B, 64, H, W]
-        x = self.body(x)  # [B, C, H, W]
-        x = self.pool(x, fg_mask)  # [B, K*C] - pooled features
-        x = self.norm_out(x)
-        return x, char_embedding, color_embedding
+        # glyph_chars in ASCII [32..127]; shift to [0..95]; space -> 0 (padding_idx)
+        gc = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)
+        B, H, W = gc.shape
+        device = gc.device
+        fg = (gc != 0).unsqueeze(1).float()  # [B,1,H,W]
+        ce = self.char_emb(gc).permute(0,3,1,2)         # [B,16,H,W]
+        co = self.col_emb(glyph_colors).permute(0,3,1,2)# [B, 4,H,W]
+        yy, xx = self._coords(B, H, W, device, ce.dtype)
+        x = torch.cat([ce * fg, co * fg, fg, yy, xx], dim=1)
+        x = self.stem(x)
+        x = self.body(x)
+        pooled = self.pool(x, fg)
+        return self.norm_out(pooled)
     
-    def _filter_topk_topp(self, logits: torch.Tensor, top_k: int, top_p: float):
-        # logits: [B, C, H, W]
-        B, C, H, W = logits.shape
-
-        # ---- top-k ----
-        if top_k > 0 and top_k < C:
-            # kth value per pixel; keep anything >= kth (ties kept)
-            kth_vals = torch.topk(logits, top_k, dim=1).values[:, -1:, :, :]  # [B,1,H,W]
-            logits = logits.masked_fill(logits < kth_vals, float('-inf'))
-
-        # ---- top-p (nucleus) ----
-        if top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(logits, dim=1, descending=True)  # [B,C,H,W]
-            probs = F.softmax(sorted_logits, dim=1)
-            cumprobs = probs.cumsum(dim=1)
-
-            remove = cumprobs > top_p                      # remove those past nucleus
-            remove[:, 1:, :, :] = remove[:, :-1, :, :].clone()  # keep at least the first
-            remove[:, 0, :, :] = False
-
-            # also keep anything that was already -inf masked
-            remove = remove | torch.isneginf(sorted_logits)
-
-            to_remove = torch.zeros_like(logits, dtype=torch.bool)
-            to_remove.scatter_(1, sorted_idx, remove)
-            logits = logits.masked_fill(to_remove, float('-inf'))
-
-        return logits
-
-    def _sample_per_pixel(self, logits: torch.Tensor):
-        # logits: [B, C, H, W]
-        B, C, H, W = logits.shape
-        probs = F.softmax(logits, dim=1)
-
-        # Guard: if a row sums to 0 (all -inf -> NaNs), fall back to argmax one-hot
-        probs = torch.nan_to_num(probs, nan=0.0)
-        zero_row = probs.sum(dim=1, keepdim=True) == 0
-        if zero_row.any():
-            argmax = logits.argmax(dim=1, keepdim=True)  # [B,1,H,W]
-            one_hot = torch.zeros_like(probs).scatter_(1, argmax, 1.0)
-            probs = torch.where(zero_row, one_hot, probs)
-
-        flat = probs.permute(0, 2, 3, 1).contiguous().view(-1, C)  # [B*H*W, C]
-        idx = torch.multinomial(flat, 1).squeeze(-1)               # [B*H*W]
-        return idx.view(B, H, W)                                   # [B,H,W]
-
-    def sample_from_logits(self, occupy_logits: torch.Tensor, glyph_logits: torch.Tensor, color_logits: torch.Tensor, temperature: float = 1.0, top_k: int = 5, top_p: float = 0.9) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample glyphs from logits.
-        Args:
-            occupy_logits (torch.Tensor): Logits for occupied pixels, [B, 1, H, W].
-            glyph_logits (torch.Tensor): Logits for glyph characters, [B, CHAR_DIM, H, W].
-            color_logits (torch.Tensor): Logits for glyph colors, [B, COLOR_DIM, H, W].
-            temperature (float): Temperature for sampling.
-            top_k (int): Top-k filtering.
-            top_p (float): Top-p (nucleus) filtering.
-        """
-        # Sample from categorical distributions
-        # Apply temperature scaling and top-k/top-p filtering if needed
-        if temperature <= 0:
-            raise ValueError("Temperature must be positive.")
-        else:
-            glyph_logits = glyph_logits / temperature
-            color_logits = color_logits / temperature
-        
-        device = glyph_logits.device
-        B, _, H, W = occupy_logits.shape
-        
-        occ_p = torch.sigmoid(occupy_logits).squeeze(1)  # [B,H,W]
-        fg_mask = (occ_p > 0.5)  # foreground mask, [B,H,W]
-
-        filtered_glyph_logits = self._filter_topk_topp(glyph_logits, top_k, top_p)
-        filtered_color_logits = self._filter_topk_topp(color_logits, top_k, top_p)
-        
-        # Sample from the filtered logits
-        glyph_samples = self._sample_per_pixel(filtered_glyph_logits)
-        color_samples = self._sample_per_pixel(filtered_color_logits)
-
-        # Convert samples back to original range
-        glyph_samples = glyph_samples + 32  # Shift back to [32, 127]
-        chars_out  = torch.full((B, H, W), 32, dtype=torch.long, device=device)
-        colors_out = torch.full((B, H, W), 0, dtype=torch.long, device=device)
-        chars_out[fg_mask]  = glyph_samples[fg_mask]
-        colors_out[fg_mask] = color_samples[fg_mask]
-        return fg_mask, chars_out, colors_out
-    
-    def decode(self, shared_feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Decode shared features into glyph logits.
-        Args:
-            shared_feat (torch.Tensor): Shared feature vector, [B, C].
-        Returns:
-            tuple: Occupy logits, glyph character logits, color logits.
-        """
-        B = shared_feat.size(0)
-        x = torch.cat([shared_feat, self.decode_coord_y.expand(B, -1, -1, -1), self.decode_coord_x.expand(B, -1, -1, -1)], dim=1)
-        x = self.decode_stem(x)
-
-        # FiLM-conditioned residual stack
-        x = self.block1(x, shared_feat)
-        x = self.block2(x, shared_feat)
-        x = self.block3(x, shared_feat)
-        x = self.block4(x, shared_feat)
-
-        # local sharpening
-        x = self.decode_refine(x)
-
-        # logits
-        occ   = self.head_occ(x)     # [B,1,H,W]
-        g_log = self.head_char(x)    # [B,CHAR_DIM,H,W]
-        c_log = self.head_color(x)   # [B,COLOR_DIM,H,W]    
-        return occ, g_log, c_log
-
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
         return self.out_dim
+    
+class MapDecoder(nn.Module):
+    """Latent vector -> occupancy/glyph/color logits at 21x79, with FiLM and CoordConv."""
+    def __init__(self, z_dim: int, char_dim: int, color_dim: int,
+                 H: int = MAP_HEIGHT, W: int = MAP_WIDTH,
+                 base_ch: int = 256, mid_ch: int = 128, drop: float = 0.1,
+                 occ_prior: float = 0.03):
+        super().__init__()
+        self.H, self.W = H, W
+        self.base_ch = base_ch
+        # coords
+        yy = torch.linspace(-1, 1, H).view(1,1,H,1).expand(1,1,H,W)
+        xx = torch.linspace(-1, 1, W).view(1,1,1,W).expand(1,1,H,W)
+        self.register_buffer("coord_y", yy)
+        self.register_buffer("coord_x", xx)
+        # project z to a broadcast feature map
+        self.z_to_map = nn.Sequential(nn.Linear(z_dim, base_ch), nn.ReLU(inplace=True), nn.Linear(base_ch, base_ch))
+        # stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(base_ch + 2, mid_ch, 3, padding=1),
+            nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+        )
+        # FiLM-conditioned residual body (anisotropic to cover width)
+        self.block1 = ResBlockFiLM(mid_ch, mid_ch, (1,1),  drop, z_dim=z_dim)
+        self.block2 = ResBlockFiLM(mid_ch, mid_ch, (1,3),  drop, z_dim=z_dim)
+        self.block3 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_dim)
+        self.block4 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_dim)
+        # local refinement
+        self.refine = nn.Sequential(
+            nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+        )
+        # heads
+        self.head_occ = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
+        self.head_chr = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, char_dim, 1))
+        self.head_col = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, color_dim, 1))
+        with torch.no_grad():
+            b = math.log(max(occ_prior, 1e-6) / max(1 - occ_prior, 1e-6))
+            self.head_occ[-1].bias.fill_(b)
+
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B = z.size(0)
+        z_map = self.z_to_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
+        x = torch.cat([z_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
+        x = self.stem(x)
+        x = self.block1(x, z)
+        x = self.block2(x, z)
+        x = self.block3(x, z)
+        x = self.block4(x, z)
+        x = self.refine(x)
+        occ = self.head_occ(x)
+        ch  = self.head_chr(x)
+        co  = self.head_col(x)
+        return occ, ch, co
+    
+    @staticmethod
+    def _filter_topk_topp_channels(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
+        """Filter along channel dim (classes) for [B,C,H,W] logits."""
+        B, C, H, W = logits.shape
+        out = logits
+        if top_k is not None and top_k > 0 and top_k < C:
+            kth = torch.topk(out, top_k, dim=1).values[:, -1:, :, :]
+            out = out.masked_fill(out < kth, float('-inf'))
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(out, dim=1, descending=True)  # [B,C,H,W]
+            probs = F.softmax(sorted_logits, dim=1)
+            cum = probs.cumsum(dim=1)
+            remove = cum > top_p
+            remove[:, 1:, :, :] = remove[:, :-1, :, :].clone()
+            remove[:, 0, :, :] = False
+            remove = remove | torch.isneginf(sorted_logits)
+            to_remove = torch.zeros_like(out, dtype=torch.bool)
+            to_remove.scatter_(1, sorted_idx, remove)
+            out = out.masked_fill(to_remove, float('-inf'))
+        return out
+
+    @staticmethod
+    def _sample_per_pixel(logits: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        """Return class indices [B,H,W] from [B,C,H,W] logits."""
+        if deterministic:
+            return logits.argmax(dim=1)
+        B, C, H, W = logits.shape
+        probs = F.softmax(logits, dim=1)
+        probs = torch.nan_to_num(probs, nan=0.0)
+        flat = probs.permute(0,2,3,1).contiguous().view(-1, C)  # [B*H*W, C]
+        zero_row = flat.sum(dim=1, keepdim=True) == 0
+        if zero_row.any():
+            arg = logits.permute(0,2,3,1).contiguous().view(-1, C).argmax(dim=1, keepdim=True)
+            one_hot = torch.zeros_like(flat).scatter_(1, arg, 1.0)
+            flat = torch.where(zero_row, one_hot, flat)
+        idx = torch.multinomial(flat, 1).squeeze(-1)
+        return idx.view(B, H, W)
+
+    @staticmethod
+    def sample_from_logits(
+        occupy_logits: torch.Tensor,
+        glyph_logits: torch.Tensor,
+        color_logits: torch.Tensor,
+        temperature: float = 1.0,
+        occ_thresh: float = 0.5,
+        deterministic: bool = True,
+        glyph_top_k: int = 0,
+        glyph_top_p: float = 1.0,
+        color_top_k: int = 0,
+        color_top_p: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Turn map logits into hard predictions.
+        Returns (fg_mask [B,H,W] bool, chars [B,H,W] ASCII, colors [B,H,W]).
+        """
+        assert temperature > 0, "temperature must be > 0"
+        device = occupy_logits.device
+        B, _, H, W = occupy_logits.shape
+        # occupancy -> foreground mask
+        occ_p = torch.sigmoid(occupy_logits).squeeze(1)
+        if deterministic:
+            fg_mask = (occ_p > occ_thresh)
+        else:
+            fg_mask = torch.bernoulli(occ_p.clamp(1e-6, 1-1e-6)).bool()
+        # scale temperatures for class heads
+        g_log = glyph_logits / temperature
+        c_log = color_logits / temperature
+        # filter
+        if not deterministic and (glyph_top_k > 0 or color_top_k > 0 or glyph_top_p < 1.0 or color_top_p < 1.0):
+            g_log = MapDecoder._filter_topk_topp_channels(g_log, top_k=glyph_top_k, top_p=glyph_top_p)
+            c_log = MapDecoder._filter_topk_topp_channels(c_log, top_k=color_top_k, top_p=color_top_p)
+        # choose indices
+        g_idx = MapDecoder._sample_per_pixel(g_log, deterministic=deterministic)  # [B,H,W] in 0..CHAR_DIM-1
+        c_idx = MapDecoder._sample_per_pixel(c_log, deterministic=deterministic)  # [B,H,W] in 0..COLOR_DIM-1
+        # write into outputs with background defaults
+        chars = torch.full((B, H, W), ord(' '), device=device, dtype=torch.long)  # 32 ' '
+        colors = torch.zeros((B, H, W), device=device, dtype=torch.long)             # 0
+        chars_fg = (g_idx + 32).clamp(32, 127)
+        chars[fg_mask] = chars_fg[fg_mask]
+        colors[fg_mask] = c_idx[fg_mask]
+        return fg_mask, chars, colors
+
+    def generate(self, z: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Convenience: z -> logits -> hard maps."""
+        occ, gl, cl = self.forward(z)
+        return self.sample_from_logits(occ, gl, cl, **kwargs)
+
     
 class GlyphBag(nn.Module):
     """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
@@ -580,7 +522,7 @@ class GlyphBag(nn.Module):
             bag[b, num_glyphs:] = torch.tensor(PADDING_IDX, dtype=torch.long, device=bag.device)  # pad the rest
         return bag  # [B, max_len, 2] of glyph ids
 
-    def forward(self, glyph_encoder: GlyphCNN, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, glyph_encoder: MapEncoder, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Encode glyphs to bag
         bag = self.encode_glyphs_to_bag(glyph_chars, glyph_colors)
         char_bag = bag[:, :, 0]  # [B, max_len] of char ids
@@ -615,143 +557,83 @@ class GlyphBag(nn.Module):
         
         # Features for samples with lengths == 0 remain as zeros (already initialized)
         
-        return features, emb, bag # [B, 32], [B, max_len, GLYPH_EMB], [B, max_len, 2]
+        return features # [B, 32]
         
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
         return 32
 
 class BlstatsPreprocessor(nn.Module):
-    """
-    Preprocesses blstats (27-dimensional) for the VAE model.
-    Uses a mixed approach: continuous normalization + discrete embeddings.
-    
-    Based on analysis from trial.ipynb:
-    - blstats[0]: x_coordinate (0-78)
-    - blstats[1]: y_coordinate (0-20)  
-    - blstats[2-8]: attributes (strength, dex, con, int, wis, cha)
-    - blstats[9]: score, blstats[13]: gold, blstats[19]: exp_points, blstats[20]: time
-    - blstats[10-11]: hp/max_hp, blstats[14-15]: energy/max_energy
-    - blstats[21]: hunger_state (0-6), blstats[23]: dungeon_num, blstats[24]: level_num
-    - blstats[25]: condition_mask (bitfield) - special handling for multiple conditions
-    - ignore game time (blstats[20]) and alignment (blstats[26] - already in hero_info)
-    """
-    def __init__(self, stats_dim=27):
+    def __init__(self, stats_dim=BLSTATS_DIM):
         super().__init__()
         self.stats_dim = stats_dim
-        self.useful_dims = [i for i in range(stats_dim) if i not in [20, 26]]  # Ignore time and alignment
-        # Define discrete stats that need embeddings
-        self.discrete_indices = [21, 23, 24]  # hunger_state, dungeon_number, level_number
-        self.condition_index = 25  # Special handling for condition mask
-        self.continuous_indices = [i for i in self.useful_dims if i not in self.discrete_indices + [self.condition_index]]
-        
-        # Embedding layers for discrete stats
-        self.hunger_emb = nn.Embedding(7, 3)    # Hunger states (0-6)
-        self.dungeon_emb = nn.Embedding(11, 4)  # Dungeon numbers (0-10)
-        self.level_emb = nn.Embedding(51, 4)    # Level numbers (0-50)
-        
-        # Condition mask processing - decode each bit as separate binary features
-        self.num_conditions = NUM_CONDITIONS
-        self.condition_bits = CONDITION_BITS
-        
-        # BatchNorm for continuous stats
-        self.batch_norm = nn.BatchNorm1d(len(self.continuous_indices) - 2)  # -2 for removed max_hp/max_energy
-        
-    def forward(self, blstats):
-        """
-        Args:
-            blstats: [B, 27] tensor of raw blstats
-        Returns:
-            processed_stats: [B, processed_dim] tensor
-        """
-
-        # Process continuous stats
-        continuous_stats = blstats[:, self.continuous_indices].float()  # [B, 21]
-        
-        # Process continuous stats - let BatchNorm handle most normalization
-        continuous_processed = continuous_stats.clone()
-        
-        # Only apply essential transformations before BatchNorm
-        # 1. Coordinate normalization (these have known, bounded ranges)
-        continuous_processed[:, 0] = continuous_stats[:, 0] / MAX_X_COORD  # x coordinate (0-78) -> [0, 1]
-        continuous_processed[:, 1] = continuous_stats[:, 1] / MAX_Y_COORD  # y coordinate (0-20) -> [0, 1]
-        
-        # 2. Log transform for heavily skewed distributions (but don't bound with tanh)
-        log_indices = [9, 13, 19]  # score, gold, exp_points
-        for idx in log_indices:
-            if idx in self.continuous_indices:
-                local_idx = self.continuous_indices.index(idx)
-                # Apply log1p to handle skewness, let BatchNorm handle scaling
-                continuous_processed[:, local_idx] = torch.log1p(torch.clamp(continuous_processed[:, local_idx], min=0))
-        
-        # 3. Keep other stats as-is - BatchNorm will normalize them appropriately
-        # No need for manual normalization of attributes, depth, armor_class, etc.
-        
-        # Create health and energy ratios
-        hp_ratio = continuous_stats[:, 10] / torch.clamp(continuous_stats[:, 11], min=1)  # hp/max_hp
-        energy_ratio = continuous_stats[:, 14] / torch.clamp(continuous_stats[:, 15], min=1)  # energy/max_energy
-        
-        # Replace health and energy stats with ratios and remove max health/energy
-        hp_idx = self.continuous_indices.index(10)  # hp
-        max_hp_idx = self.continuous_indices.index(11)  # max_hp
-        energy_idx = self.continuous_indices.index(14)  # energy
-        max_energy_idx = self.continuous_indices.index(15)  # max_energy
-        
-        continuous_processed[:, hp_idx] = hp_ratio
-        continuous_processed[:, energy_idx] = energy_ratio
-        
-        # Remove max health and max energy from continuous stats
-        # Create mask to keep all indices except max_hp and max_energy
-        keep_indices = [i for i in range(continuous_processed.size(1)) if i not in [max_hp_idx, max_energy_idx]]
-        continuous_processed = continuous_processed[:, keep_indices]  # [B, 19]
-        
-        # Apply BatchNorm
-        continuous_normalized = self.batch_norm(continuous_processed)  # [B, 19]
-        
-        # Process discrete stats
-        # if the stats are out of bounds, log the issue
-        if blstats[:, 21].max() > 6 or blstats[:, 21].min() < 0:
-            logging.warning(f"Hunger state out of bounds: {blstats[:, 21].min()} to {blstats[:, 21].max()}")
-        if blstats[:, 23].max() > 10 or blstats[:, 23].min() < 0:
-            logging.warning(f"Dungeon number out of bounds: {blstats[:, 23].min()} to {blstats[:, 23].max()}")
-        if blstats[:, 24].max() > 50 or blstats[:, 24].min() < 0:
-            logging.warning(f"Level number out of bounds: {blstats[:, 24].min()} to {blstats[:, 24].max()}")
-        hunger_state = torch.clamp(blstats[:, 21].long(), 0, 6)
-        dungeon_num = torch.clamp(blstats[:, 23].long(), 0, 10)
-        level_num = torch.clamp(blstats[:, 24].long(), 0, 50)
-        
-        hunger_emb = self.hunger_emb(hunger_state)
-        dungeon_emb = self.dungeon_emb(dungeon_num)
-        level_emb = self.level_emb(level_num)
-        
-        # Process condition mask (bitfield)
-        condition_mask = blstats[:, self.condition_index].long()  # [B]
-        condition_features = []
-        for bit_value in self.condition_bits:
-            # Extract each bit as a binary feature
-            is_condition_active = ((condition_mask & bit_value) > 0).float()  # [B]
-            condition_features.append(is_condition_active.unsqueeze(-1))  # [B, 1]
-        condition_vector = torch.cat(condition_features, dim=-1)  # [B, 13]
-        
-        # Combine all features
-        processed_stats = torch.cat([
-            continuous_normalized,  # [B, 19]
-            hunger_emb,            # [B, 3]
-            dungeon_emb,           # [B, 4]
-            level_emb,             # [B, 4]
-            condition_vector       # [B, 13]
-        ], dim=1) # [B, 19 + 3 + 4 + 4 + 13] = [B, 43]
-        
-        return processed_stats
-    
+        self.useful = [i for i in range(stats_dim) if i not in [20, 26]]
+        self.disc = [21, 23, 24]
+        self.cond_idx = 25
+        self.cont = [i for i in self.useful if i not in self.disc + [self.cond_idx]]
+        self.bn = nn.BatchNorm1d(len(self.cont) - 2)
+        # embeddings for encoder side (not used in decoder loss)
+        self.hunger_emb  = nn.Embedding(7, 3)
+        self.dungeon_emb = nn.Embedding(11, 4)
+        self.level_emb   = nn.Embedding(51, 4)
+    def forward(self, bl):
+        # encoded features for encoder MLP
+        cont = bl[:, self.cont].float()
+        proc = cont.clone()
+        # coords
+        proc[:, 0] = cont[:, 0] / MAX_X_COORD
+        proc[:, 1] = cont[:, 1] / MAX_Y_COORD
+        # log1p for score,gold,exp
+        for idx in [9, 13, 19]:
+            if idx in self.cont:
+                j = self.cont.index(idx)
+                proc[:, j] = torch.log1p(proc[:, j].clamp(min=0))
+        # ratios
+        hp_idx = self.cont.index(10); maxhp_idx = self.cont.index(11)
+        en_idx = self.cont.index(14); maxen_idx = self.cont.index(15)
+        proc[:, hp_idx] = cont[:, 10] / torch.clamp(cont[:, 11], min=1)
+        proc[:, en_idx] = cont[:, 14] / torch.clamp(cont[:, 15], min=1)
+        keep = [i for i in range(proc.size(1)) if i not in [maxhp_idx, maxen_idx]]
+        proc = proc[:, keep]
+        proc = self.bn(proc)
+        hunger = torch.clamp(bl[:, 21].long(), 0, 6)
+        dung   = torch.clamp(bl[:, 23].long(), 0, 10)
+        level  = torch.clamp(bl[:, 24].long(), 0, 50)
+        h_emb  = self.hunger_emb(hunger)
+        d_emb  = self.dungeon_emb(dung)
+        l_emb  = self.level_emb(level)
+        cond_mask = bl[:, self.cond_idx].long()
+        cond_vec = torch.stack([((cond_mask & v) > 0).float() for v in CONDITION_BITS], dim=1)
+        enc = torch.cat([proc, h_emb, d_emb, l_emb, cond_vec], dim=1)  # [B,43]
+        return enc
     def get_output_dim(self):
-        """Returns the output dimension of processed stats"""
-        continuous_dim = len(self.continuous_indices) - 2  # -2 for removed max_hp/max_energy
-        discrete_dim = 3 + 4 + 4  # hunger + dungeon + level embeddings (no alignment)
-        condition_dim = self.num_conditions  # Binary features for each condition bit
-        return continuous_dim + discrete_dim + condition_dim  # 19 + 11 + 13 = 43
+        return 43
+    # targets for decoder loss
+    def targets(self, bl) -> dict[str, torch.Tensor]:
+        with torch.no_grad():
+            cont = bl[:, self.cont].float()
+            proc = cont.clone()
+            proc[:, 0] = cont[:, 0] / MAX_X_COORD
+            proc[:, 1] = cont[:, 1] / MAX_Y_COORD
+            for idx in [9, 13, 19]:
+                if idx in self.cont:
+                    j = self.cont.index(idx)
+                    proc[:, j] = torch.log1p(proc[:, j].clamp(min=0))
+            hp_idx = self.cont.index(10); maxhp_idx = self.cont.index(11)
+            en_idx = self.cont.index(14); maxen_idx = self.cont.index(15)
+            proc[:, hp_idx] = cont[:, 10] / torch.clamp(cont[:, 11], min=1)
+            proc[:, en_idx] = cont[:, 14] / torch.clamp(cont[:, 15], min=1)
+            keep = [i for i in range(proc.size(1)) if i not in [maxhp_idx, maxen_idx]]
+            cont_norm = self.bn(proc)  # uses running stats; fine for targets
+            cont_norm = cont_norm[:, keep] if cont_norm.size(1) > len(keep) else cont_norm
+            hunger = torch.clamp(bl[:, 21].long(), 0, 6)
+            dung   = torch.clamp(bl[:, 23].long(), 0, 10)
+            level  = torch.clamp(bl[:, 24].long(), 0, 50)
+            cond_mask = bl[:, 25].long()
+            cond_vec = torch.stack([((cond_mask & v) > 0).float() for v in CONDITION_BITS], dim=1)
+        return {"cont": cont_norm, "hunger": hunger, "dungeon": dung, "level": level, "cond": cond_vec}
 
-class StatsMLP(nn.Module):
+class StatsEncoder(nn.Module):
     def __init__(self, stats: int=BLSTATS_DIM, emb_dim: int=64):
         super().__init__()
         self.preprocessor = BlstatsPreprocessor(stats_dim=stats)
@@ -765,31 +647,47 @@ class StatsMLP(nn.Module):
     def forward(self, stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         processed = self.preprocessor(stats)  # [B, 27] -> [B, 43]
         features = self.net(processed)  # [B, 43] -> [B, 16]
-        return features, processed
+        return features
     
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
         return 16
+    
+class StatsDecoder(nn.Module):
+    """Predict stats with proper likelihoods: continuous (Gaussian), discrete (CE), conditions (BCE)."""
+    def __init__(self, z_dim: int, cont_dim: int = 19):
+        super().__init__()
+        hid = 256
+        self.net = nn.Sequential(nn.Linear(z_dim, hid), nn.SiLU(), nn.Linear(hid, hid), nn.SiLU())
+        self.mu      = nn.Linear(hid, cont_dim)
+        self.logvar  = nn.Linear(hid, cont_dim)
+        self.hunger  = nn.Linear(hid, 7)
+        self.dungeon = nn.Linear(hid, 11)
+        self.level   = nn.Linear(hid, 51)
+        self.cond    = nn.Linear(hid, len(CONDITION_BITS))
+    def forward(self, z):
+        h = self.net(z)
+        return {"mu": self.mu(h), "logvar": self.logvar(h), "hunger": self.hunger(h), "dungeon": self.dungeon(h), "level": self.level(h), "cond": self.cond(h)}
 
-class MessageGRU(nn.Module):
-    def __init__(self, vocab: int=MSG_VOCAB+2, emb: int=32, hid: int=12):
+class MessageEncoder(nn.Module):
+    def __init__(self, vocab: int=MSG_VSIZE, emb: int=32, hid: int=12):
         super().__init__()
         self.emb_dim = emb
         self.hid_dim = hid
         self.vocab = vocab
-        self.emb = nn.Embedding(vocab, emb, padding_idx=0)
+        self.emb = nn.Embedding(vocab, emb, padding_idx=MSG_PAD)
         self.gru = nn.GRU(emb, hid, batch_first=True, bidirectional=True)  # bidirectional GRU
         self.out = nn.Linear(hid * 2, hid)  # output layer to reduce to hid_dim
-        self.sos = MSG_VOCAB  # start-of-sequence token
-        self.eos = MSG_VOCAB + 1  # end-of-sequence token
-        
+        self.sos = MSG_SOS  # start-of-sequence token
+        self.eos = MSG_EOS  # end-of-sequence token
+
     def forward(self, msg_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         msg_tokens: [B, 256] padded with 0s
         returns: [B, hid_dim] encoding, [B, 256, emb_dim] embeddings
         """
         # calculate lengths for packing
-        lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
+        lengths = (msg_tokens != MSG_PAD).sum(dim=1)  # [B,] - count non-padding tokens
         # for entries who length is 0, pad a ' ' token
         bempty = (lengths == 0)
         padded_msg_tokens = msg_tokens.clone()  # clone to avoid modifying original
@@ -807,59 +705,129 @@ class MessageGRU(nn.Module):
         h_fw, h_bw = h_n[0], h_n[1] # forward and backward hidden states
         h = torch.cat([h_fw, h_bw], dim=1) # [B, hid_dim * 2]
         out = self.out(h)  # [B, hid_dim * 2] -> [B, hid_dim]
-        return out, x  # return the final hidden state and the embeddings
-    
-    def teacher_forcing_decorator(self, msg_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        msg_tokens: [B, 256] padded with 0s
-        returns: [B, 256] shifted and decorated msg_tokens, [B, 256, emb_dim] shifted embeddings
-        """
-        # calculate lengths for packing
-        lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
-        bempty = (lengths == 0)
-        padded_msg_tokens = msg_tokens.clone()  # clone to avoid modifying original
-        padded_msg_tokens[bempty, 0] = ord(' ')  # set space token for empty messages
-        lengths[bempty] = 1  # set length to 1 for empty messages
-        shifted_tokens = torch.zeros_like(padded_msg_tokens)
-        shifted_tokens[:, 0] = self.sos  # set start-of-sequence token
-        shifted_tokens[:, 1:] = padded_msg_tokens[:, :-1]  # shift right by 1
-        # Get embeddings for shifted tokens
-        shifted_embeddings = self.emb(shifted_tokens)  # [B, 256, emb_dim]
-        return shifted_tokens, shifted_embeddings  # return shifted tokens and embeddings
-
-    def sample_from_logits(self, logits: torch.Tensor, temperature: float = 1.0, top_k: int = 5, top_p: float = 0.9) -> torch.Tensor:
-        """
-        Sample from the output logits using temperature, top-k, and top-p sampling.
-        """
-        # Apply temperature
-        logits = logits / temperature
-
-        # Top-k sampling
-        if top_k is not None and top_k > 0:
-            top_k_values, top_k_indices = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
-            mask = torch.zeros_like(logits, dtype=torch.bool)
-            mask.scatter_(-1, top_k_indices, True)
-            logits = logits.masked_fill(~mask, float('-inf'))
-
-        # Top-p sampling
-        if top_p is not None and top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = False
-            # Convert back to original indices and mask
-            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
-            indices_to_remove.scatter_(-1, sorted_indices, sorted_indices_to_remove)
-            logits = logits.masked_fill(indices_to_remove, float('-inf'))
-
-        # Sample from the final logits
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1)
+        return out
 
     def get_output_channels(self) -> int:
         """Returns the number of output channels."""
         return self.hid_dim
+    
+class MessageDecoder(nn.Module):
+    def __init__(self, z_dim: int, L: int = MSG_MAXLEN, ch: int = 128, drop: float = 0.1, vocab: int = MSG_VSIZE):
+        super().__init__()
+        self.L = L; self.vocab = vocab
+        x = torch.linspace(-1, 1, L).view(1,1,L)
+        self.register_buffer("pos", x)
+        self.z_to_line = nn.Sequential(nn.Linear(z_dim, ch), nn.SiLU(), nn.Linear(ch, ch))
+        self.stem = nn.Sequential(nn.Conv1d(ch+1, ch, 3, padding=1), nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU())
+        self.block = nn.Sequential(
+            nn.Conv1d(ch, ch, 3, padding=1, dilation=1),  nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU(),
+            nn.Conv1d(ch, ch, 3, padding=2, dilation=2),  nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU(),
+            nn.Conv1d(ch, ch, 3, padding=4, dilation=4),  nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU(),
+            nn.Conv1d(ch, ch, 3, padding=8, dilation=8),  nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU(),
+        )
+        self.head = nn.Conv1d(ch, vocab, 1)
+    def forward(self, z):
+        B = z.size(0)
+        line = self.z_to_line(z).unsqueeze(-1).expand(B, -1, self.L)
+        x = torch.cat([line, self.pos.expand(B, -1, -1)], dim=1)
+        x = self.stem(x)
+        x = self.block(x)
+        logits = self.head(x).transpose(1, 2)  # [B,L,V]
+        return logits
+    
+    @staticmethod
+    def _filter_topk_topp(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
+        """Apply top-k/top-p over the last dim (vocab). logits: [B,L,V]."""
+        B, L, V = logits.shape
+        out = logits
+        if top_k is not None and top_k > 0 and top_k < V:
+            kth = torch.topk(out, top_k, dim=-1).values[..., -1, None]
+            out = out.masked_fill(out < kth, float('-inf'))
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(out, dim=-1, descending=True)
+            probs = F.softmax(sorted_logits, dim=-1)
+            cum = probs.cumsum(dim=-1)
+            remove = cum > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            remove = remove | torch.isneginf(sorted_logits)
+            to_remove = torch.zeros_like(out, dtype=torch.bool)
+            to_remove.scatter_(-1, sorted_idx, remove)
+            out = out.masked_fill(to_remove, float('-inf'))
+        return out
+
+    @staticmethod
+    def sample_from_logits(
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        deterministic: bool = False,
+        allow_eos: bool = True,
+        forbid_eos_at_start: bool = True,
+        allow_pad: bool = False,
+        sos_id: int | None = MSG_SOS,
+        eos_id: int | None = MSG_EOS,
+        pad_id: int | None = MSG_PAD,
+    ) -> torch.Tensor:
+        """
+        Sample token sequences from non-AR message logits.
+        Args:
+            logits: [B, L, V]
+            temperature: softmax temperature (>0). 1.0 = no change
+            top_k/top_p: nucleus filtering along vocab dim
+            deterministic: if True, returns argmax per position (greedy)
+            allow_eos: if True, EOS can be sampled; tokens after first EOS are set to PAD
+            forbid_eos_at_start: if True, EOS is disallowed at position 0
+            allow_pad: if False, PAD is disallowed before EOS (it will still be inserted after EOS)
+            sos_id/eos_id/pad_id: special token ids; set to None to disable masking
+        Returns:
+            tokens: [B, L] long
+        """
+        assert temperature > 0, "temperature must be > 0"
+        B, L, V = logits.shape
+        logit = logits / temperature
+        # mask unwanted specials
+        if sos_id is not None:
+            logit[..., sos_id] = float('-inf')
+        if not allow_pad and pad_id is not None:
+            logit[..., pad_id] = float('-inf')
+        if forbid_eos_at_start and eos_id is not None:
+            logit[:, 0, eos_id] = float('-inf')
+        # filter
+        logit = MessageDecoder._filter_topk_topp(logit, top_k=top_k, top_p=top_p)
+        if deterministic:
+            tokens = logit.argmax(dim=-1)
+        else:
+            probs = F.softmax(logit, dim=-1)
+            probs = torch.nan_to_num(probs, nan=0.0)
+            flat = probs.reshape(B * L, V)
+            # fallback for degenerate rows (all zeros)
+            zero_row = (flat.sum(dim=-1, keepdim=True) == 0)
+            if zero_row.any():
+                arg = logit.reshape(B*L, V).argmax(dim=-1, keepdim=True)
+                one_hot = torch.zeros_like(flat).scatter_(1, arg, 1.0)
+                flat = torch.where(zero_row, one_hot, flat)
+            idx = torch.multinomial(flat, 1).squeeze(-1)  # [B*L]
+            tokens = idx.view(B, L)
+        # post-process: after first EOS -> PAD
+        if eos_id is not None and pad_id is not None and allow_eos:
+            with torch.no_grad():
+                is_eos = (tokens == eos_id)
+                # first eos position per batch; if none, set to L
+                first = torch.where(is_eos.any(dim=1), is_eos.float().argmax(dim=1), torch.full((B,), L, device=tokens.device))
+                arange = torch.arange(L, device=tokens.device).view(1, L).expand(B, L)
+                after = arange > first.view(B, 1)
+                tokens = torch.where(after, torch.full_like(tokens, pad_id), tokens)
+        # never emit SOS
+        if sos_id is not None:
+            tokens = torch.where(tokens == sos_id, torch.full_like(tokens, (eos_id if allow_eos and eos_id is not None else pad_id if pad_id is not None else 0)), tokens)
+        return tokens
+
+    def generate(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Convenience: z -> logits -> tokens."""
+        logits = self.forward(z)
+        return self.sample_from_logits(logits, **kwargs)
     
 class HeroEmbedding(nn.Module):
     """Hero embedding for MiniHack."""
@@ -881,13 +849,7 @@ class HeroEmbedding(nn.Module):
         align_emb = self.align_emb(align)
         
         hero_vec = torch.cat([role_emb, race_emb, gend_emb, align_emb], dim=-1)
-        embeddings = {
-            'role': role_emb,
-            'race': race_emb,
-            'gend': gend_emb,
-            'align': align_emb
-        }
-        return hero_vec, embeddings  # [B, 16]
+        return hero_vec  # [B, 16]
     
     def get_output_channels(self) -> int:
         """Returns the number of output channels for hero embedding."""
@@ -900,25 +862,25 @@ class MultiModalHackVAE(nn.Module):
                  dropout_rate=0.0,
                  enable_dropout_on_latent=True,
                  enable_dropout_on_decoder=True,
-                 logger: logging.Logger=None):
+                 logger: logging.Logger | None=None):
         super().__init__()
         self.logger = logger or logging.getLogger(__name__)
         self.dropout_rate = dropout_rate
         self.enable_dropout_on_latent = enable_dropout_on_latent
         self.enable_dropout_on_decoder = enable_dropout_on_decoder
         
-        self.glyph_cnn = GlyphCNN(dropout=self.dropout_rate)
-        self.glyph_bag = GlyphBag(logger=self.logger)  # for bag of glyphs
-        self.stats_mlp = StatsMLP()
-        self.msg_gru   = MessageGRU()
-        self.hero_emb = HeroEmbedding()  # for hero embedding
-        
+        self.map_encoder = MapEncoder(dropout=dropout_rate)
+        self.glyph_bag = GlyphBag(logger=self.logger) if bInclude_glyph_bag else None
+        self.stats_encoder = StatsEncoder()
+        self.msg_encoder = MessageEncoder()
+        self.hero_emb = HeroEmbedding() if bInclude_hero else None
+
         self.include_glyph_bag = bInclude_glyph_bag
         self.include_hero = bInclude_hero
 
-        fusion_in = self.glyph_cnn.get_output_channels() + \
-                    self.stats_mlp.get_output_channels() + \
-                    self.msg_gru.get_output_channels() + \
+        fusion_in = self.map_encoder.get_output_channels() + \
+                    self.stats_encoder.get_output_channels() + \
+                    self.msg_encoder.get_output_channels() + \
                     (self.glyph_bag.get_output_channels() if bInclude_glyph_bag else 0) + \
                     (self.hero_emb.get_output_channels() if bInclude_hero else 0) # cnn + stats + msg + bag of glyphs + hero embedding + inventory
         
@@ -967,98 +929,10 @@ class MultiModalHackVAE(nn.Module):
             self.decode_shared = nn.Sequential(
                 nn.Linear(LATENT_DIM, 256), nn.ReLU(),
             )
-        
-        # ------------- Decode embeddings ----------------
-        
-        # from 256 to 20 * 21 * 79 using conv transpose
-        # First reshape 256 -> (64, 1, 1), then upsample to (20, 21, 79)
-        self.decode_glyph_emb = nn.Sequential(
-            # Start: [B, 256] -> [B, 64, 1, 1]
-            nn.Linear(256, 64 * 1 * 1),
-            nn.Unflatten(1, (64, 1, 1)),  # [B, 64, 1, 1]
-            
-            # Upsample to target size: 21 x 79
-            # Step 1: [B, 64, 1, 1] -> [B, 32, 3, 10] 
-            nn.ConvTranspose2d(64, 32, kernel_size=(3, 10), stride=1, padding=0),  # -> [B, 32, 3, 10]
-            nn.ReLU(),
-            
-            # Step 2: [B, 32, 3, 10] -> [B, 20, 21, 79]
-            # kernel_size needed: (21-3+1, 79-10+1) = (19, 70)
-            nn.ConvTranspose2d(32, GLYPH_EMB, kernel_size=(19, 70), stride=1, padding=0)  # -> [B, 20, 21, 79]
-        )
-        
-        # glyph bag embeddings
-        # Note: glyph bag reconstruction (if required) is derived from char/color logits
-        # No separate head needed since glyph bag is just unique combinations of char+color
-        
-        # stats embeddings
-        self.decode_stats_emb = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, self.stats_mlp.preprocessor.get_output_dim())  # [B, 256] -> [B, 43]
-        )
-        
-        # Message decoder - use unidirectional GRU with proper hidden state size
-        self.decode_msg_latent2hidden = nn.Linear(256, self.msg_gru.hid_dim)  # [B, 256] -> [B, hid_dim]
-        self.decode_msg_gru = nn.GRU(self.msg_gru.emb_dim, self.msg_gru.hid_dim, batch_first=True)  # [B, T, emb_dim] -> [B, T, hid_dim]
-        self.decode_msg_hidden2emb = nn.Linear(self.msg_gru.hid_dim, self.msg_gru.emb_dim)  # [B, T, hid_dim] -> [B, T, emb_dim]
-        
-        # ------------- Decode logits ----------------
-        # These will take the embedding as starting point
-        
-        # Separate heads for char and color reconstruction
-        # these will return logits for each pixel
-        self.decode_occupy = nn.Sequential(
-            nn.Linear(CHAR_EMB, 8), nn.ReLU(),  # [B, 21, 79, 16] -> [B, 21, 79, 8]
-            nn.Linear(8, 1)  # [B, 21, 79, 8] -> [B, 21, 79, 1] (occupy logits)
-        )
-        self.decode_chars = nn.Sequential(
-            nn.Linear(CHAR_EMB, 32), nn.ReLU(),  # [B, 21, 79, 16] -> [B, 21, 79, 32]
-            nn.Linear(32, CHAR_DIM)  # [B, 21, 79, 32] -> [B, 21, 79, CHAR_DIM] (char logits)
-        )
-        self.decode_colors = nn.Sequential(
-            nn.Linear(COLOR_EMB, 8), nn.ReLU(),  # [B, 21, 79, 4] -> [B, 21, 79, 8]
-            nn.Linear(8, COLOR_DIM)  # [B, 21, 79, 8] -> [B, 21, 79, COLOR_DIM] (color logits)
-        )
 
-        # Note: glyph bag reconstruction is derived from char/color logits
-        # No separate head needed since glyph bag is just unique combinations of char+color
-        
-        # stats - decode to 24 relevant dimensions (excluding time and unknowns)
-        # Split into discrete and continuous components
-        self.decode_stats_continuous = nn.Sequential(
-            nn.ReLU(), 
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 64), nn.ReLU(),  # [B, 43] -> [B, 64]
-            nn.Linear(64, 19),  # [B, 64] -> [B, 19] for normalized continuous stats (matches BatchNorm input)
-        )
-        
-        # Discrete stats: hunger_state (0-6), dungeon_number (0-10), level_number (0-50)
-        self.decode_hunger_state = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 7),  # [B, 32] -> [B, 7] for hunger states
-        )
-        
-        self.decode_dungeon_number = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 11),  # [B, 32] -> [B, 11] for dungeon numbers
-        )
-        
-        self.decode_level_number = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 51),  # [B, 32] -> [B, 51] for level numbers
-        )
-        
-        # Condition mask decoder - outputs 13 binary logits (one per condition bit)
-        self.decode_condition_mask = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 13),  # [B, 32] -> [B, 13] for condition bits (binary classification per bit)
-        )
-        
-        # messages - use extended vocabulary to include SOS/EOS tokens
-        self.decode_msg = nn.Linear(self.msg_gru.emb_dim, self.msg_gru.vocab)  # [B, T, emb_dim] -> [B, T, vocab_size]
+        self.map_decoder  = MapDecoder(z_dim=256, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=256, mid_ch=128, drop=dropout_rate, occ_prior=0.03)
+        self.stats_decoder = StatsDecoder(z_dim=256, cont_dim=19)
+        self.msg_decoder   = MessageDecoder(z_dim=256, L=MSG_MAXLEN, vocab=MSG_VSIZE)
         
         # Dynamic prediction heads
         # It takes latent z, action a, HDP HMM state h and hero info c
@@ -1090,21 +964,17 @@ class MultiModalHackVAE(nn.Module):
             raise ValueError("glyph_chars and glyph_colors must have the same height and width.")
         
         # Encode all features and get embeddings
-        glyph_feat, char_emb, color_emb = self.glyph_cnn(glyph_chars, glyph_colors)  # [B,64], [B,16,H,W], [B,4,H,W]
-        stats_feat, stats_emb = self.stats_mlp(blstats)
+        glyph_feat = self.map_encoder(glyph_chars, glyph_colors)  # [B,64], [B,16,H,W], [B,4,H,W]
+        stats_feat = self.stats_encoder(blstats)
         
         # Message encoding
-        msg_feat, msg_emb_no_shift = self.msg_gru(msg_tokens)  # [B,hid_dim], [B,256,emb_dim]
-        msg_token_shift, msg_emb_shift = self.msg_gru.teacher_forcing_decorator(msg_tokens)  # [B,256] -> [B,256,emb_dim]
-        
+        msg_feat = self.msg_encoder(msg_tokens)  # [B,hid_dim], [B,256,emb_dim]
+
         features = [glyph_feat, stats_feat, msg_feat]
         
         if self.include_glyph_bag:
-            glyph_bag_feat, glyph_bag_emb, glyph_bag = self.glyph_bag(self.glyph_cnn, glyph_chars, glyph_colors) # [B,32], [B,max_len,20], [B,max_len, 2]
+            glyph_bag_feat = self.glyph_bag(self.map_encoder, glyph_chars, glyph_colors) # [B,32], [B,max_len,20], [B,max_len, 2]
             features.append(glyph_bag_feat)
-        else:
-            glyph_bag_emb = None
-            glyph_bag = None
         
         if self.include_hero != (hero_info is not None):
             raise ValueError("hero_info must be provided if and only if include_hero is True.")
@@ -1117,10 +987,8 @@ class MultiModalHackVAE(nn.Module):
             if hero_info.size(1) != 4:
                 raise ValueError("hero_info must have shape [B, 4]")
             role, race, gend, align = hero_info[:, 0], hero_info[:, 1], hero_info[:, 2], hero_info[:, 3]
-            hero_feat, hero_emb_dict = self.hero_emb(role, race, gend, align)  # [B,16], dict
+            hero_feat = self.hero_emb(role, race, gend, align)  # [B,16], dict
             features.append(hero_feat)
-        else:
-            hero_emb_dict = None
         
         fused = torch.cat(features, dim=-1)
         
@@ -1133,17 +1001,7 @@ class MultiModalHackVAE(nn.Module):
         return {
             'mu': mu,  # [B, LATENT_DIM]
             'logvar': logvar_diag,  # [B, LATENT_DIM]
-            'lowrank_factors': lowrank_factors,  # [B, LATENT_DIM, LOW_RANK] or None
-            'target_char_emb': char_emb,  # [B, 16, 21, 79]
-            'target_color_emb': color_emb,  # [B, 4, 21, 79]
-            'target_glyph_bag_emb': glyph_bag_emb,  # [B, max_len, 20] or None
-            'target_stats_emb': stats_emb,  # [B, 43]
-            'target_msg_emb': msg_emb_no_shift,  # [B, T, emb_dim]
-            'target_glyph_bag': glyph_bag,  # [B, max_len, 2]
-            'target_hero_emb': hero_emb_dict,  # dict of hero embeddings or None
-            
-            'msg_token_shift': msg_token_shift,  # [B, 256]
-            'msg_emb_shift': msg_emb_shift,  # [B, 256, emb_dim]
+            'lowrank_factors': lowrank_factors  # [B, LATENT_DIM, LOW_RANK] or None
         }
           
     def _reparameterise(self, mu, logvar, lowrank_factors=None):
@@ -1158,183 +1016,112 @@ class MultiModalHackVAE(nn.Module):
             z += lowrank_std
         return z    # [B, LATENT_DIM]
 
-    def decode(self, z, msg_token_shift=None, msg_emb_shift=None, training_mode=False, max_length=256, temperature=1.0,
-               top_k=5, top_p=0.9):
+    def decode(self, z):
+        d = self.dec_prep(z)  # [B,256]
+        occupy_logits, char_logits, color_logits = self.map_dec(d)
+        stats_pred = self.stats_dec(d)
+        msg_logits = self.msg_dec(d)
+        return {"occupy_logits": occupy_logits, "char_logits": char_logits, "color_logits": color_logits, "stats_pred": stats_pred, "msg_logits": msg_logits}
+
+    def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None):
+        
+        enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
+        z = self._reparameterise(enc["mu"], enc["logvar"])  # [B,D]
+        dec = self.decode(z)
+        return {**enc, **dec}
+    
+    @torch.no_grad()
+    def sample(
+        self,
+        glyph_chars: torch.Tensor | None = None,
+        glyph_colors: torch.Tensor | None = None,
+        blstats: torch.Tensor | None = None,
+        msg_tokens: torch.Tensor | None = None,
+        hero_info: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+        use_mean: bool = True,
+        include_logits: bool = False,
+        # map sampling
+        map_temperature: float = 1.0,
+        map_occ_thresh: float = 0.5,
+        map_deterministic: bool = True,
+        glyph_top_k: int = 0,
+        glyph_top_p: float = 1.0,
+        color_top_k: int = 0,
+        color_top_p: float = 1.0,
+        # message sampling
+        msg_temperature: float = 1.0,
+        msg_top_k: int = 0,
+        msg_top_p: float = 1.0,
+        msg_deterministic: bool = True,
+        allow_eos: bool = True,
+        forbid_eos_at_start: bool = True,
+        allow_pad: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Convenience sampler.
+        If `z` is None, encodes provided inputs and samples z (or takes mean if `use_mean`).
+        Returns a dict with hard map (`fg_mask, chars, colors`), tokenized message, and optional logits.
         """
-        Decodes the latent variable z into observations.
-        
-        Args:
-            z: [B, LATENT_DIM] - latent variable
-            msg_token_shift: [B, 256] - shifted message tokens (optional, for teacher forcing)
-            msg_emb_shift: [B, 256, emb_dim] - shifted message embeddings (optional, for teacher forcing)
-            training_mode: bool - whether to use training mode (True for training, False for generation)
-            max_length: int - maximum sequence length for autoregressive generation
-            temperature: float - temperature for sampling (default 1.0)
-            top_k: int - top-k sampling (default 5)
-            top_p: float - top-p sampling (default 0.9)
-        
-        Returns:
-            dict with decoded observations and embeddings
-        """
-        
-        # Get batch size and device
-        B = z.size(0)
-        device = z.device
-        
-        # Decode
-        shared_features = self.decode_shared(z)  # [B, 256]
-        
-        # Decode embeddings
-        glyph_emb_decoded = self.decode_glyph_emb(shared_features)  # [B, 20, 21, 79]
-        stats_emb_decoded = self.decode_stats_emb(shared_features)  # [B, 43]
-        
-        # Message decoding - support both teacher forcing and autoregressive generation
-        msg_hidden_init = self.decode_msg_latent2hidden(shared_features)  # [B, 256] -> [B, hid_dim]
-        
-        if training_mode and msg_emb_shift is not None:
-            # TRAINING MODE: Use teacher forcing with ground truth shifted sequences
-            msg_lengths = (msg_token_shift != 0).sum(dim=1)  # [B,] - count non-padding tokens
-            packed_msg_emb_shift = nn.utils.rnn.pack_padded_sequence(
-                msg_emb_shift, lengths=msg_lengths.cpu(),
-                batch_first=True, enforce_sorted=False
-            )
-            # Decode messages using GRU
-            packed_msg_hidden_decoded, _ = self.decode_msg_gru(packed_msg_emb_shift, msg_hidden_init.unsqueeze(0))
-            # Unpack the output - pad back to original length
-            msg_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(
-                packed_msg_hidden_decoded, batch_first=True, total_length=msg_emb_shift.size(1)
-            )
-            # Convert hidden states back to embeddings
-            msg_emb_decoded = self.decode_msg_hidden2emb(msg_hidden_decoded)  # [B, 256, hid_dim] -> [B, 256, emb_dim]
-            # Message decoding - GRU approach with proper teacher forcing
-            msg_logits = self.decode_msg(msg_emb_decoded)  # [B, 256, emb_dim] -> [B, 256, MSG_VOCAB]
-            generated_tokens = None  # Not generated in teacher forcing mode
-            
+        assert (z is not None) or (glyph_chars is not None and glyph_colors is not None and blstats is not None and msg_tokens is not None), \
+            "Provide either z or the full set of inputs to encode."
+
+        if z is None:
+            enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
+            mu, logvar = enc["mu"], enc["logvar"]
+            z = mu if use_mean else self._reparameterise(mu, logvar)
         else:
-            # GENERATION MODE: Autoregressive generation without teacher forcing
-            generated_tokens = torch.zeros(B, max_length, dtype=torch.long, device=device)
-            # Assume we have a start-of-sequence token (index 1) and end-of-sequence token (index 2)
-            generated_tokens[:, 0] = self.msg_gru.sos  # Start with SOS token
+            enc = None
 
-            msg_emb_decoded = torch.zeros(B, max_length, self.msg_gru.emb_dim, device=device)
-            msg_logits = torch.zeros(B, max_length, self.msg_gru.vocab, device=device)  # [B, T, vocab_size]
-            # Initialize hidden state
-            hidden = msg_hidden_init.unsqueeze(0)  # [1, B, hid_dim] for GRU
-            
-            # Generate step by step
-            for t in range(max_length - 1):
-                # Get embedding for current token
-                current_token = generated_tokens[:, t]  # [B]
-                current_emb = self.msg_gru.emb(current_token).unsqueeze(1)  # [B, 1, emb_dim]
-                
-                # Run GRU for one step
-                gru_out, hidden = self.decode_msg_gru(current_emb, hidden)  # gru_out: [B, 1, hid_dim]
-                
-                # Convert hidden to embedding
-                step_emb = self.decode_msg_hidden2emb(gru_out.squeeze(1))  # [B, emb_dim]
-                msg_emb_decoded[:, t] = step_emb
-                
-                # Get logits and sample next token
-                step_logits = self.decode_msg(step_emb.unsqueeze(1))  # [B, 1, vocab_size]
-                msg_logits[:, t] = step_logits.squeeze(1)  # [B, vocab_size]
-                
-                # sampling
-                next_token = self.msg_gru.sample_from_logits(
-                    step_logits.squeeze(1), 
-                    temperature=temperature, 
-                    top_k=top_k, 
-                    top_p=top_p
-                ).squeeze(-1)  # [B, 1] -> [B]
-                
-                generated_tokens[:, t + 1] = next_token
-                
-                # Early stopping if all sequences have generated EOS
-                if torch.all(next_token == self.msg_gru.eos):
-                    break
-            
-        # logits
-        # char logits takes first 16 channels of glyph_emb_decoded
-        # color logits takes last 4 channels of glyph_emb_decoded
-        occupy_logits = self.decode_occupy(glyph_emb_decoded[:, :CHAR_EMB, :, :].permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # [B, 16, 21, 79] -> [B, 1, 21, 79]
-        char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :].permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # [B, 16, 21, 79] -> [B, 96, 21, 79]
-        color_logits = self.decode_colors(glyph_emb_decoded[:, CHAR_EMB:, :, :].permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # [B, 4, 21, 79] -> [B, 16, 21, 79]
-        if training_mode:
-            # During training, we return logits directly
-            generated_occupy = None
-            generated_chars = None
-            generated_colors = None
-        else:
-            # During generation, sample from logits
-            generated_occupy, generated_chars, generated_colors = self.glyph_cnn.sample_from_logits(
-                occupy_logits,
-                char_logits,
-                color_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p
-            )
-        
-        # Decode stats - separate into continuous and discrete components
-        stats_continuous_normalized = self.decode_stats_continuous(stats_emb_decoded)  # [B, 19]
-        
-        hunger_state_logits = self.decode_hunger_state(stats_emb_decoded)      # [B, 7]
-        dungeon_number_logits = self.decode_dungeon_number(stats_emb_decoded)  # [B, 11]
-        level_number_logits = self.decode_level_number(stats_emb_decoded)      # [B, 51]
-        condition_mask_logits = self.decode_condition_mask(stats_emb_decoded)  # [B, 13]
+        dec = self.decode(z)
 
-        return {
-            'glyph_emb_decoded': glyph_emb_decoded,  # [B, 20, 21, 79]
-            'stats_emb_decoded': stats_emb_decoded,  # [B, 43]
-            'msg_emb_decoded': msg_emb_decoded,  # [B, 256, emb_dim]
-            'occupy_logits': occupy_logits,  # [B, 1, 21, 79]
-            'char_logits': char_logits, # [B, 256, 21, 79]
-            'color_logits': color_logits,  # [B, 16, 21, 79]
-            'stats_continuous_normalized': stats_continuous_normalized,  # [B, 19]
-            'hunger_state_logits': hunger_state_logits,  # [B, 7]
-            'dungeon_number_logits': dungeon_number_logits,  # [B, 11]
-            'level_number_logits': level_number_logits,  # [B, 51]
-            'condition_mask_logits': condition_mask_logits,  # [B, 13]
-            'msg_logits': msg_logits, # [B, 256, MSG_VOCAB]
-            'generated_occupy': generated_occupy,  # [B, 21, 79]
-            'generated_chars': generated_chars,  # [B, 21, 79]
-            'generated_colors': generated_colors,  # [B, 21, 79]
-            'generated_tokens': generated_tokens,  # [B, max_length] or None if teacher forcing
-        }
-
-    def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None, training_mode=True, temperature=1.0, top_k=5, top_p=0.9):
-        
-        fg = glyph_chars != ord(' ')  # foreground mask for glyphs
-        bad = (glyph_colors == 0) & fg  # bad pixels where color is 0 and glyph is not space
-        if bad.any():
-            i = bad.nonzero()[0].tolist()
-            raise RuntimeError(f"Found color==0 on non-space at index {i} — cannot use 0 as padding_idx.")
-        
-        encoded_vars = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
-        
-        mu = encoded_vars['mu']  # [B, LATENT_DIM]
-        logvar = encoded_vars['logvar']  # [B, LATENT_DIM]
-        lowrank_factors = encoded_vars['lowrank_factors']
-        
-        msg_token_shift = encoded_vars['msg_token_shift']  # [B, 256]
-        msg_emb_shift = encoded_vars['msg_emb_shift']  # [B, 256, emb_dim]
-        
-        z = self._reparameterise(mu, logvar, lowrank_factors)
-        
-        # Decode with teacher forcing (training mode)
-        decoded_vars = self.decode(
-            z, 
-            msg_token_shift=msg_token_shift,
-            msg_emb_shift=msg_emb_shift,
-            training_mode=training_mode,  # Use teacher forcing during training
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p
+        # --- Map sampling ---
+        fg_mask, chars, colors = MapDecoder.sample_from_logits(
+            dec["occupy_logits"], dec["char_logits"], dec["color_logits"],
+            temperature=map_temperature,
+            occ_thresh=map_occ_thresh,
+            deterministic=map_deterministic,
+            glyph_top_k=glyph_top_k, glyph_top_p=glyph_top_p,
+            color_top_k=color_top_k, color_top_p=color_top_p,
         )
 
-        return {
-            **encoded_vars,  # Contains mu, logvar, embeddings, etc.
-            **decoded_vars   # Contains all decoded outputs including generated_tokens
+        # --- Message sampling ---
+        msg_tokens_out = MessageDecoder.sample_from_logits(
+            dec["msg_logits"],
+            temperature=msg_temperature,
+            top_k=msg_top_k, top_p=msg_top_p,
+            deterministic=msg_deterministic,
+            allow_eos=allow_eos,
+            forbid_eos_at_start=forbid_eos_at_start,
+            allow_pad=allow_pad,
+            sos_id=MSG_SOS, eos_id=MSG_EOS, pad_id=MSG_PAD,
+        )
+
+        # --- Stats point predictions (no sampling) ---
+        sp = dec["stats_pred"]
+        stats_point = {
+            "cont_mu": sp["mu"],
+            "hunger": sp["hunger"].argmax(dim=-1),
+            "dungeon": sp["dungeon"].argmax(dim=-1),
+            "level": sp["level"].argmax(dim=-1),
+            "cond": (torch.sigmoid(sp["cond"]) > 0.5),
         }
+
+        out = {
+            "fg_mask": fg_mask,
+            "chars": chars,
+            "colors": colors,
+            "msg_tokens": msg_tokens_out,
+            "stats_point": stats_point,
+            "z": z,
+        }
+        if include_logits:
+            out.update({
+                "occupy_logits": dec["occupy_logits"],
+                "char_logits": dec["char_logits"],
+                "color_logits": dec["color_logits"],
+                "msg_logits": dec["msg_logits"],
+            })
+        return out
         
     def get_dropout_config(self):
         """
@@ -1346,12 +1133,40 @@ class MultiModalHackVAE(nn.Module):
         return {
             'dropout_rate': self.dropout_rate,
             'enable_dropout_on_latent': self.enable_dropout_on_latent,
-            'enable_dropout_on_decoder': self.enable_dropout_on_decoder,
-            'training_mode': self.training,
-            'dropout_active': self.training and self.dropout_rate > 0.0
+            'enable_dropout_on_decoder': self.enable_dropout_on_decoder
         }
 
 # ------------------------- loss helpers ------------------------------ #
+
+def _bce_focal_with_logits(logits, target, alpha_pos=0.25, gamma=2.0, reduction='mean'):
+    # logits, target: [B,H,W]
+    p = torch.sigmoid(logits)
+    p_t = torch.where(target > 0.5, p, 1.0 - p)
+    alpha_t = torch.where(target > 0.5, torch.full_like(target, alpha_pos), torch.full_like(target, 1.0 - alpha_pos))
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+    loss = alpha_t * (1.0 - p_t).pow(gamma) * bce
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss
+
+def _message_ce_loss(logits: torch.Tensor, tgt: torch.Tensor, pad_id: int = MSG_PAD, eos_id: int = MSG_EOS) -> torch.Tensor:
+    # logits: [B,L,V], tgt: [B,L]
+    B, L, V = logits.shape
+    with torch.no_grad():
+        pad_mask = (tgt == pad_id)
+        if eos_id is not None:
+            eos_pos = (tgt == eos_id).float()
+            after = torch.cumsum(eos_pos, dim=1) > 0
+            after[:, 0] = False
+            mask = pad_mask | after
+        else:
+            mask = pad_mask
+    ce = F.cross_entropy(logits.reshape(B*L, V), tgt.reshape(B*L), reduction='none').view(B, L)
+    keep = (~mask).float()
+    return (ce * keep).sum() / keep.sum().clamp_min(1.0)
 
 def vae_loss(
     model_output, 
@@ -1361,11 +1176,8 @@ def vae_loss(
     msg_tokens,
     valid_screen,
     raw_modality_weights={'occupy': 10.0, 'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0},
-    emb_modality_weights={'char_emb': 0.05, 'color_emb': 0.05, 'stats_emb': 1.0, 'msg_emb': 0.1},
-    focal_loss_alpha=0.75,
+    focal_loss_alpha=0.1,
     focal_loss_gamma=2.0,
-    weight_emb=1.0, 
-    weight_raw=0.1, 
     mi_beta=1.0,
     tc_beta=1.0,
     dw_beta=1.0,
@@ -1381,16 +1193,11 @@ def vae_loss(
         lowrank_factors = lowrank_factors[valid_screen]  # [valid_B, LATENT_DIM, LOW_RANK]
     
     # Raw reconstruction logits
-    occupy_logits = model_output['occupy_logits']  # [B, 1, 21, 79]
-    char_logits = model_output['char_logits']  # [B, CHAR_DIM, 21, 79]
-    color_logits = model_output['color_logits']  # [B, COLOR_DIM, 21, 79]
-    msg_logits = model_output['msg_logits']  # [B, 256, MSG_VOCAB+2]
-    
-    # Embedding reconstructions (continuous targets)
-    glyph_emb_decoded = model_output['glyph_emb_decoded']  # [B, 20, 21, 79]
-    stats_emb_decoded = model_output['stats_emb_decoded']  # [B, 43]
-    msg_emb_decoded = model_output['msg_emb_decoded']  # [B, 256, emb_dim]
-    
+    occupy_logits = model_output['occupy_logits'][valid_screen]  # [B, 1, 21, 79]
+    char_logits = model_output['char_logits'][valid_screen]  # [B, CHAR_DIM, 21, 79]
+    color_logits = model_output['color_logits'][valid_screen]  # [B, COLOR_DIM, 21, 79]
+    msg_logits = model_output['msg_logits'][valid_screen]  # [B, 256, MSG_VSIZE]
+
     valid_B = valid_screen.sum().item()  # Number of valid samples
     assert valid_B > 0, "No valid samples for loss calculation. Check valid_screen mask."
     
@@ -1399,124 +1206,56 @@ def vae_loss(
     
     # Glyph reconstruction (chars + colors)
     H, W = glyph_chars.shape[1], glyph_chars.shape[2]
-    fg_mask = (glyph_chars != ord(' '))  # [B, H, W]
-    ooc_t = fg_mask.float().unsqueeze(1)  # [B, 1, H, W]
-    masked_num = fg_mask.sum(dim=[1, 2]).clamp(min=1)
-    glyph_chars_ce = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # CE targets
-    
-    # Occupancy focal loss
-    occ_bce = F.binary_cross_entropy_with_logits(occupy_logits, ooc_t, reduction='none').squeeze(1)  # [B, H, W]
-    p = torch.sigmoid(occupy_logits).squeeze(1)
-    ooc_hw = ooc_t.squeeze(1)
-    p_t = torch.where(ooc_hw > 0.5, p, 1.0 - p)
-    alpha_pos = torch.as_tensor(focal_loss_alpha, device=occupy_logits.device, dtype=occupy_logits.dtype)
-    alpha_neg = torch.as_tensor(1.0 - focal_loss_alpha, device=occupy_logits.device, dtype=occupy_logits.dtype)
-    alpha_t = torch.where(ooc_hw > 0.5, alpha_pos, alpha_neg)
-    focal_weight = alpha_t * (1.0 - p_t).pow(focal_loss_gamma)
-    focal_loss_per_sample = (focal_weight * occ_bce).sum(dim=(1, 2)) # [B]
+    gc = glyph_chars[valid_screen]
+    fg = (gc != ord(' '))                 # [valid_B,H,W]
+    ooc_t = fg.float().unsqueeze(1)           # [valid_B,1,H,W]
+    char_t = torch.clamp(gc - 32, 0, CHAR_DIM - 1)  # [valid_B,H,W]
+    col_t  = glyph_colors[valid_screen]                 # [valid_B,H,W]
+
+    # occupancy focal BCE (mean over pixels)
+    focal_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), ooc_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
 
     # CE losses (masked by foreground)
-    char_loss_per_sample = F.cross_entropy(char_logits, glyph_chars_ce, reduction='none')  # [B, H, W]
-    masked_char_loss_per_sample = char_loss_per_sample * fg_mask.float()
-    color_loss_per_sample = F.cross_entropy(color_logits, glyph_colors, reduction='none')  # [B, H, W]
-    masked_color_loss_per_sample = color_loss_per_sample * fg_mask.float()
+    if fg.any():
+        char_loss_per_sample = F.cross_entropy(char_logits, char_t, reduction='none')  # [valid_B, H, W]
+        masked_char_loss_per_sample = char_loss_per_sample * fg.float()
+        color_loss_per_sample = F.cross_entropy(color_logits, col_t, reduction='none')  # [valid_B, H, W]
+        masked_color_loss_per_sample = color_loss_per_sample * fg.float()
 
-    # Sum over spatial dimensions for each sample
-    masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2])  # [B]
-    masked_color_loss_per_sample = masked_color_loss_per_sample.sum(dim=[1, 2])  # [B]
+        # Sum over spatial dimensions for each sample
+        masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
+        masked_color_loss_per_sample = masked_color_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
+    else:
+        masked_char_loss_per_sample = torch.zeros(valid_B, device=glyph_chars.device)
+        masked_color_loss_per_sample = torch.zeros(valid_B, device=glyph_colors.device)
 
     # Average over valid samples only
-    raw_losses['occupy'] = focal_loss_per_sample[valid_screen].mean()  # Average over valid samples
-    raw_losses['char'] = masked_char_loss_per_sample[valid_screen].mean()
-    raw_losses['color'] = masked_color_loss_per_sample[valid_screen].mean()
+    raw_losses['occupy'] = focal_loss_per_sample.mean()  # Average over valid samples
+    raw_losses['char'] = masked_char_loss_per_sample.mean()
+    raw_losses['color'] = masked_color_loss_per_sample.mean()
 
-    # Stats reconstruction
-    stats_continuous_normalized = model_output['stats_continuous_normalized']  # [B, 19]
-    hunger_state_logits = model_output['hunger_state_logits']
-    dungeon_number_logits = model_output['dungeon_number_logits']
-    level_number_logits = model_output['level_number_logits']
-    condition_mask_logits = model_output['condition_mask_logits']
+    # stats
+    pre = BlstatsPreprocessor()
+    t = pre.targets(blstats[valid_screen])
+    sp = model_output['stats_pred']
+    var = sp['logvar'].exp().clamp_min(1e-6)
+    nll_cont = 0.5 * (((t['cont'] - sp['mu'])**2 / var) + sp['logvar'] + math.log(2*math.pi))
+    nll_cont = nll_cont.mean()
+    hung_loss = F.cross_entropy(sp['hunger'], t['hunger'])
+    dung_loss = F.cross_entropy(sp['dungeon'], t['dungeon'])
+    level_loss = F.cross_entropy(sp['level'], t['level'])
+    cond_loss = F.binary_cross_entropy_with_logits(sp['cond'], t['cond'])
+    stats_loss = nll_cont + hung_loss + dung_loss + level_loss + cond_loss
+    raw_losses['stats'] = stats_loss
 
-    # Discrete targets (clamped)
-    hunger_target = torch.clamp(blstats[:, 21].long(), 0, 6)
-    dungeon_target = torch.clamp(blstats[:, 23].long(), 0, 10)
-    level_target = torch.clamp(blstats[:, 24].long(), 0, 50)
+    # message CE (mask PAD + after EOS)
+    msg_t = msg_tokens[valid_screen]
+    msg_loss = _message_ce_loss(msg_logits, msg_t, pad_id=MSG_PAD, eos_id=MSG_EOS)
+    raw_losses['msg'] = msg_loss
 
-    # Condition mask target vector
-    condition_mask_target = blstats[:, 25].long()
-    condition_target_vector = []
-    for bit_value in CONDITION_BITS:
-        is_condition_active = ((condition_mask_target & bit_value) > 0).float()  # [B]
-        condition_target_vector.append(is_condition_active)
-    condition_target_vector = torch.stack(condition_target_vector, dim=1)  # [B, 13]
-
-    # Continuous targets in BN-normalized space: first 19 dims of target_stats_emb
-    target_stats_emb = model_output['target_stats_emb']  # [B, 43]
-    continuous_targets_bn = target_stats_emb[:, :19]
-
-    stat_raw_losses = {}
-    stats_continuous_loss = F.mse_loss(stats_continuous_normalized, continuous_targets_bn, reduction='none').sum(dim=1)
-    stat_raw_losses['stats_continuous'] = stats_continuous_loss[valid_screen].mean()
-    stat_raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], hunger_target[valid_screen], reduction='mean')
-    stat_raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], dungeon_target[valid_screen], reduction='mean')
-    stat_raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], level_target[valid_screen], reduction='mean')
-    condition_loss = F.binary_cross_entropy_with_logits(condition_mask_logits, condition_target_vector, reduction='none').sum(dim=1)
-    stat_raw_losses['stats_condition'] = condition_loss[valid_screen].mean()
-
-    raw_losses['stats'] = (stat_raw_losses['stats_continuous'] +
-                           stat_raw_losses['stats_hunger'] +
-                           stat_raw_losses['stats_dungeon'] +
-                           stat_raw_losses['stats_level'] +
-                           stat_raw_losses['stats_condition'])
-
-    # Message reconstruction (token CE with EOS injection as before)
-    msg_lengths = (msg_tokens != 0).sum(dim=1)
-    msg_tokens_with_eos = msg_tokens.clone()
-    mask_has_space = msg_lengths < msg_tokens.size(1)
-    msg_tokens_with_eos[mask_has_space, msg_lengths[mask_has_space]] = MSG_VOCAB + 1
-    msg_loss_per_token = F.cross_entropy(
-        msg_logits.view(-1, msg_logits.size(-1)),
-        msg_tokens_with_eos.view(-1),
-        reduction='none',
-        ignore_index=0
-    )  # [B*seq_len]
-    
-    # Reshape and sum over sequence length for each sample
-    msg_loss_per_sample = msg_loss_per_token.view(msg_logits.size(0), -1).sum(dim=1)  # [B] - sum over seq_len
-    raw_losses['msg'] = msg_loss_per_sample[valid_screen].mean()  # Average over valid samples
-    
-    # ============= Embedding Reconstruction Losses =============
-    emb_losses = {}
-    target_char_emb = model_output['target_char_emb']  # [B, 16, 21, 79]
-    target_color_emb = model_output['target_color_emb']  # [B, 4, 21, 79]
-    target_stats_emb = model_output['target_stats_emb']  # [B, 43]
-
-    char_emb_recon, color_emb_recon = torch.split(glyph_emb_decoded, [CHAR_EMB, COLOR_EMB], dim=1)
-    char_diff = (char_emb_recon[valid_screen] - target_char_emb[valid_screen].detach()).pow(2).sum(dim=1)  # [valid_B, 21, 79]
-    color_diff = (color_emb_recon[valid_screen] - target_color_emb[valid_screen].detach()).pow(2).sum(dim=1) # [valid_B, 21, 79]
-    w = 1.0 * fg_mask[valid_screen].float() + 0.05 * (1.0 - fg_mask[valid_screen].float())  # [valid_B, 21, 79]
-
-    emb_losses['char_emb'] = (char_diff * w).sum() / valid_B  # Average over valid samples
-    emb_losses['color_emb'] = (color_diff * w).sum() / valid_B  # Average over valid samples
-    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded[valid_screen], target_stats_emb[valid_screen].detach(), reduction='sum') / valid_B
-
-    # Message embedding loss with mask on shifted tokens (exclude padding)
-    # Use non-shifted embeddings with EOS as targets to align with next-token prediction
-    target_msg_emb = model_output['target_msg_emb']  # [B, T, emb_dim]
-    msg_mask = (msg_tokens_with_eos != 0).float()  # [B, T]
-    diff_sq = (msg_emb_decoded - target_msg_emb.detach()).pow(2).sum(dim=2)  # [B, T]
-    diff_sq = diff_sq * msg_mask  # mask padding (including positions beyond EOS)
-    diff_sq_valid = diff_sq[valid_screen]
-    emb_losses['msg_emb'] = diff_sq_valid.sum() / valid_B
-
-    # ============= Combine Losses =============
-    
     # Sum raw reconstruction losses
     total_raw_loss = sum(raw_losses[k] * raw_modality_weights.get(k, 1.0) for k in raw_losses)
     
-    # Sum embedding losses (when implemented)
-    total_emb_loss = sum(emb_losses[k] * emb_modality_weights.get(k, 1.0) for k in emb_losses)
-
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
     # KL divergence for low-rank approximation
@@ -1589,8 +1328,7 @@ def vae_loss(
         }
     
     # Total weighted loss
-    total_loss = (weight_raw * total_raw_loss + 
-                  weight_emb * total_emb_loss + 
+    total_loss = (total_raw_loss + 
                   mi_beta * mutual_information + 
                   tc_beta * total_correlation +
                   dw_beta * dwkl_fb)  # Free bits regularization
@@ -1598,10 +1336,7 @@ def vae_loss(
     return {
         'total_loss': total_loss,
         'total_raw_loss': total_raw_loss,
-        'total_emb_loss': total_emb_loss,
         'kl_loss': kl_loss,
         'raw_losses': raw_losses,
-        'emb_losses': emb_losses,
-        'raw_stats_losses': stat_raw_losses,
         'kl_diagnosis': kl_diagnosis
     }

@@ -966,12 +966,6 @@ def train_multimodalhack_vae(
     shuffle_within_batch: bool = False,
     
     # Adaptive loss weighting parameters
-    initial_weight_emb: float = 1.5,
-    final_weight_emb: float = 0.0,
-    weight_emb_shape: str = 'cubic',
-    initial_weight_raw: float = 0.4,
-    final_weight_raw: float = 1.0,
-    weight_raw_shape: str = 'linear',
     initial_mi_beta: float = 0.0001,
     final_mi_beta: float = 1.0,
     mi_beta_shape: str = 'cosine',
@@ -1042,12 +1036,6 @@ def train_multimodalhack_vae(
         force_recollect: Force data recollection even if cache exists
         shuffle_batches: Whether to shuffle training batches at the start of each epoch
         shuffle_within_batch: Whether to shuffle samples within each batch (ignores temporal order)
-        initial_weight_emb: Starting weight for embedding losses (high for warm-up)
-        final_weight_emb: Final weight for embedding losses (stable after warm-up)
-        weight_emb_shape: Shape of embedding weight curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
-        initial_weight_raw: Starting weight for raw reconstruction losses (low initially)
-        final_weight_raw: Final weight for raw reconstruction losses
-        weight_raw_shape: Shape of raw weight curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
         initial_mi_beta: Starting mutual information KL divergence weight (very small initially)
         final_mi_beta: Final mutual information KL divergence weight
         mi_beta_shape: Shape of MI beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
@@ -1125,12 +1113,6 @@ def train_multimodalhack_vae(
             "shuffle_batches": shuffle_batches,
             "shuffle_within_batch": shuffle_within_batch,
             "adaptive_weighting": {
-                "initial_weight_emb": initial_weight_emb,
-                "final_weight_emb": final_weight_emb,
-                "weight_emb_shape": weight_emb_shape,
-                "initial_weight_raw": initial_weight_raw,
-                "final_weight_raw": final_weight_raw,
-                "weight_raw_shape": weight_raw_shape,
                 "initial_mi_beta": initial_mi_beta,
                 "final_mi_beta": final_mi_beta,
                 "mi_beta_shape": mi_beta_shape,
@@ -1191,8 +1173,6 @@ def train_multimodalhack_vae(
     logger.info(f"     - Enable dropout on latent: {enable_dropout_on_latent}")
     logger.info(f"     - Enable dropout on decoder: {enable_dropout_on_decoder}")
     logger.info(f"   Adaptive Loss Weighting:")
-    logger.info(f"     - Embedding weights: {initial_weight_emb:.3f} → {final_weight_emb:.3f}")
-    logger.info(f"     - Raw weights: {initial_weight_raw:.3f} → {final_weight_raw:.3f}")
     logger.info(f"     - MI beta: {initial_mi_beta:.3f} → {final_mi_beta:.3f}")
     logger.info(f"     - TC beta: {initial_tc_beta:.3f} → {final_tc_beta:.3f}")
     logger.info(f"     - DW beta: {initial_dw_beta:.3f} → {final_dw_beta:.3f}")
@@ -1209,24 +1189,6 @@ def train_multimodalhack_vae(
         """Calculate adaptive weights based on current global training step"""
         # Calculate progress based on global step for smoother transitions
         progress = min(global_step / max(total_steps - 1, 1), 1.0)
-        warmup_steps = int(warmup_epoch_ratio * total_steps) if warmup_epoch_ratio > 0 else 0
-        warmup_progress = min(global_step / max(warmup_steps - 1, 1), 1.0) if warmup_steps > 0 else 1.0
-
-        # Embedding weight: high initially, then decrease
-        weight_emb = ramp_weight(initial_weight=initial_weight_emb, 
-            final_weight=final_weight_emb, 
-            shape=weight_emb_shape, 
-            progress=warmup_progress,
-            f=f
-        )
-        
-        # Raw weight: low initially, then increase  
-        weight_raw = ramp_weight(initial_weight=initial_weight_raw, 
-            final_weight=final_weight_raw, 
-            shape=weight_raw_shape, 
-            progress=progress,
-            f=f
-        )
         
         # Mutual Information beta: very small initially, then gradually increase
         mi_beta = ramp_weight(initial_weight=initial_mi_beta, 
@@ -1254,9 +1216,9 @@ def train_multimodalhack_vae(
         
         # Log the adaptive weights (only occasionally to avoid spam)
         if global_step % 100 == 0:
-            logger.debug(f"Step {global_step}/{total_steps} - Adaptive weights: emb={weight_emb:.3f}, raw={weight_raw:.3f}, mi_beta={mi_beta:.3f}, tc_beta={tc_beta:.3f}, dw_beta={dw_beta:.3f}")
+            logger.debug(f"Step {global_step}/{total_steps} - Adaptive weights: mi_beta={mi_beta:.3f}, tc_beta={tc_beta:.3f}, dw_beta={dw_beta:.3f}")
 
-        return weight_emb, weight_raw, mi_beta, tc_beta, dw_beta
+        return mi_beta, tc_beta, dw_beta
     
     # Create adapter and datasets with caching
     adapter = BLStatsAdapter()
@@ -1460,7 +1422,7 @@ def train_multimodalhack_vae(
                 )
                 
                 # Calculate adaptive weights for this step
-                weight_emb, weight_raw, mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
+                mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
                 
                 # Calculate loss
                 train_loss_dict = vae_loss(
@@ -1470,8 +1432,6 @@ def train_multimodalhack_vae(
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['message_chars'],
                     valid_screen=batch_device['valid_screen'],
-                    weight_emb=weight_emb,
-                    weight_raw=weight_raw,
                     mi_beta=mi_beta,
                     tc_beta=tc_beta,
                     dw_beta=dw_beta,
@@ -1525,28 +1485,18 @@ def train_multimodalhack_vae(
                         "train/raw_loss/blstats": train_loss_dict['raw_losses']['stats'].item(),
                         "train/raw_loss/message": train_loss_dict['raw_losses']['msg'].item(),
 
-                        "train/emb_loss/total": train_loss_dict['total_emb_loss'].item(),
-                        "train/emb_loss/glyph_chars": train_loss_dict['emb_losses']['char_emb'].item(),
-                        "train/emb_loss/glyph_colors": train_loss_dict['emb_losses']['color_emb'].item(),
-                        "train/emb_loss/blstats": train_loss_dict['emb_losses']['stats_emb'].item(),
-                        "train/emb_loss/message": train_loss_dict['emb_losses']['msg_emb'].item(),
-
                         "train/kl_loss": train_loss_dict['kl_loss'].item(),
                         "train/kl_loss/dimension_wise": dim_kl,
                         "train/kl_loss/mutual_info": mutual_info,
                         "train/kl_loss/total_correlation": total_correlation,
 
                         # Adaptive weights
-                        "adaptive_weights/emb_weight": weight_emb,
-                        "adaptive_weights/raw_weight": weight_raw,
                         "adaptive_weights/mi_beta": mi_beta,
                         "adaptive_weights/tc_beta": tc_beta,
                         "adaptive_weights/dw_beta": dw_beta,
                         
                         # Dropout status
                         "dropout/rate": model.dropout_rate,
-                        "dropout/active": model.training and model.dropout_rate > 0.0,
-                        "dropout/training_mode": model.training,
                         
                         # Model diagnostics
                         "model/mu_var": mu.var(dim=0),
@@ -1574,7 +1524,6 @@ def train_multimodalhack_vae(
                 pbar.set_postfix({
                     'loss': f"{train_loss.item():.2f}",
                     'total_raw': f"{train_loss_dict['total_raw_loss'].item():.2f}",
-                    'total_emb': f"{train_loss_dict['total_emb_loss'].item():.2f}",
                     'kl': f"{train_loss_dict['kl_loss'].item():.2f}",
                 })
         
@@ -1616,12 +1565,11 @@ def train_multimodalhack_vae(
                     glyph_colors=batch_device['game_colors'], 
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['message_chars'],
-                    hero_info=batch_device['hero_info'],
-                    training_mode=True
+                    hero_info=batch_device['hero_info']
                 )
                 
                 # Calculate adaptive weights for this step (use current global step for consistency)
-                weight_emb, weight_raw, mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
+                mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
                 
                 # Calculate loss
                 test_loss_dict = vae_loss(
@@ -1631,8 +1579,6 @@ def train_multimodalhack_vae(
                     blstats=batch_device['blstats'],
                     msg_tokens=batch_device['message_chars'],
                     valid_screen=batch_device['valid_screen'],
-                    weight_emb=weight_emb,
-                    weight_raw=weight_raw,
                     mi_beta=mi_beta,
                     tc_beta=tc_beta,
                     dw_beta=dw_beta,
@@ -1656,12 +1602,6 @@ def train_multimodalhack_vae(
                         "test/raw_loss/glyph_colors": test_loss_dict['raw_losses']['color'].item(),
                         "test/raw_loss/blstats": test_loss_dict['raw_losses']['stats'].item(),
                         "test/raw_loss/message": test_loss_dict['raw_losses']['msg'].item(),
-
-                        "test/emb_loss/total": test_loss_dict['total_emb_loss'].item(),
-                        "test/emb_loss/glyph_chars": test_loss_dict['emb_losses']['char_emb'].item(),
-                        "test/emb_loss/glyph_colors": test_loss_dict['emb_losses']['color_emb'].item(),
-                        "test/emb_loss/blstats": test_loss_dict['emb_losses']['stats_emb'].item(),
-                        "test/emb_loss/message": test_loss_dict['emb_losses']['msg_emb'].item(),
 
                         "test/kl_loss": test_loss_dict['kl_loss'].item(),
                     }
@@ -1725,32 +1665,25 @@ def train_multimodalhack_vae(
         
         # Log epoch summary
         # Calculate current adaptive weights for display
-        current_weight_emb, current_weight_raw, current_mi_beta, current_tc_beta, current_dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
+        current_mi_beta, current_tc_beta, current_dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
         
         logger.info(f"\n=== Epoch {epoch+1}/{epochs} Summary ===")
         logger.info(f"Average Train Loss: {avg_train_loss:.3f} | Average Test Loss: {avg_test_loss:.3f}")
         if early_stopping:
             logger.info(f"Early Stopping: Best Test Loss: {best_test_loss:.4f} (epoch {best_epoch+1}) | Counter: {early_stopping_counter}/{early_stopping_patience}")
-        logger.info(f"Current Adaptive Weights: emb={current_weight_emb:.3f}, raw={current_weight_raw:.3f}")
         logger.info(f"Current KL Betas: mi={current_mi_beta:.3f}, tc={current_tc_beta:.3f}, dw={current_dw_beta:.3f}")
         logger.info(f"Global Step: {global_step}/{total_train_steps} ({100*global_step/total_train_steps:.1f}%)")
         
         # Show detailed modality breakdown for the last batch of training and testing
         logger.info(f"Final Training Batch Details:")
         raw_losses = train_loss_dict['raw_losses']
-        emb_losses = train_loss_dict['emb_losses']
         raw_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in raw_losses.items()])
-        emb_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in emb_losses.items()])
         logger.info(f"  Raw Losses: {raw_loss_str}")
-        logger.info(f"  Emb Losses: {emb_loss_str}")
         
         logger.info(f"Final Testing Batch Details:")
         raw_losses = test_loss_dict['raw_losses']
-        emb_losses = test_loss_dict['emb_losses']
         raw_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in raw_losses.items()])
-        emb_loss_str = " | ".join([f"{key}: {value.item():.3f}" for key, value in emb_losses.items()])
         logger.info(f"  Raw Losses: {raw_loss_str}")
-        logger.info(f"  Emb Losses: {emb_loss_str}")
 
         logger.info(f"Variance of model output (mu): {', '.join(f'{v:.4f}' for v in mu.var(dim=0).tolist())}")
         logger.info(f"Per-dim KL: {', '.join(f'{v:.4f}' for v in per_dim_kl.tolist())}")
@@ -1770,11 +1703,9 @@ def train_multimodalhack_vae(
                 
                 # Final batch details for comparison
                 "epoch/final_train_raw_total": train_loss_dict['total_raw_loss'].item(),
-                "epoch/final_train_emb_total": train_loss_dict['total_emb_loss'].item(),
                 "epoch/final_train_kl": train_loss_dict['kl_loss'].item(),
                 
                 "epoch/final_test_raw_total": test_loss_dict['total_raw_loss'].item(),
-                "epoch/final_test_emb_total": test_loss_dict['total_emb_loss'].item(),
                 "epoch/final_test_kl": test_loss_dict['kl_loss'].item()
             }
             
@@ -1851,12 +1782,6 @@ def train_multimodalhack_vae(
                 "shuffle_batches": shuffle_batches,
                 "shuffle_within_batch": shuffle_within_batch,
                 "adaptive_weighting": {
-                    "initial_weight_emb": initial_weight_emb,
-                    "final_weight_emb": final_weight_emb,
-                    "weight_emb_shape": weight_emb_shape,
-                    "initial_weight_raw": initial_weight_raw,
-                    "final_weight_raw": final_weight_raw,
-                    "weight_raw_shape": weight_raw_shape,
                     "initial_mi_beta": initial_mi_beta,
                     "final_mi_beta": final_mi_beta,
                     "mi_beta_shape": mi_beta_shape,
@@ -2883,12 +2808,6 @@ if __name__ == "__main__":
             force_recollect=False,  # Use the data we just collected
             shuffle_batches=True,  # Shuffle training batches each epoch for better training
             shuffle_within_batch=True,  # Shuffle within each batch for more variety
-            initial_weight_emb = 0.0,
-            final_weight_emb = 0.0,
-            weight_emb_shape = 'constant',
-            initial_weight_raw = 1.0,
-            final_weight_raw = 1.0,
-            weight_raw_shape = 'constant',
             initial_mi_beta=0.0,
             final_mi_beta=0.0,
             mi_beta_shape='constant',

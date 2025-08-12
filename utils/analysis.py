@@ -220,21 +220,18 @@ def visualize_reconstructions(
                     model_inputs[key.replace('message_chars', 'msg_tokens')] = sample[key].unsqueeze(0)
             
             # Get model output
-            model_output = model(
+            model_output = model.sample(
                 glyph_chars=model_inputs.get('game_chars'),
                 glyph_colors=model_inputs.get('game_colors'),
                 blstats=model_inputs.get('blstats'),
                 msg_tokens=model_inputs.get('msg_tokens'),
                 hero_info=model_inputs.get('hero_info'),
-                training_mode=False,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p
+                use_mean=True
             )
             
             # Get reconstructed characters and colors
-            char_recon = model_output['generated_chars'][0].cpu()  # [H, W]
-            color_recon = model_output['generated_colors'][0].cpu()  # [H, W]
+            char_recon = model_output['chars'][0].cpu()  # [H, W]
+            color_recon = model_output['colors'][0].cpu()  # [H, W]
             
             # Get original data
             char_orig = sample['game_chars'].cpu()  # [H, W]
@@ -602,10 +599,10 @@ def analyze_latent_space(
     latent_grid = torch.tensor(latent_grid, dtype=torch.float32)
     
     with torch.no_grad():
-        decode_output = model.decode(latent_grid.to(device))
-        chars = decode_output['generated_chars'].cpu()
-        colors = decode_output['generated_colors'].cpu()
-    
+        decode_output = model.sample(z=latent_grid.to(device))
+        chars = decode_output['chars'].cpu()
+        colors = decode_output['colors'].cpu()
+
     # Create TTY grid visualization
     from utils.analysis import _render_map_image
     tty_fig, tty_axes = plt.subplots(num_per_axis, num_per_axis, figsize=(30, 10))
