@@ -61,6 +61,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+import math
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
@@ -239,10 +240,45 @@ class AttnPool(nn.Module):
             Z[bad] = self.empty_vec
 
         return Z.reshape(B, -1)                     # [B, K*C]
+    
+class FiLM(nn.Module):
+    """Per-sample channel-wise affine: y = x * (1 + gamma) + beta"""
+    def __init__(self, z_dim: int, c: int):
+        super().__init__()
+        self.fc = nn.Linear(z_dim, 2 * c)
+    def forward(self, x: torch.Tensor, z: torch.Tensor):
+        B, C, H, W = x.shape
+        gamma, beta = self.fc(z).chunk(2, dim=-1)  # [B,C], [B,C]
+        gamma = gamma.view(B, C, 1, 1)
+        beta  = beta.view(B, C, 1, 1)
+        return x * (1.0 + gamma) + beta
+
+class ResBlockFiLM(nn.Module):
+    """Conv-GN-FiLM-SiLU x2 with residual; supports anisotropic dilation."""
+    def __init__(self, c_in: int, c_out: int, dilation=(1,1), drop=0.0, z_dim: int = 0):
+        super().__init__()
+        dh, dw = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+        pad = (dh, dw)
+        self.conv1 = nn.Conv2d(c_in,  c_out, 3, padding=pad, dilation=(dh, dw))
+        self.gn1   = nn.GroupNorm(_gn_groups(c_out), c_out)
+        self.film1 = FiLM(z_dim, c_out)
+
+        self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=pad, dilation=(dh, dw))
+        self.gn2   = nn.GroupNorm(_gn_groups(c_out), c_out)
+        self.film2 = FiLM(z_dim, c_out)
+
+        self.act   = nn.ReLU()
+        self.drop  = nn.Dropout2d(drop) if drop > 0 else nn.Identity()
+        self.skip  = (nn.Conv2d(c_in, c_out, 1) if c_in != c_out else nn.Identity())
+
+    def forward(self, x, z):
+        h = self.conv1(x); h = self.gn1(h); h = self.film1(h, z); h = self.act(h); h = self.drop(h)
+        h = self.conv2(h); h = self.gn2(h); h = self.film2(h, z); h = self.act(h); h = self.drop(h)
+        return h + self.skip(x)
 
 class GlyphCNN(nn.Module):
     """
-    NetHack map encoder:
+    NetHack map encoder and decoder:
       - char & color embeddings (space can be true padding)
       - +1 foreground mask channel
       - +2 CoordConv channels (x,y in [-1,1])
@@ -277,6 +313,60 @@ class GlyphCNN(nn.Module):
         # Tiny head you can keep or replace downstream
         self.out_dim = pooled_dim
         self.norm_out = nn.LayerNorm(self.out_dim)
+        
+        # decoder parts
+        self.H = MAP_HEIGHT
+        self.W = MAP_WIDTH
+        decode_yy = torch.linspace(-1, 1, self.H).view(1,1,self.H,1).expand(1,1,self.H,self.W)
+        decode_xx = torch.linspace(-1, 1, self.W).view(1,1,1,self.W).expand(1,1,self.H,self.W)
+        self.register_buffer("decode_coord_y", decode_yy)
+        self.register_buffer("decode_coord_x", decode_xx)
+        self.decode_base_ch = 256
+        self.decode_mid_ch = 512
+        
+        # Stem: mix z map + coords
+        decode_in_ch = self.decode_base_ch + 2  # + (y, x)
+        self.decode_stem = nn.Sequential(
+            nn.Conv2d(decode_in_ch, self.decode_mid_ch, 3, padding=1), 
+            nn.GroupNorm(_gn_groups(self.decode_mid_ch), self.decode_mid_ch), 
+            nn.ReLU()
+        )
+
+        # Body: widen horizontal receptive field
+        self.block1 = ResBlockFiLM(self.decode_mid_ch, self.decode_mid_ch, dilation=(1, 1),  drop=dropout, z_dim=self.decode_base_ch)
+        self.block2 = ResBlockFiLM(self.decode_mid_ch, self.decode_mid_ch, dilation=(1, 3),  drop=dropout, z_dim=self.decode_base_ch)
+        self.block3 = ResBlockFiLM(self.decode_mid_ch, self.decode_mid_ch, dilation=(1, 9),  drop=dropout, z_dim=self.decode_base_ch)
+        self.block4 = ResBlockFiLM(self.decode_mid_ch, self.decode_mid_ch, dilation=(1, 27), drop=dropout, z_dim=self.decode_base_ch)
+
+        # Local refinement (denoise / sharpen before heads)
+        self.decode_refine = nn.Sequential(
+            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch, 3, padding=1), 
+            nn.GroupNorm(_gn_groups(self.decode_mid_ch), self.decode_mid_ch), 
+            nn.ReLU(),
+            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch, 3, padding=1), 
+            nn.GroupNorm(_gn_groups(self.decode_mid_ch), self.decode_mid_ch), 
+            nn.ReLU(),
+        )
+
+        # Heads
+        self.head_occ = nn.Sequential(
+            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch//2, 1), nn.ReLU(),
+            nn.Conv2d(self.decode_mid_ch//2, 1, 1)
+        )
+        self.head_char = nn.Sequential(
+            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch//2, 1), nn.ReLU(),
+            nn.Conv2d(self.decode_mid_ch//2, CHAR_DIM, 1)
+        )
+        self.head_color = nn.Sequential(
+            nn.Conv2d(self.decode_mid_ch, self.decode_mid_ch//2, 1), nn.ReLU(),
+            nn.Conv2d(self.decode_mid_ch//2, COLOR_DIM, 1)
+        )
+
+        # Bias-init occupancy to background (low p for foreground)
+        with torch.no_grad():
+            b = math.log(max(0.03, 1e-6) / max(1 - 0.03, 1e-6))
+            # last conv of head_occ
+            self.head_occ[-1].bias.fill_(b)
 
         
     @staticmethod
@@ -393,6 +483,33 @@ class GlyphCNN(nn.Module):
         chars_out[fg_mask]  = glyph_samples[fg_mask]
         colors_out[fg_mask] = color_samples[fg_mask]
         return fg_mask, chars_out, colors_out
+    
+    def decode(self, shared_feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Decode shared features into glyph logits.
+        Args:
+            shared_feat (torch.Tensor): Shared feature vector, [B, C].
+        Returns:
+            tuple: Occupy logits, glyph character logits, color logits.
+        """
+        B = shared_feat.size(0)
+        x = torch.cat([shared_feat, self.decode_coord_y.expand(B, -1, -1, -1), self.decode_coord_x.expand(B, -1, -1, -1)], dim=1)
+        x = self.decode_stem(x)
+
+        # FiLM-conditioned residual stack
+        x = self.block1(x, shared_feat)
+        x = self.block2(x, shared_feat)
+        x = self.block3(x, shared_feat)
+        x = self.block4(x, shared_feat)
+
+        # local sharpening
+        x = self.decode_refine(x)
+
+        # logits
+        occ   = self.head_occ(x)     # [B,1,H,W]
+        g_log = self.head_char(x)    # [B,CHAR_DIM,H,W]
+        c_log = self.head_color(x)   # [B,COLOR_DIM,H,W]    
+        return occ, g_log, c_log
 
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
