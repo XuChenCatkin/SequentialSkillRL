@@ -125,9 +125,28 @@ def save_maps_and_markdown(
 
 def visualize_reconstructions(
     model, dataset, device, 
-    num_samples=4, temperature=1.0, top_k=5, top_p=0.9, 
+    num_samples=4, 
     out_dir="vae_analysis", save_path="recon_comparison.md",
-    random_sampling=True, dataset_name="Dataset"
+    random_sampling=True, dataset_name="Dataset",
+    # VAE sampling parameters
+    use_mean=True,
+    include_logits=False,
+    # map sampling parameters
+    map_temperature=1.0,
+    map_occ_thresh=0.5,
+    map_deterministic=True,
+    glyph_top_k=0,
+    glyph_top_p=1.0,
+    color_top_k=0,
+    color_top_p=1.0,
+    # message sampling parameters
+    msg_temperature=1.0,
+    msg_top_k=0,
+    msg_top_p=1.0,
+    msg_deterministic=True,
+    allow_eos=True,
+    forbid_eos_at_start=True,
+    allow_pad=False
 ):
     """
     Enhanced version of visualize_reconstructions with random sampling support
@@ -139,6 +158,54 @@ def visualize_reconstructions(
         num_samples: Number of samples to visualize
         random_sampling: Whether to randomly sample or use sequential sampling
         dataset_name: Name of the dataset for labeling
+        
+        # VAE sampling parameters
+        use_mean: If True, use mean of latent distribution; if False, sample from it
+        include_logits: Whether to include raw logits in output
+        
+        # Map sampling parameters
+        map_temperature: Temperature for map sampling (higher = more random)
+        map_occ_thresh: Threshold for occupancy prediction
+        map_deterministic: If True, use deterministic (argmax) sampling for map
+        glyph_top_k: Top-k filtering for glyph character sampling (0 = disabled)
+        glyph_top_p: Top-p (nucleus) filtering for glyph character sampling
+        color_top_k: Top-k filtering for color sampling (0 = disabled)
+        color_top_p: Top-p (nucleus) filtering for color sampling
+        
+        # Message sampling parameters
+        msg_temperature: Temperature for message token sampling
+        msg_top_k: Top-k filtering for message sampling (0 = disabled)
+        msg_top_p: Top-p (nucleus) filtering for message sampling
+        msg_deterministic: If True, use deterministic (argmax) sampling for messages
+        allow_eos: Whether to allow end-of-sequence tokens in messages
+        forbid_eos_at_start: Whether to forbid EOS tokens at the start of messages
+        allow_pad: Whether to allow padding tokens in messages
+        
+    Examples:
+        # Basic usage (deterministic reconstruction)
+        results = visualize_reconstructions(model, dataset, device)
+        
+        # More creative/random reconstruction
+        results = visualize_reconstructions(
+            model, dataset, device,
+            use_mean=False,  # Sample from latent distribution
+            map_temperature=1.5,  # Higher temperature for more variation
+            map_deterministic=False,  # Non-deterministic map sampling
+            glyph_top_k=10,  # Top-10 character sampling
+            color_top_k=5,   # Top-5 color sampling
+            msg_temperature=1.2,  # Slightly random message generation
+            msg_deterministic=False
+        )
+        
+        # High-quality reconstruction (conservative)
+        results = visualize_reconstructions(
+            model, dataset, device,
+            use_mean=True,  # Use mean latent representation
+            map_deterministic=True,  # Deterministic map sampling
+            glyph_top_k=3,  # Conservative character sampling
+            color_top_k=2,  # Conservative color sampling
+            msg_deterministic=True  # Deterministic message generation
+        )
     """
     
     model.eval()
@@ -219,14 +286,31 @@ def visualize_reconstructions(
                 if key in sample and sample[key] is not None:
                     model_inputs[key.replace('message_chars', 'msg_tokens')] = sample[key].unsqueeze(0)
             
-            # Get model output
+            # Get model output with all sampling parameters
             model_output = model.sample(
                 glyph_chars=model_inputs.get('game_chars'),
                 glyph_colors=model_inputs.get('game_colors'),
                 blstats=model_inputs.get('blstats'),
                 msg_tokens=model_inputs.get('msg_tokens'),
                 hero_info=model_inputs.get('hero_info'),
-                use_mean=True
+                use_mean=use_mean,
+                include_logits=include_logits,
+                # Map sampling parameters
+                map_temperature=map_temperature,
+                map_occ_thresh=map_occ_thresh,
+                map_deterministic=map_deterministic,
+                glyph_top_k=glyph_top_k,
+                glyph_top_p=glyph_top_p,
+                color_top_k=color_top_k,
+                color_top_p=color_top_p,
+                # Message sampling parameters
+                msg_temperature=msg_temperature,
+                msg_top_k=msg_top_k,
+                msg_top_p=msg_top_p,
+                msg_deterministic=msg_deterministic,
+                allow_eos=allow_eos,
+                forbid_eos_at_start=forbid_eos_at_start,
+                allow_pad=allow_pad
             )
             
             # Get reconstructed characters and colors
@@ -254,7 +338,25 @@ def visualize_reconstructions(
         'reconstructions': reconstructions,
         'save_path': save_path,
         'dataset_name': dataset_name,
-        'random_sampling': random_sampling
+        'random_sampling': random_sampling,
+        'sampling_params': {
+            'use_mean': use_mean,
+            'include_logits': include_logits,
+            'map_temperature': map_temperature,
+            'map_occ_thresh': map_occ_thresh,
+            'map_deterministic': map_deterministic,
+            'glyph_top_k': glyph_top_k,
+            'glyph_top_p': glyph_top_p,
+            'color_top_k': color_top_k,
+            'color_top_p': color_top_p,
+            'msg_temperature': msg_temperature,
+            'msg_top_k': msg_top_k,
+            'msg_top_p': msg_top_p,
+            'msg_deterministic': msg_deterministic,
+            'allow_eos': allow_eos,
+            'forbid_eos_at_start': forbid_eos_at_start,
+            'allow_pad': allow_pad
+        }
     }
 
 

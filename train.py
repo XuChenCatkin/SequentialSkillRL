@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
@@ -821,6 +822,7 @@ def save_checkpoint(
     train_losses: List[float],
     test_losses: List[float],
     scheduler: torch.optim.lr_scheduler._LRScheduler = None,
+    scaler = None,  # Remove specific type annotation since GradScaler API changed
     checkpoint_dir: str = "checkpoints",
     keep_last_n: int = 3,
     upload_to_hf: bool = False,
@@ -837,6 +839,7 @@ def save_checkpoint(
         train_losses: Training loss history
         test_losses: Test loss history
         scheduler: Learning rate scheduler to save (optional)
+        scaler: GradScaler for mixed precision training (optional)
         checkpoint_dir: Directory to save checkpoints
         keep_last_n: Number of recent checkpoints to keep (older ones are deleted)
         upload_to_hf: Whether to upload checkpoint to HuggingFace
@@ -876,6 +879,10 @@ def save_checkpoint(
     # Add scheduler state if available
     if scheduler is not None:
         checkpoint_data['scheduler_state_dict'] = scheduler.state_dict()
+    
+    # Add scaler state if available
+    if scaler is not None:
+        checkpoint_data['scaler_state_dict'] = scaler.state_dict()
     
     # Save checkpoint
     torch.save(checkpoint_data, checkpoint_path)
@@ -965,6 +972,9 @@ def train_multimodalhack_vae(
     shuffle_batches: bool = True,
     shuffle_within_batch: bool = False,
     
+    # Mixed precision parameters
+    use_bf16: bool = False,
+    
     # Adaptive loss weighting parameters
     initial_mi_beta: float = 0.0001,
     final_mi_beta: float = 1.0,
@@ -1036,6 +1046,7 @@ def train_multimodalhack_vae(
         force_recollect: Force data recollection even if cache exists
         shuffle_batches: Whether to shuffle training batches at the start of each epoch
         shuffle_within_batch: Whether to shuffle samples within each batch (ignores temporal order)
+        use_bf16: Whether to use BF16 mixed precision training for memory efficiency
         initial_mi_beta: Starting mutual information KL divergence weight (very small initially)
         final_mi_beta: Final mutual information KL divergence weight
         mi_beta_shape: Shape of MI beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
@@ -1110,6 +1121,7 @@ def train_multimodalhack_vae(
             "training_batches": training_batches,
             "testing_batches": testing_batches,
             "device": str(device),
+            "use_bf16": use_bf16,
             "shuffle_batches": shuffle_batches,
             "shuffle_within_batch": shuffle_within_batch,
             "adaptive_weighting": {
@@ -1165,6 +1177,7 @@ def train_multimodalhack_vae(
     logger.info(f"   Batch size: {batch_size}")
     logger.info(f"   Sequence size: {sequence_size}")
     logger.info(f"   Device: {device}")
+    logger.info(f"   Mixed Precision: BF16 = {use_bf16}")
     logger.info(f"   Data cache: {data_cache_dir}")
     logger.info(f"   Shuffle batches: {shuffle_batches}")
     logger.info(f"   Shuffle within batch: {shuffle_within_batch}")
@@ -1302,6 +1315,10 @@ def train_multimodalhack_vae(
         )
         scheduler.load_state_dict(checkpoint['scheduler_state_dict']) if 'scheduler_state_dict' in checkpoint else None
         optimizer.load_state_dict(checkpoint['optimizer_state_dict']) if 'optimizer_state_dict' in checkpoint else None
+        
+        # Initialize loss tracking from checkpoint
+        train_losses = checkpoint.get('train_losses', [])
+        test_losses = checkpoint.get('test_losses', [])
     else:
         start_epoch = 0
         # Initialize model with dropout configuration
@@ -1334,6 +1351,23 @@ def train_multimodalhack_vae(
         # Initialize loss tracking
         train_losses = []
         test_losses = []
+
+    # Initialize GradScaler for mixed precision training (for both new and resumed training)
+    scaler = torch.amp.GradScaler('cuda') if use_bf16 and device.type == 'cuda' else None
+    
+    # Restore scaler state if resuming from checkpoint and scaler is available
+    if resume_checkpoint_path and os.path.exists(resume_checkpoint_path) and scaler is not None:
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            logger.info(f"   Restored GradScaler state from checkpoint")
+    
+    # Log BF16 status
+    if use_bf16 and device.type == 'cuda':
+        logger.info(f"✨ BF16 mixed precision training enabled with GradScaler")
+    elif use_bf16 and device.type != 'cuda':
+        logger.warning(f"⚠️  BF16 requested but device is {device.type}, using FP32 instead")
+    else:
+        logger.info(f"🔧 Using FP32 precision training")
 
     # Log model architecture to wandb if requested
     if use_wandb and WANDB_AVAILABLE and log_model_architecture:
@@ -1412,35 +1446,36 @@ def train_multimodalhack_vae(
                         if value is not None and isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
                             batch_device[key] = value[shuffle_indices]
                 
-                # Forward pass
-                model_output = model(
-                    glyph_chars=batch_device['game_chars'],
-                    glyph_colors=batch_device['game_colors'], 
-                    blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['message_chars'],
-                    hero_info=batch_device['hero_info']
-                )
-                
-                # Calculate adaptive weights for this step
-                mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
-                
-                # Calculate loss
-                train_loss_dict = vae_loss(
-                    model_output=model_output,
-                    glyph_chars=batch_device['game_chars'],
-                    glyph_colors=batch_device['game_colors'],
-                    blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['message_chars'],
-                    valid_screen=batch_device['valid_screen'],
-                    mi_beta=mi_beta,
-                    tc_beta=tc_beta,
-                    dw_beta=dw_beta,
-                    free_bits=free_bits,
-                    focal_loss_alpha=focal_loss_alpha,
-                    focal_loss_gamma=focal_loss_gamma
-                )
+                # Forward pass with mixed precision if enabled
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
+                    model_output = model(
+                        glyph_chars=batch_device['game_chars'],
+                        glyph_colors=batch_device['game_colors'], 
+                        blstats=batch_device['blstats'],
+                        msg_tokens=batch_device['message_chars'],
+                        hero_info=batch_device['hero_info']
+                    )
+                    
+                    # Calculate adaptive weights for this step
+                    mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
+                    
+                    # Calculate loss
+                    train_loss_dict = vae_loss(
+                        model_output=model_output,
+                        glyph_chars=batch_device['game_chars'],
+                        glyph_colors=batch_device['game_colors'],
+                        blstats=batch_device['blstats'],
+                        msg_tokens=batch_device['message_chars'],
+                        valid_screen=batch_device['valid_screen'],
+                        mi_beta=mi_beta,
+                        tc_beta=tc_beta,
+                        dw_beta=dw_beta,
+                        free_bits=free_bits,
+                        focal_loss_alpha=focal_loss_alpha,
+                        focal_loss_gamma=focal_loss_gamma
+                    )
 
-                train_loss = train_loss_dict['total_loss']
+                    train_loss = train_loss_dict['total_loss']
                 mu = model_output['mu'].detach()
                 kl_diagnosis = train_loss_dict['kl_diagnosis']
                 per_dim_kl = kl_diagnosis['dimension_wise_kl'].detach()
@@ -1456,9 +1491,14 @@ def train_multimodalhack_vae(
                 ninety_percentile_idx = (var_explained >= 0.9).nonzero(as_tuple=True)[0][0]
                 ninety_percentile_ratio = (ninety_percentile_idx + 1) / len(var_explained)
 
-                # Backward pass
-                train_loss.backward()
-                optimizer.step()
+                # Backward pass with mixed precision scaling if enabled
+                if scaler is not None:
+                    scaler.scale(train_loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    train_loss.backward()
+                    optimizer.step()
                 scheduler.step()  # Step-based learning rate scheduling
                 
                 # Update global step counter
@@ -1480,6 +1520,8 @@ def train_multimodalhack_vae(
                         # Loss components
                         "train/raw_loss/total": train_loss_dict['total_raw_loss'].item(),
                         "train/raw_loss/occupancy": train_loss_dict['raw_losses']['occupy'].item(),
+                        "train/raw_loss/total_variation": train_loss_dict['raw_losses']['tv'].item(),
+                        "train/raw_loss/dice_loss": train_loss_dict['raw_losses']['dice'].item(),
                         "train/raw_loss/glyph_chars": train_loss_dict['raw_losses']['char'].item(),
                         "train/raw_loss/glyph_colors": train_loss_dict['raw_losses']['color'].item(),
                         "train/raw_loss/blstats": train_loss_dict['raw_losses']['stats'].item(),
@@ -1559,35 +1601,36 @@ def train_multimodalhack_vae(
                         if value is not None and isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
                             batch_device[key] = value[shuffle_indices]
                 
-                # Forward pass
-                model_output = model(
-                    glyph_chars=batch_device['game_chars'],
-                    glyph_colors=batch_device['game_colors'], 
-                    blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['message_chars'],
-                    hero_info=batch_device['hero_info']
-                )
-                
-                # Calculate adaptive weights for this step (use current global step for consistency)
-                mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
-                
-                # Calculate loss
-                test_loss_dict = vae_loss(
-                    model_output=model_output,
-                    glyph_chars=batch_device['game_chars'],
-                    glyph_colors=batch_device['game_colors'],
-                    blstats=batch_device['blstats'],
-                    msg_tokens=batch_device['message_chars'],
-                    valid_screen=batch_device['valid_screen'],
-                    mi_beta=mi_beta,
-                    tc_beta=tc_beta,
-                    dw_beta=dw_beta,
-                    free_bits=free_bits,
-                    focal_loss_alpha=focal_loss_alpha,
-                    focal_loss_gamma=focal_loss_gamma
-                )
+                # Forward pass with mixed precision if enabled
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
+                    model_output = model(
+                        glyph_chars=batch_device['game_chars'],
+                        glyph_colors=batch_device['game_colors'], 
+                        blstats=batch_device['blstats'],
+                        msg_tokens=batch_device['message_chars'],
+                        hero_info=batch_device['hero_info']
+                    )
+                    
+                    # Calculate adaptive weights for this step (use current global step for consistency)
+                    mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
+                    
+                    # Calculate loss
+                    test_loss_dict = vae_loss(
+                        model_output=model_output,
+                        glyph_chars=batch_device['game_chars'],
+                        glyph_colors=batch_device['game_colors'],
+                        blstats=batch_device['blstats'],
+                        msg_tokens=batch_device['message_chars'],
+                        valid_screen=batch_device['valid_screen'],
+                        mi_beta=mi_beta,
+                        tc_beta=tc_beta,
+                        dw_beta=dw_beta,
+                        free_bits=free_bits,
+                        focal_loss_alpha=focal_loss_alpha,
+                        focal_loss_gamma=focal_loss_gamma
+                    )
 
-                test_loss = test_loss_dict['total_loss']
+                    test_loss = test_loss_dict['total_loss']
                 epoch_test_loss += test_loss.item()
                 test_batch_count += 1
                 
@@ -1732,6 +1775,7 @@ def train_multimodalhack_vae(
                 train_losses=train_losses,
                 test_losses=test_losses,
                 scheduler=scheduler,
+                scaler=scaler,
                 checkpoint_dir=checkpoint_dir,
                 keep_last_n=keep_last_n_checkpoints,
                 upload_to_hf=hf_upload_checkpoints and upload_to_hf,
@@ -2324,12 +2368,28 @@ def create_visualization_demo(
     device: str = "cpu",
     num_samples: int = 4,
     max_latent_samples: int = 100,
-    sample_temperature: float = 1.0,
-    sample_top_k: int = 5,
-    sample_top_p: float = 0.9,
     save_dir: str = "vae_analysis",
     random_sampling: bool = True,
-    random_seed: Optional[int] = None
+    random_seed: Optional[int] = None,
+    # VAE sampling parameters
+    use_mean: bool = True,
+    include_logits: bool = False,
+    # Map sampling parameters
+    map_temperature: float = 1.0,
+    map_occ_thresh: float = 0.5,
+    map_deterministic: bool = True,
+    glyph_top_k: int = 0,
+    glyph_top_p: float = 1.0,
+    color_top_k: int = 0,
+    color_top_p: float = 1.0,
+    # Message sampling parameters
+    msg_temperature: float = 1.0,
+    msg_top_k: int = 0,
+    msg_top_p: float = 1.0,
+    msg_deterministic: bool = True,
+    allow_eos: bool = True,
+    forbid_eos_at_start: bool = True,
+    allow_pad: bool = False
 ) -> Dict:
     """
     Complete demo function that loads a model from HuggingFace and creates visualizations
@@ -2345,6 +2405,25 @@ def create_visualization_demo(
         save_dir: Directory to save results
         random_sampling: Whether to use random sampling for reconstruction visualization
         random_seed: Random seed for reproducible sampling
+        
+        # VAE sampling parameters
+        use_mean: If True, use mean of latent distribution; if False, sample from it
+        include_logits: Whether to include raw logits in output
+        
+        # Map sampling parameters (legacy parameters map to new ones)
+        map_occ_thresh: Threshold for occupancy prediction
+        map_deterministic: If True, use deterministic sampling for map
+        color_top_k: Top-k filtering for color sampling
+        color_top_p: Top-p filtering for color sampling
+        
+        # Message sampling parameters
+        msg_temperature: Temperature for message token sampling
+        msg_top_k: Top-k filtering for message sampling
+        msg_top_p: Top-p filtering for message sampling
+        msg_deterministic: If True, use deterministic sampling for messages
+        allow_eos: Whether to allow end-of-sequence tokens
+        forbid_eos_at_start: Whether to forbid EOS tokens at start
+        allow_pad: Whether to allow padding tokens
         
     Returns:
         Dictionary with analysis results
@@ -2383,13 +2462,29 @@ def create_visualization_demo(
         train_recon_results = visualize_reconstructions(
             model, train_dataset, device, 
             num_samples=num_samples, 
-            temperature=sample_temperature, 
-            top_k=sample_top_k, 
-            top_p=sample_top_p, 
             out_dir=save_dir, 
             save_path=train_save_path,
             random_sampling=random_sampling,
-            dataset_name="Training"
+            dataset_name="Training",
+            # VAE sampling parameters
+            use_mean=use_mean,
+            include_logits=include_logits,
+            # Map sampling parameters (map legacy params)
+            map_temperature=map_temperature,  # Legacy: temperature -> map_temperature
+            map_occ_thresh=map_occ_thresh,
+            map_deterministic=map_deterministic,
+            glyph_top_k=glyph_top_k,  # Legacy: top_k -> glyph_top_k
+            glyph_top_p=glyph_top_p,  # Legacy: top_p -> glyph_top_p
+            color_top_k=color_top_k,
+            color_top_p=color_top_p,
+            # Message sampling parameters
+            msg_temperature=msg_temperature,
+            msg_top_k=msg_top_k,
+            msg_top_p=msg_top_p,
+            msg_deterministic=msg_deterministic,
+            allow_eos=allow_eos,
+            forbid_eos_at_start=forbid_eos_at_start,
+            allow_pad=allow_pad
         )
         results['train_reconstruction_path'] = os.path.join(save_dir, train_save_path)
         results['train_reconstruction_results'] = train_recon_results
@@ -2400,13 +2495,29 @@ def create_visualization_demo(
         test_recon_results = visualize_reconstructions(
             model, test_dataset, device, 
             num_samples=num_samples, 
-            temperature=sample_temperature, 
-            top_k=sample_top_k, 
-            top_p=sample_top_p, 
             out_dir=save_dir, 
             save_path=test_save_path,
             random_sampling=random_sampling,
-            dataset_name="Testing"
+            dataset_name="Testing",
+            # VAE sampling parameters
+            use_mean=use_mean,
+            include_logits=include_logits,
+            # Map sampling parameters (map legacy params)
+            map_temperature=map_temperature,  # Legacy: temperature -> map_temperature
+            map_occ_thresh=map_occ_thresh,
+            map_deterministic=map_deterministic,
+            glyph_top_k=glyph_top_k,  # Legacy: top_k -> glyph_top_k
+            glyph_top_p=glyph_top_p,  # Legacy: top_p -> glyph_top_p
+            color_top_k=color_top_k,
+            color_top_p=color_top_p,
+            # Message sampling parameters
+            msg_temperature=msg_temperature,
+            msg_top_k=msg_top_k,
+            msg_top_p=msg_top_p,
+            msg_deterministic=msg_deterministic,
+            allow_eos=allow_eos,
+            forbid_eos_at_start=forbid_eos_at_start,
+            allow_pad=allow_pad
         )
         results['test_reconstruction_path'] = os.path.join(save_dir, test_save_path)
         results['test_reconstruction_results'] = test_recon_results
@@ -2725,12 +2836,12 @@ if __name__ == "__main__":
                 device="cpu",  # Use CPU for demo
                 num_samples=10,
                 max_latent_samples=1000,  # More samples since we have both datasets
-                sample_temperature=1.0,
-                sample_top_k=1,
-                sample_top_p=1.0,
                 save_dir="vae_analysis",
                 random_sampling=True,  # Enable random sampling
-                random_seed=100  # For reproducible results
+                random_seed=100,  # For reproducible results
+                use_mean=True,  # Use mean for latent space
+                map_occ_thresh=0.7,
+                map_deterministic=True  # Use deterministic sampling for maps
             )
             print(f"✅ Demo completed successfully!")
             print(f"📁 Results saved to: {results['save_dir']}")
@@ -2804,6 +2915,7 @@ if __name__ == "__main__":
             max_testing_batches=max_testing_batches,
             save_path="models/nethack-vae.pth",
             device='cuda' if torch.cuda.is_available() else 'cpu',
+            use_bf16=True,  # Enable BF16 mixed precision training for memory efficiency
             data_cache_dir="data_cache",
             force_recollect=False,  # Use the data we just collected
             shuffle_batches=True,  # Shuffle training batches each epoch for better training

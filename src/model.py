@@ -229,7 +229,7 @@ class FiLM(nn.Module):
         return x * (1.0 + gamma) + beta
 
 class ResBlockFiLM(nn.Module):
-    """Conv-GN-FiLM-SiLU x2 with residual; supports anisotropic dilation."""
+    """Conv-GN-FiLM-ReLU x2 with residual; supports anisotropic dilation."""
     def __init__(self, c_in: int, c_out: int, dilation=(1,1), drop=0.0, z_dim: int = 0):
         super().__init__()
         dh, dw = dilation if isinstance(dilation, tuple) else (dilation, dilation)
@@ -242,7 +242,7 @@ class ResBlockFiLM(nn.Module):
         self.gn2   = nn.GroupNorm(_gn_groups(c_out), c_out)
         self.film2 = FiLM(z_dim, c_out)
 
-        self.act   = nn.ReLU()
+        self.act   = nn.ReLU(inplace=True)
         self.drop  = nn.Dropout2d(drop) if drop > 0 else nn.Identity()
         self.skip  = (nn.Conv2d(c_in, c_out, 1) if c_in != c_out else nn.Identity())
 
@@ -325,8 +325,8 @@ class MapDecoder(nn.Module):
         self.H, self.W = H, W
         self.base_ch = base_ch
         # coords
-        yy = torch.linspace(-1, 1, H).view(1,1,H,1).expand(1,1,H,W)
-        xx = torch.linspace(-1, 1, W).view(1,1,1,W).expand(1,1,H,W)
+        yy = torch.linspace(-1, 1, H).view(1,1,H,1).expand(1,1,H,W).clone()
+        xx = torch.linspace(-1, 1, W).view(1,1,1,W).expand(1,1,H,W).clone()
         self.register_buffer("coord_y", yy)
         self.register_buffer("coord_x", xx)
         # project z to a broadcast feature map
@@ -337,8 +337,8 @@ class MapDecoder(nn.Module):
             nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
         )
         # FiLM-conditioned residual body (anisotropic to cover width)
-        self.block1 = ResBlockFiLM(mid_ch, mid_ch, (1,1),  drop, z_dim=z_dim)
-        self.block2 = ResBlockFiLM(mid_ch, mid_ch, (1,3),  drop, z_dim=z_dim)
+        # self.block1 = ResBlockFiLM(mid_ch, mid_ch, (1,1),  drop, z_dim=z_dim)
+        # self.block2 = ResBlockFiLM(mid_ch, mid_ch, (1,3),  drop, z_dim=z_dim)
         self.block3 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_dim)
         self.block4 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_dim)
         # local refinement
@@ -359,8 +359,8 @@ class MapDecoder(nn.Module):
         z_map = self.z_to_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
         x = torch.cat([z_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
         x = self.stem(x)
-        x = self.block1(x, z)
-        x = self.block2(x, z)
+        # x = self.block1(x, z)
+        # x = self.block2(x, z)
         x = self.block3(x, z)
         x = self.block4(x, z)
         x = self.refine(x)
@@ -624,8 +624,9 @@ class BlstatsPreprocessor(nn.Module):
             proc[:, hp_idx] = cont[:, 10] / torch.clamp(cont[:, 11], min=1)
             proc[:, en_idx] = cont[:, 14] / torch.clamp(cont[:, 15], min=1)
             keep = [i for i in range(proc.size(1)) if i not in [maxhp_idx, maxen_idx]]
+            # Apply keep filtering BEFORE batch norm, same as in forward()
+            proc = proc[:, keep]
             cont_norm = self.bn(proc)  # uses running stats; fine for targets
-            cont_norm = cont_norm[:, keep] if cont_norm.size(1) > len(keep) else cont_norm
             hunger = torch.clamp(bl[:, 21].long(), 0, 6)
             dung   = torch.clamp(bl[:, 23].long(), 0, 10)
             level  = torch.clamp(bl[:, 24].long(), 0, 50)
@@ -922,18 +923,18 @@ class MultiModalHackVAE(nn.Module):
         # This will be shared across all decoders
         if self.dropout_rate > 0.0 and self.enable_dropout_on_decoder:
             self.decode_shared = nn.Sequential(
-                nn.Linear(LATENT_DIM, 256), nn.ReLU(),
+                nn.Linear(LATENT_DIM, 96), nn.ReLU(),
                 nn.Dropout(self.dropout_rate),
             )
         else:
             self.decode_shared = nn.Sequential(
-                nn.Linear(LATENT_DIM, 256), nn.ReLU(),
+                nn.Linear(LATENT_DIM, 96), nn.ReLU(),
             )
 
-        self.map_decoder  = MapDecoder(z_dim=256, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=256, mid_ch=128, drop=dropout_rate, occ_prior=0.03)
-        self.stats_decoder = StatsDecoder(z_dim=256, cont_dim=19)
-        self.msg_decoder   = MessageDecoder(z_dim=256, L=MSG_MAXLEN, vocab=MSG_VSIZE)
-        
+        self.map_decoder  = MapDecoder(z_dim=96, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=96, mid_ch=64, drop=dropout_rate, occ_prior=0.03)
+        self.stats_decoder = StatsDecoder(z_dim=96, cont_dim=19)
+        self.msg_decoder   = MessageDecoder(z_dim=96, L=MSG_MAXLEN, vocab=MSG_VSIZE)
+
         # Dynamic prediction heads
         # It takes latent z, action a, HDP HMM state h and hero info c
         # TODO: Implement dynamic prediction heads
@@ -1017,10 +1018,10 @@ class MultiModalHackVAE(nn.Module):
         return z    # [B, LATENT_DIM]
 
     def decode(self, z):
-        d = self.dec_prep(z)  # [B,256]
-        occupy_logits, char_logits, color_logits = self.map_dec(d)
-        stats_pred = self.stats_dec(d)
-        msg_logits = self.msg_dec(d)
+        d = self.decode_shared(z)  # [B,256]
+        occupy_logits, char_logits, color_logits = self.map_decoder(d)
+        stats_pred = self.stats_decoder(d)
+        msg_logits = self.msg_decoder(d)
         return {"occupy_logits": occupy_logits, "char_logits": char_logits, "color_logits": color_logits, "stats_pred": stats_pred, "msg_logits": msg_logits}
 
     def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None):
@@ -1175,7 +1176,7 @@ def vae_loss(
     blstats, 
     msg_tokens,
     valid_screen,
-    raw_modality_weights={'occupy': 10.0, 'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0},
+    raw_modality_weights={'occupy': 10.0, 'char': 1.0, 'color': 1.0, 'stats': 0.5, 'msg': 0.5},
     focal_loss_alpha=0.1,
     focal_loss_gamma=2.0,
     mi_beta=1.0,
@@ -1213,13 +1214,33 @@ def vae_loss(
     col_t  = glyph_colors[valid_screen]                 # [valid_B,H,W]
 
     # occupancy focal BCE (mean over pixels)
-    focal_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), ooc_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
+    #occ_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), ooc_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
+    fg_rate = 0.05
+    pos_weight = torch.tensor([(1 - fg_rate) / max(fg_rate, 1e-6)], device=occupy_logits.device, dtype=occupy_logits.dtype) 
+    occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, ooc_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2])  # [valid_B]
+    assert occ_loss_per_sample.shape == (valid_B,), f"occupy loss shape mismatch: {occ_loss_per_sample.shape} != ({valid_B},)"
+    p = torch.sigmoid(occupy_logits)          # [B,1,H,W]
+    dx = p[..., :, 1:] - p[..., :, :-1]
+    dy = p[..., 1:, :] - p[..., :-1, :]
+    tv = (dx.abs().mean() + dy.abs().mean())
+
+    # Dice (alternative or in addition; keep weight small)
+    probs = p.squeeze(1); target = ooc_t.squeeze(1)
+    inter = (probs * target).sum(dim=(1,2))
+    dice = (2*inter + 1e-5) / (probs.sum(dim=(1,2)) + target.sum(dim=(1,2)) + 1e-5)
+    dice_loss = 1 - dice.mean()
 
     # CE losses (masked by foreground)
     if fg.any():
-        char_loss_per_sample = F.cross_entropy(char_logits, char_t, reduction='none')  # [valid_B, H, W]
+        char_hist = torch.bincount(char_t.view(-1), minlength=CHAR_DIM)  # [CHAR_DIM]
+        color_hist = torch.bincount(col_t.view(-1), minlength=COLOR_DIM)  # [COLOR_DIM]
+        char_w = (char_hist.float().max() / char_hist.float().maximum(1))  # [CHAR_DIM]
+        color_w = (color_hist.float().max() / color_hist.float().maximum(1))  # [COLOR_DIM]
+        char_w = char_w.to(glyph_chars.device)  # Ensure same device
+        color_w = color_w.to(glyph_colors.device)
+        char_loss_per_sample = F.cross_entropy(char_logits, char_t, reduction='none', weight=char_w, label_smoothing=0.05)  # [valid_B, H, W]
         masked_char_loss_per_sample = char_loss_per_sample * fg.float()
-        color_loss_per_sample = F.cross_entropy(color_logits, col_t, reduction='none')  # [valid_B, H, W]
+        color_loss_per_sample = F.cross_entropy(color_logits, col_t, reduction='none', weight=color_w, label_smoothing=0.05)  # [valid_B, H, W]
         masked_color_loss_per_sample = color_loss_per_sample * fg.float()
 
         # Sum over spatial dimensions for each sample
@@ -1230,21 +1251,30 @@ def vae_loss(
         masked_color_loss_per_sample = torch.zeros(valid_B, device=glyph_colors.device)
 
     # Average over valid samples only
-    raw_losses['occupy'] = focal_loss_per_sample.mean()  # Average over valid samples
+    raw_losses['occupy'] = occ_loss_per_sample.mean() + 0.01 * tv + 0.1 * dice_loss  # Average over valid samples
     raw_losses['char'] = masked_char_loss_per_sample.mean()
     raw_losses['color'] = masked_color_loss_per_sample.mean()
 
     # stats
     pre = BlstatsPreprocessor()
+    pre = pre.to(blstats.device)
     t = pre.targets(blstats[valid_screen])
     sp = model_output['stats_pred']
-    var = sp['logvar'].exp().clamp_min(1e-6)
-    nll_cont = 0.5 * (((t['cont'] - sp['mu'])**2 / var) + sp['logvar'] + math.log(2*math.pi))
+    # Filter stats_pred by valid_screen to match target dimensions
+    sp_filtered = {}
+    for key, value in sp.items():
+        if isinstance(value, torch.Tensor):
+            sp_filtered[key] = value[valid_screen]
+        else:
+            sp_filtered[key] = value
+    
+    var = sp_filtered['logvar'].exp().clamp_min(1e-6)
+    nll_cont = 0.5 * (((t['cont'] - sp_filtered['mu'])**2 / var) + sp_filtered['logvar'] + math.log(2*math.pi))
     nll_cont = nll_cont.mean()
-    hung_loss = F.cross_entropy(sp['hunger'], t['hunger'])
-    dung_loss = F.cross_entropy(sp['dungeon'], t['dungeon'])
-    level_loss = F.cross_entropy(sp['level'], t['level'])
-    cond_loss = F.binary_cross_entropy_with_logits(sp['cond'], t['cond'])
+    hung_loss = F.cross_entropy(sp_filtered['hunger'], t['hunger'])
+    dung_loss = F.cross_entropy(sp_filtered['dungeon'], t['dungeon'])
+    level_loss = F.cross_entropy(sp_filtered['level'], t['level'])
+    cond_loss = F.binary_cross_entropy_with_logits(sp_filtered['cond'], t['cond'])
     stats_loss = nll_cont + hung_loss + dung_loss + level_loss + cond_loss
     raw_losses['stats'] = stats_loss
 
@@ -1255,6 +1285,8 @@ def vae_loss(
 
     # Sum raw reconstruction losses
     total_raw_loss = sum(raw_losses[k] * raw_modality_weights.get(k, 1.0) for k in raw_losses)
+    raw_losses['tv'] = tv  # Add total variation loss
+    raw_losses['dice'] = dice_loss
     
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
