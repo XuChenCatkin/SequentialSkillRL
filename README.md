@@ -14,6 +14,7 @@ pipx ensurepath
 Then relaunch the terminal and run
 ```bash
 pipx install poetry
+poetry install
 # If poetry command is not found, use the full path:
 /root/.local/bin/poetry install
 ```
