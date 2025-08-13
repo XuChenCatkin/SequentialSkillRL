@@ -59,7 +59,7 @@ import env_utils
 
 # Add src to path for importing the existing MultiModalHackVAE
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from model import MultiModalHackVAE, vae_loss
+from model import MultiModalHackVAE, vae_loss, LATENT_DIM, CHAR_DIM, COLOR_DIM
 import torch.optim as optim
 import sqlite3
 import random
@@ -1394,6 +1394,9 @@ def train_multimodalhack_vae(
     early_stopping_counter = 0
     best_epoch = -1
     
+    # for diagnostics
+    bag_char_prob = nn.Sequential(nn.Linear(LATENT_DIM, 256), nn.ReLU(), nn.Linear(256, CHAR_DIM)).to(device)
+    
     for epoch in range(start_epoch, epochs):
         logger.info(f"🎯 Epoch {epoch+1}/{epochs} - Starting epoch...")
         
@@ -1493,6 +1496,27 @@ def train_multimodalhack_vae(
                 median_ratio = (median_idx + 1) / len(var_explained)
                 ninety_percentile_idx = (var_explained >= 0.9).nonzero(as_tuple=True)[0][0]
                 ninety_percentile_ratio = (ninety_percentile_idx + 1) / len(var_explained)
+                
+                with torch.no_grad():
+                    valid_screen = batch_device['valid_screen']  # [B, max_bag_size]
+                    z  = mu[valid_screen]                                  # or reparam if you prefer
+                    bag_char_logits = bag_char_prob(z)                 # [B,CHAR_DIM]
+                    bag_char_pred   = torch.sigmoid(bag_char_logits)    # [B,CHAR_DIM]
+                    bag_t = model.glyph_bag.encode_glyphs_to_bag(batch_device['game_chars'], batch_device['game_colors'])  # [B,max_bag_size, 2]
+                    bag_t_char = bag_t[valid_screen, :, 0]  # [valid_B, max_bag_size]
+                    bag_t_char = torch.clamp(bag_t_char - 32, min=0, max=CHAR_DIM-1)  # [valid_B, max_bag_size]
+                    valid_B = bag_t_char.shape[0]
+                    bag = torch.zeros(valid_B, CHAR_DIM, device=device, dtype=torch.float32)
+                    for b in range(valid_B):
+                        bag[b, bag_t_char[b]] = 1.0
+                    bag[:,0] = 0.0  # Remove the padding character
+
+                    # quick metric: F1@0.5 presence
+                    pred_bin = (bag_char_pred > 0.5).float()
+                    tp = (pred_bin * bag).sum(dim=1)
+                    fp = (pred_bin * (1-bag)).sum(dim=1)
+                    fn = ((1-pred_bin) * bag).sum(dim=1)
+                    f1 = (2*tp / (2*tp + fp + fn + 1e-6)).mean().item()
 
                 # Backward pass with mixed precision scaling if enabled
                 if scaler is not None:
@@ -1569,6 +1593,7 @@ def train_multimodalhack_vae(
                         "model/kl_eigenval_max": kl_eig.max().item(),
                         "model/kl_eigenval_min": kl_eig.min().item(),
                         "model/kl_eigenval_exceed_0.2": (kl_eig > 0.2).sum().item() / kl_eig.numel(),
+                        "model/f1_at_0.5": f1,
                     }
                     wandb.log(wandb_log_dict)
 
@@ -2973,7 +2998,7 @@ if __name__ == "__main__":
             log_gradients=True,
             
             # HuggingFace integration example
-            upload_to_hf=True, 
+            upload_to_hf=False, 
             hf_repo_name="CatkinChen/nethack-vae",
             hf_upload_directly=True,  # Upload directly without extra local save
             hf_upload_checkpoints=True,  # Also upload checkpoints

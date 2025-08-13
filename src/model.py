@@ -931,11 +931,9 @@ class MultiModalHackVAE(nn.Module):
         #     self.decode_shared = nn.Sequential(
         #         nn.Linear(LATENT_DIM, 256), nn.ReLU(),
         #     )
-        self.decode_shared = nn.Identity()
-
-        self.map_decoder  = MapDecoder(z_dim=96, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=96, mid_ch=96, drop=dropout_rate, occ_prior=0.1)
-        self.stats_decoder = StatsDecoder(z_dim=96, cont_dim=19)
-        self.msg_decoder   = MessageDecoder(z_dim=96, L=MSG_MAXLEN, vocab=MSG_VSIZE)
+        self.map_decoder  = MapDecoder(z_dim=LATENT_DIM, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=LATENT_DIM, mid_ch=96, drop=dropout_rate, occ_prior=0.1)
+        self.stats_decoder = StatsDecoder(z_dim=LATENT_DIM, cont_dim=19)
+        self.msg_decoder   = MessageDecoder(z_dim=LATENT_DIM, L=MSG_MAXLEN, vocab=MSG_VSIZE)
 
         # Dynamic prediction heads
         # It takes latent z, action a, HDP HMM state h and hero info c
@@ -1020,10 +1018,9 @@ class MultiModalHackVAE(nn.Module):
         return z    # [B, LATENT_DIM]
 
     def decode(self, z):
-        d = self.decode_shared(z)  # [B,256]
-        occupy_logits, char_logits, color_logits = self.map_decoder(d)
-        stats_pred = self.stats_decoder(d)
-        msg_logits = self.msg_decoder(d)
+        occupy_logits, char_logits, color_logits = self.map_decoder(z)
+        stats_pred = self.stats_decoder(z)
+        msg_logits = self.msg_decoder(z)
         return {"occupy_logits": occupy_logits, "char_logits": char_logits, "color_logits": color_logits, "stats_pred": stats_pred, "msg_logits": msg_logits}
 
     def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None):
