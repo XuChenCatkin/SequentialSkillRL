@@ -66,7 +66,7 @@ CHAR_EMB = 16      # char‑id embedding dim (0-15)
 COLOR_DIM = 16      # colour id space for colours
 COLOR_EMB = 4       # colour‑id embedding dim
 GLYPH_EMB = CHAR_EMB + COLOR_EMB  # glyph embedding dim
-LATENT_DIM = 96     # z‑dim for VAE
+LATENT_DIM = 128     # z‑dim for VAE
 BLSTATS_DIM = 27   # raw scalar stats (hp, gold, …)
 MSG_PAD = 0  
 MSG_VOCAB = 128     # Nethack takes 32-127 byte for char of messages
@@ -922,19 +922,20 @@ class MultiModalHackVAE(nn.Module):
         # 3. For dynamic predictions p(x_{t+1} | z_t, a_t, h_t, c)
         
         # This will be shared across all decoders
-        if self.dropout_rate > 0.0 and self.enable_dropout_on_decoder:
-            self.decode_shared = nn.Sequential(
-                nn.Linear(LATENT_DIM, 96), nn.ReLU(),
-                nn.Dropout(self.dropout_rate),
-            )
-        else:
-            self.decode_shared = nn.Sequential(
-                nn.Linear(LATENT_DIM, 96), nn.ReLU(),
-            )
+        # if self.dropout_rate > 0.0 and self.enable_dropout_on_decoder:
+        #     self.decode_shared = nn.Sequential(
+        #         nn.Linear(LATENT_DIM, 256), nn.ReLU(),
+        #         nn.Dropout(self.dropout_rate),
+        #     )
+        # else:
+        #     self.decode_shared = nn.Sequential(
+        #         nn.Linear(LATENT_DIM, 256), nn.ReLU(),
+        #     )
+        self.decode_shared = nn.Identity()
 
-        self.map_decoder  = MapDecoder(z_dim=96, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=96, mid_ch=64, drop=dropout_rate, occ_prior=0.03)
-        self.stats_decoder = StatsDecoder(z_dim=96, cont_dim=19)
-        self.msg_decoder   = MessageDecoder(z_dim=96, L=MSG_MAXLEN, vocab=MSG_VSIZE)
+        self.map_decoder  = MapDecoder(z_dim=128, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=128, mid_ch=96, drop=dropout_rate, occ_prior=0.1)
+        self.stats_decoder = StatsDecoder(z_dim=128, cont_dim=19)
+        self.msg_decoder   = MessageDecoder(z_dim=128, L=MSG_MAXLEN, vocab=MSG_VSIZE)
 
         # Dynamic prediction heads
         # It takes latent z, action a, HDP HMM state h and hero info c

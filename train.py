@@ -2925,7 +2925,7 @@ if __name__ == "__main__":
             max_testing_batches=max_testing_batches,
             save_path="models/nethack-vae.pth",
             device='cuda' if torch.cuda.is_available() else 'cpu',
-            use_bf16=True,  # Enable BF16 mixed precision training
+            use_bf16=False,  # Enable BF16 mixed precision training
             data_cache_dir="data_cache",
             force_recollect=False,  # Use the data we just collected
             shuffle_batches=True,  # Shuffle training batches each epoch for better training
