@@ -21,6 +21,8 @@ poetry install
 
 In terminal, run
 ```bash
+# Change to the project directory first
+cd /workspace/SequentialSkillRL
 # Get the environment path and activate it
 source $(/root/.local/bin/poetry env info --path)/bin/activate
 ```
