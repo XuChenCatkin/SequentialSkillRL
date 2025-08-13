@@ -59,6 +59,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 import math
+from typing import Optional
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
@@ -76,6 +77,8 @@ MSG_VSIZE = MSG_VOCAB + 2  # vocab size including SOS/EOS
 MSG_MAXLEN = 256  # max length of message text (padded/truncated)
 GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
 PADDING_IDX = [32, 0]  # padding index for glyphs (blank space char, black color)
+PADDING_CHAR = 32      # padding character (blank space)
+PADDING_COLOR = 0       # padding color (black)
 LOW_RANK = 0      # low-rank factorisation rank for covariance
 # NetHack map dimensions (from NetHack source: include/config.h)
 MAP_HEIGHT = 21     # ROWNO - number of rows in the map
@@ -140,12 +143,75 @@ BLSTATS_CAT = [
     "alignment",         # 26: Alignment (-1 to 1, -1=chaotic, 0=neutral, 1=lawful)
 ]
 
+COMMON_CHARS = [ord('#'), ord('.'), ord('-'), ord('|')]
+COMMON_IDXS = [a - 32 for a in COMMON_CHARS]  # indices in 0..95
+HERO_CHAR = ord('@')  # hero character code (ASCII 64)
+BAG_Z = 24         # slice of z reserved for glyph-bag / anchors
+BAG_MLP = 32       # feature size from glyph-bag encoder
+
+
 def _gn_groups(c: int) -> int:
     """Pick a sensible GroupNorm group count that divides c."""
     for g in (32, 16, 8, 4, 2, 1):
         if c % g == 0:
             return g
     return 1
+
+def _pair_index(char_ascii: torch.Tensor, color_id: torch.Tensor) -> torch.Tensor:
+    """
+    Map ASCII char (32..127) + color (0..15) -> flat pair index [0..GLYPH_DIM-1].
+    Both tensors are same shape; returns long tensor of that shape.
+    """
+    ch = (char_ascii - 32).clamp(0, CHAR_DIM - 1)
+    co = color_id.clamp(0, COLOR_DIM - 1)
+    return ch * COLOR_DIM + co
+
+def make_pair_bag(glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> torch.Tensor:
+    """
+    Returns a binary presence vector for (char,color) pairs, excluding (32,0).
+    glyph_chars/colors: [B,H,W]  ->  bag: [B, GLYPH_DIM] in {0,1}.
+    """
+    B, H, W = glyph_chars.shape
+    flat_idx = _pair_index(glyph_chars, glyph_colors)   # [B,H,W]
+    bag = torch.zeros(B, GLYPH_DIM, device=glyph_chars.device, dtype=torch.float32)
+    bag.scatter_add_(1, flat_idx.view(B, -1), torch.ones(B, H*W, device=glyph_chars.device))
+    # remove the padding pair (space, black)
+    pad_idx = _pair_index(torch.full_like(glyph_chars, PADDING_CHAR), torch.zeros_like(glyph_colors))
+    pad_counts = torch.zeros(B, GLYPH_DIM, device=glyph_chars.device).scatter_add_(
+        1, pad_idx.view(B, -1), torch.ones(B, H*W, device=glyph_chars.device)
+    )
+    bag = (bag - pad_counts).clamp_min_(0.0)
+    bag = (bag > 0).float()
+    return bag
+
+def bag_marginals(bag_pairs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    bag_pairs: [B, GLYPH_DIM] -> (char_presence [B,CHAR_DIM], color_presence [B,COLOR_DIM])
+    """
+    B = bag_pairs.size(0)
+    pairs = bag_pairs.view(B, CHAR_DIM, COLOR_DIM)
+    char_pres  = (pairs.max(dim=2).values).float()
+    color_pres = (pairs.max(dim=1).values).float()
+    return char_pres, color_pres
+
+def hero_presence_and_centroid(glyph_chars: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Presence p in {0,1} and centroid (y,x) in [-1,1]^2 for '@'.
+    If absent, centroid is (0,0) and p=0 (loss masked by p).
+    """
+    B, H, W = glyph_chars.shape
+    is_hero = (glyph_chars == HERO_CHAR).float()                  # [B,H,W]
+    present = (is_hero.sum(dim=(1,2)) > 0).float()               # [B]
+    # coords in [-1,1]
+    yy = torch.linspace(-1, 1, H, device=glyph_chars.device).view(1, H, 1).expand(B, H, W)
+    xx = torch.linspace(-1, 1, W, device=glyph_chars.device).view(1, 1, W).expand(B, H, W)
+    area = is_hero.sum(dim=(1,2)).clamp_min(1.0)                 # avoid /0
+    cy = (is_hero * yy).sum(dim=(1,2)) / area
+    cx = (is_hero * xx).sum(dim=(1,2)) / area
+    centroid = torch.stack([cy, cx], dim=1)                      # [B,2]
+    # for absent cases, centroids won’t be used (masked by present)
+    return present, centroid
+
 
 class ConvBlock(nn.Module):
     """
@@ -321,10 +387,11 @@ class MapDecoder(nn.Module):
     def __init__(self, z_dim: int, char_dim: int, color_dim: int,
                  H: int = MAP_HEIGHT, W: int = MAP_WIDTH,
                  base_ch: int = 256, mid_ch: int = 128, drop: float = 0.1,
-                 occ_prior: float = 0.03):
+                 occ_prior: float = 0.03, bag_bias_strength: float = 5.0):
         super().__init__()
         self.H, self.W = H, W
         self.base_ch = base_ch
+        self.bag_bias_strength = bag_bias_strength
         # coords
         yy = torch.linspace(-1, 1, H).view(1,1,H,1).expand(1,1,H,W).clone()
         xx = torch.linspace(-1, 1, W).view(1,1,1,W).expand(1,1,H,W).clone()
@@ -354,8 +421,20 @@ class MapDecoder(nn.Module):
         with torch.no_grad():
             b = math.log(max(occ_prior, 1e-6) / max(1 - occ_prior, 1e-6))
             self.head_occ[-1].bias.fill_(b)
+            
+    def _prior_to_bias(self, prior: torch.Tensor) -> torch.Tensor:
+        """
+        prior: probabilities in [0,1], shape [B,C].
+        Returns additive bias (logits) [B,C] scaled by bag_bias_strength.
+        """
+        p = prior.clamp(1e-6, 1 - 1e-6)
+        return self.bag_bias_strength * torch.log(p / (1 - p))
 
-    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    def forward(self, z: torch.Tensor,
+                char_prior: Optional[torch.Tensor] = None,   # [B,CHAR_DIM] optional
+                color_prior: Optional[torch.Tensor] = None   # [B,COLOR_DIM] optional
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B = z.size(0)
         z_map = self.z_to_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
         x = torch.cat([z_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
@@ -366,10 +445,17 @@ class MapDecoder(nn.Module):
         x = self.block4(x, z)
         x = self.refine(x)
         occ = self.head_occ(x)
-        ch  = self.head_chr(x)
-        co  = self.head_col(x)
-        return occ, ch, co
-    
+        g_log  = self.head_chr(x)
+        c_log  = self.head_col(x)
+        
+        if char_prior is not None:
+            cb = self._prior_to_bias(char_prior).view(B, self.char_dim, 1, 1).expand_as(g_log)
+            g_log = g_log + cb
+        if color_prior is not None:
+            kb = self._prior_to_bias(color_prior).view(B, self.color_dim, 1, 1).expand_as(c_log)
+            c_log = c_log + kb
+        return occ, g_log, c_log
+
     @staticmethod
     def _filter_topk_topp_channels(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
         """Filter along channel dim (classes) for [B,C,H,W] logits."""
@@ -456,113 +542,6 @@ class MapDecoder(nn.Module):
         """Convenience: z -> logits -> hard maps."""
         occ, gl, cl = self.forward(z)
         return self.sample_from_logits(occ, gl, cl, **kwargs)
-
-    
-class GlyphBag(nn.Module):
-    """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
-    def __init__(self, max_len=64, logger: logging.Logger=None):
-        super().__init__()
-        self.logger = logger or logging.getLogger(__name__)
-        if max_len <= 0:
-            raise ValueError("max_len must be a positive integer.")
-        if max_len > GLYPH_DIM:
-            self.logger.warning(f"max_len ({max_len}) is larger than GLYPH_DIM ({GLYPH_DIM}), truncating to {GLYPH_DIM}.")
-            max_len = GLYPH_DIM
-        self.max_len = max_len  # max number of unique glyphs in the bag
-        self.net = nn.RNN(GLYPH_EMB, 32, batch_first=True)  # simple RNN for bag encoding
-            
-        
-    def encode_glyphs_to_bag(self, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> torch.Tensor:
-        """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
-        # Create a bag of glyphs tensor
-        B, H, W = glyph_chars.size()
-        bag = torch.zeros(B, self.max_len, 2, dtype=torch.long, device=glyph_chars.device)
-        
-        # Encode each glyph as a unique id
-        g_ids = torch.concat([glyph_chars.unsqueeze(1), glyph_colors.unsqueeze(1)], dim=1)  # [B, 2, H, W]
-        g_ids = g_ids.view(B, 2, -1)  # flatten to [B, 2, H*W]
-        # for each batch, create a sorted bag of glyphs
-        for b in range(B):
-            # g_ids[b] has shape [2, H*W], find unique glyph pairs along dim=1
-            unique_glyphs, counts = torch.unique(g_ids[b], return_counts=True, dim=1)
-            
-            # Filter out blank space (32, 0) from unique_glyphs
-            blank_space_mask = (unique_glyphs[0] == 32) & (unique_glyphs[1] == 0)
-            non_blank_mask = ~blank_space_mask
-            if non_blank_mask.any():
-                unique_glyphs = unique_glyphs[:, non_blank_mask]
-                counts = counts[non_blank_mask]
-            else:
-                # If all glyphs are blank space, keep empty tensors
-                unique_glyphs = torch.empty((2, 0), dtype=unique_glyphs.dtype, device=unique_glyphs.device)
-                counts = torch.empty((0,), dtype=counts.dtype, device=counts.device)
-            
-            # Sort by the glyph pairs - need to sort by both char and color
-            # First sort by character (row 0), then by color (row 1) for ties
-            if unique_glyphs.size(1) > 0:
-                sorted_indices = torch.arange(unique_glyphs.size(1), device=unique_glyphs.device)
-                perm_sec = torch.argsort(unique_glyphs[1], stable=True)  # sort by color
-                sorted_indices = sorted_indices[perm_sec]  # apply color sort
-                perm_pri = torch.argsort(unique_glyphs[0][sorted_indices], stable=True)  # sort by char
-                sorted_indices = sorted_indices[perm_pri]  # apply char sort
-                sorted_glyphs = unique_glyphs[:, sorted_indices]
-                sorted_counts = counts[sorted_indices]
-            else:
-                # No non-blank glyphs found
-                sorted_glyphs = unique_glyphs
-                sorted_counts = counts
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Batch {b}: unique glyphs {unique_glyphs.size(1)}, counts {counts.size(0)}")
-                self.logger.debug(f"Batch {b}: sorted glyphs {sorted_glyphs}, counts {sorted_counts}")
-            if sorted_glyphs.size(1) > self.max_len:
-                self.logger.warning(f"Batch {b}: Too many unique glyphs ({sorted_glyphs.size(1)}), truncating to {self.max_len}.")
-            # Fill the bag with glyph ids (up to max_len)
-            num_glyphs = min(sorted_glyphs.size(1), self.max_len)
-            if num_glyphs > 0:
-                bag[b, :num_glyphs] = sorted_glyphs[:, :num_glyphs].t()
-            bag[b, num_glyphs:] = torch.tensor(PADDING_IDX, dtype=torch.long, device=bag.device)  # pad the rest
-        return bag  # [B, max_len, 2] of glyph ids
-
-    def forward(self, glyph_encoder: MapEncoder, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Encode glyphs to bag
-        bag = self.encode_glyphs_to_bag(glyph_chars, glyph_colors)
-        char_bag = bag[:, :, 0]  # [B, max_len] of char ids
-        color_bag = bag[:, :, 1]  # [B, max_len] of color ids
-        char_bag = torch.clamp(char_bag - 32, 0, CHAR_DIM - 1)  # Ensure char ids are in range [0, CHAR_DIM-1]
-        char_emb = glyph_encoder.char_emb(char_bag)  # [B, max_len] -> [B, max_len, CHAR_EMB]
-        color_emb = glyph_encoder.col_emb(color_bag)  # [B, max_len] -> [B, max_len, COLOR_EMB]
-        emb = torch.cat([char_emb, color_emb], dim=2)  # [B, max_len, GLYPH_EMB]
-        # Use RNN to encode the bag into a fixed-size vector
-        padding_indices = torch.tensor(PADDING_IDX, dtype=torch.long, device=bag.device)  # [2]
-        lengths = (bag != padding_indices).all(dim=-1).sum(dim=1).cpu()  # [B] - count non-padding glyphs
-        
-        # Initialize features tensor with dtype matching embeddings
-        B = emb.size(0)
-        features = torch.zeros(B, 32, device=emb.device, dtype=emb.dtype)  # [B, 32] - output size of RNN
-        
-        # Find samples with non-zero lengths
-        valid_mask = lengths > 0
-        
-        if valid_mask.any():
-            # Extract embeddings and lengths for valid samples
-            valid_emb = emb[valid_mask]  # [valid_B, max_len, GLYPH_EMB]
-            valid_lengths = lengths[valid_mask]  # [valid_B]
-            
-            # Process valid embeddings through RNN
-            packed_emb = nn.utils.rnn.pack_padded_sequence(valid_emb, lengths=valid_lengths, batch_first=True, enforce_sorted=False)
-            _, h = self.net(packed_emb)  # h: [1, valid_B, 32]
-            valid_features = h.squeeze(0)  # [valid_B, 32]
-            
-            # Assign valid features back to the full tensor with dtype compatibility
-            features[valid_mask] = valid_features.to(features.dtype)
-        
-        # Features for samples with lengths == 0 remain as zeros (already initialized)
-        
-        return features # [B, 32]
-        
-    def get_output_channels(self) -> int:
-        """Returns the number of output channels after self.net."""
-        return 32
 
 class BlstatsPreprocessor(nn.Module):
     def __init__(self, stats_dim=BLSTATS_DIM):
@@ -870,9 +849,11 @@ class MultiModalHackVAE(nn.Module):
         self.dropout_rate = dropout_rate
         self.enable_dropout_on_latent = enable_dropout_on_latent
         self.enable_dropout_on_decoder = enable_dropout_on_decoder
+        self.z_bag_dim = BAG_Z
+        assert LATENT_DIM > self.z_bag_dim, "LATENT_DIM must be greater than BAG_Z"
+        self.num_pairs = GLYPH_DIM
         
         self.map_encoder = MapEncoder(dropout=dropout_rate)
-        self.glyph_bag = GlyphBag(logger=self.logger) if bInclude_glyph_bag else None
         self.stats_encoder = StatsEncoder()
         self.msg_encoder = MessageEncoder()
         self.hero_emb = HeroEmbedding() if bInclude_hero else None
@@ -883,7 +864,6 @@ class MultiModalHackVAE(nn.Module):
         fusion_in = self.map_encoder.get_output_channels() + \
                     self.stats_encoder.get_output_channels() + \
                     self.msg_encoder.get_output_channels() + \
-                    (self.glyph_bag.get_output_channels() if bInclude_glyph_bag else 0) + \
                     (self.hero_emb.get_output_channels() if bInclude_hero else 0) # cnn + stats + msg + bag of glyphs + hero embedding + inventory
         
         # Add dropout to the encoder fusion layer if enabled
