@@ -134,6 +134,8 @@ def visualize_reconstructions(
     # map sampling parameters
     map_temperature=1.0,
     map_occ_thresh=0.5,
+    rare_occ_thresh=0.5,
+    hero_presence_thresh=0.5,
     map_deterministic=True,
     glyph_top_k=0,
     glyph_top_p=1.0,
@@ -298,6 +300,8 @@ def visualize_reconstructions(
                 # Map sampling parameters
                 map_temperature=map_temperature,
                 map_occ_thresh=map_occ_thresh,
+                rare_occ_thresh=rare_occ_thresh,
+                hero_presence_thresh=hero_presence_thresh,
                 map_deterministic=map_deterministic,
                 glyph_top_k=glyph_top_k,
                 glyph_top_p=glyph_top_p,

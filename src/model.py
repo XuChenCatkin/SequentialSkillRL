@@ -384,45 +384,63 @@ class MapEncoder(nn.Module):
     
 class MapDecoder(nn.Module):
     """Latent vector -> occupancy/glyph/color logits at 21x79, with FiLM and CoordConv."""
-    def __init__(self, z_dim: int, char_dim: int, color_dim: int,
+    def __init__(self, z_bag_dim: int, z_core_dim:int, char_dim: int, color_dim: int,
                  H: int = MAP_HEIGHT, W: int = MAP_WIDTH,
                  base_ch: int = 256, mid_ch: int = 128, drop: float = 0.1,
                  occ_prior: float = 0.1, rare_cond_prior: float = 0.05):
         super().__init__()
         self.H, self.W = H, W
         self.base_ch = base_ch
+        self.z_bag_dim = z_bag_dim
+        self.z_core_dim = z_core_dim
         # coords
         yy = torch.linspace(-1, 1, H).view(1,1,H,1).expand(1,1,H,W).clone()
         xx = torch.linspace(-1, 1, W).view(1,1,1,W).expand(1,1,H,W).clone()
         self.register_buffer("coord_y", yy)
         self.register_buffer("coord_x", xx)
         # project z to a broadcast feature map
-        self.z_to_map = nn.Sequential(nn.Linear(z_dim, base_ch), nn.ReLU(inplace=True), nn.Linear(base_ch, base_ch))
+        self.z_core_to_map = nn.Sequential(nn.Linear(z_core_dim, base_ch), nn.ReLU(inplace=True), nn.Linear(base_ch, base_ch))
         # stem
-        self.stem = nn.Sequential(
+        self.core_stem = nn.Sequential(
             nn.Conv2d(base_ch + 2, mid_ch, 3, padding=1),
             nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
         )
         # FiLM-conditioned residual body (anisotropic to cover width)
-        # self.block1 = ResBlockFiLM(mid_ch, mid_ch, (1,1),  drop, z_dim=z_dim)
-        # self.block2 = ResBlockFiLM(mid_ch, mid_ch, (1,3),  drop, z_dim=z_dim)
-        self.block3 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_dim)
-        self.block4 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_dim)
+        self.core_block1 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_core_dim)
+        self.core_block2 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_core_dim)
         # local refinement
-        self.refine = nn.Sequential(
+        self.core_refine = nn.Sequential(
             nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
             nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
         )
         # heads
         self.head_occ = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
-        self.head_rare = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
         self.head_chr = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, char_dim, 1))
         self.head_col = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, color_dim, 1))
+        
+        self.z_bag_to_map = nn.Sequential(nn.Linear(z_bag_dim, base_ch), nn.ReLU(inplace=True), nn.Linear(base_ch, base_ch))
+        # stem
+        self.bag_stem = nn.Sequential(
+            nn.Conv2d(base_ch + 2, mid_ch, 3, padding=1),
+            nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+        )
+        # FiLM-conditioned residual body (anisotropic to cover width)
+        self.bag_block1 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_bag_dim)
+        self.bag_block2 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_bag_dim)
+        # local refinement
+        self.bag_refine = nn.Sequential(
+            nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+        )
+        self.head_rare_occ = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
+        self.head_rare_chr = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, char_dim, 1))
+        self.head_rare_col = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, color_dim, 1))
+        
         with torch.no_grad():
             b = math.log(max(occ_prior, 1e-6) / max(1 - occ_prior, 1e-6))
             self.head_occ[-1].bias.fill_(b)
             rb = math.log(max(rare_cond_prior, 1e-6) / max(1 - rare_cond_prior, 1e-6))
-            self.head_rare[-1].bias.fill_(rb)
+            self.head_rare_occ[-1].bias.fill_(rb)
 
     def _prior_to_bias(self, prior: torch.Tensor, strength: float) -> torch.Tensor:
         """
@@ -439,20 +457,28 @@ class MapDecoder(nn.Module):
                 bag_bias_strength: float = 1.0,  # strength of prior bias
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B = z.size(0)
-        z_map = self.z_to_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
-        x = torch.cat([z_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
-        x = self.stem(x)
-        # x = self.block1(x, z)
-        # x = self.block2(x, z)
-        x = self.block3(x, z)
-        x = self.block4(x, z)
-        x = self.refine(x)
-        occ = self.head_occ(x)
-        rare_occ = self.head_rare(x)
-        g_log  = self.head_chr(x)
-        c_log  = self.head_col(x)
-        g_rare_log = g_log
-        c_rare_log = c_log
+        z_bag  = z[:, :self.z_bag_dim]
+        z_core = z[:, self.z_bag_dim:]
+
+        z_core_map = self.z_core_to_map(z_core).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
+        x_core = torch.cat([z_core_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
+        x_core = self.core_stem(x_core)
+        x_core = self.core_block1(x_core, z_core)
+        x_core = self.core_block2(x_core, z_core)
+        x_core = self.core_refine(x_core)
+        occ = self.head_occ(x_core)
+        g_log  = self.head_chr(x_core)
+        c_log  = self.head_col(x_core)
+        
+        z_bag_map = self.z_bag_to_map(z_bag).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
+        x_bag = torch.cat([z_bag_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
+        x_bag = self.bag_stem(x_bag)
+        x_bag = self.bag_block1(x_bag, z_bag)
+        x_bag = self.bag_block2(x_bag, z_bag)
+        x_bag = self.bag_refine(x_bag)
+        rare_occ = self.head_rare_occ(x_bag)
+        g_rare_log  = self.head_rare_chr(x_bag)
+        c_rare_log  = self.head_rare_col(x_bag)
         
         if char_bag_prior is not None:
             cb = self._prior_to_bias(char_bag_prior, bag_bias_strength).view(B, CHAR_DIM, 1, 1).expand_as(g_log)
@@ -933,10 +959,10 @@ class MultiModalHackVAE(nn.Module):
         #     self.decode_shared = nn.Sequential(
         #         nn.Linear(LATENT_DIM, 256), nn.ReLU(),
         #     )
-        rest_dim = LATENT_DIM - self.z_bag_dim
-        self.map_decoder  = MapDecoder(z_dim=rest_dim, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=rest_dim, mid_ch=96, drop=dropout_rate, occ_prior=0.1)
-        self.stats_decoder = StatsDecoder(z_dim=rest_dim, cont_dim=19)
-        self.msg_decoder   = MessageDecoder(z_dim=rest_dim, L=MSG_MAXLEN, vocab=MSG_VSIZE)
+        core_dim = LATENT_DIM - self.z_bag_dim
+        self.map_decoder  = MapDecoder(z_bag_dim=self.z_bag_dim, z_core_dim=core_dim, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=96, mid_ch=96, drop=dropout_rate)
+        self.stats_decoder = StatsDecoder(z_dim=core_dim, cont_dim=19)
+        self.msg_decoder   = MessageDecoder(z_dim=core_dim, L=MSG_MAXLEN, vocab=MSG_VSIZE)
         self.bag_head = nn.Sequential(
             nn.Linear(self.z_bag_dim, 256), nn.ReLU(inplace=True),
             nn.Linear(256, self.num_pairs)
@@ -981,10 +1007,11 @@ class MultiModalHackVAE(nn.Module):
         rare_glyph_chars = torch.full_like(glyph_chars, ord(' '))  # fill with space character
         rare_glyph_colors = torch.zeros_like(glyph_colors)  # fill with black color
         is_fg = (glyph_chars != ord(' ')) & (glyph_colors != 0)  # foreground mask
+        is_hero = (glyph_chars == HERO_CHAR)
         is_common = torch.zeros_like(is_fg, dtype=torch.bool)  # common glyphs mask
         for c in COMMON_GLYPHS:
             is_common |= (glyph_chars == c[0]) & (glyph_colors == c[1])
-        is_rare = is_fg & ~is_common  # rare glyphs mask
+        is_rare = is_fg & ~is_common & ~is_hero  # rare glyphs mask
         rare_glyph_chars[is_rare] = glyph_chars[is_rare]
         rare_glyph_colors[is_rare] = glyph_colors[is_rare]
         rare_glyph_feat = self.map_encoder(rare_glyph_chars, rare_glyph_colors)  # [B,64]
@@ -1050,7 +1077,7 @@ class MultiModalHackVAE(nn.Module):
         if self.detach_bag_prior:
             char_prior = char_prior.detach()
             color_prior = color_prior.detach()
-        occupy_logits, char_logits, color_logits, rare_occ_logits, rare_char_logits, rare_color_logits = self.map_decoder(z_core, char_prior, color_prior) 
+        occupy_logits, char_logits, color_logits, rare_occ_logits, rare_char_logits, rare_color_logits = self.map_decoder(z, char_prior, color_prior, bag_bias_strength=3.0) 
         stats_pred = self.stats_decoder(z_core)
         msg_logits = self.msg_decoder(z_core)
         hero_logit   = self.hero_presence_head(z_bag).squeeze(-1)       # [B]
@@ -1096,6 +1123,8 @@ class MultiModalHackVAE(nn.Module):
         # map sampling
         map_temperature: float = 1.0,
         map_occ_thresh: float = 0.5,
+        rare_occ_thresh: float = 0.5,
+        hero_presence_thresh: float = 0.5,
         map_deterministic: bool = True,
         glyph_top_k: int = 0,
         glyph_top_p: float = 1.0,
@@ -1136,10 +1165,24 @@ class MultiModalHackVAE(nn.Module):
             dec['rare_color_logits'],
             temperature=map_temperature,
             occ_thresh=map_occ_thresh,
+            rare_occ_thresh=rare_occ_thresh,
             deterministic=map_deterministic,
             glyph_top_k=glyph_top_k, glyph_top_p=glyph_top_p,
             color_top_k=color_top_k, color_top_p=color_top_p,
         )
+        
+        hero_presence_logit = dec["hero_presence_logits"]
+        if map_deterministic:
+            has_hero = (torch.sigmoid(hero_presence_logit) > hero_presence_thresh)  # [B]
+        else:
+            has_hero = torch.bernoulli(torch.sigmoid(hero_presence_logit))  # [B]
+        hero_centroid = dec["hero_centroid"]
+        hero_yy = ((hero_centroid[:, 0] + 1) / 2 * MAP_HEIGHT).round().long()  # [B]
+        hero_xx = ((hero_centroid[:, 1] + 1) / 2 * MAP_WIDTH).round().long()
+        hero_yy = torch.clamp(hero_yy, 0, MAP_HEIGHT - 1)  # clamp to valid range
+        hero_xx = torch.clamp(hero_xx, 0, MAP_WIDTH - 1)
+        chars[has_hero, hero_yy[has_hero], hero_xx[has_hero]] = HERO_CHAR
+        colors[has_hero, hero_yy[has_hero], hero_xx[has_hero]] = 7
 
         # --- Message sampling ---
         msg_tokens_out = MessageDecoder.sample_from_logits(
@@ -1180,6 +1223,8 @@ class MultiModalHackVAE(nn.Module):
                 "rare_occupy_logits": dec["rare_occ_logits"],
                 "rare_char_logits": dec["rare_char_logits"],
                 "rare_color_logits": dec["rare_color_logits"],
+                "hero_presence_logits": hero_presence_logit,
+                "hero_centroid": hero_centroid,
                 "msg_logits": dec["msg_logits"],
             })
         return out
@@ -1237,16 +1282,16 @@ def vae_loss(
     msg_tokens,
     valid_screen,
     raw_modality_weights={
-        'occupy': 0.1, 
-        'rare_occupy': 0.1, 
+        'occupy': 0.5, 
+        'rare_occupy': 0.5, 
         'common_char': 1.0, 
         'common_color': 1.0, 
         'rare_char': 2.0,
         'rare_color': 2.0,
         'stats': 0.5, 
         'msg': 0.5, 
-        'bag': 2.0, 
-        'hero_loc': 2.0
+        'bag': 20, 
+        'hero_loc': 100
     },
     focal_loss_alpha=0.1,
     focal_loss_gamma=2.0,
@@ -1301,7 +1346,7 @@ def vae_loss(
     hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen]) # [valid_B], [valid_B,2]
     
     # ---- hero presence + centroid ----
-    hero_bce = F.binary_cross_entropy_with_logits(hero_presence_logits, hero_p_t, pos_weight=10.0)  # [valid_B]
+    hero_bce = F.binary_cross_entropy_with_logits(hero_presence_logits, hero_p_t, pos_weight=torch.full_like(hero_presence_logits, 10))  # [valid_B]
     # centroid error only when hero exists (mask by target presence)
     hero_mse = ((hero_centroid - hero_c_t) ** 2).sum(dim=1) # [valid_B,2] -> [valid_B]
     hero_mse = hero_mse * hero_p_t
@@ -1410,28 +1455,28 @@ def vae_loss(
     raw_losses['msg'] = msg_loss
     
     # ---- bag presence BCE (weighted) ----
-    bag_logits = model_output.get("bag_logits", None)
-    if bag_logits is not None:
-        # weights: emphasize '@' and de-emphasize very common chars
-        with torch.no_grad():
-            w = torch.ones(valid_B, GLYPH_DIM, device=bag_t.device) * 0.01
-            # downweight common chars (all colors)
-            common_idx = []
-            for ch in COMMON_GLYPHS:
-                ci = (ch[0] - 32)
-                if 0 <= ci < CHAR_DIM:
-                    base = ci * COLOR_DIM + ch[1]
-                    common_idx.extend(base)
-            if common_idx:
-                w[:, common_idx] = 0
+    bag_logits = model_output["bag_logits"][valid_screen]
+    # weights: emphasize '@' and de-emphasize very common chars
+    with torch.no_grad():
+        w = torch.ones(valid_B, GLYPH_DIM, device=bag_t.device) * 0.01
+        # downweight common chars (all colors)
+        common_idx = []
+        for ch in COMMON_GLYPHS:
+            ci = (ch[0] - 32)
+            if 0 <= ci < CHAR_DIM:
+                base = ci * COLOR_DIM + ch[1]
+                common_idx.append(base)
+        if common_idx:
+            w[:, common_idx] = 0
 
-            w[:, 0] = 0.0  # ignore space glyph
+        w[:, 0] = 0.0  # ignore space glyph
+        hero_index = HERO_CHAR - 32
+        w[:, hero_index * COLOR_DIM:(hero_index + 1) * COLOR_DIM] = 0.0  # ignore hero glyphs
+        for ci in range(CHAR_DIM):
+            w[:, ci * COLOR_DIM] = 0.0  # ignore all chars with no colors
+        w[bag_t.bool()] = 1.0  # emphasize bag presence
 
-            w[bag_t] = 1.0  # emphasize bag presence
-
-        bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='mean')
-    else:
-        bag_bce = torch.tensor(0.0, device=mu.device)
+        bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='none').sum(dim=1).mean()
     
     raw_losses['bag'] = bag_bce
 
@@ -1454,7 +1499,7 @@ def vae_loss(
         Sigma_q_bar = UUT_bar + torch.diag(var.mean(dim=0))  # [LATENT_DIM, LATENT_DIM]
         tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))  # Trace of Sigma_q
         Dinvu = U / var.unsqueeze(-1)  # [valid_B, LATENT_DIM, LOW_RANK]
-        I_plus = torch.malmul(U.transpose(1, 2), Dinvu)  # [valid_B, LATENT_DIM, LATENT_DIM]
+        I_plus = torch.bmm(U.transpose(1, 2), Dinvu)  # [valid_B, LATENT_DIM, LATENT_DIM]
         eye_d = torch.eye(d, device=mu.device, dtype=mu.dtype).unsqueeze(0)  # [1, LATENT_DIM, LATENT_DIM]
         I_plus = I_plus + eye_d  # [valid_B, LATENT_DIM, LATENT_DIM]
         sign2, logdet_small = torch.linalg.slogdet(I_plus)  # log(det(I + U^T * diag(1/var) * U))

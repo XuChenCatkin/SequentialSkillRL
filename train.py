@@ -1497,27 +1497,6 @@ def train_multimodalhack_vae(
                 median_ratio = (median_idx + 1) / len(var_explained)
                 ninety_percentile_idx = (var_explained >= 0.9).nonzero(as_tuple=True)[0][0]
                 ninety_percentile_ratio = (ninety_percentile_idx + 1) / len(var_explained)
-                
-                with torch.no_grad():
-                    valid_screen = batch_device['valid_screen']  # [B, max_bag_size]
-                    z  = mu[valid_screen]                                  # or reparam if you prefer
-                    bag_char_logits = bag_char_prob(z)                 # [B,CHAR_DIM]
-                    bag_char_pred   = torch.sigmoid(bag_char_logits)    # [B,CHAR_DIM]
-                    bag_t = model.glyph_bag.encode_glyphs_to_bag(batch_device['game_chars'], batch_device['game_colors'])  # [B,max_bag_size, 2]
-                    bag_t_char = bag_t[valid_screen, :, 0]  # [valid_B, max_bag_size]
-                    bag_t_char = torch.clamp(bag_t_char - 32, min=0, max=CHAR_DIM-1)  # [valid_B, max_bag_size]
-                    valid_B = bag_t_char.shape[0]
-                    bag = torch.zeros(valid_B, CHAR_DIM, device=device, dtype=torch.float32)
-                    for b in range(valid_B):
-                        bag[b, bag_t_char[b]] = 1.0
-                    bag[:,0] = 0.0  # Remove the padding character
-
-                    # quick metric: F1@0.5 presence
-                    pred_bin = (bag_char_pred > 0.5).float()
-                    tp = (pred_bin * bag).sum(dim=1)
-                    fp = (pred_bin * (1-bag)).sum(dim=1)
-                    fn = ((1-pred_bin) * bag).sum(dim=1)
-                    f1 = (2*tp / (2*tp + fp + fn + 1e-6)).mean().item()
 
                 # Backward pass with mixed precision scaling if enabled
                 if scaler is not None:
@@ -1596,8 +1575,7 @@ def train_multimodalhack_vae(
                         "model/kl_eigenval": safe_tensor_for_wandb(kl_eig),
                         "model/kl_eigenval_max": kl_eig.max().item(),
                         "model/kl_eigenval_min": kl_eig.min().item(),
-                        "model/kl_eigenval_exceed_0.2": (kl_eig > 0.2).sum().item() / kl_eig.numel(),
-                        "model/f1_at_0.5": f1,
+                        "model/kl_eigenval_exceed_0.2": (kl_eig > 0.2).sum().item() / kl_eig.numel()
                     }
                     wandb.log(wandb_log_dict)
 
@@ -2419,6 +2397,8 @@ def create_visualization_demo(
     # Map sampling parameters
     map_temperature: float = 1.0,
     map_occ_thresh: float = 0.5,
+    rare_occ_thresh: float = 0.5,
+    hero_presence_thresh: float = 0.5,
     map_deterministic: bool = True,
     glyph_top_k: int = 0,
     glyph_top_p: float = 1.0,
@@ -2454,6 +2434,11 @@ def create_visualization_demo(
         
         # Map sampling parameters (legacy parameters map to new ones)
         map_occ_thresh: Threshold for occupancy prediction
+        rare_occ_thresh: Threshold for rare occupancy prediction
+        hero_presence_thresh: Threshold for hero presence prediction
+        map_temperature: Temperature for map sampling (legacy: temperature)
+        glyph_top_k: Top-k filtering for glyph sampling (legacy: top_k)
+        glyph_top_p: Top-p filtering for glyph sampling (legacy: top_p)
         map_deterministic: If True, use deterministic sampling for map
         color_top_k: Top-k filtering for color sampling
         color_top_p: Top-p filtering for color sampling
@@ -2514,6 +2499,8 @@ def create_visualization_demo(
             # Map sampling parameters (map legacy params)
             map_temperature=map_temperature,  # Legacy: temperature -> map_temperature
             map_occ_thresh=map_occ_thresh,
+            rare_occ_thresh=rare_occ_thresh,
+            hero_presence_thresh=hero_presence_thresh,
             map_deterministic=map_deterministic,
             glyph_top_k=glyph_top_k,  # Legacy: top_k -> glyph_top_k
             glyph_top_p=glyph_top_p,  # Legacy: top_p -> glyph_top_p
@@ -2547,6 +2534,8 @@ def create_visualization_demo(
             # Map sampling parameters (map legacy params)
             map_temperature=map_temperature,  # Legacy: temperature -> map_temperature
             map_occ_thresh=map_occ_thresh,
+            rare_occ_thresh=rare_occ_thresh,
+            hero_presence_thresh=hero_presence_thresh,
             map_deterministic=map_deterministic,
             glyph_top_k=glyph_top_k,  # Legacy: top_k -> glyph_top_k
             glyph_top_p=glyph_top_p,  # Legacy: top_p -> glyph_top_p
@@ -2883,6 +2872,8 @@ if __name__ == "__main__":
                 random_seed=100,  # For reproducible results
                 use_mean=True,  # Use mean for latent space
                 map_occ_thresh=0.7,
+                rare_occ_thresh=0.5,
+                hero_presence_thresh=0.2,
                 map_deterministic=True  # Use deterministic sampling for maps
             )
             print(f"✅ Demo completed successfully!")
