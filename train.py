@@ -1454,6 +1454,7 @@ def train_multimodalhack_vae(
                 
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
+                    model.set_bag_detach(global_step < warmup_steps)  # Detach bag during warmup phase
                     model_output = model(
                         glyph_chars=batch_device['game_chars'],
                         glyph_colors=batch_device['game_colors'], 
@@ -1554,10 +1555,13 @@ def train_multimodalhack_vae(
                         # Loss components
                         "train/raw_loss/total": train_loss_dict['total_raw_loss'].item(),
                         "train/raw_loss/occupancy": train_loss_dict['raw_losses']['occupy'].item(),
+                        "train/raw_loss/rare_occupancy": train_loss_dict['raw_losses']['rare_occupy'].item(),
                         "train/raw_loss/total_variation": train_loss_dict['raw_losses']['tv'].item(),
                         "train/raw_loss/dice_loss": train_loss_dict['raw_losses']['dice'].item(),
-                        "train/raw_loss/glyph_chars": train_loss_dict['raw_losses']['char'].item(),
-                        "train/raw_loss/glyph_colors": train_loss_dict['raw_losses']['color'].item(),
+                        "train/raw_loss/common_glyph_chars": train_loss_dict['raw_losses']['common_char'].item(),
+                        "train/raw_loss/common_glyph_colors": train_loss_dict['raw_losses']['common_color'].item(),
+                        "train/raw_loss/rare_glyph_chars": train_loss_dict['raw_losses']['rare_char'].item(),
+                        "train/raw_loss/rare_glyph_colors": train_loss_dict['raw_losses']['rare_color'].item(),
                         "train/raw_loss/blstats": train_loss_dict['raw_losses']['stats'].item(),
                         "train/raw_loss/message": train_loss_dict['raw_losses']['msg'].item(),
 
@@ -1676,8 +1680,11 @@ def train_multimodalhack_vae(
                         # Loss components
                         "test/raw_loss/total": test_loss_dict['total_raw_loss'].item(),
                         "test/raw_loss/occupancy": test_loss_dict['raw_losses']['occupy'].item(),
-                        "test/raw_loss/glyph_chars": test_loss_dict['raw_losses']['char'].item(),
-                        "test/raw_loss/glyph_colors": test_loss_dict['raw_losses']['color'].item(),
+                        "test/raw_loss/rare_occupancy": test_loss_dict['raw_losses']['rare_occupy'].item(),
+                        "test/raw_loss/common_glyph_chars": test_loss_dict['raw_losses']['common_char'].item(),
+                        "test/raw_loss/common_glyph_colors": test_loss_dict['raw_losses']['common_color'].item(),
+                        "test/raw_loss/rare_glyph_chars": test_loss_dict['raw_losses']['rare_char'].item(),
+                        "test/raw_loss/rare_glyph_colors": test_loss_dict['raw_losses']['rare_color'].item(),
                         "test/raw_loss/blstats": test_loss_dict['raw_losses']['stats'].item(),
                         "test/raw_loss/message": test_loss_dict['raw_losses']['msg'].item(),
 

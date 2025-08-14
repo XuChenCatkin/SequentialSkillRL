@@ -144,7 +144,7 @@ BLSTATS_CAT = [
 ]
 
 COMMON_CHARS = [ord('#'), ord('.'), ord('-'), ord('|')]
-COMMON_IDXS = [a - 32 for a in COMMON_CHARS]  # indices in 0..95
+COMMON_GLYPHS = [(a, 7) for a in COMMON_CHARS] # (char, color) pairs for common glyphs
 HERO_CHAR = ord('@')  # hero character code (ASCII 64)
 BAG_Z = 24         # slice of z reserved for glyph-bag / anchors
 BAG_MLP = 32       # feature size from glyph-bag encoder
@@ -329,7 +329,7 @@ class MapEncoder(nn.Module):
 
     Forward returns a vector suitable for a VAE encoder MLP or heads.
     """
-    def __init__(self, dropout=0.0, attn_queries=4, feat_channels=96):
+    def __init__(self, dropout=0.0, attn_queries=2, feat_channels=96):
         super().__init__()
         self.char_emb = nn.Embedding(CHAR_DIM + 1, CHAR_EMB, padding_idx=0)
         self.col_emb  = nn.Embedding(COLOR_DIM + 1, COLOR_EMB, padding_idx=0)
@@ -387,11 +387,10 @@ class MapDecoder(nn.Module):
     def __init__(self, z_dim: int, char_dim: int, color_dim: int,
                  H: int = MAP_HEIGHT, W: int = MAP_WIDTH,
                  base_ch: int = 256, mid_ch: int = 128, drop: float = 0.1,
-                 occ_prior: float = 0.03, bag_bias_strength: float = 5.0):
+                 occ_prior: float = 0.1, rare_cond_prior: float = 0.05):
         super().__init__()
         self.H, self.W = H, W
         self.base_ch = base_ch
-        self.bag_bias_strength = bag_bias_strength
         # coords
         yy = torch.linspace(-1, 1, H).view(1,1,H,1).expand(1,1,H,W).clone()
         xx = torch.linspace(-1, 1, W).view(1,1,1,W).expand(1,1,H,W).clone()
@@ -416,24 +415,28 @@ class MapDecoder(nn.Module):
         )
         # heads
         self.head_occ = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
+        self.head_rare = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
         self.head_chr = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, char_dim, 1))
         self.head_col = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, color_dim, 1))
         with torch.no_grad():
             b = math.log(max(occ_prior, 1e-6) / max(1 - occ_prior, 1e-6))
             self.head_occ[-1].bias.fill_(b)
-            
-    def _prior_to_bias(self, prior: torch.Tensor) -> torch.Tensor:
+            rb = math.log(max(rare_cond_prior, 1e-6) / max(1 - rare_cond_prior, 1e-6))
+            self.head_rare[-1].bias.fill_(rb)
+
+    def _prior_to_bias(self, prior: torch.Tensor, strength: float) -> torch.Tensor:
         """
         prior: probabilities in [0,1], shape [B,C].
         Returns additive bias (logits) [B,C] scaled by bag_bias_strength.
         """
         p = prior.clamp(1e-6, 1 - 1e-6)
-        return self.bag_bias_strength * torch.log(p / (1 - p))
+        return strength * torch.log(p / (1 - p))
 
 
     def forward(self, z: torch.Tensor,
-                char_prior: Optional[torch.Tensor] = None,   # [B,CHAR_DIM] optional
-                color_prior: Optional[torch.Tensor] = None   # [B,COLOR_DIM] optional
+                char_bag_prior: Optional[torch.Tensor] = None,   # [B,CHAR_DIM] optional
+                color_bag_prior: Optional[torch.Tensor] = None,   # [B,COLOR_DIM] optional
+                bag_bias_strength: float = 1.0,  # strength of prior bias
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B = z.size(0)
         z_map = self.z_to_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
@@ -445,16 +448,19 @@ class MapDecoder(nn.Module):
         x = self.block4(x, z)
         x = self.refine(x)
         occ = self.head_occ(x)
+        rare_occ = self.head_rare(x)
         g_log  = self.head_chr(x)
         c_log  = self.head_col(x)
+        g_rare_log = g_log
+        c_rare_log = c_log
         
-        if char_prior is not None:
-            cb = self._prior_to_bias(char_prior).view(B, self.char_dim, 1, 1).expand_as(g_log)
-            g_log = g_log + cb
-        if color_prior is not None:
-            kb = self._prior_to_bias(color_prior).view(B, self.color_dim, 1, 1).expand_as(c_log)
-            c_log = c_log + kb
-        return occ, g_log, c_log
+        if char_bag_prior is not None:
+            cb = self._prior_to_bias(char_bag_prior, bag_bias_strength).view(B, CHAR_DIM, 1, 1).expand_as(g_log)
+            g_rare_log = g_rare_log + cb
+        if color_bag_prior is not None:
+            kb = self._prior_to_bias(color_bag_prior, bag_bias_strength).view(B, COLOR_DIM, 1, 1).expand_as(c_log)
+            c_rare_log = c_rare_log + kb
+        return occ, g_log, c_log, rare_occ, g_rare_log, c_rare_log
 
     @staticmethod
     def _filter_topk_topp_channels(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
@@ -497,10 +503,14 @@ class MapDecoder(nn.Module):
     @staticmethod
     def sample_from_logits(
         occupy_logits: torch.Tensor,
+        rare_occupy_logits: torch.Tensor,
         glyph_logits: torch.Tensor,
         color_logits: torch.Tensor,
+        rare_glyph_logits: torch.Tensor,
+        rare_color_logits: torch.Tensor,
         temperature: float = 1.0,
         occ_thresh: float = 0.5,
+        rare_occ_thresh: float = 0.5,
         deterministic: bool = True,
         glyph_top_k: int = 0,
         glyph_top_p: float = 1.0,
@@ -516,32 +526,44 @@ class MapDecoder(nn.Module):
         B, _, H, W = occupy_logits.shape
         # occupancy -> foreground mask
         occ_p = torch.sigmoid(occupy_logits).squeeze(1)
+        rare_occ_p = torch.sigmoid(rare_occupy_logits).squeeze(1)
         if deterministic:
             fg_mask = (occ_p > occ_thresh)
+            rare_fg_mask = (rare_occ_p > rare_occ_thresh) & fg_mask
         else:
             fg_mask = torch.bernoulli(occ_p.clamp(1e-6, 1-1e-6)).bool()
+            rare_fg_mask = torch.bernoulli(rare_occ_p.clamp(1e-6, 1-1e-6)).bool() & fg_mask
         # scale temperatures for class heads
         g_log = glyph_logits / temperature
         c_log = color_logits / temperature
+        g_rare_log = rare_glyph_logits / temperature
+        c_rare_log = rare_color_logits / temperature
         # filter
         if not deterministic and (glyph_top_k > 0 or color_top_k > 0 or glyph_top_p < 1.0 or color_top_p < 1.0):
             g_log = MapDecoder._filter_topk_topp_channels(g_log, top_k=glyph_top_k, top_p=glyph_top_p)
             c_log = MapDecoder._filter_topk_topp_channels(c_log, top_k=color_top_k, top_p=color_top_p)
+            g_rare_log = MapDecoder._filter_topk_topp_channels(g_rare_log, top_k=glyph_top_k, top_p=glyph_top_p)
+            c_rare_log = MapDecoder._filter_topk_topp_channels(c_rare_log, top_k=color_top_k, top_p=color_top_p)
         # choose indices
         g_idx = MapDecoder._sample_per_pixel(g_log, deterministic=deterministic)  # [B,H,W] in 0..CHAR_DIM-1
         c_idx = MapDecoder._sample_per_pixel(c_log, deterministic=deterministic)  # [B,H,W] in 0..COLOR_DIM-1
+        rare_g_idx = MapDecoder._sample_per_pixel(g_rare_log, deterministic=deterministic)  # [B,H,W]
+        rare_c_idx = MapDecoder._sample_per_pixel(c_rare_log, deterministic=deterministic)
         # write into outputs with background defaults
         chars = torch.full((B, H, W), ord(' '), device=device, dtype=torch.long)  # 32 ' '
         colors = torch.zeros((B, H, W), device=device, dtype=torch.long)             # 0
         chars_fg = (g_idx + 32).clamp(32, 127)
+        rare_chars_fg = (rare_g_idx + 32).clamp(32, 127)
         chars[fg_mask] = chars_fg[fg_mask]
         colors[fg_mask] = c_idx[fg_mask]
-        return fg_mask, chars, colors
+        chars[rare_fg_mask] = rare_chars_fg[rare_fg_mask]
+        colors[rare_fg_mask] = rare_c_idx[rare_fg_mask]
+        return fg_mask, rare_fg_mask, chars, colors
 
     def generate(self, z: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convenience: z -> logits -> hard maps."""
-        occ, gl, cl = self.forward(z)
-        return self.sample_from_logits(occ, gl, cl, **kwargs)
+        occ, gl, cl, rare_occ, rare_gl, rare_cl = self.forward(z)
+        return self.sample_from_logits(occ, gl, cl, rare_occ, rare_gl, rare_cl, **kwargs)
 
 class BlstatsPreprocessor(nn.Module):
     def __init__(self, stats_dim=BLSTATS_DIM):
@@ -861,10 +883,10 @@ class MultiModalHackVAE(nn.Module):
         self.include_glyph_bag = bInclude_glyph_bag
         self.include_hero = bInclude_hero
 
-        fusion_in = self.map_encoder.get_output_channels() + \
+        fusion_in = 2 * self.map_encoder.get_output_channels() + \
                     self.stats_encoder.get_output_channels() + \
                     self.msg_encoder.get_output_channels() + \
-                    (self.hero_emb.get_output_channels() if bInclude_hero else 0) # cnn + stats + msg + bag of glyphs + hero embedding + inventory
+                    (self.hero_emb.get_output_channels() if bInclude_hero else 0) # cnn + stats + msg + hero embedding
         
         # Add dropout to the encoder fusion layer if enabled
         if self.dropout_rate > 0.0 and self.enable_dropout_on_latent:
@@ -911,9 +933,17 @@ class MultiModalHackVAE(nn.Module):
         #     self.decode_shared = nn.Sequential(
         #         nn.Linear(LATENT_DIM, 256), nn.ReLU(),
         #     )
-        self.map_decoder  = MapDecoder(z_dim=LATENT_DIM, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=LATENT_DIM, mid_ch=96, drop=dropout_rate, occ_prior=0.1)
-        self.stats_decoder = StatsDecoder(z_dim=LATENT_DIM, cont_dim=19)
-        self.msg_decoder   = MessageDecoder(z_dim=LATENT_DIM, L=MSG_MAXLEN, vocab=MSG_VSIZE)
+        rest_dim = LATENT_DIM - self.z_bag_dim
+        self.map_decoder  = MapDecoder(z_dim=rest_dim, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=rest_dim, mid_ch=96, drop=dropout_rate, occ_prior=0.1)
+        self.stats_decoder = StatsDecoder(z_dim=rest_dim, cont_dim=19)
+        self.msg_decoder   = MessageDecoder(z_dim=rest_dim, L=MSG_MAXLEN, vocab=MSG_VSIZE)
+        self.bag_head = nn.Sequential(
+            nn.Linear(self.z_bag_dim, 256), nn.ReLU(inplace=True),
+            nn.Linear(256, self.num_pairs)
+        )
+        self.hero_presence_head = nn.Linear(self.z_bag_dim, 1)   # logits
+        self.hero_centroid_head = nn.Linear(self.z_bag_dim, 2)   # tanh -> [-1,1]
+        self.detach_bag_prior = True  # whether to detach the bag prior from the gradients
 
         # Dynamic prediction heads
         # It takes latent z, action a, HDP HMM state h and hero info c
@@ -945,18 +975,27 @@ class MultiModalHackVAE(nn.Module):
             raise ValueError("glyph_chars and glyph_colors must have the same height and width.")
         
         # Encode all features and get embeddings
-        glyph_feat = self.map_encoder(glyph_chars, glyph_colors)  # [B,64], [B,16,H,W], [B,4,H,W]
+        glyph_feat = self.map_encoder(glyph_chars, glyph_colors)  # [B,64]
+        
+        # rare glyph features
+        rare_glyph_chars = torch.full_like(glyph_chars, ord(' '))  # fill with space character
+        rare_glyph_colors = torch.zeros_like(glyph_colors)  # fill with black color
+        is_fg = (glyph_chars != ord(' ')) & (glyph_colors != 0)  # foreground mask
+        is_common = torch.zeros_like(is_fg, dtype=torch.bool)  # common glyphs mask
+        for c in COMMON_GLYPHS:
+            is_common |= (glyph_chars == c[0]) & (glyph_colors == c[1])
+        is_rare = is_fg & ~is_common  # rare glyphs mask
+        rare_glyph_chars[is_rare] = glyph_chars[is_rare]
+        rare_glyph_colors[is_rare] = glyph_colors[is_rare]
+        rare_glyph_feat = self.map_encoder(rare_glyph_chars, rare_glyph_colors)  # [B,64]
+
         stats_feat = self.stats_encoder(blstats)
         
         # Message encoding
         msg_feat = self.msg_encoder(msg_tokens)  # [B,hid_dim], [B,256,emb_dim]
 
-        features = [glyph_feat, stats_feat, msg_feat]
-        
-        if self.include_glyph_bag:
-            glyph_bag_feat = self.glyph_bag(self.map_encoder, glyph_chars, glyph_colors) # [B,32], [B,max_len,20], [B,max_len, 2]
-            features.append(glyph_bag_feat)
-        
+        features = [glyph_feat, rare_glyph_feat, stats_feat, msg_feat]
+
         if self.include_hero != (hero_info is not None):
             raise ValueError("hero_info must be provided if and only if include_hero is True.")
         
@@ -998,15 +1037,48 @@ class MultiModalHackVAE(nn.Module):
         return z    # [B, LATENT_DIM]
 
     def decode(self, z):
-        occupy_logits, char_logits, color_logits = self.map_decoder(z)
-        stats_pred = self.stats_decoder(z)
-        msg_logits = self.msg_decoder(z)
-        return {"occupy_logits": occupy_logits, "char_logits": char_logits, "color_logits": color_logits, "stats_pred": stats_pred, "msg_logits": msg_logits}
+        # split z -> [z_bag | z_core]
+        z_bag  = z[:, :self.z_bag_dim]
+        z_core = z[:, self.z_bag_dim:]
 
-    def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None):
+        # --- bag prediction ---
+        bag_logits = self.bag_head(z_bag)                       # [B,GLYPH_DIM]
+        bag_probs  = torch.sigmoid(bag_logits)
+        char_prior, color_prior = bag_marginals(bag_probs)      # [B,CHAR_DIM], [B,COLOR_DIM]
+
+        # optionally detach priors (training schedule)
+        if self.detach_bag_prior:
+            char_prior = char_prior.detach()
+            color_prior = color_prior.detach()
+        occupy_logits, char_logits, color_logits, rare_occ_logits, rare_char_logits, rare_color_logits = self.map_decoder(z_core, char_prior, color_prior) 
+        stats_pred = self.stats_decoder(z_core)
+        msg_logits = self.msg_decoder(z_core)
+        hero_logit   = self.hero_presence_head(z_bag).squeeze(-1)       # [B]
+        hero_centre = torch.tanh(self.hero_centroid_head(z_bag))  # [B,2] -> [-1,1] range
+        return {
+            "occupy_logits": occupy_logits, 
+            "char_logits": char_logits, 
+            "color_logits": color_logits, 
+            "stats_pred": stats_pred, 
+            "msg_logits": msg_logits, 
+            "bag_logits" : bag_logits,
+            "bag_char_prior": char_prior,
+            "bag_color_prior": color_prior,
+            "rare_occ_logits": rare_occ_logits,
+            "rare_char_logits": rare_char_logits,
+            "rare_color_logits": rare_color_logits,
+            "hero_presence_logits": hero_logit, 
+            "hero_centroid": hero_centre
+        }
+        
+    def set_bag_detach(self, flag: bool = True):
+        self.detach_bag_prior = flag
+
+    def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None, detach_bag=True):
         
         enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
         z = self._reparameterise(enc["mu"], enc["logvar"])  # [B,D]
+        self.set_bag_detach(detach_bag)  # set detach flag for bag prior
         dec = self.decode(z)
         return {**enc, **dec}
     
@@ -1055,8 +1127,13 @@ class MultiModalHackVAE(nn.Module):
         dec = self.decode(z)
 
         # --- Map sampling ---
-        fg_mask, chars, colors = MapDecoder.sample_from_logits(
-            dec["occupy_logits"], dec["char_logits"], dec["color_logits"],
+        fg_mask, rare_fg_mask, chars, colors = MapDecoder.sample_from_logits(
+            dec["occupy_logits"], 
+            dec["rare_occ_logits"],
+            dec["char_logits"], 
+            dec["color_logits"],
+            dec['rare_char_logits'],
+            dec['rare_color_logits'],
             temperature=map_temperature,
             occ_thresh=map_occ_thresh,
             deterministic=map_deterministic,
@@ -1088,6 +1165,7 @@ class MultiModalHackVAE(nn.Module):
 
         out = {
             "fg_mask": fg_mask,
+            "rare_fg_mask": rare_fg_mask,
             "chars": chars,
             "colors": colors,
             "msg_tokens": msg_tokens_out,
@@ -1099,6 +1177,9 @@ class MultiModalHackVAE(nn.Module):
                 "occupy_logits": dec["occupy_logits"],
                 "char_logits": dec["char_logits"],
                 "color_logits": dec["color_logits"],
+                "rare_occupy_logits": dec["rare_occ_logits"],
+                "rare_char_logits": dec["rare_char_logits"],
+                "rare_color_logits": dec["rare_color_logits"],
                 "msg_logits": dec["msg_logits"],
             })
         return out
@@ -1155,7 +1236,18 @@ def vae_loss(
     blstats, 
     msg_tokens,
     valid_screen,
-    raw_modality_weights={'occupy': 0.1, 'char': 1.0, 'color': 1.0, 'stats': 0.5, 'msg': 0.5},
+    raw_modality_weights={
+        'occupy': 0.1, 
+        'rare_occupy': 0.1, 
+        'common_char': 1.0, 
+        'common_color': 1.0, 
+        'rare_char': 2.0,
+        'rare_color': 2.0,
+        'stats': 0.5, 
+        'msg': 0.5, 
+        'bag': 2.0, 
+        'hero_loc': 2.0
+    },
     focal_loss_alpha=0.1,
     focal_loss_gamma=2.0,
     mi_beta=1.0,
@@ -1176,7 +1268,12 @@ def vae_loss(
     occupy_logits = model_output['occupy_logits'][valid_screen]  # [B, 1, 21, 79]
     char_logits = model_output['char_logits'][valid_screen]  # [B, CHAR_DIM, 21, 79]
     color_logits = model_output['color_logits'][valid_screen]  # [B, COLOR_DIM, 21, 79]
+    rare_occ_logits = model_output['rare_occ_logits'][valid_screen]  # [B, 1, 21, 79]
+    rare_char_logits = model_output['rare_char_logits'][valid_screen]  # [B, CHAR_DIM, 21, 79]
+    rare_color_logits = model_output['rare_color_logits'][valid_screen]  # [B, COLOR_DIM, 21, 79]
     msg_logits = model_output['msg_logits'][valid_screen]  # [B, 256, MSG_VSIZE]
+    hero_presence_logits = model_output['hero_presence_logits'][valid_screen]  # [B]
+    hero_centroid = model_output['hero_centroid'][valid_screen]  # [B, 2]
 
     valid_B = valid_screen.sum().item()  # Number of valid samples
     assert valid_B > 0, "No valid samples for loss calculation. Check valid_screen mask."
@@ -1187,24 +1284,51 @@ def vae_loss(
     # Glyph reconstruction (chars + colors)
     H, W = glyph_chars.shape[1], glyph_chars.shape[2]
     gc = glyph_chars[valid_screen]
+    col_t = glyph_colors[valid_screen]
     fg = (gc != ord(' '))                 # [valid_B,H,W]
-    ooc_t = fg.float().unsqueeze(1)           # [valid_B,1,H,W]
+    common_fg = torch.zeros_like(fg, dtype=torch.bool)  # common glyphs mask
+    for c in COMMON_GLYPHS:
+        common_fg |= (gc == c[0]) & (col_t == c[1])
+    hero_fg = torch.zeros_like(fg, dtype=torch.bool)  # hero glyphs mask
+    hero_fg |= (gc == HERO_CHAR)
+    rare_fg = fg & ~common_fg & ~hero_fg  # rare glyphs mask
+    common_fg = fg & common_fg & ~hero_fg  # common glyphs mask
+    occ_t = fg.float().unsqueeze(1)           # [valid_B,1,H,W]
+    rare_occ_t = rare_fg.float().unsqueeze(1)  # [valid_B,1,H,W]
+    common_occ_t = common_fg.float().unsqueeze(1)  # [valid_B,1,H,W]
     char_t = torch.clamp(gc - 32, 0, CHAR_DIM - 1)  # [valid_B,H,W]
-    col_t  = glyph_colors[valid_screen]                 # [valid_B,H,W]
+    bag_t = make_pair_bag(glyph_chars[valid_screen], glyph_colors[valid_screen])  # [valid_B,GLYPH_DIM]
+    hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen]) # [valid_B], [valid_B,2]
+    
+    # ---- hero presence + centroid ----
+    hero_bce = F.binary_cross_entropy_with_logits(hero_presence_logits, hero_p_t, pos_weight=10.0)  # [valid_B]
+    # centroid error only when hero exists (mask by target presence)
+    hero_mse = ((hero_centroid - hero_c_t) ** 2).sum(dim=1) # [valid_B,2] -> [valid_B]
+    hero_mse = hero_mse * hero_p_t
+    hero_loss = hero_bce + 5.0 * hero_mse
+    raw_losses['hero_loc'] = hero_loss.mean()  # Average over valid samples
 
     # occupancy focal BCE (mean over pixels)
-    #occ_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), ooc_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
+    #occ_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), occ_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
     fg_rate = 0.25
     pos_weight = torch.tensor([(1 - fg_rate) / max(fg_rate, 1e-6)], device=occupy_logits.device, dtype=occupy_logits.dtype) 
-    occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, ooc_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2,3])  # [valid_B]
+    occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, occ_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2,3])  # [valid_B]
     assert occ_loss_per_sample.shape == (valid_B,), f"occupy loss shape mismatch: {occ_loss_per_sample.shape} != ({valid_B},)"
+    
+    rare_fg_rate = 0.05
+    rare_pos_weight = torch.tensor([(1 - rare_fg_rate) / max(rare_fg_rate, 1e-6)], device=rare_occ_logits.device, dtype=rare_occ_logits.dtype)
+    rare_occ_loss_per_sample = F.binary_cross_entropy_with_logits(rare_occ_logits, rare_occ_t, reduction='none', pos_weight=rare_pos_weight)
+    rare_occ_loss_per_sample = (rare_occ_loss_per_sample * occ_t).sum(dim=[1,2,3])  # [valid_B]
+    
+    
+    # total variation loss (TV) for occupancy map
     p = torch.sigmoid(occupy_logits)          # [B,1,H,W]
     dx = p[..., :, 1:] - p[..., :, :-1]
     dy = p[..., 1:, :] - p[..., :-1, :]
     tv = (dx.abs().mean() + dy.abs().mean()) * H * W
 
     # Dice (alternative or in addition; keep weight small)
-    probs = p.squeeze(1); target = ooc_t.squeeze(1)
+    probs = p.squeeze(1); target = occ_t.squeeze(1)
     inter = (probs * target).sum(dim=(1,2))
     dice = (2*inter + 1e-5) / (probs.sum(dim=(1,2)) + target.sum(dim=(1,2)) + 1e-5)
     dice_loss = (1 - dice.mean()) * H * W
@@ -1212,47 +1336,50 @@ def vae_loss(
     # CE losses (masked by foreground)
     if fg.any():
         IGNORE = -100
-        char_t_mask = torch.where(fg, char_t, torch.full_like(char_t, IGNORE))
-        col_t_mask  = torch.where(fg, col_t,  torch.full_like(col_t,  IGNORE))
-
-        # foreground-only counts
-        fg_flat = fg.view(-1)
-        char_flat = char_t.view(-1)[fg_flat]
-        col_flat  = col_t.view(-1)[fg_flat]
-
-        def make_weights(counts, cap=5.0):
-            w = 1.0 / torch.log1p(counts).clamp_min(1.0)
-            w = w / w.mean()               # normalize so mean weight ≈ 1
-            w = w.clamp(max=cap)           # avoid extreme scaling
-            return w
-
-        char_cnt = torch.bincount(char_flat, minlength=CHAR_DIM).to(occupy_logits.device)
-        col_cnt  = torch.bincount(col_flat,  minlength=COLOR_DIM).to(occupy_logits.device)
-
-        char_w = make_weights(char_cnt)    # shape [CHAR_DIM], float
-        color_w = make_weights(col_cnt)    # shape [COLOR_DIM], float
+        common_char_t_mask = torch.where(common_fg, char_t, torch.full_like(char_t, IGNORE))
+        common_col_t_mask  = torch.where(common_fg, col_t,  torch.full_like(col_t,  IGNORE))
+        rare_char_t_mask = torch.where(rare_fg, char_t, torch.full_like(char_t, IGNORE))
+        rare_col_t_mask  = torch.where(rare_fg, col_t,  torch.full_like(col_t,  IGNORE))
 
         # CE computed only on FG via ignore_index
-        masked_char_loss_per_sample = F.cross_entropy(
-            char_logits, char_t_mask, weight=char_w, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
+        rare_char_loss_per_sample = F.cross_entropy(
+            rare_char_logits, rare_char_t_mask, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
         )
-        assert masked_char_loss_per_sample.shape == (valid_B, H, W), f"masked_char_loss shape mismatch: {masked_char_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
-        masked_color_loss_per_sample = F.cross_entropy(
-            color_logits, col_t_mask, weight=color_w, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
+        assert rare_char_loss_per_sample.shape == (valid_B, H, W), f"rare_char_loss_per_sample shape mismatch: {rare_char_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
+        
+        rare_color_loss_per_sample = F.cross_entropy(
+            rare_color_logits, rare_col_t_mask, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
         )
-        assert masked_color_loss_per_sample.shape == (valid_B, H, W), f"masked_color_loss shape mismatch: {masked_color_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
+        assert rare_color_loss_per_sample.shape == (valid_B, H, W), f"rare_color_loss_per_sample shape mismatch: {rare_color_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
+
+        common_char_loss_per_sample = F.cross_entropy(
+            char_logits, common_char_t_mask, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
+        )
+        assert common_char_loss_per_sample.shape == (valid_B, H, W), f"common_char_loss_per_sample shape mismatch: {common_char_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
+
+        common_color_loss_per_sample = F.cross_entropy(
+            color_logits, common_col_t_mask, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
+        )
+        assert common_color_loss_per_sample.shape == (valid_B, H, W), f"common_color_loss_per_sample shape mismatch: {common_color_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
 
         # Sum over spatial dimensions for each sample
-        masked_char_loss_per_sample = masked_char_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
-        masked_color_loss_per_sample = masked_color_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
+        rare_char_loss_per_sample = rare_char_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
+        rare_color_loss_per_sample = rare_color_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
+        common_char_loss_per_sample = common_char_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
+        common_color_loss_per_sample = common_color_loss_per_sample.sum(dim=[1, 2])
     else:
-        masked_char_loss_per_sample = torch.zeros(valid_B, device=glyph_chars.device)
-        masked_color_loss_per_sample = torch.zeros(valid_B, device=glyph_colors.device)
+        rare_char_loss_per_sample = torch.zeros(valid_B, device=glyph_chars.device)
+        rare_color_loss_per_sample = torch.zeros(valid_B, device=glyph_colors.device)
+        common_char_loss_per_sample = torch.zeros(valid_B, device=glyph_chars.device)
+        common_color_loss_per_sample = torch.zeros(valid_B, device=glyph_colors.device)
 
     # Average over valid samples only
     raw_losses['occupy'] = occ_loss_per_sample.mean() + 0.01 * tv + 0.1 * dice_loss  # Average over valid samples
-    raw_losses['char'] = masked_char_loss_per_sample.mean()
-    raw_losses['color'] = masked_color_loss_per_sample.mean()
+    raw_losses['rare_occupy'] = rare_occ_loss_per_sample.mean()
+    raw_losses['common_char'] = common_char_loss_per_sample.mean()
+    raw_losses['common_color'] = common_color_loss_per_sample.mean()
+    raw_losses['rare_char'] = rare_char_loss_per_sample.mean()
+    raw_losses['rare_color'] = rare_color_loss_per_sample.mean()
 
     # stats
     pre = BlstatsPreprocessor()
@@ -1281,6 +1408,32 @@ def vae_loss(
     msg_t = msg_tokens[valid_screen]
     msg_loss = _message_ce_loss(msg_logits, msg_t, pad_id=MSG_PAD, eos_id=MSG_EOS)
     raw_losses['msg'] = msg_loss
+    
+    # ---- bag presence BCE (weighted) ----
+    bag_logits = model_output.get("bag_logits", None)
+    if bag_logits is not None:
+        # weights: emphasize '@' and de-emphasize very common chars
+        with torch.no_grad():
+            w = torch.ones(valid_B, GLYPH_DIM, device=bag_t.device) * 0.01
+            # downweight common chars (all colors)
+            common_idx = []
+            for ch in COMMON_GLYPHS:
+                ci = (ch[0] - 32)
+                if 0 <= ci < CHAR_DIM:
+                    base = ci * COLOR_DIM + ch[1]
+                    common_idx.extend(base)
+            if common_idx:
+                w[:, common_idx] = 0
+
+            w[:, 0] = 0.0  # ignore space glyph
+
+            w[bag_t] = 1.0  # emphasize bag presence
+
+        bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='mean')
+    else:
+        bag_bce = torch.tensor(0.0, device=mu.device)
+    
+    raw_losses['bag'] = bag_bce
 
     # Sum raw reconstruction losses
     total_raw_loss = sum(raw_losses[k] * raw_modality_weights.get(k, 1.0) for k in raw_losses)
