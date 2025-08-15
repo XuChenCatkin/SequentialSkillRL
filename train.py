@@ -3073,7 +3073,7 @@ if __name__ == "__main__":
             final_tc_beta=5.0,
             tc_beta_shape='constant',
             initial_dw_beta=0.02,
-            final_dw_beta=0.3,
+            final_dw_beta=4.0,
             dw_beta_shape='custom',
             custom_kl_beta_function = lambda init, end, progress: init + (end - init) * min(progress, 0.2) * 5.0, 
             warmup_epoch_ratio = 0.2,
