@@ -2982,10 +2982,10 @@ if __name__ == "__main__":
                 max_latent_samples=1000,  # More samples since we have both datasets
                 save_dir="vae_analysis",
                 random_sampling=True,  # Enable random sampling
-                random_seed=100,  # For reproducible results
+                random_seed=50,  # For reproducible results
                 use_mean=True,  # Use mean for latent space
                 map_occ_thresh=0.7,
-                rare_occ_thresh=0.5,
+                rare_occ_thresh=0.7,
                 hero_presence_thresh=0.2,
                 map_deterministic=True  # Use deterministic sampling for maps
             )
