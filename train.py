@@ -2604,6 +2604,7 @@ def create_visualization_demo(
             num_samples=num_samples, 
             out_dir=save_dir, 
             save_path=train_save_path,
+            img_file_prefix="train_",
             random_sampling=random_sampling,
             dataset_name="Training",
             # VAE sampling parameters
@@ -2639,6 +2640,7 @@ def create_visualization_demo(
             num_samples=num_samples, 
             out_dir=save_dir, 
             save_path=test_save_path,
+            img_file_prefix="test_",
             random_sampling=random_sampling,
             dataset_name="Testing",
             # VAE sampling parameters
@@ -2984,8 +2986,8 @@ if __name__ == "__main__":
                 random_sampling=True,  # Enable random sampling
                 random_seed=50,  # For reproducible results
                 use_mean=True,  # Use mean for latent space
-                map_occ_thresh=0.7,
-                rare_occ_thresh=0.7,
+                map_occ_thresh=0.5,
+                rare_occ_thresh=0.5,
                 hero_presence_thresh=0.2,
                 map_deterministic=True  # Use deterministic sampling for maps
             )
@@ -3074,7 +3076,7 @@ if __name__ == "__main__":
             tc_beta_shape='constant',
             initial_dw_beta=0.02,
             final_dw_beta=4.0,
-            dw_beta_shape='custom',
+            dw_beta_shape='linear',
             custom_kl_beta_function = lambda init, end, progress: init + (end - init) * min(progress, 0.2) * 5.0, 
             warmup_epoch_ratio = 0.2,
             free_bits=0.15,
@@ -3087,7 +3089,7 @@ if __name__ == "__main__":
             enable_dropout_on_decoder=True,
             
             # Early stopping settings
-            early_stopping = False,
+            early_stopping = True,
             early_stopping_patience = 3,
             early_stopping_min_delta = 0.01,
 

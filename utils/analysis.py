@@ -66,6 +66,7 @@ def save_maps_and_markdown(
     reconstructions,
     out_dir="vae_analysis",
     md_filename="recon_comparison.md",
+    img_file_prefix="",
     font_path=None,
     font_size=18,
     bg=(0,0,0),
@@ -90,8 +91,8 @@ def save_maps_and_markdown(
             img_o = _render_map_image(char_orig, color_orig, font_path=font_path, font_size=font_size, bg=bg)
             img_r = _render_map_image(char_recon, color_recon, font_path=font_path, font_size=font_size, bg=bg)
 
-            fn_o = f"sample_{i:03d}_orig.png"
-            fn_r = f"sample_{i:03d}_recon.png"
+            fn_o = f"{img_file_prefix}sample_{i:03d}_orig.png"
+            fn_r = f"{img_file_prefix}sample_{i:03d}_recon.png"
             img_o.save(img_dir / fn_o)
             img_r.save(img_dir / fn_r)
 
@@ -127,6 +128,7 @@ def visualize_reconstructions(
     model, dataset, device, 
     num_samples=4, 
     out_dir="vae_analysis", save_path="recon_comparison.md",
+    img_file_prefix="",
     random_sampling=True, dataset_name="Dataset",
     # VAE sampling parameters
     use_mean=True,
@@ -331,6 +333,7 @@ def visualize_reconstructions(
     save_maps_and_markdown(originals, reconstructions,
                             out_dir=out_dir,
                             md_filename=save_path,
+                            img_file_prefix=img_file_prefix,
                             font_path="DejaVuSansMono.ttf",  # optional
                             font_size=18)
     
