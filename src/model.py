@@ -190,8 +190,8 @@ def bag_marginals(bag_pairs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     B = bag_pairs.size(0)
     pairs = bag_pairs.view(B, CHAR_DIM, COLOR_DIM)
-    char_pres  = (pairs.max(dim=2).values).float()
-    color_pres = (pairs.max(dim=1).values).float()
+    char_pres  = 1.0 - torch.prod(1.0 - pairs, dim=2)
+    color_pres = 1.0 - torch.prod(1.0 - pairs, dim=1)
     return char_pres, color_pres
 
 def hero_presence_and_centroid(glyph_chars: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1048,7 +1048,8 @@ class MultiModalHackVAE(nn.Module):
         return {
             'mu': mu,  # [B, LATENT_DIM]
             'logvar': logvar_diag,  # [B, LATENT_DIM]
-            'lowrank_factors': lowrank_factors  # [B, LATENT_DIM, LOW_RANK] or None
+            'lowrank_factors': lowrank_factors,  # [B, LATENT_DIM, LOW_RANK] or None
+            "stats_encoder": self.stats_encoder
         }
           
     def _reparameterise(self, mu, logvar, lowrank_factors=None):
@@ -1077,7 +1078,7 @@ class MultiModalHackVAE(nn.Module):
         if self.detach_bag_prior:
             char_prior = char_prior.detach()
             color_prior = color_prior.detach()
-        occupy_logits, char_logits, color_logits, rare_occ_logits, rare_char_logits, rare_color_logits = self.map_decoder(z, char_prior, color_prior, bag_bias_strength=0.5) 
+        occupy_logits, char_logits, color_logits, rare_occ_logits, rare_char_logits, rare_color_logits = self.map_decoder(z, char_prior, color_prior, bag_bias_strength=3.0) 
         stats_pred = self.stats_decoder(z_core)
         msg_logits = self.msg_decoder(z_core)
         hero_logit   = self.hero_presence_head(z_bag).squeeze(-1)       # [B]
@@ -1356,12 +1357,18 @@ def vae_loss(
     # occupancy focal BCE (mean over pixels)
     #occ_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), occ_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
     fg_rate = 0.25
-    pos_weight = torch.tensor([(1 - fg_rate) / max(fg_rate, 1e-6)], device=occupy_logits.device, dtype=occupy_logits.dtype) 
+    with torch.no_grad():
+        pos = occ_t.sum()
+        neg = occ_t.numel() - pos
+        pos_weight = (neg / pos).clamp(max=10.0)
     occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, occ_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2,3])  # [valid_B]
     assert occ_loss_per_sample.shape == (valid_B,), f"occupy loss shape mismatch: {occ_loss_per_sample.shape} != ({valid_B},)"
     
     rare_fg_rate = 0.05
-    rare_pos_weight = torch.tensor([(1 - rare_fg_rate) / max(rare_fg_rate, 1e-6)], device=rare_occ_logits.device, dtype=rare_occ_logits.dtype)
+    with torch.no_grad():
+        rare_pos = rare_occ_t.sum()
+        rare_neg = occ_t.sum() - rare_pos
+        rare_pos_weight = (rare_neg / rare_pos).clamp(max=10.0)
     rare_occ_loss_per_sample = F.binary_cross_entropy_with_logits(rare_occ_logits, rare_occ_t, reduction='none', pos_weight=rare_pos_weight)
     rare_occ_loss_per_sample = (rare_occ_loss_per_sample * occ_t).sum(dim=[1,2,3])  # [valid_B]
     
@@ -1427,9 +1434,11 @@ def vae_loss(
     raw_losses['rare_color'] = rare_color_loss_per_sample.mean()
 
     # stats
-    pre = BlstatsPreprocessor()
+    pre = model_output['stats_encoder'].preprocessor
     pre = pre.to(blstats.device)
-    t = pre.targets(blstats[valid_screen])
+    pre.eval()
+    with torch.no_grad():
+        t = pre.targets(blstats[valid_screen])
     sp = model_output['stats_pred']
     # Filter stats_pred by valid_screen to match target dimensions
     sp_filtered = {}
