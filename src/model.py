@@ -1077,7 +1077,7 @@ class MultiModalHackVAE(nn.Module):
         if self.detach_bag_prior:
             char_prior = char_prior.detach()
             color_prior = color_prior.detach()
-        occupy_logits, char_logits, color_logits, rare_occ_logits, rare_char_logits, rare_color_logits = self.map_decoder(z, char_prior, color_prior, bag_bias_strength=3.0) 
+        occupy_logits, char_logits, color_logits, rare_occ_logits, rare_char_logits, rare_color_logits = self.map_decoder(z, char_prior, color_prior, bag_bias_strength=0.5) 
         stats_pred = self.stats_decoder(z_core)
         msg_logits = self.msg_decoder(z_core)
         hero_logit   = self.hero_presence_head(z_bag).squeeze(-1)       # [B]
@@ -1282,15 +1282,15 @@ def vae_loss(
     msg_tokens,
     valid_screen,
     raw_modality_weights={
-        'occupy': 0.5, 
-        'rare_occupy': 0.5, 
+        'occupy': 2.0, 
+        'rare_occupy': 2.0, 
         'common_char': 1.0, 
         'common_color': 1.0, 
         'rare_char': 2.0,
         'rare_color': 2.0,
         'stats': 0.5, 
         'msg': 0.5, 
-        'bag': 20, 
+        'bag': 50, 
         'hero_loc': 100
     },
     focal_loss_alpha=0.1,

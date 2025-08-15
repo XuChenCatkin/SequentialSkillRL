@@ -1541,6 +1541,8 @@ def train_multimodalhack_vae(
                         "train/raw_loss/common_glyph_colors": train_loss_dict['raw_losses']['common_color'].item(),
                         "train/raw_loss/rare_glyph_chars": train_loss_dict['raw_losses']['rare_char'].item(),
                         "train/raw_loss/rare_glyph_colors": train_loss_dict['raw_losses']['rare_color'].item(),
+                        "train/raw_loss/bag_loss": train_loss_dict['raw_losses']['bag'].item(),
+                        "train/raw_loss/hero_loc": train_loss_dict['raw_losses']['hero_loc'].item(),
                         "train/raw_loss/blstats": train_loss_dict['raw_losses']['stats'].item(),
                         "train/raw_loss/message": train_loss_dict['raw_losses']['msg'].item(),
 
@@ -2281,6 +2283,72 @@ If you use this model, please consider citing:
         raise
 
 
+def load_model_from_local(
+    checkpoint_path: str,
+    device: str = "cpu",
+    **model_kwargs
+) -> MultiModalHackVAE:
+    """
+    Load MultiModalHackVAE model from local checkpoint
+    
+    Args:
+        checkpoint_path: Path to local checkpoint file
+        device: Device to load the model on
+        **model_kwargs: Additional arguments for model initialization (override config)
+        
+    Returns:
+        Loaded MultiModalHackVAE model
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    
+    try:
+        print(f"📥 Loading model from local checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        
+        # Extract model configuration from checkpoint
+        model_config = {
+            "bInclude_glyph_bag": checkpoint.get('model_config', {}).get('bInclude_glyph_bag', True),
+            "bInclude_hero": checkpoint.get('model_config', {}).get('bInclude_hero', True),
+            "dropout_rate": checkpoint.get('model_config', {}).get('dropout_rate', 0.1),
+            "enable_dropout_on_latent": checkpoint.get('model_config', {}).get('enable_dropout_on_latent', True),
+            "enable_dropout_on_decoder": checkpoint.get('model_config', {}).get('enable_dropout_on_decoder', True),
+        }
+        
+        # Override with any provided kwargs
+        model_config.update(model_kwargs)
+        
+        print(f"🏗️  Initializing model with config: {model_config}")
+        model = MultiModalHackVAE(**model_config)
+        
+        # Load state dict
+        print(f"⚡ Loading model weights...")
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✅ Loaded model state dict from checkpoint")
+            if 'final_train_loss' in checkpoint:
+                print(f"📊 Final training loss: {checkpoint['final_train_loss']:.4f}")
+            if 'final_test_loss' in checkpoint:
+                print(f"📊 Final test loss: {checkpoint['final_test_loss']:.4f}")
+        else:
+            # Fallback: try to load the checkpoint directly as state dict
+            model.load_state_dict(checkpoint)
+            print(f"✅ Loaded model state dict directly")
+        
+        model = model.to(device)
+        model.eval()
+        
+        print(f"✅ Model loaded successfully from local checkpoint")
+        print(f"🎯 Model on device: {device}")
+        print(f"🎯 Model in evaluation mode")
+        
+        return model
+        
+    except Exception as e:
+        print(f"❌ Error loading from local checkpoint: {e}")
+        raise
+
+
 def load_model_from_huggingface(
     repo_name: str,
     revision_name: Optional[str] = None,
@@ -2476,9 +2544,54 @@ def create_visualization_demo(
     if random_seed is not None:
         print(f"🌱 Random seed: {random_seed}")
     
-    # Load model from HuggingFace
+    # Load model from HuggingFace with local fallback
     print(f"\n1️⃣ Loading model from HuggingFace...")
-    model = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
+    model = None
+    
+    try:
+        model = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
+    except Exception as e:
+        print(f"⚠️  Failed to load from HuggingFace: {e}")
+        print(f"🔄 Attempting to load from local checkpoints...")
+        
+        # Try to find the latest local checkpoint
+        checkpoint_dir = "checkpoints"
+        local_checkpoint_path = None
+        
+        if os.path.exists(checkpoint_dir):
+            # Find the latest checkpoint file
+            checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
+            if checkpoint_files:
+                # Sort by modification time, latest first
+                checkpoint_files.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)), reverse=True)
+                local_checkpoint_path = os.path.join(checkpoint_dir, checkpoint_files[0])
+                print(f"📁 Found latest checkpoint: {local_checkpoint_path}")
+            else:
+                print(f"❌ No checkpoint files found in {checkpoint_dir}")
+        
+        # Also check for a saved model file
+        if local_checkpoint_path is None:
+            potential_paths = [
+                "models/nethack-vae.pth",
+                "nethack-vae.pth",
+                "model.pth"
+            ]
+            for path in potential_paths:
+                if os.path.exists(path):
+                    local_checkpoint_path = path
+                    print(f"📁 Found saved model: {local_checkpoint_path}")
+                    break
+        
+        if local_checkpoint_path is not None:
+            try:
+                model = load_model_from_local(local_checkpoint_path, device=device)
+                print(f"✅ Successfully loaded model from local checkpoint")
+            except Exception as local_e:
+                print(f"❌ Failed to load from local checkpoint: {local_e}")
+                raise RuntimeError(f"Failed to load model from both HuggingFace ({e}) and local checkpoint ({local_e})")
+        else:
+            print(f"❌ No local checkpoints found")
+            raise RuntimeError(f"Failed to load model from HuggingFace ({e}) and no local checkpoints available")
 
     results = {'model': model, 'save_dir': save_dir}
     
@@ -2996,7 +3109,7 @@ if __name__ == "__main__":
             log_gradients=True,
             
             # HuggingFace integration example
-            upload_to_hf=False, 
+            upload_to_hf=True, 
             hf_repo_name="CatkinChen/nethack-vae",
             hf_upload_directly=True,  # Upload directly without extra local save
             hf_upload_checkpoints=True,  # Also upload checkpoints
