@@ -1485,7 +1485,7 @@ def vae_loss(
             w[:, ci * COLOR_DIM] = 0.0  # ignore all chars with no colors
         w[bag_t.bool()] = 1.0  # emphasize bag presence
 
-        bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='none').sum(dim=1).mean()
+    bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='none').sum(dim=1).mean()
     
     raw_losses['bag'] = bag_bce
 
