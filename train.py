@@ -1536,8 +1536,6 @@ def train_multimodalhack_vae(
                         "train/raw_loss/total": train_loss_dict['total_raw_loss'].item(),
                         "train/raw_loss/occupancy": train_loss_dict['raw_losses']['occupy'].item(),
                         "train/raw_loss/rare_occupancy": train_loss_dict['raw_losses']['rare_occupy'].item(),
-                        "train/raw_loss/total_variation": train_loss_dict['raw_losses']['tv'].item(),
-                        "train/raw_loss/dice_loss": train_loss_dict['raw_losses']['dice'].item(),
                         "train/raw_loss/common_glyph_chars": train_loss_dict['raw_losses']['common_char'].item(),
                         "train/raw_loss/common_glyph_colors": train_loss_dict['raw_losses']['common_color'].item(),
                         "train/raw_loss/rare_glyph_chars": train_loss_dict['raw_losses']['rare_char'].item(),

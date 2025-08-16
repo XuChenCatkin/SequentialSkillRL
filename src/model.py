@@ -1291,8 +1291,8 @@ def vae_loss(
         'rare_color': 2.0,
         'stats': 0.5, 
         'msg': 0.5, 
-        'bag': 50, 
-        'hero_loc': 100
+        'bag': 8, 
+        'hero_loc': 8
     },
     focal_loss_alpha=0.1,
     focal_loss_gamma=2.0,
@@ -1478,8 +1478,6 @@ def vae_loss(
 
     # Sum raw reconstruction losses
     total_raw_loss = sum(raw_losses[k] * raw_modality_weights.get(k, 1.0) for k in raw_losses)
-    raw_losses['tv'] = tv  # Add total variation loss
-    raw_losses['dice'] = dice_loss
     
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
