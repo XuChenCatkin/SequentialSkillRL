@@ -1372,19 +1372,6 @@ def vae_loss(
     rare_occ_loss_per_sample = F.binary_cross_entropy_with_logits(rare_occ_logits, rare_occ_t, reduction='none', pos_weight=rare_pos_weight)
     rare_occ_loss_per_sample = (rare_occ_loss_per_sample * occ_t).sum(dim=[1,2,3])  # [valid_B]
     
-    
-    # total variation loss (TV) for occupancy map
-    p = torch.sigmoid(occupy_logits)          # [B,1,H,W]
-    dx = p[..., :, 1:] - p[..., :, :-1]
-    dy = p[..., 1:, :] - p[..., :-1, :]
-    tv = (dx.abs().mean() + dy.abs().mean()) * H * W
-
-    # Dice (alternative or in addition; keep weight small)
-    probs = p.squeeze(1); target = occ_t.squeeze(1)
-    inter = (probs * target).sum(dim=(1,2))
-    dice = (2*inter + 1e-5) / (probs.sum(dim=(1,2)) + target.sum(dim=(1,2)) + 1e-5)
-    dice_loss = (1 - dice.mean()) * H * W
-
     # CE losses (masked by foreground)
     if fg.any():
         IGNORE = -100
@@ -1426,7 +1413,7 @@ def vae_loss(
         common_color_loss_per_sample = torch.zeros(valid_B, device=glyph_colors.device)
 
     # Average over valid samples only
-    raw_losses['occupy'] = occ_loss_per_sample.mean() + 0.01 * tv + 0.1 * dice_loss  # Average over valid samples
+    raw_losses['occupy'] = occ_loss_per_sample.mean()  # Average over valid samples
     raw_losses['rare_occupy'] = rare_occ_loss_per_sample.mean()
     raw_losses['common_char'] = common_char_loss_per_sample.mean()
     raw_losses['common_color'] = common_color_loss_per_sample.mean()
