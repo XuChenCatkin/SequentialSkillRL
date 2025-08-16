@@ -1,0 +1,186 @@
+{
+  "total_cells": 169881600,
+  "unique_pairs": 180,
+  "top_pairs": [
+    {
+      "char_code": 46,
+      "color_code": 8,
+      "ascii_char": ".",
+      "count": 13640825,
+      "percentage": 8.02960709105636
+    },
+    {
+      "char_code": 35,
+      "color_code": 7,
+      "ascii_char": "#",
+      "count": 10723231,
+      "percentage": 6.312179188328812
+    },
+    {
+      "char_code": 45,
+      "color_code": 7,
+      "ascii_char": "-",
+      "count": 10061081,
+      "percentage": 5.922407723967751
+    },
+    {
+      "char_code": 124,
+      "color_code": 7,
+      "ascii_char": "|",
+      "count": 3661876,
+      "percentage": 2.155545980259192
+    },
+    {
+      "char_code": 46,
+      "color_code": 7,
+      "ascii_char": ".",
+      "count": 2654847,
+      "percentage": 1.5627631244349005
+    },
+    {
+      "char_code": 45,
+      "color_code": 3,
+      "ascii_char": "-",
+      "count": 355571,
+      "percentage": 0.20930518667118744
+    },
+    {
+      "char_code": 124,
+      "color_code": 3,
+      "ascii_char": "|",
+      "count": 241325,
+      "percentage": 0.1420548193565401
+    },
+    {
+      "char_code": 96,
+      "color_code": 7,
+      "ascii_char": "`",
+      "count": 94550,
+      "percentage": 0.055656410111512955
+    },
+    {
+      "char_code": 64,
+      "color_code": 15,
+      "ascii_char": "@",
+      "count": 92477,
+      "percentage": 0.05443614847046414
+    },
+    {
+      "char_code": 60,
+      "color_code": 7,
+      "ascii_char": "<",
+      "count": 80215,
+      "percentage": 0.04721818019138035
+    },
+    {
+      "char_code": 62,
+      "color_code": 7,
+      "ascii_char": ">",
+      "count": 75159,
+      "percentage": 0.044241989715189875
+    },
+    {
+      "char_code": 110,
+      "color_code": 7,
+      "ascii_char": "n",
+      "count": 59574,
+      "percentage": 0.03506795320976492
+    },
+    {
+      "char_code": 111,
+      "color_code": 7,
+      "ascii_char": "o",
+      "count": 59444,
+      "percentage": 0.03499142932489451
+    },
+    {
+      "char_code": 123,
+      "color_code": 12,
+      "ascii_char": "{",
+      "count": 51332,
+      "percentage": 0.030216338908981316
+    },
+    {
+      "char_code": 41,
+      "color_code": 6,
+      "ascii_char": ")",
+      "count": 50673,
+      "percentage": 0.029828421677215188
+    },
+    {
+      "char_code": 116,
+      "color_code": 7,
+      "ascii_char": "t",
+      "count": 49973,
+      "percentage": 0.029416369989451473
+    },
+    {
+      "char_code": 101,
+      "color_code": 7,
+      "ascii_char": "e",
+      "count": 48488,
+      "percentage": 0.028542231766124172
+    },
+    {
+      "char_code": 115,
+      "color_code": 7,
+      "ascii_char": "s",
+      "count": 47002,
+      "percentage": 0.027667504897528634
+    },
+    {
+      "char_code": 100,
+      "color_code": 15,
+      "ascii_char": "d",
+      "count": 46628,
+      "percentage": 0.027447351567209163
+    },
+    {
+      "char_code": 42,
+      "color_code": 7,
+      "ascii_char": "*",
+      "count": 45736,
+      "percentage": 0.026922279987944546
+    },
+    {
+      "char_code": 97,
+      "color_code": 7,
+      "ascii_char": "a",
+      "count": 34327,
+      "percentage": 0.020206426122664257
+    },
+    {
+      "char_code": 109,
+      "color_code": 7,
+      "ascii_char": "m",
+      "count": 32452,
+      "percentage": 0.01910271624472574
+    },
+    {
+      "char_code": 40,
+      "color_code": 3,
+      "ascii_char": "(",
+      "count": 30341,
+      "percentage": 0.017860086083484026
+    },
+    {
+      "char_code": 37,
+      "color_code": 3,
+      "ascii_char": "%",
+      "count": 28782,
+      "percentage": 0.016942388110307415
+    },
+    {
+      "char_code": 102,
+      "color_code": 15,
+      "ascii_char": "f",
+      "count": 28037,
+      "percentage": 0.016503847385473176
+    }
+  ],
+  "analysis_params": {
+    "top_k": 25,
+    "dataset_size": 100,
+    "show_ascii_chars": true
+  }
+}

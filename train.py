@@ -23,6 +23,7 @@ import warnings
 import re  # Add regex import for status line parsing
 import json
 import logging
+from collections import Counter
 from datetime import datetime
 import tempfile  # Add tempfile import
 from torch.optim.lr_scheduler import OneCycleLR
@@ -2921,6 +2922,197 @@ def create_model_demo_notebook(repo_name: str, save_path: str = "demo_notebook.i
     print(f"📓 Demo notebook created: {save_path}")
 
 
+def analyze_glyph_char_color_pairs(
+    dataset: List[Dict],
+    top_k: int = 50,
+    save_dir: str = "bin_count_analysis",
+    save_plot: bool = True,
+    show_ascii_chars: bool = True
+) -> Dict:
+    """
+    Analyze the distribution of (glyph_char, glyph_color) pairs in the dataset.
+    
+    Args:
+        dataset: List of data batches from NetHackDataCollector
+        top_k: Number of top pairs to display
+        save_dir: Directory to save analysis results
+        save_plot: Whether to save the plot
+        show_ascii_chars: Whether to show ASCII character representations
+        
+    Returns:
+        Dictionary with analysis results
+    """
+    print(f"🔍 Starting glyph (char, color) pair analysis...")
+    print(f"📊 Dataset size: {len(dataset)} batches")
+    
+    # Create save directory
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Counter for (char, color) pairs
+    pair_counter = Counter()
+    total_cells = 0
+    
+    # Process each batch
+    for batch_idx, batch in enumerate(tqdm(dataset, desc="Processing batches")):
+        game_chars = batch['game_chars']  # Shape: (num_games, num_time, 21, 79)
+        game_colors = batch['game_colors']  # Shape: (num_games, num_time, 21, 79)
+        
+        # Flatten the spatial and temporal dimensions
+        chars_flat = game_chars.flatten()  # All character codes
+        colors_flat = game_colors.flatten()  # All color codes
+        
+        # Count pairs
+        for char, color in zip(chars_flat.tolist(), colors_flat.tolist()):
+            pair_counter[(char, color)] += 1
+            total_cells += 1
+    
+    print(f"📈 Total cells analyzed: {total_cells:,}")
+    print(f"🎨 Unique (char, color) pairs found: {len(pair_counter):,}")
+    
+    # Get top k pairs (excluding space character pairs)
+    filtered_pairs = [(key, count) for key, count in pair_counter.items() if key[0] != 32]
+    top_pairs = sorted(filtered_pairs, key=lambda x: x[1], reverse=True)[:top_k]
+    
+    # Convert to readable format
+    pair_data = []
+    for (char, color), count in top_pairs:
+        ascii_repr = chr(char) if 32 <= char <= 126 else f"\\x{char:02x}"
+        percentage = (count / total_cells) * 100
+        pair_data.append({
+            'char_code': char,
+            'color_code': color,
+            'ascii_char': ascii_repr,
+            'count': count,
+            'percentage': percentage
+        })
+    
+    # Print top pairs
+    print(f"\n🏆 Top {top_k} (char, color) pairs (excluding spaces):")
+    print("-" * 80)
+    if show_ascii_chars:
+        print(f"{'Rank':<4} {'Char':<6} {'Color':<5} {'ASCII':<8} {'Count':<12} {'Percentage':<10}")
+    else:
+        print(f"{'Rank':<4} {'Char':<6} {'Color':<5} {'Count':<12} {'Percentage':<10}")
+    print("-" * 80)
+    
+    for i, data in enumerate(pair_data):
+        if show_ascii_chars:
+            ascii_str = f"'{data['ascii_char']}'"
+            print(f"{i+1:<4} {data['char_code']:<6} {data['color_code']:<5} "
+                  f"{ascii_str:<8} {data['count']:<12,} {data['percentage']:<10.2f}%")
+        else:
+            print(f"{i+1:<4} {data['char_code']:<6} {data['color_code']:<5} "
+                  f"{data['count']:<12,} {data['percentage']:<10.2f}%")
+    
+    # Create visualization
+    if save_plot and len(top_pairs) > 0:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+        
+        # Plot 1: Bar chart of top pairs
+        pair_labels = []
+        counts = []
+        colors_for_plot = []
+        
+        # Color mapping for NetHack colors (0-15)
+        nethack_colors = [
+            '#000000',  # 0: black
+            '#FF0000',  # 1: red  
+            '#00FF00',  # 2: green
+            '#FFFF00',  # 3: yellow
+            '#0000FF',  # 4: blue
+            '#FF00FF',  # 5: magenta
+            '#00FFFF',  # 6: cyan
+            '#FFFFFF',  # 7: white
+            '#808080',  # 8: gray
+            '#FF8000',  # 9: orange
+            '#80FF80',  # 10: light green
+            '#FFFF80',  # 11: light yellow
+            '#8080FF',  # 12: light blue
+            '#FF80FF',  # 13: light magenta
+            '#80FFFF',  # 14: light cyan
+            '#C0C0C0'   # 15: light gray
+        ]
+        
+        for (char, color), count in top_pairs:
+            ascii_repr = chr(char) if 32 <= char <= 126 else f"\\x{char:02x}"
+            pair_labels.append(f"'{ascii_repr}' ({char}, {color})")
+            counts.append(count)
+            # Use actual NetHack color if available, otherwise use default
+            if 0 <= color < len(nethack_colors):
+                colors_for_plot.append(nethack_colors[color])
+            else:
+                colors_for_plot.append('#808080')  # Default gray
+        
+        bars = ax1.bar(range(len(counts)), counts, color=colors_for_plot, alpha=0.7, edgecolor='black')
+        ax1.set_xlabel('(Character, Color) Pairs')
+        ax1.set_ylabel('Count (log scale)')
+        ax1.set_yscale('log')
+        ax1.set_title(f'Top {top_k} Most Frequent (Glyph Char, Glyph Color) Pairs (Excluding Spaces)')
+        ax1.set_xticks(range(len(pair_labels)))
+        ax1.set_xticklabels(pair_labels, rotation=45, ha='right')
+        
+        # Add count labels on bars
+        for bar, count in zip(bars, counts):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                    f'{count:,}', ha='center', va='bottom', fontsize=8)
+        
+        # Plot 2: Character distribution (top chars only, excluding space)
+        char_counter = Counter()
+        for (char, color), count in pair_counter.items():
+            if char != 32:  # Exclude space character
+                char_counter[char] += count
+        
+        top_chars = char_counter.most_common(20)  # Top 20 characters
+        char_codes = [char for char, _ in top_chars]
+        char_counts = [count for _, count in top_chars]
+        char_labels = [f"'{chr(char)}' ({char})" if 32 <= char <= 126 else f"\\x{char:02x} ({char})" 
+                      for char in char_codes]
+        
+        bars2 = ax2.bar(range(len(char_counts)), char_counts, color='skyblue', alpha=0.7, edgecolor='black')
+        ax2.set_xlabel('Character Codes')
+        ax2.set_ylabel('Total Count (log scale)')
+        ax2.set_yscale('log')
+        ax2.set_title('Top 20 Most Frequent Characters (All Colors Combined, Excluding Spaces)')
+        ax2.set_xticks(range(len(char_labels)))
+        ax2.set_xticklabels(char_labels, rotation=45, ha='right')
+        
+        # Add count labels on bars
+        for bar, count in zip(bars2, char_counts):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                    f'{count:,}', ha='center', va='bottom', fontsize=8)
+        
+        plt.tight_layout()
+        
+        if save_plot:
+            plot_path = os.path.join(save_dir, f"glyph_char_color_analysis_top_{top_k}.png")
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            print(f"📊 Plot saved to: {plot_path}")
+        
+        plt.show()
+    
+    # Save detailed results to JSON
+    results = {
+        'total_cells': total_cells,
+        'unique_pairs': len(pair_counter),
+        'top_pairs': pair_data,
+        'analysis_params': {
+            'top_k': top_k,
+            'dataset_size': len(dataset),
+            'show_ascii_chars': show_ascii_chars
+        }
+    }
+    
+    if save_plot:
+        results_path = os.path.join(save_dir, "glyph_analysis_results.json")
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"💾 Results saved to: {results_path}")
+    
+    return results
+
+
 if __name__ == "__main__":
     
     train_file = "nld-aa-training"
@@ -3037,6 +3229,102 @@ if __name__ == "__main__":
         print(f"✅ Data collection completed!")
         print(f"   📊 Train batches: {len(train_dataset)}")
         print(f"   📊 Test batches: {len(test_dataset)}")
+    
+    elif len(sys.argv) > 1 and sys.argv[1] == "bin_count_analysis":
+        # Bin count analysis mode: python train.py bin_count_analysis [top_k] [dataset_type]
+        top_k = int(sys.argv[2]) if len(sys.argv) > 2 else 50
+        dataset_type = sys.argv[3] if len(sys.argv) > 3 else "both"  # "train", "test", or "both"
+        
+        print(f"🔍 Running Glyph (Char, Color) Bin Count Analysis")
+        print(f"📊 Top K pairs to analyze: {top_k}")
+        print(f"📁 Dataset type: {dataset_type}")
+        
+        # Prepare data collector
+        collector = NetHackDataCollector('ttyrecs.db')
+        adapter = BLStatsAdapter()
+        
+        datasets_to_analyze = []
+        dataset_names = []
+        
+        if dataset_type in ["train", "both"]:
+            print(f"📊 Loading training dataset...")
+            train_dataset = collector.collect_or_load_data(
+                dataset_name=train_file,
+                adapter=adapter,
+                save_path=train_cache_file,
+                max_batches=max_training_batches,
+                batch_size=batch_size,
+                seq_length=sequence_size,
+                force_recollect=False
+            )
+            datasets_to_analyze.append(train_dataset)
+            dataset_names.append("train")
+        
+        if dataset_type in ["test", "both"]:
+            print(f"📊 Loading test dataset...")
+            test_dataset = collector.collect_or_load_data(
+                dataset_name=test_file,
+                adapter=adapter,
+                save_path=test_cache_file,
+                max_batches=max_testing_batches,
+                batch_size=batch_size,
+                seq_length=sequence_size,
+                force_recollect=False
+            )
+            datasets_to_analyze.append(test_dataset)
+            dataset_names.append("test")
+        
+        # Run analysis on each dataset
+        for dataset, dataset_name in zip(datasets_to_analyze, dataset_names):
+            print(f"\n🔬 Analyzing {dataset_name} dataset...")
+            save_dir = f"bin_count_analysis/{dataset_name}"
+            
+            try:
+                results = analyze_glyph_char_color_pairs(
+                    dataset=dataset,
+                    top_k=top_k,
+                    save_dir=save_dir,
+                    save_plot=True,
+                    show_ascii_chars=True
+                )
+                
+                print(f"✅ {dataset_name.capitalize()} analysis completed!")
+                print(f"📁 Results saved to: {save_dir}")
+                print(f"📊 Total cells: {results['total_cells']:,}")
+                print(f"🎨 Unique pairs: {results['unique_pairs']:,}")
+                
+            except Exception as e:
+                print(f"❌ {dataset_name.capitalize()} analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # If analyzing both datasets, create a combined analysis
+        if dataset_type == "both" and len(datasets_to_analyze) == 2:
+            print(f"\n🔗 Creating combined analysis...")
+            combined_dataset = datasets_to_analyze[0] + datasets_to_analyze[1]
+            save_dir = "bin_count_analysis/combined"
+            
+            try:
+                results = analyze_glyph_char_color_pairs(
+                    dataset=combined_dataset,
+                    top_k=top_k,
+                    save_dir=save_dir,
+                    save_plot=True,
+                    show_ascii_chars=True
+                )
+                
+                print(f"✅ Combined analysis completed!")
+                print(f"📁 Results saved to: {save_dir}")
+                print(f"📊 Total cells: {results['total_cells']:,}")
+                print(f"🎨 Unique pairs: {results['unique_pairs']:,}")
+                
+            except Exception as e:
+                print(f"❌ Combined analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print(f"\n🎉 Bin count analysis completed!")
+    
     elif len(sys.argv) > 1 and sys.argv[1] == "train":
         hf_model_card_data = {
             "author": "Xu Chen",
