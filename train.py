@@ -2927,7 +2927,8 @@ def analyze_glyph_char_color_pairs(
     top_k: int = 50,
     save_dir: str = "bin_count_analysis",
     save_plot: bool = True,
-    show_ascii_chars: bool = True
+    show_ascii_chars: bool = True,
+    save_complete_data: bool = True
 ) -> Dict:
     """
     Analyze the distribution of (glyph_char, glyph_color) pairs in the dataset.
@@ -2938,6 +2939,7 @@ def analyze_glyph_char_color_pairs(
         save_dir: Directory to save analysis results
         save_plot: Whether to save the plot
         show_ascii_chars: Whether to show ASCII character representations
+        save_complete_data: Whether to save complete count data to JSON
         
     Returns:
         Dictionary with analysis results
@@ -2968,6 +2970,54 @@ def analyze_glyph_char_color_pairs(
     
     print(f"📈 Total cells analyzed: {total_cells:,}")
     print(f"🎨 Unique (char, color) pairs found: {len(pair_counter):,}")
+    
+    # Save complete count data to JSON if requested
+    if save_complete_data:
+        # Create readable format for pairs
+        readable_pairs = {}
+        for (char, color), count in pair_counter.items():
+            ascii_repr = chr(char) if 32 <= char <= 126 else f"\\x{char:02x}"
+            pair_key = f"({char},{color})"
+            readable_pairs[pair_key] = {
+                'char_code': char,
+                'color_code': color,
+                'ascii_char': ascii_repr,
+                'count': count,
+                'percentage': (count / total_cells) * 100
+            }
+        
+        # Create readable format for characters
+        char_counter = Counter()
+        for (char, color), count in pair_counter.items():
+            char_counter[char] += count
+        
+        readable_chars = {}
+        for char, count in char_counter.items():
+            ascii_repr = chr(char) if 32 <= char <= 126 else f"\\x{char:02x}"
+            readable_chars[str(char)] = {
+                'char_code': char,
+                'ascii_char': ascii_repr,
+                'total_count': count,
+                'percentage': (count / total_cells) * 100
+            }
+        
+        complete_data = {
+            'total_cells': total_cells,
+            'unique_pairs': len(pair_counter),
+            'pair_counts': readable_pairs,
+            'char_counts': readable_chars,
+            'analysis_metadata': {
+                'dataset_size': len(dataset),
+                'timestamp': datetime.now().isoformat(),
+                'analysis_type': 'glyph_char_color_pairs'
+            }
+        }
+        
+        # Save complete data
+        complete_data_path = os.path.join(save_dir, "complete_bin_counts.json")
+        with open(complete_data_path, 'w') as f:
+            json.dump(complete_data, f, indent=2)
+        print(f"💾 Complete count data saved to: {complete_data_path}")
     
     # Get top k pairs (excluding space character pairs)
     filtered_pairs = [(key, count) for key, count in pair_counter.items() if key[0] != 32]
@@ -3016,21 +3066,21 @@ def analyze_glyph_char_color_pairs(
         # Color mapping for NetHack colors (0-15)
         nethack_colors = [
             '#000000',  # 0: black
-            '#FF0000',  # 1: red  
-            '#00FF00',  # 2: green
-            '#FFFF00',  # 3: yellow
-            '#0000FF',  # 4: blue
-            '#FF00FF',  # 5: magenta
-            '#00FFFF',  # 6: cyan
-            '#FFFFFF',  # 7: white
+            '#800000',  # 1: red  
+            '#008000',  # 2: green
+            '#808000',  # 3: yellow
+            '#000080',  # 4: blue
+            '#800080',  # 5: magenta
+            '#008080',  # 6: cyan
+            '#C0C0C0',  # 7: white
             '#808080',  # 8: gray
-            '#FF8000',  # 9: orange
-            '#80FF80',  # 10: light green
-            '#FFFF80',  # 11: light yellow
-            '#8080FF',  # 12: light blue
-            '#FF80FF',  # 13: light magenta
-            '#80FFFF',  # 14: light cyan
-            '#C0C0C0'   # 15: light gray
+            '#ff0000',  # 9: bright red
+            '#00ff00',  # 10: bright green
+            '#ffff00',  # 11: bright yellow
+            '#0000ff',  # 12: bright blue
+            '#ff00ff',  # 13: bright magenta
+            '#00ffff',  # 14: bright cyan
+            '#ffffff'   # 15: bright white
         ]
         
         for (char, color), count in top_pairs:
@@ -3109,6 +3159,207 @@ def analyze_glyph_char_color_pairs(
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"💾 Results saved to: {results_path}")
+    
+    return results
+
+
+def plot_glyph_char_color_pairs_from_saved(
+    data_path: str,
+    top_k: int = 50,
+    save_dir: str = None,
+    save_plot: bool = True,
+    show_ascii_chars: bool = True,
+    exclude_space: bool = True
+) -> Dict:
+    """
+    Load saved bin count data and create visualizations.
+    
+    Args:
+        data_path: Path to the saved complete_bin_counts.json file
+        top_k: Number of top pairs to display
+        save_dir: Directory to save plots (if None, uses directory of data_path)
+        save_plot: Whether to save the plot
+        show_ascii_chars: Whether to show ASCII character representations
+        exclude_space: Whether to exclude space character (ASCII 32) from analysis
+        
+    Returns:
+        Dictionary with analysis results
+    """
+    print(f"📥 Loading saved bin count data from: {data_path}")
+    
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Saved data file not found: {data_path}")
+    
+    # Load the complete data
+    with open(data_path, 'r') as f:
+        complete_data = json.load(f)
+    
+    total_cells = complete_data['total_cells']
+    unique_pairs = complete_data['unique_pairs']
+    
+    print(f"📈 Loaded data: {total_cells:,} total cells, {unique_pairs:,} unique pairs")
+    
+    # Convert pair_counts back to Counter format
+    pair_counter = Counter()
+    for pair_key, pair_data in complete_data['pair_counts'].items():
+        char = pair_data['char_code']
+        color = pair_data['color_code']
+        count = pair_data['count']
+        pair_counter[(char, color)] = count
+    
+    # Set save directory
+    if save_dir is None:
+        save_dir = os.path.dirname(data_path)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Filter pairs if excluding space
+    if exclude_space:
+        filtered_pairs = [(key, count) for key, count in pair_counter.items() if key[0] != 32]
+        print(f"🚫 Excluding space character pairs")
+    else:
+        filtered_pairs = list(pair_counter.items())
+    
+    # Get top k pairs
+    top_pairs = sorted(filtered_pairs, key=lambda x: x[1], reverse=True)[:top_k]
+    
+    # Convert to readable format
+    pair_data = []
+    for (char, color), count in top_pairs:
+        ascii_repr = chr(char) if 32 <= char <= 126 else f"\\x{char:02x}"
+        percentage = (count / total_cells) * 100
+        pair_data.append({
+            'char_code': char,
+            'color_code': color,
+            'ascii_char': ascii_repr,
+            'count': count,
+            'percentage': percentage
+        })
+    
+    # Print top pairs
+    exclude_text = " (excluding spaces)" if exclude_space else ""
+    print(f"\n🏆 Top {top_k} (char, color) pairs{exclude_text}:")
+    print("-" * 80)
+    if show_ascii_chars:
+        print(f"{'Rank':<4} {'Char':<6} {'Color':<5} {'ASCII':<8} {'Count':<12} {'Percentage':<10}")
+    else:
+        print(f"{'Rank':<4} {'Char':<6} {'Color':<5} {'Count':<12} {'Percentage':<10}")
+    print("-" * 80)
+    
+    for i, data in enumerate(pair_data):
+        if show_ascii_chars:
+            ascii_str = f"'{data['ascii_char']}'"
+            print(f"{i+1:<4} {data['char_code']:<6} {data['color_code']:<5} "
+                  f"{ascii_str:<8} {data['count']:<12,} {data['percentage']:<10.2f}%")
+        else:
+            print(f"{i+1:<4} {data['char_code']:<6} {data['color_code']:<5} "
+                  f"{data['count']:<12,} {data['percentage']:<10.2f}%")
+    
+    # Create visualization
+    if save_plot and len(top_pairs) > 0:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+        
+        # Plot 1: Bar chart of top pairs
+        pair_labels = []
+        counts = []
+        colors_for_plot = []
+        
+        # Color mapping for NetHack colors (0-15)
+        nethack_colors = [
+            '#000000',  # 0: black
+            '#800000',  # 1: red  
+            '#008000',  # 2: green
+            '#808000',  # 3: yellow
+            '#000080',  # 4: blue
+            '#800080',  # 5: magenta
+            '#008080',  # 6: cyan
+            '#C0C0C0',  # 7: white
+            '#808080',  # 8: gray
+            '#ff0000',  # 9: bright red
+            '#00ff00',  # 10: bright green
+            '#ffff00',  # 11: bright yellow
+            '#0000ff',  # 12: bright blue
+            '#ff00ff',  # 13: bright magenta
+            '#00ffff',  # 14: bright cyan
+            '#ffffff'   # 15: bright white
+        ]
+        
+        for (char, color), count in top_pairs:
+            ascii_repr = chr(char) if 32 <= char <= 126 else f"\\x{char:02x}"
+            pair_labels.append(f"'{ascii_repr}' ({char}, {color})")
+            counts.append(count)
+            # Use actual NetHack color if available, otherwise use default
+            if 0 <= color < len(nethack_colors):
+                colors_for_plot.append(nethack_colors[color])
+            else:
+                colors_for_plot.append('#808080')  # Default gray
+        
+        bars = ax1.bar(range(len(counts)), counts, color=colors_for_plot, alpha=0.7, edgecolor='black')
+        ax1.set_xlabel('(Character, Color) Pairs')
+        ax1.set_ylabel('Count (log scale)')
+        ax1.set_yscale('log')
+        title_suffix = " (Excluding Spaces)" if exclude_space else ""
+        ax1.set_title(f'Top {top_k} Most Frequent (Glyph Char, Glyph Color) Pairs{title_suffix}')
+        ax1.set_xticks(range(len(pair_labels)))
+        ax1.set_xticklabels(pair_labels, rotation=45, ha='right')
+        
+        # Add count labels on bars
+        for bar, count in zip(bars, counts):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                    f'{count:,}', ha='center', va='bottom', fontsize=8)
+        
+        # Plot 2: Character distribution (top chars only, optionally excluding space)
+        char_counter = Counter()
+        for char_str, char_data in complete_data['char_counts'].items():
+            char = char_data['char_code']
+            count = char_data['total_count']
+            if not exclude_space or char != 32:
+                char_counter[char] = count
+        
+        top_chars = char_counter.most_common(20)  # Top 20 characters
+        char_codes = [char for char, _ in top_chars]
+        char_counts = [count for _, count in top_chars]
+        char_labels = [f"'{chr(char)}' ({char})" if 32 <= char <= 126 else f"\\x{char:02x} ({char})" 
+                      for char in char_codes]
+        
+        bars2 = ax2.bar(range(len(char_counts)), char_counts, color='skyblue', alpha=0.7, edgecolor='black')
+        ax2.set_xlabel('Character Codes')
+        ax2.set_ylabel('Total Count (log scale)')
+        ax2.set_yscale('log')
+        char_title_suffix = " (Excluding Spaces)" if exclude_space else ""
+        ax2.set_title(f'Top 20 Most Frequent Characters (All Colors Combined{char_title_suffix})')
+        ax2.set_xticks(range(len(char_labels)))
+        ax2.set_xticklabels(char_labels, rotation=45, ha='right')
+        
+        # Add count labels on bars
+        for bar, count in zip(bars2, char_counts):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                    f'{count:,}', ha='center', va='bottom', fontsize=8)
+        
+        plt.tight_layout()
+        
+        if save_plot:
+            plot_suffix = "_no_space" if exclude_space else ""
+            plot_path = os.path.join(save_dir, f"glyph_char_color_analysis_top_{top_k}{plot_suffix}.png")
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            print(f"📊 Plot saved to: {plot_path}")
+        
+        plt.show()
+    
+    # Return results
+    results = {
+        'total_cells': total_cells,
+        'unique_pairs': unique_pairs,
+        'top_pairs': pair_data,
+        'analysis_params': {
+            'top_k': top_k,
+            'exclude_space': exclude_space,
+            'show_ascii_chars': show_ascii_chars,
+            'data_source': data_path
+        },
+        'metadata': complete_data.get('analysis_metadata', {})
+    }
     
     return results
 
@@ -3285,7 +3536,8 @@ if __name__ == "__main__":
                     top_k=top_k,
                     save_dir=save_dir,
                     save_plot=True,
-                    show_ascii_chars=True
+                    show_ascii_chars=True,
+                    save_complete_data=True
                 )
                 
                 print(f"✅ {dataset_name.capitalize()} analysis completed!")
@@ -3310,7 +3562,8 @@ if __name__ == "__main__":
                     top_k=top_k,
                     save_dir=save_dir,
                     save_plot=True,
-                    show_ascii_chars=True
+                    show_ascii_chars=True,
+                    save_complete_data=True
                 )
                 
                 print(f"✅ Combined analysis completed!")
@@ -3324,6 +3577,41 @@ if __name__ == "__main__":
                 traceback.print_exc()
         
         print(f"\n🎉 Bin count analysis completed!")
+    
+    elif len(sys.argv) > 1 and sys.argv[1] == "plot_bin_count":
+        # Plot from saved data mode: python train.py plot_bin_count <data_path> [top_k] [exclude_space]
+        if len(sys.argv) < 3:
+            print("❌ Usage: python train.py plot_bin_count <data_path> [top_k] [exclude_space]")
+            print("   Example: python train.py plot_bin_count bin_count_analysis/train/complete_bin_counts.json 30 true")
+            sys.exit(1)
+        
+        data_path = sys.argv[2]
+        top_k = int(sys.argv[3]) if len(sys.argv) > 3 else 50
+        exclude_space = sys.argv[4].lower() in ['true', '1', 'yes'] if len(sys.argv) > 4 else True
+        
+        print(f"📊 Plotting bin count analysis from saved data")
+        print(f"📁 Data path: {data_path}")
+        print(f"📊 Top K pairs: {top_k}")
+        print(f"🚫 Exclude spaces: {exclude_space}")
+        
+        try:
+            results = plot_glyph_char_color_pairs_from_saved(
+                data_path=data_path,
+                top_k=top_k,
+                save_plot=True,
+                show_ascii_chars=True,
+                exclude_space=exclude_space
+            )
+            
+            print(f"✅ Plot generation completed!")
+            print(f"📊 Total cells: {results['total_cells']:,}")
+            print(f"🎨 Unique pairs: {results['unique_pairs']:,}")
+            print(f"📈 Showing top {len(results['top_pairs'])} pairs")
+            
+        except Exception as e:
+            print(f"❌ Plot generation failed: {e}")
+            import traceback
+            traceback.print_exc()
     
     elif len(sys.argv) > 1 and sys.argv[1] == "train":
         hf_model_card_data = {
