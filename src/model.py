@@ -406,13 +406,13 @@ class MapDecoder(nn.Module):
             nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
         )
         # FiLM-conditioned residual body (anisotropic to cover width)
-        self.core_block1 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_core_dim)
-        self.core_block2 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_core_dim)
-        # local refinement
-        self.core_refine = nn.Sequential(
-            nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-            nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-        )
+        # self.core_block1 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_core_dim)
+        # self.core_block2 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_core_dim)
+        # # local refinement
+        # self.core_refine = nn.Sequential(
+        #     nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+        #     nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+        # )
         # heads
         self.head_occ = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
         self.head_chr = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, char_dim, 1))
@@ -425,13 +425,13 @@ class MapDecoder(nn.Module):
             nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
         )
         # FiLM-conditioned residual body (anisotropic to cover width)
-        self.bag_block1 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_bag_dim)
-        self.bag_block2 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_bag_dim)
-        # local refinement
-        self.bag_refine = nn.Sequential(
-            nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-            nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-        )
+        # self.bag_block1 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_bag_dim)
+        # self.bag_block2 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_bag_dim)
+        # # local refinement
+        # self.bag_refine = nn.Sequential(
+        #     nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+        #     nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
+        # )
         self.head_rare_occ = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
         self.head_rare_chr = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, char_dim, 1))
         self.head_rare_col = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, color_dim, 1))
@@ -463,9 +463,9 @@ class MapDecoder(nn.Module):
         z_core_map = self.z_core_to_map(z_core).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
         x_core = torch.cat([z_core_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
         x_core = self.core_stem(x_core)
-        x_core = self.core_block1(x_core, z_core)
-        x_core = self.core_block2(x_core, z_core)
-        x_core = self.core_refine(x_core)
+        # x_core = self.core_block1(x_core, z_core)
+        # x_core = self.core_block2(x_core, z_core)
+        # x_core = self.core_refine(x_core)
         occ = self.head_occ(x_core)
         g_log  = self.head_chr(x_core)
         c_log  = self.head_col(x_core)
@@ -473,9 +473,9 @@ class MapDecoder(nn.Module):
         z_bag_map = self.z_bag_to_map(z_bag).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
         x_bag = torch.cat([z_bag_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
         x_bag = self.bag_stem(x_bag)
-        x_bag = self.bag_block1(x_bag, z_bag)
-        x_bag = self.bag_block2(x_bag, z_bag)
-        x_bag = self.bag_refine(x_bag)
+        # x_bag = self.bag_block1(x_bag, z_bag)
+        # x_bag = self.bag_block2(x_bag, z_bag)
+        # x_bag = self.bag_refine(x_bag)
         rare_occ = self.head_rare_occ(x_bag)
         g_rare_log  = self.head_rare_chr(x_bag)
         c_rare_log  = self.head_rare_col(x_bag)
