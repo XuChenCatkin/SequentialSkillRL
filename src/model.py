@@ -59,15 +59,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 import math
-from typing import Optional
+from typing import Optional, List, Dict
+from enum import IntEnum
+from dataclasses import dataclass, field
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
-CHAR_EMB = 16      # char‑id embedding dim (0-15)
 COLOR_DIM = 16      # colour id space for colours
-COLOR_EMB = 4       # colour‑id embedding dim
-GLYPH_EMB = CHAR_EMB + COLOR_EMB  # glyph embedding dim
-LATENT_DIM = 96     # z‑dim for VAE
 BLSTATS_DIM = 27   # raw scalar stats (hp, gold, …)
 MSG_PAD = 0  
 MSG_VOCAB = 128     # Nethack takes 32-127 byte for char of messages
@@ -79,7 +77,6 @@ GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
 PADDING_IDX = [32, 0]  # padding index for glyphs (blank space char, black color)
 PADDING_CHAR = 32      # padding character (blank space)
 PADDING_COLOR = 0       # padding color (black)
-LOW_RANK = 0      # low-rank factorisation rank for covariance
 # NetHack map dimensions (from NetHack source: include/config.h)
 MAP_HEIGHT = 21     # ROWNO - number of rows in the map
 MAP_WIDTH = 79      # COLNO-1 - playable columns (COLNO=80, but rightmost is UI)
@@ -89,10 +86,6 @@ ROLE_CAD = 13     # role cardinality for MiniHack (e.g. 4 for 'knight')
 RACE_CAD = 5      # race cardinality for MiniHack (e.g. 0 for 'human')
 GEND_CAD = 3      # gender cardinality for MiniHack (e.g. 'male', 'female', 'neuter')
 ALIGN_CAD = 3     # alignment cardinality for MiniHack (e.g. 1 for 'lawful')
-ROLE_EMB = 8      # role embedding dim
-RACE_EMB = 4      # race embedding dim
-GEND_EMB = 2      # gender embedding dim
-ALIGN_EMB = 2     # alignment embedding dim
 
 # Condition mask constants (blstats[25] bit field)
 CONDITION_BITS = [
@@ -146,8 +139,354 @@ BLSTATS_CAT = [
 COMMON_CHARS = [ord('#'), ord('.'), ord('-'), ord('|')]
 COMMON_GLYPHS = [(a, 7) for a in COMMON_CHARS] # (char, color) pairs for common glyphs
 HERO_CHAR = ord('@')  # hero character code (ASCII 64)
-BAG_Z = 24         # slice of z reserved for glyph-bag / anchors
-BAG_MLP = 32       # feature size from glyph-bag encoder
+
+# Color constants
+CLR_BLACK, CLR_RED, CLR_GREEN, CLR_BROWN = 0, 1, 2, 3
+CLR_BLUE, CLR_MAGENTA, CLR_CYAN, CLR_GRAY = 4, 5, 6, 7
+NO_COLOR, CLR_ORANGE, CLR_BRIGHT_GREEN = 8, 9, 10
+CLR_YELLOW, CLR_BRIGHT_BLUE, CLR_BRIGHT_MAGENTA = 11, 12, 13
+CLR_BRIGHT_CYAN, CLR_WHITE = 14, 15
+
+
+class NetHackCategory(IntEnum):
+    """
+    Enum for categorizing NetHack game elements into meaningful groups.
+    
+    Usage:
+        category = categorize_glyph(char_code, color_code)
+        if category == NetHackCategory.WALLS:
+            # handle wall logic
+        
+    Values are designed to be used as indices for:
+    - Neural network outputs
+    - Data analysis and visualization
+    - Game logic categorization
+    """
+    UNKNOWN = 0      # Default/unrecognized elements
+    WALLS = 1        # Walls and barriers
+    DOORS = 2        # Doors
+    FLOORS = 3       # Walkable floor tiles
+    UP_STAIRS = 4    # Stairs and ladders
+    DOWN_STAIRS = 5  # Stairs and ladders
+    WATER_LAVA = 6   # Water and lava
+    TRAPS = 7        # All types of traps
+    ITEMS = 8        # Pickupable items (weapons, armor, etc.)
+    FURNITURE = 9    # Non-movable environment objects
+    PLAYER_OR_HUMAN = 10  # Player character or human-like entities
+    HARMLESS_MONSTERS = 11    # Living creatures that do not pose a threat
+    LOW_THREAT_MONSTERS = 12  # Low-threat monsters (e.g. rats, kobolds)
+    MEDIUM_THREAT_MONSTERS = 13  # Medium-threat monsters (e.g. goblins, orcs)
+    HIGH_THREAT_MONSTERS = 14  # High-threat monsters (e.g. dragons, demons)
+    EXTREME_THREAT_MONSTERS = 15  # Extreme-threat monsters (e.g. demons, liches)
+    UNKNOWN_MONSTERS = 16  # Monsters with unknown threat level
+
+    @classmethod
+    def get_categories(cls) -> List[str]:
+        """Get list of all category names."""
+        return [category.name for category in cls]
+    
+    @classmethod
+    def get_category_count(cls) -> int:
+        """Get total number of categories."""
+        return len(cls)
+
+    def get_category_name(self) -> str:
+        """Get the name of the category."""
+        return self.name
+
+
+# Complete categorization sets (existing structure preserved)
+WALLS = {
+    (ord('|'), CLR_GRAY), 
+    (ord('-'), CLR_GRAY),
+    (ord('#'), CLR_CYAN),    # iron bars
+}
+
+DOORS = {
+    (ord('+'), CLR_BROWN),   # closed door
+    
+}
+
+FLOORS = {
+    (ord('.'), CLR_GRAY),    # room floor
+    (ord('.'), CLR_BLACK),   # dark room
+    (ord('#'), CLR_GRAY),    # corridor
+    (ord('.'), CLR_CYAN),    # ice
+    (ord('|'), CLR_BROWN),   # open door horizontal
+    (ord('-'), CLR_BROWN),   # open door vertical
+}
+
+UP_STAIRS = {
+    (ord('<'), CLR_GRAY),    # stairs up
+    (ord('<'), CLR_BROWN)    # ladder up
+}
+
+DOWN_STAIRS = {
+    (ord('>'), CLR_GRAY),    # stairs down
+    (ord('>'), CLR_BROWN),   # ladder down
+}
+
+WATER_LAVA = {
+    (ord('}'), CLR_BLUE),    # water
+    (ord('}'), CLR_RED),     # lava
+}
+
+TRAPS = {
+    (ord('^'), CLR_CYAN),              # metal traps (arrow, dart, bear)
+    (ord('^'), CLR_GRAY),              # stone traps (falling rock, boulder, statue)
+    (ord('^'), CLR_BROWN),             # wooden traps (squeaky board, hole, trap door)
+    (ord('^'), CLR_RED),               # fire traps (land mine, fire)
+    (ord('^'), CLR_BLUE),              # rust traps
+    (ord('^'), CLR_BLACK),             # pit traps
+    (ord('^'), CLR_BRIGHT_BLUE),       # magic traps (sleeping gas, magic, anti-magic)
+    (ord('^'), CLR_MAGENTA),           # teleport traps
+    (ord('^'), CLR_BRIGHT_MAGENTA),    # magic portal
+    (ord('^'), CLR_BRIGHT_GREEN),      # polymorph traps
+    (ord('"'), CLR_GRAY),              # web
+    (ord('~'), CLR_MAGENTA),           # vibrating square
+}
+
+ITEMS = {
+    (ord('$'), CLR_YELLOW),            # gold
+    (ord('"'), CLR_BRIGHT_MAGENTA),    # amulet
+    (ord(')'), CLR_CYAN),              # weapon
+    (ord('['), CLR_BROWN),             # armor
+    (ord('='), CLR_CYAN),              # ring
+    (ord('('), CLR_BROWN),             # tool
+    (ord('%'), CLR_RED),               # food
+    (ord('!'), CLR_BLUE),              # potion
+    (ord('?'), CLR_WHITE),             # scroll
+    (ord('+'), CLR_BROWN),             # spellbook
+    (ord('/'), CLR_BROWN),             # wand
+    (ord('*'), CLR_GRAY),              # gem
+    (ord('`'), CLR_GRAY),              # rock
+}
+
+FURNITURE = {
+    (ord('_'), CLR_GRAY),              # altar
+    (ord('|'), CLR_WHITE),             # grave
+    (ord('\\'), CLR_YELLOW),           # throne
+    (ord('#'), CLR_GRAY),              # sink (when context is furniture)
+    (ord('{'), CLR_BRIGHT_BLUE),       # fountain
+    (ord('#'), CLR_GREEN),             # tree
+}
+
+def categorize_monster_by_threat_level(char, color):
+    """Categorize monsters by threat level using both character and color."""
+
+    # CLR_BRIGHT_MAGENTA color always indicates extreme threat regardless of character
+    if color == CLR_BRIGHT_MAGENTA:
+        return NetHackCategory.EXTREME_THREAT_MONSTERS
+    
+    # Character-based base threat assessment with color modifiers
+    
+    # Harmless/weak - but color can upgrade threat
+    if char in ['r', 'n', 'y', ':', 'l']:  # rodents, nymphs, lights, lizards, leprechauns
+        if color in [CLR_RED, CLR_BLACK]:  # Aggressive/dark variants
+            return NetHackCategory.LOW_THREAT_MONSTERS  # Upgrade from harmless
+        return NetHackCategory.HARMLESS_MONSTERS
+
+    # Low threat - color can modify
+    if char in ['a', 'b', 'j', 'k', 'f', 'B', 'F', 'e', ';']:  # ants, blobs, jellies, kobolds, cats, bats, fungi, eyes, eels
+        if color == CLR_RED:  # Fire variants (fire ants, hell hounds)
+            return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Upgrade threat
+        elif color == CLR_BLACK:  # Dark/evil variants
+            return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Upgrade threat
+        return NetHackCategory.LOW_THREAT_MONSTERS
+
+    # Medium threat - color can modify significantly
+    if char in ['d', 'o', 'g', 'h', 's', 'G', 'O', 'c', 'p', 'q', 'u', 'C', 'S', 'K', 'Y']:
+        if color == CLR_RED:  # Fire/hell variants (hell hounds, fire giants)
+            return NetHackCategory.HIGH_THREAT_MONSTERS  # Upgrade threat
+        elif color == CLR_BLACK:  # Dark/powerful variants
+            return NetHackCategory.HIGH_THREAT_MONSTERS  # Upgrade threat
+        return NetHackCategory.MEDIUM_THREAT_MONSTERS
+
+    # High threat - color can push to extreme
+    if char in ['D', 'L', 'V', 'H', 'T', 'v', 'w', 'E', 'N', 'P', 'R', 'U', 'X', 'J']:
+        # Special case: Dragons have color-specific threat levels
+        if char == 'D':
+            if color == CLR_RED:    # Red dragon - extremely dangerous
+                return NetHackCategory.EXTREME_THREAT_MONSTERS
+            elif color == CLR_BLACK: # Black dragon - very dangerous
+                return NetHackCategory.EXTREME_THREAT_MONSTERS
+            elif color in [1, 4, 2, 11, 0, 15, 6]:  # All adult dragons are high threat
+                return NetHackCategory.HIGH_THREAT_MONSTERS
+        
+        # Liches with special colors
+        if char == 'L' and color in [CLR_RED, CLR_BLACK]:
+            return NetHackCategory.EXTREME_THREAT_MONSTERS  # Master lich, arch-lich
+
+        # Giants with fire/dark variants
+        if char == 'H' and color in [CLR_RED, CLR_BLACK]:
+            return NetHackCategory.EXTREME_THREAT_MONSTERS  # Fire giants, storm giants
+
+        return NetHackCategory.HIGH_THREAT_MONSTERS
+    
+    # Extreme threat - color confirms or maintains
+    if char in ['&', 'A', 'W', 'Q']:
+        # Demons with CLR_BRIGHT_MAGENTA color are the worst
+        if char == '&' and color == CLR_BRIGHT_MAGENTA:
+            return NetHackCategory.EXTREME_THREAT_MONSTERS  # Demon lords, princes
+        return NetHackCategory.EXTREME_THREAT_MONSTERS
+
+    # Special/variable threat
+    if char == '@':
+        return NetHackCategory.PLAYER_OR_HUMAN  # Could be player OR NPC human
+
+    # Unique/special cases with color consideration
+    if char == ' ':  # ghosts
+        if color == CLR_BLACK:
+            return NetHackCategory.HIGH_THREAT_MONSTERS  # Dark/powerful ghosts
+        return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Regular ghosts
+    
+    if char == "'":  # golems
+        if color in [CLR_RED, CLR_BLACK, 8]:  # Iron golems, special golems
+            return NetHackCategory.EXTREME_THREAT_MONSTERS
+        return NetHackCategory.HIGH_THREAT_MONSTERS  # Regular golems
+    
+    if char in ['m', 't', ']']:  # mimics, trappers, mimic_def
+        if color in [CLR_RED, CLR_BLACK]:  # Aggressive/dangerous variants
+            return NetHackCategory.HIGH_THREAT_MONSTERS
+        return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Surprise/ambush monsters
+    
+    if char in ['i', 'x', 'z', 'M', 'Z']:  # imps, xan, zruty, mummies, zombies
+        if color in [CLR_RED, CLR_BLACK]:  # Powerful undead/demons
+            return NetHackCategory.HIGH_THREAT_MONSTERS
+        return NetHackCategory.MEDIUM_THREAT_MONSTERS
+    
+    if char == '~':  # worm tails
+        return NetHackCategory.LOW_THREAT_MONSTERS  # Just tail segments
+
+    return NetHackCategory.UNKNOWN
+
+def categorize_glyph(char_code: int, color_code: int) -> NetHackCategory:
+    """
+    Categorize a (character, color) pair into a NetHackCategory.
+    
+    Args:
+        char_code: ASCII character code (32-127)
+        color_code: Color index (0-15)
+        
+    Returns:
+        NetHackCategory enum value
+        
+    Examples:
+        categorize_glyph(ord('|'), CLR_GRAY) -> NetHackCategory.WALLS
+        categorize_glyph(ord('.'), CLR_GRAY) -> NetHackCategory.FLOORS
+    """
+    pair = (char_code, color_code)
+    
+    # Space/padding
+    if char_code == PADDING_CHAR and color_code == PADDING_COLOR:
+        return NetHackCategory.UNKNOWN
+    
+    # Check predefined categories
+    if pair in WALLS:
+        return NetHackCategory.WALLS
+    elif pair in DOORS:
+        return NetHackCategory.DOORS
+    elif pair in FLOORS:
+        return NetHackCategory.FLOORS
+    elif pair in UP_STAIRS:
+        return NetHackCategory.UP_STAIRS
+    elif pair in DOWN_STAIRS:
+        return NetHackCategory.DOWN_STAIRS
+    elif pair in WATER_LAVA:
+        return NetHackCategory.WATER_LAVA
+    elif pair in TRAPS:
+        return NetHackCategory.TRAPS
+    elif pair in ITEMS:
+        return NetHackCategory.ITEMS
+    elif pair in FURNITURE:
+        return NetHackCategory.FURNITURE
+    elif char_code.isalpha() or char_code in ['@', ' ', "'", '&', ';', ':', '~', ']']:
+        return categorize_monster_by_threat_level(char_code, color_code)
+    else:
+        return NetHackCategory.UNKNOWN
+
+
+def categorize_glyph_tensor(char_tensor: torch.Tensor, color_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Vectorized categorization for tensors of glyph data.
+    
+    Args:
+        char_tensor: Tensor of character codes, any shape
+        color_tensor: Tensor of color codes, same shape as char_tensor
+        
+    Returns:
+        Tensor of category indices (NetHackCategory values), same shape as input
+        
+    Example:
+        chars = torch.tensor([[ord('.'), ord('|')], [ord('@'), ord(' ')]])
+        colors = torch.tensor([[CLR_GRAY, CLR_GRAY], [CLR_WHITE, CLR_BLACK]])
+        categories = categorize_glyph_tensor(chars, colors)
+        # Returns: [[FLOORS, WALLS], [HERO, SPACE]]
+    """
+    original_shape = char_tensor.shape
+    char_flat = char_tensor.flatten()
+    color_flat = color_tensor.flatten()
+    
+    # Initialize result tensor
+    result = torch.full_like(char_flat, NetHackCategory.UNKNOWN.value, dtype=torch.long)
+    
+    # Vectorized categorization using masks
+    hero_mask = char_flat == HERO_CHAR
+    result[hero_mask] = NetHackCategory.PLAYER_OR_HUMAN.value
+
+    space_mask = (char_flat == PADDING_CHAR) & (color_flat == PADDING_COLOR)
+    
+    # For other categories, we need to check pairs
+    # This is less efficient but more readable - could be optimized if needed
+    for i in range(len(char_flat)):
+        if not (hero_mask[i] or space_mask[i]):
+            category = categorize_glyph(char_flat[i].item(), color_flat[i].item())
+            result[i] = category.value
+    
+    return result.reshape(original_shape)
+
+
+def get_category_distribution(char_tensor: torch.Tensor, color_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Get the distribution of categories in the given tensors.
+    
+    Args:
+        char_tensor: Tensor of character codes
+        color_tensor: Tensor of color codes
+        
+    Returns:
+        Tensor of shape [num_categories] with counts for each category
+    """
+    categories = categorize_glyph_tensor(char_tensor, color_tensor)
+    num_categories = NetHackCategory.get_category_count()
+    
+    # Count occurrences of each category
+    counts = torch.zeros(num_categories, dtype=torch.long)
+    for i in range(num_categories):
+        counts[i] = (categories == i).sum()
+    
+    return counts
+
+
+def print_category_distribution(char_tensor: torch.Tensor, color_tensor: torch.Tensor):
+    """
+    Print a human-readable distribution of categories.
+    
+    Args:
+        char_tensor: Tensor of character codes
+        color_tensor: Tensor of color codes
+    """
+    counts = get_category_distribution(char_tensor, color_tensor)
+    total = counts.sum().item()
+    
+    print("Category Distribution:")
+    print("-" * 40)
+    for category in NetHackCategory:
+        count = counts[category.value].item()
+        percentage = (count / total * 100) if total > 0 else 0
+        print(f"{category.name:<12}: {count:>6} ({percentage:>5.1f}%)")
+    print("-" * 40)
+    print(f"{'TOTAL':<12}: {total:>6} (100.0%)")
 
 
 def _gn_groups(c: int) -> int:
@@ -212,6 +551,21 @@ def hero_presence_and_centroid(glyph_chars: torch.Tensor) -> tuple[torch.Tensor,
     # for absent cases, centroids won’t be used (masked by present)
     return present, centroid
 
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, num_layers: int = 2, dropout: float = 0.0):
+        super().__init__()
+        layers: List[nn.Module] = []
+        d = in_dim
+        for i in range(num_layers - 1):
+            layers += [nn.Linear(d, hidden), nn.ReLU(inplace=True)]
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            d = hidden
+        layers.append(nn.Linear(d, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 class ConvBlock(nn.Module):
     """
@@ -318,6 +672,91 @@ class ResBlockFiLM(nn.Module):
         h = self.conv2(h); h = self.gn2(h); h = self.film2(h, z); h = self.act(h); h = self.drop(h)
         return h + self.skip(x)
 
+
+@dataclass
+class VAEConfig:
+    
+    # Embedding dimensions
+    # --- Character and color embeddings
+    char_emb: int = 16      # char‑id embedding dim (0-15)
+    color_emb: int = 4       # colour‑id embedding dim
+    glyph_emb: int = field(init=False)  # glyph embedding dim
+    
+    # --- Entity embeddings
+    role_emb: int = 8        # role embedding dim
+    race_emb: int = 4      # race embedding dim
+    gend_emb: int = 2      # gender embedding dim
+    align_emb: int = 2     # alignment embedding dim
+
+    dropout: float = 0.0    # dropout rate for all layers
+
+    # --- Latent space
+    latent_dim: int = 96     # z‑dim for VAE
+    bag_dim: int = 24        # bag embedding dim (for glyph-bag)
+    core_dim: int = field(init=False)  # core embedding dim (for map encoder)
+    low_rank: int = 0        # low-rank factorisation rank for covariance
+    
+    # Encoder settings
+    # --- Map encoder ---
+    attn_queries: int = 4          # number of attention queries for pooling
+    map_feat_channels: int = 96         # feature channels in map encoder
+    # --- Stats encoder ---
+    stat_feat_channels: int = 16         # feature channels in stats encoder
+    # --- Message encoder ---
+    msg_emb: int = 32                     # message embedding dim
+    msg_hidden: int = 12                # message hidden dim
+
+    # Decoder settings
+    # --- Map decoder ---
+    ego_window: int = 9                       # must be odd
+    ego_classes: int = NetHackCategory.get_category_count()  # number of ego classes
+    map_dec_base_ch: int = 64          # base channels in map decoder
+    passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
+    
+    # Dynamics heads
+    action_dim: int = 0                        # one‑hot; 0 disables forward/inverse
+    forward_hidden: int = 256
+    use_inverse_dynamics: bool = True
+
+    # Skill belief (future sticky HMM integration)
+    skill_num: int = 0                         # number of skills; 0 disables skill head
+
+    # KL prior mode
+    prior_mode: str = "standard"               # "standard" | "hmm" | "blend"
+    prior_blend_alpha: float = 0.5
+
+    # Loss weights
+    raw_modality_weights: Dict[str, float] = field(default_factory=lambda: {
+        'ego_sem': 3.5,
+        'ego_bits': 1.0,
+        'passability': 1.8,
+        'safety': 0.8,
+        'reward': 1.0,
+        'done': 1.0,
+        'value': 1.0,
+        'bag': 8.0,
+        'stats': 0.5,
+        'goal': 1.0,
+        'lowres_occ': 0.3,
+        'forward': 1.0,
+        'inverse': 0.8,
+        'ego_char': 0.3,
+        'ego_color': 0.3,
+    })
+
+    # KL settings
+    beta: float = 1.0                          # trainer can do capacity scheduling externally
+    
+    def __post_init__(self):
+        self.glyph_emb = self.char_emb + self.color_emb
+        self.core_dim = self.latent_dim - self.bag_dim
+        if self.core_dim <= 0:
+            raise ValueError("Core dimension must be positive; check latent_dim and bag_dim settings.")
+        if self.ego_window % 2 == 0:
+            raise ValueError("Ego window must be odd; got {}".format(self.ego_window))
+        if self.action_dim < 0:
+            raise ValueError("Action dimension must be non-negative; got {}".format(self.action_dim))
+
 class MapEncoder(nn.Module):
     """
     NetHack map encoder:
@@ -329,28 +768,28 @@ class MapEncoder(nn.Module):
 
     Forward returns a vector suitable for a VAE encoder MLP or heads.
     """
-    def __init__(self, dropout=0.0, attn_queries=2, feat_channels=96):
+    def __init__(self, config: VAEConfig):
         super().__init__()
-        self.char_emb = nn.Embedding(CHAR_DIM + 1, CHAR_EMB, padding_idx=0)
-        self.col_emb  = nn.Embedding(COLOR_DIM + 1, COLOR_EMB, padding_idx=0)
-        in_ch = CHAR_EMB + COLOR_EMB + 1  # + foreground mask
+        self.char_emb = nn.Embedding(CHAR_DIM + 1, config.char_emb, padding_idx=0)
+        self.col_emb  = nn.Embedding(COLOR_DIM + 1, config.color_emb, padding_idx=0)
+        in_ch = config.char_emb + config.color_emb + 1  # + foreground mask
         in_ch += 2 # +2 for CoordConv (x,y in [-1,1])
 
         # Stem
-        self.stem = ConvBlock(in_ch, 64, k=3, dilation=1, drop=dropout)
+        self.stem = ConvBlock(in_ch, 64, k=3, dilation=1, drop=config.dropout)
 
         # Body: mix normal and width-focused dilations (map is 21x79)
         self.body = nn.Sequential(
-            ConvBlock(64, 64, k=3, dilation=1,        drop=dropout),      # local
-            ConvBlock(64, 64, k=3, dilation=(1, 3),   drop=dropout),      # widen RF (width)
-            ConvBlock(64, 64, k=3, dilation=1,        drop=dropout),
-            ConvBlock(64, 96, k=3, dilation=(1, 9),   drop=dropout),
-            ConvBlock(96, feat_channels, k=3, dilation=1, drop=dropout),
+            ConvBlock(64, 64, k=3, dilation=1,        drop=config.dropout),      # local
+            ConvBlock(64, 64, k=3, dilation=(1, 3),   drop=config.dropout),      # widen RF (width)
+            ConvBlock(64, 64, k=3, dilation=1,        drop=config.dropout),
+            ConvBlock(64, 96, k=3, dilation=(1, 9),   drop=config.dropout),
+            ConvBlock(96, config.map_feat_channels, k=3, dilation=1, drop=config.dropout),
         )
 
         # Pooling
-        self.pool = AttnPool(C=feat_channels, K=attn_queries)
-        pooled_dim = feat_channels * attn_queries
+        self.pool = AttnPool(C=config.map_feat_channels, K=config.attn_queries)
+        pooled_dim = config.map_feat_channels * config.attn_queries
 
         # Tiny head you can keep or replace downstream
         self.out_dim = pooled_dim
@@ -384,63 +823,32 @@ class MapEncoder(nn.Module):
     
 class MapDecoder(nn.Module):
     """Latent vector -> occupancy/glyph/color logits at 21x79, with FiLM and CoordConv."""
-    def __init__(self, z_bag_dim: int, z_core_dim:int, char_dim: int, color_dim: int,
-                 H: int = MAP_HEIGHT, W: int = MAP_WIDTH,
-                 base_ch: int = 256, mid_ch: int = 128, drop: float = 0.1,
-                 occ_prior: float = 0.1, rare_cond_prior: float = 0.05):
+    def __init__(self, config: VAEConfig):
         super().__init__()
-        self.H, self.W = H, W
-        self.base_ch = base_ch
-        self.z_bag_dim = z_bag_dim
-        self.z_core_dim = z_core_dim
-        # coords
-        yy = torch.linspace(-1, 1, H).view(1,1,H,1).expand(1,1,H,W).clone()
-        xx = torch.linspace(-1, 1, W).view(1,1,1,W).expand(1,1,H,W).clone()
-        self.register_buffer("coord_y", yy)
-        self.register_buffer("coord_x", xx)
+        self.z_bag_dim = config.bag_dim
+        self.z_core_dim = config.core_dim
+        self.latent_dim = config.latent_dim
+        self.ego_window = config.ego_window
+        self.ego_classes = config.ego_classes
+        self.base_ch = config.map_dec_base_ch
+        
+        self.bag_head = MLP(self.z_bag_dim, 128, GLYPH_DIM, num_layers=2, dropout=config.dropout)
+        
+        self.hero_presence_head = nn.Linear(self.z_bag_dim, 1)   # logits
+        self.hero_centroid_head = nn.Linear(self.z_bag_dim, 2)   # tanh -> [-1,1]
+        self.ego_head = MLP(config.latent_dim, 128, self.ego_window * self.ego_window * self.ego_classes, num_layers=2, dropout=config.dropout)
+        
         # project z to a broadcast feature map
-        self.z_core_to_map = nn.Sequential(nn.Linear(z_core_dim, base_ch), nn.ReLU(inplace=True), nn.Linear(base_ch, base_ch))
-        # stem
-        self.core_stem = nn.Sequential(
-            nn.Conv2d(base_ch + 2, mid_ch, 3, padding=1),
-            nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-        )
+        self.z_core_to_map = nn.Sequential(nn.Linear(self.z_core_dim, config.map_dec_base_ch), nn.ReLU(inplace=True), nn.Linear(config.map_dec_base_ch, config.map_dec_base_ch))
+        self.head_occ = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, 1, 1))
+
+        self.z_to_ego_map = nn.Sequential(nn.Linear(self.latent_dim, config.map_dec_base_ch), nn.ReLU(inplace=True), nn.Linear(config.map_dec_base_ch, config.map_dec_base_ch))
         # FiLM-conditioned residual body (anisotropic to cover width)
-        # self.core_block1 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_core_dim)
-        # self.core_block2 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_core_dim)
-        # # local refinement
-        # self.core_refine = nn.Sequential(
-        #     nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-        #     nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-        # )
+        self.core_block = ResBlockFiLM(config.map_dec_base_ch, config.map_dec_base_ch, (1,9),  config.dropout, z_dim=self.latent_dim)
+
         # heads
-        self.head_occ = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
-        self.head_chr = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, char_dim, 1))
-        self.head_col = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, color_dim, 1))
-        
-        self.z_bag_to_map = nn.Sequential(nn.Linear(z_bag_dim, base_ch), nn.ReLU(inplace=True), nn.Linear(base_ch, base_ch))
-        # stem
-        self.bag_stem = nn.Sequential(
-            nn.Conv2d(base_ch + 2, mid_ch, 3, padding=1),
-            nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-        )
-        # FiLM-conditioned residual body (anisotropic to cover width)
-        # self.bag_block1 = ResBlockFiLM(mid_ch, mid_ch, (1,9),  drop, z_dim=z_bag_dim)
-        # self.bag_block2 = ResBlockFiLM(mid_ch, mid_ch, (1,27), drop, z_dim=z_bag_dim)
-        # # local refinement
-        # self.bag_refine = nn.Sequential(
-        #     nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-        #     nn.Conv2d(mid_ch, mid_ch, 3, padding=1), nn.GroupNorm(_gn_groups(mid_ch), mid_ch), nn.ReLU(inplace=True),
-        # )
-        self.head_rare_occ = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, 1, 1))
-        self.head_rare_chr = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, char_dim, 1))
-        self.head_rare_col = nn.Sequential(nn.Conv2d(mid_ch, mid_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(mid_ch//2, color_dim, 1))
-        
-        with torch.no_grad():
-            b = math.log(max(occ_prior, 1e-6) / max(1 - occ_prior, 1e-6))
-            self.head_occ[-1].bias.fill_(b)
-            rb = math.log(max(rare_cond_prior, 1e-6) / max(1 - rare_cond_prior, 1e-6))
-            self.head_rare_occ[-1].bias.fill_(rb)
+        self.head_chr = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, CHAR_DIM, 1))
+        self.head_col = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, COLOR_DIM, 1))
 
     def _prior_to_bias(self, prior: torch.Tensor, strength: float) -> torch.Tensor:
         """
@@ -451,42 +859,33 @@ class MapDecoder(nn.Module):
         return strength * torch.log(p / (1 - p))
 
 
-    def forward(self, z: torch.Tensor,
-                char_bag_prior: Optional[torch.Tensor] = None,   # [B,CHAR_DIM] optional
-                color_bag_prior: Optional[torch.Tensor] = None,   # [B,COLOR_DIM] optional
-                bag_bias_strength: float = 1.0,  # strength of prior bias
+    def forward(self, z: torch.Tensor
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
         B = z.size(0)
         z_bag  = z[:, :self.z_bag_dim]
         z_core = z[:, self.z_bag_dim:]
 
-        z_core_map = self.z_core_to_map(z_core).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
-        x_core = torch.cat([z_core_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
-        x_core = self.core_stem(x_core)
-        # x_core = self.core_block1(x_core, z_core)
-        # x_core = self.core_block2(x_core, z_core)
-        # x_core = self.core_refine(x_core)
-        occ = self.head_occ(x_core)
-        g_log  = self.head_chr(x_core)
-        c_log  = self.head_col(x_core)
+        bag_head_logits = self.bag_head(z_bag)  # [B, GLYPH_DIM]
+        hero_logits = self.hero_presence_head(z_bag).squeeze(1)  # [B,]
+        hero_centroid = torch.tanh(self.hero_centroid_head(z_bag))  # [B,2] in [-1,1]
+        ego_logits = self.ego_head(z).view(-1, self.ego_classes, self.ego_window, self.ego_window)  # [B, C, k, k]
         
-        z_bag_map = self.z_bag_to_map(z_bag).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.H, self.W)
-        x_bag = torch.cat([z_bag_map, self.coord_y.expand(B,-1,-1,-1), self.coord_x.expand(B,-1,-1,-1)], dim=1)
-        x_bag = self.bag_stem(x_bag)
-        # x_bag = self.bag_block1(x_bag, z_bag)
-        # x_bag = self.bag_block2(x_bag, z_bag)
-        # x_bag = self.bag_refine(x_bag)
-        rare_occ = self.head_rare_occ(x_bag)
-        g_rare_log  = self.head_rare_chr(x_bag)
-        c_rare_log  = self.head_rare_col(x_bag)
+        z_core_map = self.z_core_to_map(z_core).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, MAP_HEIGHT, MAP_WIDTH)  # [B, C, H, W]
+        occ = self.head_occ(z_core_map)  # [B, 1, H, W]
+        z_ego_map = self.z_to_ego_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.ego_window, self.ego_window)  # [B, C, k, k]
+        x_ego = self.core_block(z_ego_map, z)  # [B, C, k, k]
+        g_logits = self.head_chr(x_ego)  # [B, CHAR_DIM, k, k]
+        c_logits = self.head_col(x_ego)  # [B, COLOR_DIM, k, k]
         
-        if char_bag_prior is not None:
-            cb = self._prior_to_bias(char_bag_prior, bag_bias_strength).view(B, CHAR_DIM, 1, 1).expand_as(g_log)
-            g_rare_log = g_rare_log + cb
-        if color_bag_prior is not None:
-            kb = self._prior_to_bias(color_bag_prior, bag_bias_strength).view(B, COLOR_DIM, 1, 1).expand_as(c_log)
-            c_rare_log = c_rare_log + kb
-        return occ, g_log, c_log, rare_occ, g_rare_log, c_rare_log
+        out['bag_logits'] = bag_head_logits
+        out['hero_presence_logits'] = hero_logits
+        out['hero_centroid'] = hero_centroid
+        out['ego_class_logits'] = ego_logits
+        out['occupy_logits'] = occ
+        out['ego_char_logits'] = g_logits
+        out['ego_color_logits'] = c_logits
+        return out
 
     @staticmethod
     def _filter_topk_topp_channels(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
@@ -663,14 +1062,14 @@ class BlstatsPreprocessor(nn.Module):
         return {"cont": cont_norm, "hunger": hunger, "dungeon": dung, "level": level, "cond": cond_vec}
 
 class StatsEncoder(nn.Module):
-    def __init__(self, stats: int=BLSTATS_DIM, emb_dim: int=64):
+    def __init__(self, config: VAEConfig, stats: int = BLSTATS_DIM):
         super().__init__()
         self.preprocessor = BlstatsPreprocessor(stats_dim=stats)
         input_dim = self.preprocessor.get_output_dim()  # 43 dimensions after preprocessing
-        
+        self.out_dim = config.stat_feat_channels  # 16 output channels
         self.net = nn.Sequential(
             nn.Linear(input_dim, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
+            nn.Linear(32, config.stat_feat_channels), nn.ReLU(),
         )
         
     def forward(self, stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -680,14 +1079,14 @@ class StatsEncoder(nn.Module):
     
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
-        return 16
-    
+        return self.out_dim
+
 class StatsDecoder(nn.Module):
     """Predict stats with proper likelihoods: continuous (Gaussian), discrete (CE), conditions (BCE)."""
     def __init__(self, z_dim: int, cont_dim: int = 19):
         super().__init__()
         hid = 256
-        self.net = nn.Sequential(nn.Linear(z_dim, hid), nn.SiLU(), nn.Linear(hid, hid), nn.SiLU())
+        self.net = nn.Sequential(nn.Linear(z_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
         self.mu      = nn.Linear(hid, cont_dim)
         self.logvar  = nn.Linear(hid, cont_dim)
         self.hunger  = nn.Linear(hid, 7)
@@ -699,14 +1098,14 @@ class StatsDecoder(nn.Module):
         return {"mu": self.mu(h), "logvar": self.logvar(h), "hunger": self.hunger(h), "dungeon": self.dungeon(h), "level": self.level(h), "cond": self.cond(h)}
 
 class MessageEncoder(nn.Module):
-    def __init__(self, vocab: int=MSG_VSIZE, emb: int=32, hid: int=12):
+    def __init__(self, config: VAEConfig,vocab: int=MSG_VSIZE):
         super().__init__()
-        self.emb_dim = emb
-        self.hid_dim = hid
+        self.emb_dim = config.msg_emb
+        self.hid_dim = config.msg_hidden
         self.vocab = vocab
-        self.emb = nn.Embedding(vocab, emb, padding_idx=MSG_PAD)
-        self.gru = nn.GRU(emb, hid, batch_first=True, bidirectional=True)  # bidirectional GRU
-        self.out = nn.Linear(hid * 2, hid)  # output layer to reduce to hid_dim
+        self.emb = nn.Embedding(vocab, self.emb_dim, padding_idx=MSG_PAD)
+        self.gru = nn.GRU(self.emb_dim, self.hid_dim, batch_first=True, bidirectional=True)  # bidirectional GRU
+        self.out = nn.Linear(self.hid_dim * 2, self.hid_dim)  # output layer to reduce to hid_dim
         self.sos = MSG_SOS  # start-of-sequence token
         self.eos = MSG_EOS  # end-of-sequence token
 
@@ -860,13 +1259,14 @@ class MessageDecoder(nn.Module):
     
 class HeroEmbedding(nn.Module):
     """Hero embedding for MiniHack."""
-    def __init__(self):
+    def __init__(self, config: VAEConfig):
         super().__init__()
-        self.role_emb = nn.Embedding(ROLE_CAD, ROLE_EMB)
-        self.race_emb = nn.Embedding(RACE_CAD, RACE_EMB)
-        self.gend_emb = nn.Embedding(GEND_CAD, GEND_EMB)
-        self.align_emb = nn.Embedding(ALIGN_CAD, ALIGN_EMB)
-    
+        self.role_emb = nn.Embedding(ROLE_CAD, config.role_emb)
+        self.race_emb = nn.Embedding(RACE_CAD, config.race_emb)
+        self.gend_emb = nn.Embedding(GEND_CAD, config.gend_emb)
+        self.align_emb = nn.Embedding(ALIGN_CAD, config.align_emb)
+        self.out_dim = config.role_emb + config.race_emb + config.gend_emb + config.align_emb
+
     def forward(self, role: torch.Tensor, race: torch.Tensor,
                 gend: torch.Tensor, align: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Forward pass for hero embedding."""
@@ -882,8 +1282,7 @@ class HeroEmbedding(nn.Module):
     
     def get_output_channels(self) -> int:
         """Returns the number of output channels for hero embedding."""
-        return ROLE_EMB + RACE_EMB + GEND_EMB + ALIGN_EMB  # 16
-
+        return self.out_dim  # 16
 class MultiModalHackVAE(nn.Module):
     def __init__(self, 
                  bInclude_glyph_bag=True, 
