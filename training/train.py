@@ -54,7 +54,7 @@ except ImportError:
     print("⚠️  scikit-learn not available. Install with: pip install scikit-learn")
     SKLEARN_AVAILABLE = False
 
-from src.model import MultiModalHackVAE, vae_loss, LATENT_DIM, CHAR_DIM
+from src.model import MultiModalHackVAE, vae_loss, CHAR_DIM, VAEConfig
 import torch.optim as optim
 import random
 from pathlib import Path

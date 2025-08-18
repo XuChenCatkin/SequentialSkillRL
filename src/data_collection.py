@@ -10,6 +10,170 @@ import os
 import pickle
 import re
 
+# ---- Direction / actions -----------------------------------------------------
+DIRS_8 = [(-1,0),(+1,0),(0,+1),(0,-1),(-1,+1),(-1,-1),(+1,+1),(+1,-1)]  # N,S,E,W,NE,NW,SE,SW
+ACTION_NAMES = ["N","S","E","W","NE","NW","SE","SW","WAIT"]
+ACTION_DIM = 9  # 8 moves + wait
+
+VI_KEY_TO_DIR = {
+    ord('k'):(-1,0), ord('j'):(+1,0), ord('l'):(0,+1), ord('h'):(0,-1),
+    ord('u'):(-1,+1), ord('y'):(-1,-1), ord('n'):(+1,+1), ord('b'):(+1,-1),
+}
+WAIT_KEYS = {ord('.'), ord(' '), 13}  # '.', space, Enter
+
+def map_keypress_to_action_index(code: int) -> int:
+    """Map tty key code to action index in 0..8 (8 = WAIT). Unknown → WAIT."""
+    if code in VI_KEY_TO_DIR:
+        dy, dx = VI_KEY_TO_DIR[code]
+    else:
+        # try arrows (optional): you can extend this table if your dataset encodes arrows specially
+        dy, dx = (0,0)
+        if code in WAIT_KEYS:
+            dy, dx = (0,0)
+    # map to index
+    if   (dy,dx)==(-1,0): return 0
+    elif (dy,dx)==(+1,0): return 1
+    elif (dy,dx)==(0,+1): return 2
+    elif (dy,dx)==(0,-1): return 3
+    elif (dy,dx)==(-1,+1): return 4
+    elif (dy,dx)==(-1,-1):return 5
+    elif (dy,dx)==(+1,+1):return 6
+    elif (dy,dx)==(+1,-1):return 7
+    else:                  return 8  # WAIT
+
+def one_hot(indices: torch.Tensor, num_classes: int) -> torch.Tensor:
+    out = torch.zeros(*indices.shape, num_classes, dtype=torch.float32)
+    out.scatter_(-1, indices.long().unsqueeze(-1), 1.0)
+    return out
+
+# ---- Passability / safety rules (ASCII) -------------------------------------
+WALLS       = {ord('|'), ord('-')}
+GROUND      = {ord('.'), ord('#')}
+CLOSED_DOOR = {ord('+')}
+OPEN_DOOR   = {ord('/')}          # if absent in your tty, treat as ground
+STAIRS      = {ord('<'), ord('>')}
+TRAPS       = {ord('^')}
+BOULDER     = {ord('0')}
+WATER_LAVA  = {ord('~')}
+SPECIAL     = {ord('_'), ord('}'), ord('{'), ord('\\')}
+ITEMS       = set(map(ord, list(')$!?"[=*%/,:;')))
+
+def is_monster(ch: int) -> bool:
+    return (65 <= ch <= 90) or (97 <= ch <= 122)  # A..Z or a..z
+
+PASSABLE = GROUND | OPEN_DOOR | STAIRS | SPECIAL | ITEMS  # monsters treated separately
+
+def compute_passability_and_safety(chars: torch.Tensor,
+                                   colors: torch.Tensor,
+                                   hero_y: int, hero_x: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (pass8, safe8) as float tensors of shape [8]."""
+    H, W = chars.shape
+    pass8 = torch.zeros(8, dtype=torch.float32)
+    safe8 = torch.zeros(8, dtype=torch.float32)
+    for i,(dy,dx) in enumerate(DIRS_8):
+        y, x = hero_y + dy, hero_x + dx
+        if not (0 <= y < H and 0 <= x < W):
+            pass8[i] = 0.0; safe8[i] = 0.0; continue
+        ch = int(chars[y,x])
+        # legal to step?
+        legal = (ch in PASSABLE) or is_monster(ch)
+        # safety: legal AND not a hazard/unknown/monster
+        unsafe = (ch in TRAPS) or (ch in WATER_LAVA) or (ch == ord(' ')) or is_monster(ch)
+        pass8[i] = 1.0 if legal else 0.0
+        safe8[i] = 1.0 if (legal and not unsafe) else 0.0
+    return pass8, safe8
+
+# ---- Goal vector (nearest stairs) -------------------------------------------
+def nearest_stairs_vector(chars: torch.Tensor,
+                          hero_y: int, hero_x: int,
+                          prefer: str = '>') -> tuple[float, float] | None:
+    """Return (dx,dy) in [-1,1] from hero to nearest visible stairs (prefer '>' or '<')."""
+    H, W = chars.shape
+    goal_ch = ord(prefer)
+    ys, xs = (chars == goal_ch).nonzero(as_tuple=True)
+    if ys.numel() == 0:
+        # fall back to the other stairs if present
+        alt = ord('<') if prefer == '>' else ord('>')
+        ys, xs = (chars == alt).nonzero(as_tuple=True)
+        if ys.numel() == 0:
+            return None
+    # choose Euclidean nearest
+    dy = ys - hero_y
+    dx = xs - hero_x
+    i = (dy*dy + dx*dx).argmin().item()
+    gx, gy = int(xs[i].item()), int(ys[i].item())
+    # normalize to [-1,1]
+    dxn = max(-1.0, min(1.0, (gx - hero_x) / (W/2)))
+    dyn = max(-1.0, min(1.0, (gy - hero_y) / (H/2)))
+    return (dxn, dyn)
+
+# ---- Ego crop and class mapping ---------------------------------------------
+def crop_ego(chars: torch.Tensor, hero_y: int, hero_x: int, k: int) -> torch.Tensor:
+    """Return ego crop [k,k] of ASCII codes, padded with spaces 32."""
+    H, W = chars.shape
+    r = k // 2
+    out = torch.full((k,k), fill_value=32, dtype=chars.dtype)  # spaces
+    y0, y1 = max(0, hero_y - r), min(H, hero_y + r + 1)
+    x0, x1 = max(0, hero_x - r), min(W, hero_x + r + 1)
+    oy0, oy1 = r - (hero_y - y0), r + (y1 - hero_y)
+    ox0, ox1 = r - (hero_x - x0), r + (x1 - hero_x)
+    out[oy0:oy1, ox0:ox1] = chars[y0:y1, x0:x1]
+    return out
+
+def map_ego_classes(ego_chars: torch.Tensor, mapper: callable | None) -> torch.Tensor:
+    """
+    Map ego ASCII grid [k,k] -> class ids [k,k].
+    If mapper is None, use a compact affordance palette as fallback.
+    """
+    k = ego_chars.shape[0]
+    out = torch.zeros((k,k), dtype=torch.long)
+    if mapper is not None:
+        # expect mapper(char_int:int) -> class_id:int
+        for y in range(k):
+            for x in range(k):
+                out[y,x] = int(mapper(int(ego_chars[y,x])))
+        return out
+
+    # Fallback coarse palette ~12 classes
+    for y in range(k):
+        for x in range(k):
+            ch = int(ego_chars[y,x])
+            if ch == 32:             cid = 0  # unknown
+            elif ch in WALLS:        cid = 2
+            elif ch in GROUND:       cid = 1
+            elif ch in CLOSED_DOOR:  cid = 3
+            elif ch == ord('<'):     cid = 4
+            elif ch == ord('>'):     cid = 5
+            elif ch in TRAPS:        cid = 8
+            elif ch in BOULDER:      cid = 9
+            elif ch in WATER_LAVA:   cid = 10
+            elif ch in SPECIAL:      cid = 11
+            elif is_monster(ch):     cid = 7
+            elif ch in ITEMS:        cid = 6
+            else:                    cid = 1
+            out[y,x] = cid
+    return out
+
+# ---- Discounted k-step returns ----------------------------------------------
+def discounted_k_step(rewards: np.ndarray, done: np.ndarray, k: int, gamma: float) -> np.ndarray:
+    """
+    rewards: [T] float, done: [T] bool for the *result* at timestep t (i.e., episode ends at t if done[t])
+    Returns G^{(k)}_t = sum_{i=0}^{k-1} gamma^i r_{t+i}, stopping at done.
+    """
+    T = rewards.shape[0]
+    out = np.zeros(T, dtype=np.float32)
+    for t in range(T):
+        g, w = 0.0, 1.0
+        for i in range(k):
+            ti = t + i
+            if ti >= T or done[ti]:
+                break
+            g += w * rewards[ti]
+            w *= gamma
+        out[t] = g
+    return out
+
+
 class NetHackDataCollector:
     """Collects and preprocesses NetHack data for VAE training"""
     
@@ -141,23 +305,28 @@ class NetHackDataCollector:
         return None
     
     def collect_data_batch(self, dataset_name: str, adapter: callable, max_batches: int = 1000, 
-                          batch_size: int = 32, seq_length: int = 32, game_ids: List[int] | None = None) -> List[Dict]:
+                       batch_size: int = 32, seq_length: int = 32, game_ids: List[int] | None = None,
+                       *,
+                       ego_window: int = 11,
+                       value_horizons: List[int] = [5, 10],
+                       gamma: float = 0.99,
+                       goal_prefer: str = '>',
+                       ego_class_mapper: callable | None = None,
+                       allow_diagonal: bool = True) -> List[Dict]:
         """
-        Collect data from the dataset for VAE training
-        
-        Args:
-            dataset_name: Name of dataset in database
-            max_samples: Maximum number of samples to collect
-            batch_size: Batch size for dataset loader
-            seq_length: Sequence length for dataset loader
-            
-        Returns:
-            List of processed data samples
+        Collect data from the dataset for VAE training and build decision-sufficient targets.
+
+        - Adds: action_index, action_onehot, reward_target, done_target, value_k_target,
+                passability_target, safety_target, goal_target (+goal_mask), ego_sem_target, has_next.
+        - Shapes are [num_games, num_time, ...], consistent with your current pipeline.
+        - z_next_detached is produced later during training by encoding obs_{t+1}; here we prepare has_next masks.
+
+        ego_class_mapper: optional callable(int ascii_code) -> class_id.
+                        If None, a compact fallback mapping is used.
         """
         print(f"Collecting {max_batches} batches from {dataset_name} for VAE training...")
         print(f"  - Batch size: {batch_size}, Sequence length: {seq_length}")
         
-        # Create dataset loader
         dataset = nld.TtyrecDataset(
             dataset_name,
             batch_size=batch_size,
@@ -176,79 +345,164 @@ class NetHackDataCollector:
                 
             print(f"Processing batch {batch_idx + 1}...")
             
-            this_batch = {}  # Create new dictionary
-            
+            this_batch: Dict[str, torch.Tensor] = {}
             num_games, num_time = minibatch['tty_chars'].shape[:2]
             
-            # Deep copy numpy arrays to torch tensors
+            # Copy raw arrays -> torch
             for key, item in minibatch.items():
                 if isinstance(item, np.ndarray):
-                    # Create a copy of the numpy array first, then convert to tensor
-                    this_batch[key] = torch.tensor(item) 
+                    this_batch[key] = torch.tensor(item)
                 else:
                     this_batch[key] = item
 
+            # Preallocate tensors
             message_chars_minibatch = torch.zeros((num_games, num_time, 256), dtype=torch.long)
-            game_chars_minibatch = torch.ones((num_games, num_time, 21, 79), dtype=torch.long) * 32  # Fill with spaces
-            game_colors_minibatch = torch.zeros((num_games, num_time, 21, 79), dtype=torch.long)
-            status_chars_minibatch = torch.zeros((num_games, num_time, 2, 80), dtype=torch.long)
-            hero_info_minibatch = torch.ones((num_games, num_time, 4), dtype=torch.int32)
-            blstats_minibatch = torch.zeros((num_games, num_time, 27), dtype=torch.float32)
-            valid_screen_minibatch = torch.ones((num_games, num_time), dtype=torch.bool)
+            game_chars_minibatch    = torch.ones((num_games, num_time, 21, 79), dtype=torch.long) * 32
+            game_colors_minibatch   = torch.zeros((num_games, num_time, 21, 79), dtype=torch.long)
+            status_chars_minibatch  = torch.zeros((num_games, num_time, 2, 80), dtype=torch.long)
+            hero_info_minibatch     = torch.ones((num_games, num_time, 4), dtype=torch.int32)
+            blstats_minibatch       = torch.zeros((num_games, num_time, 27), dtype=torch.float32)
+            valid_screen_minibatch  = torch.ones((num_games, num_time), dtype=torch.bool)
 
+            # New targets
+            action_index_mb    = torch.full((num_games, num_time), fill_value=8, dtype=torch.long)          # default WAIT
+            action_onehot_mb   = torch.zeros((num_games, num_time, ACTION_DIM), dtype=torch.float32)
+            reward_target_mb   = torch.zeros((num_games, num_time), dtype=torch.float32)
+            done_target_mb     = torch.zeros((num_games, num_time), dtype=torch.float32)
+            passability_mb     = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
+            safety_mb          = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
+            goal_target_mb     = torch.zeros((num_games, num_time, 2), dtype=torch.float32)
+            goal_mask_mb       = torch.zeros((num_games, num_time), dtype=torch.float32)
+            has_next_mb        = torch.zeros((num_games, num_time), dtype=torch.bool)
+            ego_sem_mb         = torch.zeros((num_games, num_time, ego_window, ego_window), dtype=torch.long)
+
+            # Convenience aliases to raw
+            tty_chars = this_batch['tty_chars']    # [G,T, H,W]
+            tty_colors= this_batch['tty_colors']   # [G,T, H,W]
+            done_raw  = this_batch['done'].astype(bool) if isinstance(this_batch['done'], np.ndarray) else np.array(this_batch['done'], dtype=bool)
+            done_raw  = torch.tensor(done_raw)     # [G,T] bool
+            scores    = torch.tensor(this_batch['scores'], dtype=torch.float32) if 'scores' in this_batch else torch.zeros(num_games, num_time)
+            keycodes  = torch.tensor(this_batch['keypresses'], dtype=torch.int64)  # [G,T]
+            
             # Process each game in the batch
-            for game_idx in range(this_batch['tty_chars'].shape[0]):
-                # Process each timestep
-                for time_idx in range(this_batch['tty_chars'].shape[1]):
-                    
-                    game_id = int(this_batch['gameids'][game_idx, time_idx])
-                    if 'scores' in this_batch:
-                        score = float(this_batch['scores'][game_idx, time_idx])
-                    else:
-                        score = 0.0
+            for g in range(num_games):
+                last_hero = None
+                # Per-game rewards: r[t] = score[t+1]-score[t]
+                r = torch.zeros(num_time, dtype=torch.float32)
+                if 'scores' in this_batch:
+                    r[:-1] = scores[g,1:] - scores[g,:-1]
+                # Fill scalar targets and actions first (vectorized per game)
+                for t in range(num_time):
+                    kcode = int(keycodes[g,t].item())
+                    ai = map_keypress_to_action_index(kcode)
+                    action_index_mb[g,t] = ai
+                    # done at this timestep (result of previous action)
+                    done_target_mb[g,t]  = float(done_raw[g,t].item())
+                    # reward at this timestep
+                    reward_target_mb[g,t] = float(r[t].item())
+                    has_next_mb[g,t] = (t+1 < num_time) and (not bool(done_raw[g,t].item()))
+                # One-hot actions
+                action_onehot_mb[g] = one_hot(action_index_mb[g], ACTION_DIM)
 
-                    # Get TTY data
-                    tty_chars = this_batch['tty_chars'][game_idx, time_idx]
-                    tty_colors = this_batch['tty_colors'][game_idx, time_idx]
-                    
-                    is_valid_map = detect_valid_map(tty_chars)
+                # Build k-step returns per game (stop at done)
+                done_np = done_raw[g].cpu().numpy()
+                r_np    = r.cpu().numpy()
+                vals = []
+                for k in value_horizons:
+                    vals.append(discounted_k_step(r_np, done_np, k=k, gamma=gamma))
+                # [M,T] -> [T,M]
+                vals = np.stack(vals, axis=0).transpose(1,0)
+                vals = torch.tensor(vals, dtype=torch.float32)
+                this_val = vals  # [T,M]
+
+                # Per-timestep spatial targets (passability/safety/ego/goal)
+                for t in range(num_time):
+                    chars = tty_chars[g,t]     # [H,W] int
+                    colors= tty_colors[g,t]
+                    is_valid_map = detect_valid_map(chars.numpy() if isinstance(chars, torch.Tensor) else chars)
                     if not is_valid_map:
-                        valid_screen_minibatch[game_idx, time_idx] = False
+                        valid_screen_minibatch[g,t] = False
                         continue
-                    
-                    game_map = get_game_map(tty_chars, tty_colors)
-                    
-                    # Extract text information
-                    current_message = get_current_message(tty_chars)
-                    message_chars = torch.tensor([ord(c) for c in current_message.ljust(256, chr(0))], dtype=torch.long)
-                    status_lines = get_status_lines(tty_chars)
-                    status_chars = tty_chars[22:, :]
-                    
-                    hero_info = self.get_hero_info(game_id, current_message)
-                    if hero_info is None:
-                        print(tty_render(tty_chars, tty_colors))
-                        raise Exception(f"⚠️ No hero info found for game {game_id}, skipping sample")
 
-                    # Fill in the minibatch tensors
-                    message_chars_minibatch[game_idx, time_idx] = message_chars
-                    game_chars_minibatch[game_idx, time_idx] = game_map['chars']
-                    game_colors_minibatch[game_idx, time_idx] = game_map['colors']
-                    status_chars_minibatch[game_idx, time_idx] = status_chars
-                    hero_info_minibatch[game_idx, time_idx] = hero_info
-                    blstats_minibatch[game_idx, time_idx] = adapter(game_map['chars'], status_lines, score)
+                    game_map = get_game_map(chars, colors)
+                    chars_map = game_map['chars']    # torch.[H,W] long
+                    colors_map= game_map['colors']   # torch.[H,W] long
 
-            this_batch['message_chars'] = message_chars_minibatch
-            this_batch['game_chars'] = game_chars_minibatch
-            this_batch['game_colors'] = game_colors_minibatch
-            this_batch['status_chars'] = status_chars_minibatch
-            this_batch['hero_info'] = hero_info_minibatch
-            this_batch['blstats'] = blstats_minibatch
-            this_batch['valid_screen'] = valid_screen_minibatch
+                    # hero pos: prefer '@', else tty_cursor if within bounds, else last seen
+                    ys, xs = (chars_map == ord('@')).nonzero(as_tuple=True)
+                    if ys.numel() > 0:
+                        hy, hx = int(ys[0].item()), int(xs[0].item())
+                        last_hero = (hy, hx)
+                    elif 'tty_cursor' in this_batch:
+                        cy, cx = int(this_batch['tty_cursor'][g,t,0]), int(this_batch['tty_cursor'][g,t,1])
+                        if 0 <= cy < chars_map.shape[0] and 0 <= cx < chars_map.shape[1]:
+                            hy, hx = cy, cx
+                            last_hero = (hy, hx)
+                        elif last_hero is not None:
+                            hy, hx = last_hero
+                        else:
+                            valid_screen_minibatch[g,t] = False
+                            continue
+                    elif last_hero is not None:
+                        hy, hx = last_hero
+                    else:
+                        valid_screen_minibatch[g,t] = False
+                        continue
+
+                    # passability & safety
+                    p8, s8 = compute_passability_and_safety(chars_map, colors_map, hy, hx)
+                    passability_mb[g,t] = p8
+                    safety_mb[g,t]      = s8
+
+                    # ego semantic classes
+                    ego_chars = crop_ego(chars_map, hy, hx, ego_window)
+                    ego_sem   = map_ego_classes(ego_chars, ego_class_mapper)
+                    ego_sem_mb[g,t] = ego_sem
+
+                    # goal vector
+                    goal_vec = nearest_stairs_vector(chars_map, hy, hx, prefer=goal_prefer)
+                    if goal_vec is not None:
+                        goal_target_mb[g,t,0] = goal_vec[0]
+                        goal_target_mb[g,t,1] = goal_vec[1]
+                        goal_mask_mb[g,t]     = 1.0
+                    else:
+                        goal_target_mb[g,t].zero_()
+                        goal_mask_mb[g,t] = 0.0
+
+                # attach value targets (same T for the game)
+                # allocate on first assignment, then fill
+                if 'value_k_target' not in this_batch:
+                    this_batch['value_k_target'] = torch.zeros((num_games, num_time, len(value_horizons)), dtype=torch.float32)
+                this_batch['value_k_target'][g] = this_val
+
+            # Pack up everything
+            this_batch['message_chars']   = message_chars_minibatch
+            this_batch['game_chars']      = game_chars_minibatch
+            this_batch['game_colors']     = game_colors_minibatch
+            this_batch['status_chars']    = status_chars_minibatch
+            this_batch['hero_info']       = hero_info_minibatch
+            this_batch['blstats']         = blstats_minibatch
+            this_batch['valid_screen']    = valid_screen_minibatch
+
+            # New keys
+            this_batch['action_index']      = action_index_mb
+            this_batch['action_onehot']     = action_onehot_mb
+            this_batch['reward_target']     = reward_target_mb
+            this_batch['done_target']       = done_target_mb
+            # value_k_target already set per-game above
+            this_batch['passability_target']= passability_mb
+            this_batch['safety_target']     = safety_mb
+            this_batch['goal_target']       = goal_target_mb
+            this_batch['goal_mask']         = goal_mask_mb
+            this_batch['ego_sem_target']    = ego_sem_mb
+            this_batch['has_next']          = has_next_mb
+
             collected_batches.append(this_batch)
             batch_count += 1
 
         print(f"✅ Successfully collected {len(collected_batches)} batches from {batch_count} processed batches")
         return collected_batches
+
     
     def save_collected_data(self, collected_batches: List[Dict], save_path: str) -> None:
         """
