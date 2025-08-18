@@ -533,22 +533,18 @@ def bag_marginals(bag_pairs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     color_pres = 1.0 - torch.prod(1.0 - pairs, dim=1)
     return char_pres, color_pres
 
-def hero_presence_and_centroid(glyph_chars: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def hero_presence_and_centroid(glyph_chars: torch.Tensor, blstats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Presence p in {0,1} and centroid (y,x) in [-1,1]^2 for '@'.
     If absent, centroid is (0,0) and p=0 (loss masked by p).
     """
     B, H, W = glyph_chars.shape
-    is_hero = (glyph_chars == HERO_CHAR).float()                  # [B,H,W]
-    present = (is_hero.sum(dim=(1,2)) > 0).float()               # [B]
-    # coords in [-1,1]
-    yy = torch.linspace(-1, 1, H, device=glyph_chars.device).view(1, H, 1).expand(B, H, W)
-    xx = torch.linspace(-1, 1, W, device=glyph_chars.device).view(1, 1, W).expand(B, H, W)
-    area = is_hero.sum(dim=(1,2)).clamp_min(1.0)                 # avoid /0
-    cy = (is_hero * yy).sum(dim=(1,2)) / area
-    cx = (is_hero * xx).sum(dim=(1,2)) / area
+    ux = round(blstats[:, 0] * MAX_X_COORD)  # x coordinate
+    uy = round(blstats[:, 1] * MAX_Y_COORD)  # y coordinate
+    present = (glyph_chars[:, uy, ux] == HERO_CHAR).float()  # [B]
+    cy = blstats[:, 1].view(B, 1) * 2 - 1  # y coordinate in [-1,1]
+    cx = blstats[:, 0].view(B, 1) * 2 - 1  # x coordinate in [-1,1]
     centroid = torch.stack([cy, cx], dim=1)                      # [B,2]
-    # for absent cases, centroids won’t be used (masked by present)
     return present, centroid
 
 class MLP(nn.Module):
@@ -688,7 +684,8 @@ class VAEConfig:
     gend_emb: int = 2      # gender embedding dim
     align_emb: int = 2     # alignment embedding dim
 
-    dropout: float = 0.0    # dropout rate for all layers
+    encoder_dropout: float = 0.0    # dropout rate for all encoder blocks
+    decoder_dropout: float = 0.0    # dropout rate for all decoder blocks
 
     # --- Latent space
     latent_dim: int = 96     # z‑dim for VAE
@@ -698,7 +695,7 @@ class VAEConfig:
     
     # Encoder settings
     # --- Map encoder ---
-    attn_queries: int = 4          # number of attention queries for pooling
+    attn_queries: int = 2          # number of attention queries for pooling
     map_feat_channels: int = 96         # feature channels in map encoder
     # --- Stats encoder ---
     stat_feat_channels: int = 16         # feature channels in stats encoder
@@ -711,13 +708,19 @@ class VAEConfig:
     ego_window: int = 9                       # must be odd
     ego_classes: int = NetHackCategory.get_category_count()  # number of ego classes
     map_dec_base_ch: int = 64          # base channels in map decoder
-    passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
+    
+    # --- Stats decoder ---
+    stats_cond_dim: int = 19  # number of continuous stats
+    
+    # --- Message decoder ---
+    msg_ch: int = 128
     
     # Dynamics heads
     action_dim: int = 0                        # one‑hot; 0 disables forward/inverse
     forward_hidden: int = 256
     use_inverse_dynamics: bool = True
 
+    passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
     # Skill belief (future sticky HMM integration)
     skill_num: int = 0                         # number of skills; 0 disables skill head
 
@@ -776,15 +779,15 @@ class MapEncoder(nn.Module):
         in_ch += 2 # +2 for CoordConv (x,y in [-1,1])
 
         # Stem
-        self.stem = ConvBlock(in_ch, 64, k=3, dilation=1, drop=config.dropout)
+        self.stem = ConvBlock(in_ch, 64, k=3, dilation=1, drop=config.encoder_dropout)
 
         # Body: mix normal and width-focused dilations (map is 21x79)
         self.body = nn.Sequential(
-            ConvBlock(64, 64, k=3, dilation=1,        drop=config.dropout),      # local
-            ConvBlock(64, 64, k=3, dilation=(1, 3),   drop=config.dropout),      # widen RF (width)
-            ConvBlock(64, 64, k=3, dilation=1,        drop=config.dropout),
-            ConvBlock(64, 96, k=3, dilation=(1, 9),   drop=config.dropout),
-            ConvBlock(96, config.map_feat_channels, k=3, dilation=1, drop=config.dropout),
+            ConvBlock(64, 64, k=3, dilation=1,        drop=config.encoder_dropout),      # local
+            ConvBlock(64, 64, k=3, dilation=(1, 3),   drop=config.encoder_dropout),      # widen RF (width)
+            ConvBlock(64, 64, k=3, dilation=1,        drop=config.decoder_dropout),
+            ConvBlock(64, 96, k=3, dilation=(1, 9),   drop=config.decoder_dropout),
+            ConvBlock(96, config.map_feat_channels, k=3, dilation=1, drop=config.decoder_dropout),
         )
 
         # Pooling
@@ -832,19 +835,19 @@ class MapDecoder(nn.Module):
         self.ego_classes = config.ego_classes
         self.base_ch = config.map_dec_base_ch
         
-        self.bag_head = MLP(self.z_bag_dim, 128, GLYPH_DIM, num_layers=2, dropout=config.dropout)
+        self.bag_head = MLP(self.z_bag_dim, 128, GLYPH_DIM, num_layers=2, dropout=config.decoder_dropout)
         
         self.hero_presence_head = nn.Linear(self.z_bag_dim, 1)   # logits
         self.hero_centroid_head = nn.Linear(self.z_bag_dim, 2)   # tanh -> [-1,1]
-        self.ego_head = MLP(config.latent_dim, 128, self.ego_window * self.ego_window * self.ego_classes, num_layers=2, dropout=config.dropout)
-        
+        self.ego_head = MLP(config.latent_dim, 128, self.ego_window * self.ego_window * self.ego_classes, num_layers=2, dropout=config.decoder_dropout)
+
         # project z to a broadcast feature map
         self.z_core_to_map = nn.Sequential(nn.Linear(self.z_core_dim, config.map_dec_base_ch), nn.ReLU(inplace=True), nn.Linear(config.map_dec_base_ch, config.map_dec_base_ch))
         self.head_occ = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, 1, 1))
 
         self.z_to_ego_map = nn.Sequential(nn.Linear(self.latent_dim, config.map_dec_base_ch), nn.ReLU(inplace=True), nn.Linear(config.map_dec_base_ch, config.map_dec_base_ch))
         # FiLM-conditioned residual body (anisotropic to cover width)
-        self.core_block = ResBlockFiLM(config.map_dec_base_ch, config.map_dec_base_ch, (1,9),  config.dropout, z_dim=self.latent_dim)
+        self.core_block = ResBlockFiLM(config.map_dec_base_ch, config.map_dec_base_ch, (1,9),  config.decoder_dropout, z_dim=self.latent_dim)
 
         # heads
         self.head_chr = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, CHAR_DIM, 1))
@@ -1083,12 +1086,12 @@ class StatsEncoder(nn.Module):
 
 class StatsDecoder(nn.Module):
     """Predict stats with proper likelihoods: continuous (Gaussian), discrete (CE), conditions (BCE)."""
-    def __init__(self, z_dim: int, cont_dim: int = 19):
+    def __init__(self, config: VAEConfig):
         super().__init__()
         hid = 256
-        self.net = nn.Sequential(nn.Linear(z_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
-        self.mu      = nn.Linear(hid, cont_dim)
-        self.logvar  = nn.Linear(hid, cont_dim)
+        self.net = nn.Sequential(nn.Linear(config.core_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
+        self.mu      = nn.Linear(hid, config.stats_cond_dim)
+        self.logvar  = nn.Linear(hid, config.stats_cond_dim)
         self.hunger  = nn.Linear(hid, 7)
         self.dungeon = nn.Linear(hid, 11)
         self.level   = nn.Linear(hid, 51)
@@ -1140,20 +1143,20 @@ class MessageEncoder(nn.Module):
         return self.hid_dim
     
 class MessageDecoder(nn.Module):
-    def __init__(self, z_dim: int, L: int = MSG_MAXLEN, ch: int = 128, drop: float = 0.1, vocab: int = MSG_VSIZE):
+    def __init__(self, config: VAEConfig, L: int = MSG_MAXLEN, vocab: int = MSG_VSIZE):
         super().__init__()
         self.L = L; self.vocab = vocab
         x = torch.linspace(-1, 1, L).view(1,1,L)
         self.register_buffer("pos", x)
-        self.z_to_line = nn.Sequential(nn.Linear(z_dim, ch), nn.SiLU(), nn.Linear(ch, ch))
-        self.stem = nn.Sequential(nn.Conv1d(ch+1, ch, 3, padding=1), nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU())
+        self.z_to_line = nn.Sequential(nn.Linear(config.core_dim, config.msg_ch), nn.ReLU(), nn.Linear(config.msg_ch, config.msg_ch))
+        self.stem = nn.Sequential(nn.Conv1d(config.msg_ch+1, config.msg_ch, 3, padding=1), nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU())
         self.block = nn.Sequential(
-            nn.Conv1d(ch, ch, 3, padding=1, dilation=1),  nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU(),
-            nn.Conv1d(ch, ch, 3, padding=2, dilation=2),  nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU(),
-            nn.Conv1d(ch, ch, 3, padding=4, dilation=4),  nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU(),
-            nn.Conv1d(ch, ch, 3, padding=8, dilation=8),  nn.GroupNorm(_gn_groups(ch), ch), nn.SiLU(),
+            nn.Conv1d(config.msg_ch, config.msg_ch, 3, padding=1, dilation=1),  nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU(),
+            nn.Conv1d(config.msg_ch, config.msg_ch, 3, padding=2, dilation=2),  nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU(),
+            nn.Conv1d(config.msg_ch, config.msg_ch, 3, padding=4, dilation=4),  nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU(),
+            nn.Conv1d(config.msg_ch, config.msg_ch, 3, padding=8, dilation=8),  nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU(),
         )
-        self.head = nn.Conv1d(ch, vocab, 1)
+        self.head = nn.Conv1d(config.msg_ch, vocab, 1)
     def forward(self, z):
         B = z.size(0)
         line = self.z_to_line(z).unsqueeze(-1).expand(B, -1, self.L)
@@ -1283,99 +1286,128 @@ class HeroEmbedding(nn.Module):
     def get_output_channels(self) -> int:
         """Returns the number of output channels for hero embedding."""
         return self.out_dim  # 16
+
+class ActionValueHead(nn.Module):
+    """Action value head for VAE."""
+    def __init__(self, cfg: VAEConfig):
+        super().__init__()
+        self.passability = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 2, cfg.decoder_dropout)
+        self.reward = MLP(cfg.latent_dim, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
+        self.done = MLP(cfg.latent_dim, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
+        self.value = MLP(cfg.latent_dim, cfg.forward_hidden, len(cfg.value_horizons), 2, cfg.decoder_dropout)
+        self.safety = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 2, cfg.decoder_dropout)
+        self.goal = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.goal_dir_dim, 2, cfg.decoder_dropout) if cfg.goal_dir_dim > 0 else None
+        self.skill_belief = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.skill_num, 2, cfg.decoder_dropout) if cfg.skill_num > 0 else None
+
+    def forward(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        Forward pass for action value head.
+        
+        Args:
+            z: [B, latent_dim] latent vector
+        
+        Returns:
+            Dictionary with outputs:
+            - passability: [B, passability_dirs]
+            - reward: [B, 1]
+            - done: [B, 1]
+            - value: [B, num_horizons]
+            - safety: [B, passability_dirs]
+            - goal: [B, goal_dir_dim] (if applicable)
+            - skill_belief: [B, skill_num] (if applicable)
+        """
+        out = {
+            "passability_logits": self.passability(z),
+            "reward": self.reward(z),
+            "done_logits": self.done(z),
+            "value": self.value(z),
+            "safety_logits": self.safety(z),
+        }
+        if self.goal is not None:
+            out["goal_pred"] = self.goal(z)
+        if self.skill_belief is not None:
+            out["skill_logits"] = self.skill_belief(z)
+        return out
+
+class LatentForwardModel(nn.Module):
+    def __init__(self, cfg: VAEConfig):
+        super().__init__()
+        self.enabled = cfg.action_dim > 0
+        self.skill_num = cfg.skill_num
+        if not self.enabled:
+            return
+        self.net = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, cfg.latent_dim, num_layers=3)
+
+    def forward(self, z: torch.Tensor, action_onehot: torch.Tensor, h_onehot: torch.Tensor = None) -> torch.Tensor:
+        if not self.enabled:
+            raise RuntimeError("Forward model disabled (action_dim=0).")
+        if self.skill_num > 0:
+            assert h_onehot is not None and h_onehot.size(1) == self.skill_num, \
+                f"Expected h_onehot of shape [B, {self.skill_num}], got {h_onehot.shape}"
+            action_onehot = torch.cat([action_onehot, h_onehot], dim=1)  # [B, A + skill_num]
+        x = torch.cat([z, action_onehot], dim=1)
+        return self.net(x)
+
+
+class InverseDynamics(nn.Module):
+    def __init__(self, cfg: VAEConfig):
+        super().__init__()
+        self.enabled = (cfg.action_dim > 0) and cfg.use_inverse_dynamics
+        self.skill_num = cfg.skill_num
+        if not self.enabled:
+            return
+        self.net = MLP(2 * cfg.latent_dim, 256, cfg.action_dim + cfg.skill_num, num_layers=3)
+
+    def forward(self, z_t: torch.Tensor, z_tp1: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            raise RuntimeError("Inverse dynamics disabled.")
+        x = torch.cat([z_t, z_tp1], dim=1)
+        return self.net(x)  # logits [B, A + skill_num]
+
 class MultiModalHackVAE(nn.Module):
-    def __init__(self, 
-                 bInclude_glyph_bag=True, 
-                 bInclude_hero=True,
-                 dropout_rate=0.0,
-                 enable_dropout_on_latent=True,
-                 enable_dropout_on_decoder=True,
+    def __init__(self, config: VAEConfig,
                  logger: logging.Logger | None=None):
         super().__init__()
         self.logger = logger or logging.getLogger(__name__)
-        self.dropout_rate = dropout_rate
-        self.enable_dropout_on_latent = enable_dropout_on_latent
-        self.enable_dropout_on_decoder = enable_dropout_on_decoder
-        self.z_bag_dim = BAG_Z
-        assert LATENT_DIM > self.z_bag_dim, "LATENT_DIM must be greater than BAG_Z"
-        self.num_pairs = GLYPH_DIM
         
-        self.map_encoder = MapEncoder(dropout=dropout_rate)
-        self.stats_encoder = StatsEncoder()
-        self.msg_encoder = MessageEncoder()
-        self.hero_emb = HeroEmbedding() if bInclude_hero else None
-
-        self.include_glyph_bag = bInclude_glyph_bag
-        self.include_hero = bInclude_hero
+        self.map_encoder = MapEncoder(config)
+        self.stats_encoder = StatsEncoder(config)
+        self.msg_encoder = MessageEncoder(config)
+        self.hero_emb = HeroEmbedding(config)
 
         fusion_in = 2 * self.map_encoder.get_output_channels() + \
                     self.stats_encoder.get_output_channels() + \
                     self.msg_encoder.get_output_channels() + \
-                    (self.hero_emb.get_output_channels() if bInclude_hero else 0) # cnn + stats + msg + hero embedding
+                    self.hero_emb.get_output_channels() # cnn + stats + msg + hero embedding
         
         # Add dropout to the encoder fusion layer if enabled
-        if self.dropout_rate > 0.0 and self.enable_dropout_on_latent:
+        if config.encoder_dropout > 0.0:
             self.to_latent = nn.Sequential(
                 nn.LayerNorm(fusion_in),
-                nn.Dropout(self.dropout_rate),
+                nn.Dropout(config.encoder_dropout),
                 nn.Linear(fusion_in, 256), nn.ReLU(),
-                nn.Dropout(self.dropout_rate),
+                nn.Dropout(config.encoder_dropout),
             )
         else:
             self.to_latent = nn.Sequential(
                 nn.LayerNorm(fusion_in),
                 nn.Linear(fusion_in, 256), nn.ReLU(),
             )
-        self.latent_dim = LATENT_DIM
-        self.lowrank_dim = LOW_RANK
-        self.mu_head     = nn.Linear(256, LATENT_DIM)
-        self.logvar_diag_head = nn.Linear(256, LATENT_DIM)  # diagonal part
-        self.lowrank_factor_head = nn.Linear(256, LATENT_DIM * LOW_RANK) if LOW_RANK else None # low-rank factors
+        self.latent_dim = config.latent_dim
+        self.lowrank_dim = config.low_rank
+        self.mu_head     = nn.Linear(256, self.latent_dim)
+        self.logvar_diag_head = nn.Linear(256, self.latent_dim)  # diagonal part
+        self.lowrank_factor_head = nn.Linear(256, self.latent_dim * self.lowrank_dim) if self.lowrank_dim else None # low-rank factors
 
-        # We will have 3 categories of decoder heads:
-        # 1. For reconstruction of observations:
-        #    - glyphs (pixel-wise categorical for both char and color)
-        #    - glyphs_bag (pixel-wise categorical) (optional)
-        #    - stats (pixel-wise categorical)
-        #    - messages (token-wise categorical)
-        #    - heros (token-wise categorical) (optional)
-        # 2. For reconstruction of frozen embeddings (optional):
-        #    - glyph_char_embeddings (pixel-wise continuous)
-        #    - glyph_color_embeddings (pixel-wise continuous)
-        #    - glyph_bag_embeddings (pixel-wise continuous) (optional)
-        #    - stats_embeddings (pixel-wise continuous)
-        #    - messages_embeddings (pixel-wise continuous)
-        #    - heros_embeddings (pixel-wise continuous) (optional)
-        # 3. For dynamic predictions p(x_{t+1} | z_t, a_t, h_t, c)
-        
-        # This will be shared across all decoders
-        # if self.dropout_rate > 0.0 and self.enable_dropout_on_decoder:
-        #     self.decode_shared = nn.Sequential(
-        #         nn.Linear(LATENT_DIM, 256), nn.ReLU(),
-        #         nn.Dropout(self.dropout_rate),
-        #     )
-        # else:
-        #     self.decode_shared = nn.Sequential(
-        #         nn.Linear(LATENT_DIM, 256), nn.ReLU(),
-        #     )
-        core_dim = LATENT_DIM - self.z_bag_dim
-        self.map_decoder  = MapDecoder(z_bag_dim=self.z_bag_dim, z_core_dim=core_dim, char_dim=CHAR_DIM, color_dim=COLOR_DIM, H=MAP_HEIGHT, W=MAP_WIDTH, base_ch=96, mid_ch=96, drop=dropout_rate)
-        self.stats_decoder = StatsDecoder(z_dim=core_dim, cont_dim=19)
-        self.msg_decoder   = MessageDecoder(z_dim=core_dim, L=MSG_MAXLEN, vocab=MSG_VSIZE)
-        self.bag_head = nn.Sequential(
-            nn.Linear(self.z_bag_dim, 256), nn.ReLU(inplace=True),
-            nn.Linear(256, self.num_pairs)
-        )
-        self.hero_presence_head = nn.Linear(self.z_bag_dim, 1)   # logits
-        self.hero_centroid_head = nn.Linear(self.z_bag_dim, 2)   # tanh -> [-1,1]
-        self.detach_bag_prior = True  # whether to detach the bag prior from the gradients
-
-        # Dynamic prediction heads
-        # It takes latent z, action a, HDP HMM state h and hero info c
-        # TODO: Implement dynamic prediction heads
+        self.map_decoder  = MapDecoder(config)
+        self.stats_decoder = StatsDecoder(config)
+        self.msg_decoder   = MessageDecoder(config)
+        self.action_value_head = ActionValueHead(config)
+        self.latent_forward_model = LatentForwardModel(config)
+        self.inverse_dynamics = InverseDynamics(config)
         
 
-    def encode(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None):
+    def encode(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info):
         """
         Encodes the input features into a latent space.
         
@@ -1406,11 +1438,10 @@ class MultiModalHackVAE(nn.Module):
         rare_glyph_chars = torch.full_like(glyph_chars, ord(' '))  # fill with space character
         rare_glyph_colors = torch.zeros_like(glyph_colors)  # fill with black color
         is_fg = (glyph_chars != ord(' ')) & (glyph_colors != 0)  # foreground mask
-        is_hero = (glyph_chars == HERO_CHAR)
         is_common = torch.zeros_like(is_fg, dtype=torch.bool)  # common glyphs mask
         for c in COMMON_GLYPHS:
             is_common |= (glyph_chars == c[0]) & (glyph_colors == c[1])
-        is_rare = is_fg & ~is_common & ~is_hero  # rare glyphs mask
+        is_rare = is_fg & ~is_common  # rare glyphs mask
         rare_glyph_chars[is_rare] = glyph_chars[is_rare]
         rare_glyph_colors[is_rare] = glyph_colors[is_rare]
         rare_glyph_feat = self.map_encoder(rare_glyph_chars, rare_glyph_colors)  # [B,64]
@@ -1419,22 +1450,16 @@ class MultiModalHackVAE(nn.Module):
         
         # Message encoding
         msg_feat = self.msg_encoder(msg_tokens)  # [B,hid_dim], [B,256,emb_dim]
-
-        features = [glyph_feat, rare_glyph_feat, stats_feat, msg_feat]
-
-        if self.include_hero != (hero_info is not None):
-            raise ValueError("hero_info must be provided if and only if include_hero is True.")
         
         # Hero embedding
         # check shape of hero_info should be [B, 4] with role, race, gend, align
-        if hero_info is not None:
-            if hero_info.size(0) != B:
-                raise ValueError("hero_info must have the same batch size as glyph_chars and glyph_colors.")
-            if hero_info.size(1) != 4:
-                raise ValueError("hero_info must have shape [B, 4]")
-            role, race, gend, align = hero_info[:, 0], hero_info[:, 1], hero_info[:, 2], hero_info[:, 3]
-            hero_feat = self.hero_emb(role, race, gend, align)  # [B,16], dict
-            features.append(hero_feat)
+        if hero_info.size(0) != B:
+            raise ValueError("hero_info must have the same batch size as glyph_chars and glyph_colors.")
+        if hero_info.size(1) != 4:
+            raise ValueError("hero_info must have shape [B, 4]")
+        role, race, gend, align = hero_info[:, 0], hero_info[:, 1], hero_info[:, 2], hero_info[:, 3]
+        hero_feat = self.hero_emb(role, race, gend, align)  # [B,16], dict
+        features = [glyph_feat, rare_glyph_feat, stats_feat, msg_feat, hero_feat]
         
         fused = torch.cat(features, dim=-1)
         
@@ -1442,8 +1467,8 @@ class MultiModalHackVAE(nn.Module):
         h = self.to_latent(fused)
         mu = self.mu_head(h)
         logvar_diag = self.logvar_diag_head(h)
-        lowrank_factors = self.lowrank_factor_head(h).view(B, LATENT_DIM, LOW_RANK) if self.lowrank_factor_head is not None else None
-        
+        lowrank_factors = self.lowrank_factor_head(h).view(B, self.latent_dim, self.lowrank_dim) if self.lowrank_factor_head is not None else None
+
         return {
             'mu': mu,  # [B, LATENT_DIM]
             'logvar': logvar_diag,  # [B, LATENT_DIM]
@@ -1463,50 +1488,44 @@ class MultiModalHackVAE(nn.Module):
             z += lowrank_std
         return z    # [B, LATENT_DIM]
 
-    def decode(self, z):
+    def decode(self, z, action_onehot=None, z_next_detach=None):
         # split z -> [z_bag | z_core]
         z_bag  = z[:, :self.z_bag_dim]
         z_core = z[:, self.z_bag_dim:]
 
-        # --- bag prediction ---
-        bag_logits = self.bag_head(z_bag)                       # [B,GLYPH_DIM]
-        bag_probs  = torch.sigmoid(bag_logits)
-        char_prior, color_prior = bag_marginals(bag_probs)      # [B,CHAR_DIM], [B,COLOR_DIM]
-
-        # optionally detach priors (training schedule)
-        if self.detach_bag_prior:
-            char_prior = char_prior.detach()
-            color_prior = color_prior.detach()
-        occupy_logits, char_logits, color_logits, rare_occ_logits, rare_char_logits, rare_color_logits = self.map_decoder(z, char_prior, color_prior, bag_bias_strength=3.0) 
+        out_map = self.map_decoder(z)  # decode map features
         stats_pred = self.stats_decoder(z_core)
         msg_logits = self.msg_decoder(z_core)
-        hero_logit   = self.hero_presence_head(z_bag).squeeze(-1)       # [B]
-        hero_centre = torch.tanh(self.hero_centroid_head(z_bag))  # [B,2] -> [-1,1] range
+        out_action = self.action_value_head(z)
+        latent_pred = self.latent_forward_model(z, action_onehot) if action_onehot is not None and self.latent_forward_model.enabled else None
+        inverse_dynamics_logits = self.inverse_dynamics(z, z_next_detach) if z_next_detach is not None and self.inverse_dynamics.enabled else None
+        
         return {
-            "occupy_logits": occupy_logits, 
-            "char_logits": char_logits, 
-            "color_logits": color_logits, 
+            **out_map,
             "stats_pred": stats_pred, 
             "msg_logits": msg_logits, 
-            "bag_logits" : bag_logits,
-            "bag_char_prior": char_prior,
-            "bag_color_prior": color_prior,
-            "rare_occ_logits": rare_occ_logits,
-            "rare_char_logits": rare_char_logits,
-            "rare_color_logits": rare_color_logits,
-            "hero_presence_logits": hero_logit, 
-            "hero_centroid": hero_centre
+            **out_action,
+            "latent_pred": latent_pred,  # [B, LATENT_DIM] or None
+            "inverse_dynamics_logits": inverse_dynamics_logits,  # [B, A + skill_num] or None
         }
-        
-    def set_bag_detach(self, flag: bool = True):
-        self.detach_bag_prior = flag
 
-    def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None, detach_bag=True):
-        
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        glyph_chars = batch['game_chars'] # [B, 21, 79]
+        glyph_colors = batch['game_colors'] # [B, 21, 79]
+        blstats = batch['blstats'] # [B, BLSTATS_DIM]
+        msg_tokens = batch['message_chars'] # [B, 256]
+        hero_info = batch['hero_info'] # [B, 4]
         enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
         z = self._reparameterise(enc["mu"], enc["logvar"])  # [B,D]
-        self.set_bag_detach(detach_bag)  # set detach flag for bag prior
-        dec = self.decode(z)
+        if self.latent_forward_model.enabled and ('action_onehot' in batch):
+            action_onehot = batch['action_onehot']
+        else:
+            action_onehot = None
+        if self.inverse_dynamics.enabled and ('z_next_detach' in batch):
+            z_next_detach = batch['z_next_detach']
+        else:
+            z_next_detach = None
+        dec = self.decode(z, action_onehot=action_onehot, z_next_detach=z_next_detach)
         return {**enc, **dec}
     
     @torch.no_grad()
@@ -1629,18 +1648,6 @@ class MultiModalHackVAE(nn.Module):
             })
         return out
         
-    def get_dropout_config(self):
-        """
-        Get dropout configuration for logging and debugging
-        
-        Returns:
-            Dict containing dropout configuration
-        """
-        return {
-            'dropout_rate': self.dropout_rate,
-            'enable_dropout_on_latent': self.enable_dropout_on_latent,
-            'enable_dropout_on_decoder': self.enable_dropout_on_decoder
-        }
 
 # ------------------------- loss helpers ------------------------------ #
 
@@ -1675,24 +1682,9 @@ def _message_ce_loss(logits: torch.Tensor, tgt: torch.Tensor, pad_id: int = MSG_
     return (ce * keep).sum() / keep.sum().clamp_min(1.0)
 
 def vae_loss(
-    model_output, 
-    glyph_chars, 
-    glyph_colors, 
-    blstats, 
-    msg_tokens,
-    valid_screen,
-    raw_modality_weights={
-        'occupy': 2.0, 
-        'rare_occupy': 2.0, 
-        'common_char': 1.0, 
-        'common_color': 1.0, 
-        'rare_char': 2.0,
-        'rare_color': 2.0,
-        'stats': 0.5, 
-        'msg': 0.5, 
-        'bag': 8, 
-        'hero_loc': 8
-    },
+    model_output,
+    batch, 
+    config,
     focal_loss_alpha=0.1,
     focal_loss_gamma=2.0,
     mi_beta=1.0,
@@ -1702,6 +1694,18 @@ def vae_loss(
     """
     VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
     """
+    # Extract inputs from batch
+    glyph_chars = batch['game_chars']  # [B, 21, 79]
+    glyph_colors = batch['game_colors']  # [B, 21, 79]
+    blstats = batch['blstats'] # [B, BLSTATS_DIM]
+    # stats
+    pre = model_output['stats_encoder'].preprocessor
+    pre = pre.to(blstats.device)
+    pre.eval()
+    with torch.no_grad():
+        t = pre.targets(blstats[valid_screen])
+    msg_tokens = batch['message_chars']  # [B, 256]
+    valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
     # Extract outputs from model
     mu = model_output['mu'][valid_screen]  # [valid_B, LATENT_DIM]
     logvar = model_output['logvar'][valid_screen]
@@ -1711,15 +1715,31 @@ def vae_loss(
     
     # Raw reconstruction logits
     occupy_logits = model_output['occupy_logits'][valid_screen]  # [B, 1, 21, 79]
-    char_logits = model_output['char_logits'][valid_screen]  # [B, CHAR_DIM, 21, 79]
-    color_logits = model_output['color_logits'][valid_screen]  # [B, COLOR_DIM, 21, 79]
-    rare_occ_logits = model_output['rare_occ_logits'][valid_screen]  # [B, 1, 21, 79]
-    rare_char_logits = model_output['rare_char_logits'][valid_screen]  # [B, CHAR_DIM, 21, 79]
-    rare_color_logits = model_output['rare_color_logits'][valid_screen]  # [B, COLOR_DIM, 21, 79]
-    msg_logits = model_output['msg_logits'][valid_screen]  # [B, 256, MSG_VSIZE]
+    ego_char_logits = model_output['ego_char_logits'][valid_screen]  # [B, CHAR_DIM, k, k]
+    ego_color_logits = model_output['ego_color_logits'][valid_screen]  # [B, COLOR_DIM, k, k]
+    ego_class_logits = model_output['ego_class_logits'][valid_screen]  # [B, CLASS_DIM, k, k]
     hero_presence_logits = model_output['hero_presence_logits'][valid_screen]  # [B]
     hero_centroid = model_output['hero_centroid'][valid_screen]  # [B, 2]
-
+    bag_logits = model_output['bag_logits'][valid_screen]  # [B, GLYPH_DIM]
+    
+    # message logits
+    msg_logits = model_output['msg_logits'][valid_screen]  # [B, 256, MSG_VSIZE]
+    
+    # action related outputs
+    passibility_logits = model_output['passability_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
+    reward = model_output['reward'][valid_screen]
+    done_logits = model_output['done_logits'][valid_screen]  # [B, 1]
+    value = model_output['value'][valid_screen]  # [B, NUM_HORIZONS]
+    safety_logits = model_output['safety_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
+    goal_pred = model_output.get('goal_pred', None)  # [B, GOAL_DIR_DIM] if applicable
+    skill_logits = model_output.get('skill_logits', None)  # [B, SKILL_NUM] if applicable
+    
+    # latent forward model
+    latent_pred = model_output.get('latent_pred', None)
+    
+    # inverse dynamics logits
+    inverse_dynamics_logits = model_output.get('inverse_dynamics_logits', None)
+    
     valid_B = valid_screen.sum().item()  # Number of valid samples
     assert valid_B > 0, "No valid samples for loss calculation. Check valid_screen mask."
     
@@ -1731,25 +1751,14 @@ def vae_loss(
     gc = glyph_chars[valid_screen]
     col_t = glyph_colors[valid_screen]
     fg = (gc != ord(' '))                 # [valid_B,H,W]
-    common_fg = torch.zeros_like(fg, dtype=torch.bool)  # common glyphs mask
-    for c in COMMON_GLYPHS:
-        common_fg |= (gc == c[0]) & (col_t == c[1])
-    hero_fg = torch.zeros_like(fg, dtype=torch.bool)  # hero glyphs mask
-    hero_fg |= (gc == HERO_CHAR)
-    rare_fg = fg & ~common_fg & ~hero_fg  # rare glyphs mask
-    common_fg = fg & common_fg & ~hero_fg  # common glyphs mask
     occ_t = fg.float().unsqueeze(1)           # [valid_B,1,H,W]
-    rare_occ_t = rare_fg.float().unsqueeze(1)  # [valid_B,1,H,W]
-    common_occ_t = common_fg.float().unsqueeze(1)  # [valid_B,1,H,W]
     char_t = torch.clamp(gc - 32, 0, CHAR_DIM - 1)  # [valid_B,H,W]
     bag_t = make_pair_bag(glyph_chars[valid_screen], glyph_colors[valid_screen])  # [valid_B,GLYPH_DIM]
-    hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen]) # [valid_B], [valid_B,2]
+    hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen], t) # [valid_B], [valid_B,2]
     
     # ---- hero presence + centroid ----
     hero_bce = F.binary_cross_entropy_with_logits(hero_presence_logits, hero_p_t, pos_weight=torch.full_like(hero_presence_logits, 10))  # [valid_B]
-    # centroid error only when hero exists (mask by target presence)
     hero_mse = ((hero_centroid - hero_c_t) ** 2).sum(dim=1) # [valid_B,2] -> [valid_B]
-    hero_mse = hero_mse * hero_p_t
     hero_loss = hero_bce + 5.0 * hero_mse
     raw_losses['hero_loc'] = hero_loss.mean()  # Average over valid samples
 
@@ -1762,69 +1771,28 @@ def vae_loss(
         pos_weight = (neg / pos).clamp(max=10.0)
     occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, occ_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2,3])  # [valid_B]
     assert occ_loss_per_sample.shape == (valid_B,), f"occupy loss shape mismatch: {occ_loss_per_sample.shape} != ({valid_B},)"
-    
-    rare_fg_rate = 0.05
-    with torch.no_grad():
-        rare_pos = rare_occ_t.sum()
-        rare_neg = occ_t.sum() - rare_pos
-        rare_pos_weight = (rare_neg / rare_pos).clamp(max=10.0)
-    rare_occ_loss_per_sample = F.binary_cross_entropy_with_logits(rare_occ_logits, rare_occ_t, reduction='none', pos_weight=rare_pos_weight)
-    rare_occ_loss_per_sample = (rare_occ_loss_per_sample * occ_t).sum(dim=[1,2,3])  # [valid_B]
-    
-    # CE losses (masked by foreground)
-    if fg.any():
-        IGNORE = -100
-        common_char_t_mask = torch.where(common_fg, char_t, torch.full_like(char_t, IGNORE))
-        common_col_t_mask  = torch.where(common_fg, col_t,  torch.full_like(col_t,  IGNORE))
-        rare_char_t_mask = torch.where(rare_fg, char_t, torch.full_like(char_t, IGNORE))
-        rare_col_t_mask  = torch.where(rare_fg, col_t,  torch.full_like(col_t,  IGNORE))
-
-        # CE computed only on FG via ignore_index
-        rare_char_loss_per_sample = F.cross_entropy(
-            rare_char_logits, rare_char_t_mask, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
-        )
-        assert rare_char_loss_per_sample.shape == (valid_B, H, W), f"rare_char_loss_per_sample shape mismatch: {rare_char_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
-        
-        rare_color_loss_per_sample = F.cross_entropy(
-            rare_color_logits, rare_col_t_mask, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
-        )
-        assert rare_color_loss_per_sample.shape == (valid_B, H, W), f"rare_color_loss_per_sample shape mismatch: {rare_color_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
-
-        common_char_loss_per_sample = F.cross_entropy(
-            char_logits, common_char_t_mask, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
-        )
-        assert common_char_loss_per_sample.shape == (valid_B, H, W), f"common_char_loss_per_sample shape mismatch: {common_char_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
-
-        common_color_loss_per_sample = F.cross_entropy(
-            color_logits, common_col_t_mask, ignore_index=IGNORE, label_smoothing=0.05, reduction='none'
-        )
-        assert common_color_loss_per_sample.shape == (valid_B, H, W), f"common_color_loss_per_sample shape mismatch: {common_color_loss_per_sample.shape} != ({valid_B}, {H}, {W})"
-
-        # Sum over spatial dimensions for each sample
-        rare_char_loss_per_sample = rare_char_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
-        rare_color_loss_per_sample = rare_color_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
-        common_char_loss_per_sample = common_char_loss_per_sample.sum(dim=[1, 2])  # [valid_B]
-        common_color_loss_per_sample = common_color_loss_per_sample.sum(dim=[1, 2])
-    else:
-        rare_char_loss_per_sample = torch.zeros(valid_B, device=glyph_chars.device)
-        rare_color_loss_per_sample = torch.zeros(valid_B, device=glyph_colors.device)
-        common_char_loss_per_sample = torch.zeros(valid_B, device=glyph_chars.device)
-        common_color_loss_per_sample = torch.zeros(valid_B, device=glyph_colors.device)
-
-    # Average over valid samples only
     raw_losses['occupy'] = occ_loss_per_sample.mean()  # Average over valid samples
-    raw_losses['rare_occupy'] = rare_occ_loss_per_sample.mean()
-    raw_losses['common_char'] = common_char_loss_per_sample.mean()
-    raw_losses['common_color'] = common_color_loss_per_sample.mean()
-    raw_losses['rare_char'] = rare_char_loss_per_sample.mean()
-    raw_losses['rare_color'] = rare_color_loss_per_sample.mean()
-
-    # stats
-    pre = model_output['stats_encoder'].preprocessor
-    pre = pre.to(blstats.device)
-    pre.eval()
+    
+    # ---- bag presence BCE (weighted) ----
+    # weights: de-emphasize very common chars
     with torch.no_grad():
-        t = pre.targets(blstats[valid_screen])
+        w = torch.ones(valid_B, GLYPH_DIM, device=bag_t.device)
+        # downweight common chars (all colors)
+        common_idx = []
+        for ch in COMMON_GLYPHS:
+            ci = (ch[0] - 32)
+            if 0 <= ci < CHAR_DIM:
+                base = ci * COLOR_DIM + ch[1]
+                common_idx.append(base)
+        if common_idx:
+            w[:, common_idx] = 0.1
+
+        w[:, 0] = 0.0  # ignore space glyph
+
+    bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='none').sum(dim=1).mean()
+    
+    raw_losses['bag'] = bag_bce
+    
     sp = model_output['stats_pred']
     # Filter stats_pred by valid_screen to match target dimensions
     sp_filtered = {}
@@ -1849,35 +1817,62 @@ def vae_loss(
     msg_loss = _message_ce_loss(msg_logits, msg_t, pad_id=MSG_PAD, eos_id=MSG_EOS)
     raw_losses['msg'] = msg_loss
     
-    # ---- bag presence BCE (weighted) ----
-    bag_logits = model_output["bag_logits"][valid_screen]
-    # weights: emphasize '@' and de-emphasize very common chars
-    with torch.no_grad():
-        w = torch.ones(valid_B, GLYPH_DIM, device=bag_t.device) * 0.01
-        # downweight common chars (all colors)
-        common_idx = []
-        for ch in COMMON_GLYPHS:
-            ci = (ch[0] - 32)
-            if 0 <= ci < CHAR_DIM:
-                base = ci * COLOR_DIM + ch[1]
-                common_idx.append(base)
-        if common_idx:
-            w[:, common_idx] = 0
-
-        w[:, 0] = 0.0  # ignore space glyph
-        hero_index = HERO_CHAR - 32
-        w[:, hero_index * COLOR_DIM:(hero_index + 1) * COLOR_DIM] = 0.0  # ignore hero glyphs
-        for ci in range(CHAR_DIM):
-            w[:, ci * COLOR_DIM] = 0.0  # ignore all chars with no colors
-        w[bag_t.bool()] = 1.0  # emphasize bag presence
-
-    bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='none').sum(dim=1).mean()
+    # --- Core heads ---
+    if 'ego_char' in batch:
+        ce = F.cross_entropy(ego_char_logits, batch['ego_char'].long(), reduction='mean')
+        raw_losses['ego_char'] = ce * w.get('ego_char', 0.0)
     
-    raw_losses['bag'] = bag_bce
+    if 'ego_color' in batch:
+        ce = F.cross_entropy(ego_color_logits, batch['ego_color'].long(), reduction='mean')
+        raw_losses['ego_color'] = ce * w.get('ego_color', 0.0)
+
+    if 'ego_class' in batch:
+        ce = F.cross_entropy(ego_class_logits, batch['ego_class'].long(), reduction='mean')
+        raw_losses['ego_class'] = ce * w.get('ego_class', 0.0)
+
+    if 'passability_target' in batch:
+        bce = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'], reduction='mean')
+        raw_losses['passability'] = bce * w.get('passability', 0.0)
+
+    if 'reward_target' in batch:
+        mse = F.mse_loss(reward, batch['reward_target'], reduction='mean')
+        raw_losses['reward'] = mse * w.get('reward', 0.0)
+    if 'done_target' in batch:
+        bce = F.binary_cross_entropy_with_logits(done_logits, batch['done_target'], reduction='mean')
+        raw_losses['done'] = bce * w.get('done', 0.0)
+    if 'value_k_target' in batch:
+        mse = F.mse_loss(value, batch['value_k_target'], reduction='mean')
+        raw_losses['value'] = mse * w.get('value', 0.0)
+
+    # --- Safety risk (8 dirs) ---
+    if 'safety_target' in batch:
+        bce = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'], reduction='mean')
+        raw_losses['safety'] = bce * w.get('safety', 0.0)
+
+    # --- Goal direction ---
+    if ('goal_target' in batch) and ('goal_pred' in model_output):
+        mse = F.mse_loss(goal_pred, batch['goal_target'], reduction='mean')
+        raw_losses['goal'] = mse * w.get('goal', 0.0)
+
+    # --- Dynamics ---
+    if (latent_pred is not None) and ('z_next_detached' in batch) and ('action_onehot' in batch):
+        z_next_tgt = batch['z_next_detached']
+        mse = F.mse_loss(latent_pred, z_next_tgt, reduction='mean')
+        cos = 1.0 - F.cosine_similarity(latent_pred, z_next_tgt, dim=1).mean()
+        raw_losses['forward'] = (0.5 * (mse + cos)) * w.get('forward', 0.0)
+
+    if inverse_dynamics_logits is not None:
+        if 'action_index' in batch:
+            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_index'].long(), reduction='mean')
+        elif 'action_onehot' in batch:
+            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_onehot'].argmax(dim=1).long(), reduction='mean')
+        else:
+            ce = inverse_dynamics_logits.sum() * 0.0  # no target; zero loss
+        raw_losses['inverse'] = ce * w.get('inverse', 0.0)
 
     # Sum raw reconstruction losses
-    total_raw_loss = sum(raw_losses[k] * raw_modality_weights.get(k, 1.0) for k in raw_losses)
-    
+    total_raw_loss = sum(raw_losses[k] * config.raw_modality_weights.get(k, 1.0) for k in raw_losses)
+
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
     # KL divergence for low-rank approximation

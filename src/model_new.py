@@ -282,24 +282,24 @@ class Heads(nn.Module):
         nb = len(cfg.ego_bits)
 
         # Core heads
-        #self.ego_sem = nn.Linear(H, k * k * C_sem)
-        self.passability = nn.Linear(H, cfg.passability_dirs)
-        self.reward = nn.Linear(H, 1)
-        self.done = nn.Linear(H, 1)
-        self.value = nn.Linear(H, len(cfg.value_horizons))
+        # self.ego_sem = nn.Linear(H, k * k * C_sem)
+        # self.passability = nn.Linear(H, cfg.passability_dirs)
+        # self.reward = nn.Linear(H, 1)
+        # self.done = nn.Linear(H, 1)
+        # self.value = nn.Linear(H, len(cfg.value_horizons))
 
         # Optional/context heads
         # self.bag = MLP(H, H, cfg.bag_dim, num_layers=2) if cfg.bag_dim > 0 else None
-        self.stats = MLP(H, H, cfg.stats_dim, num_layers=2) if cfg.stats_dim > 0 else None
+        # self.stats = MLP(H, H, cfg.stats_dim, num_layers=2) if cfg.stats_dim > 0 else None
 
         # Optional ego bits
         # self.ego_bits = nn.Linear(H, nb * k * k) if nb > 0 else None
 
         # Optional safety risk (8 dirs)
-        self.safety = nn.Linear(H, cfg.passability_dirs)
+        # self.safety = nn.Linear(H, cfg.passability_dirs)
 
         # Goal direction / distance
-        self.goal = nn.Linear(H, cfg.goal_dir_dim) if cfg.goal_dir_dim > 0 else None
+        # self.goal = nn.Linear(H, cfg.goal_dir_dim) if cfg.goal_dir_dim > 0 else None
 
         # Low‑res global occupancy
         # hpr, wpr = cfg.lowres_occ_shape
@@ -311,7 +311,7 @@ class Heads(nn.Module):
         # self.ego_color = nn.Linear(H, k * k * cfg.ego_color_vocab) if cfg.ego_color_vocab > 0 else None
 
         # Skill belief (filtered)
-        self.skill_belief = nn.Linear(H, cfg.skill_num) if cfg.skill_num > 0 else None
+        # self.skill_belief = nn.Linear(H, cfg.skill_num) if cfg.skill_num > 0 else None
 
     def forward(self, z: torch.Tensor, cfg: VAEConfig) -> Dict[str, torch.Tensor]:
         h = F.relu(self.trunk(z))
