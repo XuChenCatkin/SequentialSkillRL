@@ -341,7 +341,7 @@ def categorize_monster_by_threat_level(char, color):
         return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Regular ghosts
     
     if char == "'":  # golems
-        if color in [CLR_RED, CLR_BLACK, 8]:  # Iron golems, special golems
+        if color in [CLR_RED, CLR_BLACK, NO_COLOR]:  # Iron golems, special golems
             return NetHackCategory.EXTREME_THREAT_MONSTERS
         return NetHackCategory.HIGH_THREAT_MONSTERS  # Regular golems
     
@@ -400,8 +400,8 @@ def categorize_glyph(char_code: int, color_code: int) -> NetHackCategory:
         return NetHackCategory.ITEMS
     elif pair in FURNITURE:
         return NetHackCategory.FURNITURE
-    elif char_code.isalpha() or char_code in ['@', ' ', "'", '&', ';', ':', '~', ']']:
-        return categorize_monster_by_threat_level(char_code, color_code)
+    elif chr(char_code).isalpha() or chr(char_code) in ['@', ' ', "'", '&', ';', ':', '~', ']']:
+        return categorize_monster_by_threat_level(chr(char_code), color_code)
     else:
         return NetHackCategory.UNKNOWN
 
@@ -689,7 +689,7 @@ class VAEConfig:
 
     # --- Latent space
     latent_dim: int = 96     # z‑dim for VAE
-    bag_dim: int = 24        # bag embedding dim (for glyph-bag)
+    bag_dim: int = 16        # bag embedding dim (for glyph-bag)
     core_dim: int = field(init=False)  # core embedding dim (for map encoder)
     low_rank: int = 0        # low-rank factorisation rank for covariance
     
@@ -719,8 +719,9 @@ class VAEConfig:
     action_dim: int = 0                        # one‑hot; 0 disables forward/inverse
     forward_hidden: int = 256
     use_inverse_dynamics: bool = True
-
+    goal_dir_dim: int = 0                      # 0 disables (set 2 for (dx,dy) regression)
     passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
+    value_horizons: List[int] = field(default_factory=lambda: [1, 5, 10])
     # Skill belief (future sticky HMM integration)
     skill_num: int = 0                         # number of skills; 0 disables skill head
 
@@ -730,8 +731,7 @@ class VAEConfig:
 
     # Loss weights
     raw_modality_weights: Dict[str, float] = field(default_factory=lambda: {
-        'ego_sem': 3.5,
-        'ego_bits': 1.0,
+        'ego_class': 3.5,
         'passability': 1.8,
         'safety': 0.8,
         'reward': 1.0,
@@ -739,16 +739,15 @@ class VAEConfig:
         'value': 1.0,
         'bag': 8.0,
         'stats': 0.5,
+        'msg': 0.5,
         'goal': 1.0,
-        'lowres_occ': 0.3,
+        'occupy': 0.3,
         'forward': 1.0,
         'inverse': 0.8,
         'ego_char': 0.3,
         'ego_color': 0.3,
+        'hero_loc': 1.0,
     })
-
-    # KL settings
-    beta: float = 1.0                          # trainer can do capacity scheduling externally
     
     def __post_init__(self):
         self.glyph_emb = self.char_emb + self.color_emb
@@ -891,107 +890,91 @@ class MapDecoder(nn.Module):
         return out
 
     @staticmethod
-    def _filter_topk_topp_channels(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
-        """Filter along channel dim (classes) for [B,C,H,W] logits."""
-        B, C, H, W = logits.shape
-        out = logits
-        if top_k is not None and top_k > 0 and top_k < C:
-            kth = torch.topk(out, top_k, dim=1).values[:, -1:, :, :]
-            out = out.masked_fill(out < kth, float('-inf'))
-        if top_p is not None and top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(out, dim=1, descending=True)  # [B,C,H,W]
-            probs = F.softmax(sorted_logits, dim=1)
-            cum = probs.cumsum(dim=1)
-            remove = cum > top_p
-            remove[:, 1:, :, :] = remove[:, :-1, :, :].clone()
-            remove[:, 0, :, :] = False
-            remove = remove | torch.isneginf(sorted_logits)
-            to_remove = torch.zeros_like(out, dtype=torch.bool)
-            to_remove.scatter_(1, sorted_idx, remove)
-            out = out.masked_fill(to_remove, float('-inf'))
-        return out
-
-    @staticmethod
-    def _sample_per_pixel(logits: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        """Return class indices [B,H,W] from [B,C,H,W] logits."""
+    def _sample_per_pixel(
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        deterministic: bool = True
+    ) -> torch.Tensor:
+        """
+        logits: [B, C, H, W] -> returns indices [B, H, W]
+        """
         if deterministic:
             return logits.argmax(dim=1)
+
         B, C, H, W = logits.shape
-        probs = F.softmax(logits, dim=1)
-        probs = torch.nan_to_num(probs, nan=0.0)
-        flat = probs.permute(0,2,3,1).contiguous().view(-1, C)  # [B*H*W, C]
-        zero_row = flat.sum(dim=1, keepdim=True) == 0
-        if zero_row.any():
-            arg = logits.permute(0,2,3,1).contiguous().view(-1, C).argmax(dim=1, keepdim=True)
-            one_hot = torch.zeros_like(flat).scatter_(1, arg, 1.0)
-            flat = torch.where(zero_row, one_hot, flat)
-        idx = torch.multinomial(flat, 1).squeeze(-1)
+        x = (logits / max(temperature, 1e-6)).permute(0, 2, 3, 1).reshape(B*H*W, C)  # [BHW,C]
+
+        if top_k > 0:
+            vals, inds = torch.topk(x, k=min(top_k, C), dim=1)
+            mask = torch.full_like(x, float("-inf"))
+            mask.scatter_(1, inds, vals)
+            x = mask
+
+        if 0.0 < top_p < 1.0:
+            probs = x.softmax(dim=1)
+            sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=1)
+            cum = sorted_probs.cumsum(dim=1)
+            keep = cum <= top_p
+            # always keep at least 1
+            keep[:, 0] = True
+            filtered = torch.full_like(x, float("-inf"))
+            filtered.scatter_(1, sorted_idx, torch.where(keep, x.gather(1, sorted_idx), torch.full_like(sorted_probs, float("-inf"))))
+            x = filtered
+
+        idx = torch.distributions.Categorical(logits=x).sample()  # [BHW]
         return idx.view(B, H, W)
 
     @staticmethod
-    def sample_from_logits(
-        occupy_logits: torch.Tensor,
-        rare_occupy_logits: torch.Tensor,
-        glyph_logits: torch.Tensor,
-        color_logits: torch.Tensor,
-        rare_glyph_logits: torch.Tensor,
-        rare_color_logits: torch.Tensor,
+    def sample_ego_from_logits(
+        ego_char_logits: torch.Tensor,
+        ego_color_logits: torch.Tensor,
+        ego_class_logits: torch.Tensor,
         temperature: float = 1.0,
-        occ_thresh: float = 0.5,
-        rare_occ_thresh: float = 0.5,
-        deterministic: bool = True,
         glyph_top_k: int = 0,
         glyph_top_p: float = 1.0,
         color_top_k: int = 0,
         color_top_p: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        class_top_k: int = 0,
+        class_top_p: float = 1.0,
+        deterministic: bool = True
+    ) -> dict[str, torch.Tensor]:
         """
-        Turn map logits into hard predictions.
-        Returns (fg_mask [B,H,W] bool, chars [B,H,W] ASCII, colors [B,H,W]).
+        Inputs are logits:
+          - ego_char_logits:  [B, CHAR_DIM, k, k]
+          - ego_color_logits: [B, COLOR_DIM, k, k]
+          - ego_class_logits: [B, NUM_CLASSES, k, k]
+        Returns integer maps:
+          - ego_chars:  [B, k, k]    ASCII in [32..127] (space==32)
+          - ego_colors: [B, k, k]    in [0..15]
+          - ego_class:  [B, k, k]    class indices
         """
-        assert temperature > 0, "temperature must be > 0"
-        device = occupy_logits.device
-        B, _, H, W = occupy_logits.shape
-        # occupancy -> foreground mask
-        occ_p = torch.sigmoid(occupy_logits).squeeze(1)
-        rare_occ_p = torch.sigmoid(rare_occupy_logits).squeeze(1)
-        if deterministic:
-            fg_mask = (occ_p > occ_thresh)
-            rare_fg_mask = (rare_occ_p > rare_occ_thresh) & fg_mask
-        else:
-            fg_mask = torch.bernoulli(occ_p.clamp(1e-6, 1-1e-6)).bool()
-            rare_fg_mask = torch.bernoulli(rare_occ_p.clamp(1e-6, 1-1e-6)).bool() & fg_mask
-        # scale temperatures for class heads
-        g_log = glyph_logits / temperature
-        c_log = color_logits / temperature
-        g_rare_log = rare_glyph_logits / temperature
-        c_rare_log = rare_color_logits / temperature
-        # filter
-        if not deterministic and (glyph_top_k > 0 or color_top_k > 0 or glyph_top_p < 1.0 or color_top_p < 1.0):
-            g_log = MapDecoder._filter_topk_topp_channels(g_log, top_k=glyph_top_k, top_p=glyph_top_p)
-            c_log = MapDecoder._filter_topk_topp_channels(c_log, top_k=color_top_k, top_p=color_top_p)
-            g_rare_log = MapDecoder._filter_topk_topp_channels(g_rare_log, top_k=glyph_top_k, top_p=glyph_top_p)
-            c_rare_log = MapDecoder._filter_topk_topp_channels(c_rare_log, top_k=color_top_k, top_p=color_top_p)
-        # choose indices
-        g_idx = MapDecoder._sample_per_pixel(g_log, deterministic=deterministic)  # [B,H,W] in 0..CHAR_DIM-1
-        c_idx = MapDecoder._sample_per_pixel(c_log, deterministic=deterministic)  # [B,H,W] in 0..COLOR_DIM-1
-        rare_g_idx = MapDecoder._sample_per_pixel(g_rare_log, deterministic=deterministic)  # [B,H,W]
-        rare_c_idx = MapDecoder._sample_per_pixel(c_rare_log, deterministic=deterministic)
-        # write into outputs with background defaults
-        chars = torch.full((B, H, W), ord(' '), device=device, dtype=torch.long)  # 32 ' '
-        colors = torch.zeros((B, H, W), device=device, dtype=torch.long)             # 0
-        chars_fg = (g_idx + 32).clamp(32, 127)
-        rare_chars_fg = (rare_g_idx + 32).clamp(32, 127)
-        chars[fg_mask] = chars_fg[fg_mask]
-        colors[fg_mask] = c_idx[fg_mask]
-        chars[rare_fg_mask] = rare_chars_fg[rare_fg_mask]
-        colors[rare_fg_mask] = rare_c_idx[rare_fg_mask]
-        return fg_mask, rare_fg_mask, chars, colors
+        # sample per-pixel indices
+        char_idx = MapDecoder._sample_per_pixel(
+            ego_char_logits, temperature, glyph_top_k, glyph_top_p, deterministic
+        )                                # [B,k,k] in [0..CHAR_DIM-1]
+        color_idx = MapDecoder._sample_per_pixel(
+            ego_color_logits, temperature, color_top_k, color_top_p, deterministic
+        )                                # [B,k,k] in [0..COLOR_DIM-1]
+        class_idx = MapDecoder._sample_per_pixel(
+            ego_class_logits, temperature, class_top_k, class_top_p, deterministic
+        )                                # [B,k,k]
+
+        # shift chars back to ASCII range
+        ego_chars = (char_idx + 32).clamp(32, 127)     # [B,k,k] ASCII
+        ego_colors = color_idx                         # [B,k,k] 0..15
+        ego_class  = class_idx                         # [B,k,k]
+
+        return {"ego_chars": ego_chars, "ego_colors": ego_colors, "ego_class": ego_class}
 
     def generate(self, z: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convenience: z -> logits -> hard maps."""
-        occ, gl, cl, rare_occ, rare_gl, rare_cl = self.forward(z)
-        return self.sample_from_logits(occ, gl, cl, rare_occ, rare_gl, rare_cl, **kwargs)
+        out = self.forward(z)
+        ego_char_logits = out['ego_char_logits']  # [B, CHAR_DIM, k, k]
+        ego_color_logits = out['ego_color_logits']
+        ego_class_logits = out['ego_class_logits']  # [B, C, k, k]
+        return self.sample_from_logits(ego_char_logits, ego_color_logits, ego_class_logits, **kwargs)
 
 class BlstatsPreprocessor(nn.Module):
     def __init__(self, stats_dim=BLSTATS_DIM):
@@ -1542,13 +1525,14 @@ class MultiModalHackVAE(nn.Module):
         # map sampling
         map_temperature: float = 1.0,
         map_occ_thresh: float = 0.5,
-        rare_occ_thresh: float = 0.5,
         hero_presence_thresh: float = 0.5,
         map_deterministic: bool = True,
         glyph_top_k: int = 0,
         glyph_top_p: float = 1.0,
         color_top_k: int = 0,
         color_top_p: float = 1.0,
+        class_top_k: int = 0,
+        class_top_p: float = 1.0,
         # message sampling
         msg_temperature: float = 1.0,
         msg_top_k: int = 0,
@@ -1575,20 +1559,17 @@ class MultiModalHackVAE(nn.Module):
         dec = self.decode(z)
 
         # --- Map sampling ---
-        fg_mask, rare_fg_mask, chars, colors = MapDecoder.sample_from_logits(
-            dec["occupy_logits"], 
-            dec["rare_occ_logits"],
-            dec["char_logits"], 
-            dec["color_logits"],
-            dec['rare_char_logits'],
-            dec['rare_color_logits'],
+        ego_samples = MapDecoder.sample_ego_from_logits(
+            dec["ego_char_logits"], dec["ego_color_logits"], dec["ego_class_logits"],
             temperature=map_temperature,
-            occ_thresh=map_occ_thresh,
-            rare_occ_thresh=rare_occ_thresh,
             deterministic=map_deterministic,
             glyph_top_k=glyph_top_k, glyph_top_p=glyph_top_p,
             color_top_k=color_top_k, color_top_p=color_top_p,
+            class_top_k=class_top_k, class_top_p=class_top_p
         )
+        
+        # Occupancy mask
+        occupy = (torch.sigmoid(dec["occupy_logits"]) > map_occ_thresh).float()  # [B,1,21,79]
         
         hero_presence_logit = dec["hero_presence_logits"]
         if map_deterministic:
@@ -1596,12 +1577,6 @@ class MultiModalHackVAE(nn.Module):
         else:
             has_hero = torch.bernoulli(torch.sigmoid(hero_presence_logit))  # [B]
         hero_centroid = dec["hero_centroid"]
-        hero_yy = ((hero_centroid[:, 0] + 1) / 2 * MAP_HEIGHT).round().long()  # [B]
-        hero_xx = ((hero_centroid[:, 1] + 1) / 2 * MAP_WIDTH).round().long()
-        hero_yy = torch.clamp(hero_yy, 0, MAP_HEIGHT - 1)  # clamp to valid range
-        hero_xx = torch.clamp(hero_xx, 0, MAP_WIDTH - 1)
-        chars[has_hero, hero_yy[has_hero], hero_xx[has_hero]] = HERO_CHAR
-        colors[has_hero, hero_yy[has_hero], hero_xx[has_hero]] = 7
 
         # --- Message sampling ---
         msg_tokens_out = MessageDecoder.sample_from_logits(
@@ -1626,10 +1601,10 @@ class MultiModalHackVAE(nn.Module):
         }
 
         out = {
-            "fg_mask": fg_mask,
-            "rare_fg_mask": rare_fg_mask,
-            "chars": chars,
-            "colors": colors,
+            "occupancy_mask": occupy,
+            "hero_presence": has_hero,
+            "hero_centroid": hero_centroid,
+            **ego_samples,
             "msg_tokens": msg_tokens_out,
             "stats_point": stats_point,
             "z": z,
@@ -1637,11 +1612,9 @@ class MultiModalHackVAE(nn.Module):
         if include_logits:
             out.update({
                 "occupy_logits": dec["occupy_logits"],
-                "char_logits": dec["char_logits"],
-                "color_logits": dec["color_logits"],
-                "rare_occupy_logits": dec["rare_occ_logits"],
-                "rare_char_logits": dec["rare_char_logits"],
-                "rare_color_logits": dec["rare_color_logits"],
+                "ego_char_logits": dec["ego_char_logits"],
+                "ego_color_logits": dec["ego_color_logits"],
+                "ego_class_logits": dec["ego_class_logits"],
                 "hero_presence_logits": hero_presence_logit,
                 "hero_centroid": hero_centroid,
                 "msg_logits": dec["msg_logits"],
