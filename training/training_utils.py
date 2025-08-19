@@ -7,7 +7,7 @@ from huggingface_hub import HfApi, login, RepositoryNotFoundError
 from huggingface_hub import hf_hub_download
 from huggingface_hub import HfFileSystem
 from matplotlib import pyplot as plt
-from model import MultiModalHackVAE
+from src.model import MultiModalHackVAE
 
 # Weights & Biases integration
 try:
@@ -40,6 +40,7 @@ def save_checkpoint(
     epoch: int,
     train_losses: List[float],
     test_losses: List[float],
+    config = None,  # VAEConfig object
     scheduler: torch.optim.lr_scheduler._LRScheduler = None,
     scaler = None,  # Remove specific type annotation since GradScaler API changed
     checkpoint_dir: str = "checkpoints",
@@ -82,14 +83,7 @@ def save_checkpoint(
         'optimizer_state_dict': optimizer.state_dict(),
         'train_losses': train_losses,
         'test_losses': test_losses,
-        'model_config': {
-            # All MultiModalHackVAE constructor parameters
-            'bInclude_glyph_bag': getattr(model, 'include_glyph_bag', True),
-            'bInclude_hero': getattr(model, 'include_hero', True),
-            'dropout_rate': getattr(model, 'dropout_rate', 0.0),
-            'enable_dropout_on_latent': getattr(model, 'enable_dropout_on_latent', False),
-            'enable_dropout_on_decoder': getattr(model, 'enable_dropout_on_decoder', False),
-        },
+        'config': config,
         'checkpoint_timestamp': datetime.now().isoformat(),
         'final_train_loss': train_losses[-1] if train_losses else None,
         'final_test_loss': test_losses[-1] if test_losses else None,
@@ -248,11 +242,6 @@ def save_model_to_huggingface(
             "dataset": "NetHack Learning Dataset",
             "latent_dim": getattr(model, 'latent_dim', 'unknown'),
             "lowrank_dim": getattr(model, 'lowrank_dim', 'unknown'),
-            'bInclude_glyph_bag': getattr(model, 'include_glyph_bag', True),
-            'bInclude_hero': getattr(model, 'include_hero', True),
-            'dropout_rate': getattr(model, 'dropout_rate', 0.1),
-            'enable_dropout_on_latent': getattr(model, 'enable_dropout_on_latent', True),
-            'enable_dropout_on_decoder': getattr(model, 'enable_dropout_on_decoder', True),
             "architecture": "Multi-modal Variational Autoencoder for NetHack game states"
         }
         

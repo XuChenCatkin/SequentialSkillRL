@@ -4,14 +4,18 @@ from enum import IntEnum
 import torch
 import nle.dataset as nld
 from nle.nethack import tty_render
-from utils import detect_valid_map, get_game_map, get_current_message, get_status_lines
+from utils.env_utils import detect_valid_map, get_game_map, get_current_message, get_status_lines
 import time
 import numpy as np
 import os
 import pickle
 import re
-from model import PADDING_CHAR, PADDING_COLOR, HERO_CHAR
 from utils.action_utils import ACTION_DIM, batch_keypress_static_map
+
+# Constants (avoid circular import)
+PADDING_CHAR = 32      # padding character (blank space)
+PADDING_COLOR = 0       # padding color (black)  
+HERO_CHAR = ord('@')  # hero character code (ASCII 64)
 
 DIRS_8 = [(-1,0),(0,+1),(+1,0),(0,-1),(-1,+1),(+1,+1),(+1,-1),(-1,-1)]  # N,E,S,W,NE,SE,SW,NW
 ACTION_NAMES = ["N","E","S","W","NE","SE","SW","NW"]
@@ -1025,11 +1029,11 @@ class BLStatsAdapter:
         for y in range(height):
             for x in range(width):
                 if chars[y, x] == ord('@'):
-                    return (x, y)
+                    return (y, x)
         
         # If '@' not found, return center of map as fallback
-        return (width // 2, height // 2)
-    
+        return (height // 2, width // 2)
+
     def _parse_status_comprehensive(self, status_lines: List[str]) -> Dict:
         """Comprehensive status line parsing with multiple format support"""
         if not status_lines:

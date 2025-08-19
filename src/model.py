@@ -62,6 +62,14 @@ import math
 from typing import Optional, List, Dict
 from enum import IntEnum
 from dataclasses import dataclass, field
+from nle import nethack
+
+# Import NetHackCategory from data_collection
+try:
+    from .data_collection import NetHackCategory
+except ImportError:
+    # Fallback for when running as script
+    from src.data_collection import NetHackCategory
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
@@ -190,11 +198,11 @@ def hero_presence_and_centroid(glyph_chars: torch.Tensor, blstats: torch.Tensor)
     If absent, centroid is (0,0) and p=0 (loss masked by p).
     """
     B, H, W = glyph_chars.shape
-    ux = round(blstats[:, 0] * MAX_X_COORD)  # x coordinate
-    uy = round(blstats[:, 1] * MAX_Y_COORD)  # y coordinate
-    present = (glyph_chars[:, uy, ux] == HERO_CHAR).float()  # [B]
-    cy = blstats[:, 1].view(B, 1) * 2 - 1  # y coordinate in [-1,1]
-    cx = blstats[:, 0].view(B, 1) * 2 - 1  # x coordinate in [-1,1]
+
+    y_coord, x_coord = blstats[:, 0], blstats[:, 1]
+    present = (glyph_chars[torch.arange(B), y_coord, x_coord] == HERO_CHAR).float()  # [B]
+    cy = (y_coord / MAX_Y_COORD * 2 - 1).view(B, 1)  # y coordinate in [-1,1]
+    cx = (x_coord / MAX_X_COORD * 2 - 1).view(B, 1)  # x coordinate in [-1,1]
     centroid = torch.stack([cy, cx], dim=1)                      # [B,2]
     return present, centroid
 
@@ -356,7 +364,7 @@ class VAEConfig:
 
     # Decoder settings
     # --- Map decoder ---
-    ego_window: int = 9                       # must be odd
+    ego_window: int = 11                       # must be odd
     ego_classes: int = NetHackCategory.get_category_count()  # number of ego classes
     map_dec_base_ch: int = 64          # base channels in map decoder
     
@@ -367,10 +375,10 @@ class VAEConfig:
     msg_ch: int = 128
     
     # Dynamics heads
-    action_dim: int = 0                        # one‑hot; 0 disables forward/inverse
+    action_dim: int = len(nethack.ACTIONS)     # one‑hot; 0 disables forward/inverse
     forward_hidden: int = 256
     use_inverse_dynamics: bool = True
-    goal_dir_dim: int = 0                      # 0 disables (set 2 for (dx,dy) regression)
+    goal_dir_dim: int = 2                      # 0 disables (set 2 for (dx,dy) regression)
     passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
     value_horizons: List[int] = field(default_factory=lambda: [1, 5, 10])
     # Skill belief (future sticky HMM integration)
@@ -399,6 +407,19 @@ class VAEConfig:
         'ego_color': 0.3,
         'hero_loc': 1.0,
     })
+    
+    # KL Beta parameters for adaptive loss weighting
+    initial_mi_beta: float = 0.0001
+    final_mi_beta: float = 1.0
+    mi_beta_shape: str = 'cosine'
+    initial_tc_beta: float = 0.0001
+    final_tc_beta: float = 1.0
+    tc_beta_shape: str = 'cosine'
+    initial_dw_beta: float = 0.0001
+    final_dw_beta: float = 1.0
+    dw_beta_shape: str = 'cosine'
+    warmup_epoch_ratio: float = 0.3
+    free_bits: float = 0.0
     
     def __post_init__(self):
         self.glyph_emb = self.char_emb + self.color_emb
@@ -1029,6 +1050,8 @@ class MultiModalHackVAE(nn.Module):
             )
         self.latent_dim = config.latent_dim
         self.lowrank_dim = config.low_rank
+        self.z_bag_dim = config.bag_dim  # Add missing attribute
+        self.z_core_dim = config.core_dim  # Add missing attribute
         self.mu_head     = nn.Linear(256, self.latent_dim)
         self.logvar_diag_head = nn.Linear(256, self.latent_dim)  # diagonal part
         self.lowrank_factor_head = nn.Linear(256, self.latent_dim * self.lowrank_dim) if self.lowrank_dim else None # low-rank factors
@@ -1309,12 +1332,10 @@ def vae_loss(
     model_output,
     batch, 
     config,
-    focal_loss_alpha=0.1,
-    focal_loss_gamma=2.0,
     mi_beta=1.0,
     tc_beta=1.0,
-    dw_beta=1.0,
-    free_bits=0.0):
+    dw_beta=1.0
+    ):
     """
     VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
     """
@@ -1322,14 +1343,15 @@ def vae_loss(
     glyph_chars = batch['game_chars']  # [B, 21, 79]
     glyph_colors = batch['game_colors']  # [B, 21, 79]
     blstats = batch['blstats'] # [B, BLSTATS_DIM]
+    msg_tokens = batch['message_chars']  # [B, 256]
+    valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
+    
     # stats
     pre = model_output['stats_encoder'].preprocessor
     pre = pre.to(blstats.device)
     pre.eval()
     with torch.no_grad():
         t = pre.targets(blstats[valid_screen])
-    msg_tokens = batch['message_chars']  # [B, 256]
-    valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
     # Extract outputs from model
     mu = model_output['mu'][valid_screen]  # [valid_B, LATENT_DIM]
     logvar = model_output['logvar'][valid_screen]
@@ -1378,7 +1400,7 @@ def vae_loss(
     occ_t = fg.float().unsqueeze(1)           # [valid_B,1,H,W]
     char_t = torch.clamp(gc - 32, 0, CHAR_DIM - 1)  # [valid_B,H,W]
     bag_t = make_pair_bag(glyph_chars[valid_screen], glyph_colors[valid_screen])  # [valid_B,GLYPH_DIM]
-    hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen], t) # [valid_B], [valid_B,2]
+    hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen], blstats[valid_screen]) # [valid_B], [valid_B,2]
     
     # ---- hero presence + centroid ----
     hero_bce = F.binary_cross_entropy_with_logits(hero_presence_logits, hero_p_t, pos_weight=torch.full_like(hero_presence_logits, 10))  # [valid_B]
@@ -1443,47 +1465,40 @@ def vae_loss(
     
     # --- Core heads ---
     if 'ego_char' in batch:
-        ce = F.cross_entropy(ego_char_logits, batch['ego_char'].long(), reduction='mean')
-        raw_losses['ego_char'] = ce * w.get('ego_char', 0.0)
+        raw_losses['ego_char'] = F.cross_entropy(ego_char_logits, batch['ego_char'].long(), reduction='mean')
     
     if 'ego_color' in batch:
-        ce = F.cross_entropy(ego_color_logits, batch['ego_color'].long(), reduction='mean')
-        raw_losses['ego_color'] = ce * w.get('ego_color', 0.0)
+        raw_losses['ego_color'] = F.cross_entropy(ego_color_logits, batch['ego_color'].long(), reduction='mean')
 
     if 'ego_class' in batch:
-        ce = F.cross_entropy(ego_class_logits, batch['ego_class'].long(), reduction='mean')
-        raw_losses['ego_class'] = ce * w.get('ego_class', 0.0)
+        raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, batch['ego_class'].long(), reduction='mean')
 
     if 'passability_target' in batch:
-        bce = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'], reduction='mean')
-        raw_losses['passability'] = bce * w.get('passability', 0.0)
+        raw_losses['passability'] = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'], reduction='mean')
 
     if 'reward_target' in batch:
-        mse = F.mse_loss(reward, batch['reward_target'], reduction='mean')
-        raw_losses['reward'] = mse * w.get('reward', 0.0)
+        raw_losses['reward'] = F.mse_loss(reward, batch['reward_target'], reduction='mean')
+
     if 'done_target' in batch:
-        bce = F.binary_cross_entropy_with_logits(done_logits, batch['done_target'], reduction='mean')
-        raw_losses['done'] = bce * w.get('done', 0.0)
+        raw_losses['done'] = F.binary_cross_entropy_with_logits(done_logits, batch['done_target'], reduction='mean')
+        
     if 'value_k_target' in batch:
-        mse = F.mse_loss(value, batch['value_k_target'], reduction='mean')
-        raw_losses['value'] = mse * w.get('value', 0.0)
+        raw_losses['value'] = F.mse_loss(value, batch['value_k_target'], reduction='mean')
 
     # --- Safety risk (8 dirs) ---
     if 'safety_target' in batch:
-        bce = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'], reduction='mean')
-        raw_losses['safety'] = bce * w.get('safety', 0.0)
+        raw_losses['safety'] = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'], reduction='mean')
 
     # --- Goal direction ---
     if ('goal_target' in batch) and ('goal_pred' in model_output):
-        mse = F.mse_loss(goal_pred, batch['goal_target'], reduction='mean')
-        raw_losses['goal'] = mse * w.get('goal', 0.0)
+        raw_losses['goal'] = F.mse_loss(goal_pred, batch['goal_target'], reduction='mean')
 
     # --- Dynamics ---
     if (latent_pred is not None) and ('z_next_detached' in batch) and ('action_onehot' in batch):
         z_next_tgt = batch['z_next_detached']
         mse = F.mse_loss(latent_pred, z_next_tgt, reduction='mean')
         cos = 1.0 - F.cosine_similarity(latent_pred, z_next_tgt, dim=1).mean()
-        raw_losses['forward'] = (0.5 * (mse + cos)) * w.get('forward', 0.0)
+        raw_losses['forward'] = (0.5 * (mse + cos))
 
     if inverse_dynamics_logits is not None:
         if 'action_index' in batch:
@@ -1492,7 +1507,7 @@ def vae_loss(
             ce = F.cross_entropy(inverse_dynamics_logits, batch['action_onehot'].argmax(dim=1).long(), reduction='mean')
         else:
             ce = inverse_dynamics_logits.sum() * 0.0  # no target; zero loss
-        raw_losses['inverse'] = ce * w.get('inverse', 0.0)
+        raw_losses['inverse'] = ce
 
     # Sum raw reconstruction losses
     total_raw_loss = sum(raw_losses[k] * config.raw_modality_weights.get(k, 1.0) for k in raw_losses)
@@ -1542,7 +1557,7 @@ def vae_loss(
     # Dimension-wise KL divergence with free bits regularization
     diag_S_bar = torch.diag(total_S).clamp_min(eps)  # Diagonal of the covariance matrix, [LATENT_DIM]
     dwkl_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())  # [LATENT_DIM]
-    dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - free_bits, min=0)  # Free bits regularization
+    dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - config.free_bits, min=0)  # Free bits regularization
     dwkl = dwkl_per_dim.sum()  # Sum over dimensions
     dwkl_fb = dwkl_fb_per_dim.sum()  # Free bits regularization sum
     

@@ -61,7 +61,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import logging
 from src.data_collection import NetHackDataCollector, BLStatsAdapter
-from training_utils import save_checkpoint, save_model_to_huggingface, load_model_from_huggingface, \
+from training.training_utils import save_checkpoint, save_model_to_huggingface, load_model_from_huggingface, \
     upload_training_artifacts_to_huggingface, create_model_demo_notebook, load_model_from_local
 
 # Import our utility functions
@@ -108,6 +108,7 @@ def train_multimodalhack_vae(
     train_file: str, 
     test_file: str,                     
     dbfilename: str = 'ttyrecs.db',
+    config: VAEConfig = None,
     epochs: int = 10, 
     batch_size: int = 32, 
     sequence_size: int = 32, 
@@ -128,26 +129,8 @@ def train_multimodalhack_vae(
     # Mixed precision parameters
     use_bf16: bool = False,
     
-    # Adaptive loss weighting parameters
-    initial_mi_beta: float = 0.0001,
-    final_mi_beta: float = 1.0,
-    mi_beta_shape: str = 'cosine',
-    initial_tc_beta: float = 0.0001,
-    final_tc_beta: float = 1.0,
-    tc_beta_shape: str = 'cosine',
-    initial_dw_beta: float = 0.0001,
-    final_dw_beta: float = 1.0,
-    dw_beta_shape: str = 'cosine',
+    # Custom KL beta function (optional override)
     custom_kl_beta_function: Optional[Callable[[float, float, float], float]] = None,
-    free_bits: float = 0.0,
-    warmup_epoch_ratio: float = 0.3,
-    focal_loss_alpha: float = 0.75,
-    focal_loss_gamma: float = 2.0,
-    
-    # Dropout and regularization parameters
-    dropout_rate: float = 0.0,
-    enable_dropout_on_latent: bool = True,
-    enable_dropout_on_decoder: bool = True,
     
     # Model saving and checkpointing parameters
     save_path: str = "models/nethack-vae.pth",
@@ -191,6 +174,8 @@ def train_multimodalhack_vae(
         train_file: Path to the training samples
         test_file: Path to the testing samples
         dbfilename: Path to the NetHack Learning Dataset database file
+        config: VAEConfig object containing model configuration and training hyperparameters.
+                If None, will create default config. For resuming from checkpoint, config from checkpoint takes precedence.
         epochs: Number of training epochs
         batch_size: Training batch size
         max_learning_rate: max learning rate for optimizer
@@ -200,16 +185,7 @@ def train_multimodalhack_vae(
         shuffle_batches: Whether to shuffle training batches at the start of each epoch
         shuffle_within_batch: Whether to shuffle samples within each batch (ignores temporal order)
         use_bf16: Whether to use BF16 mixed precision training for memory efficiency
-        initial_mi_beta: Starting mutual information KL divergence weight (very small initially)
-        final_mi_beta: Final mutual information KL divergence weight
-        mi_beta_shape: Shape of MI beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
-        initial_tc_beta: Starting total correlation KL divergence weight (very small initially)
-        final_tc_beta: Final total correlation KL divergence weight
-        tc_beta_shape: Shape of TC beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
-        initial_dw_beta: Starting dimension-wise KL divergence weight (very small initially)
-        final_dw_beta: Final dimension-wise KL divergence weight
-        dw_beta_shape: Shape of DW beta curve ('linear', 'cubic', 'sigmoid', 'cosine', 'exponential')
-        custom_kl_beta_function: Custom function for KL beta ramping (applies to all three betas)
+        custom_kl_beta_function: Optional custom function for KL beta ramping (overrides config beta curves)
         free_bits: Target free bits for KL loss (0.0 disables)
         warmup_epoch_ratio: Ratio of epochs for warm-up phase
         focal_loss_alpha: Alpha parameter for focal loss (0.0 disables)
@@ -254,6 +230,10 @@ def train_multimodalhack_vae(
         # Ensure device is a torch.device object, not a string
         device = torch.device(device)
 
+    # Setup VAEConfig
+    if config is None:
+        config = VAEConfig()
+
     # Setup logging
     if logger is None:
         logging.basicConfig(
@@ -280,25 +260,42 @@ def train_multimodalhack_vae(
             "use_bf16": use_bf16,
             "shuffle_batches": shuffle_batches,
             "shuffle_within_batch": shuffle_within_batch,
+            "vae_config": {
+                "latent_dim": config.latent_dim,
+                "encoder_dropout": config.encoder_dropout,
+                "decoder_dropout": config.decoder_dropout,
+                "initial_mi_beta": config.initial_mi_beta,
+                "final_mi_beta": config.final_mi_beta,
+                "mi_beta_shape": config.mi_beta_shape,
+                "initial_tc_beta": config.initial_tc_beta,
+                "final_tc_beta": config.final_tc_beta,
+                "tc_beta_shape": config.tc_beta_shape,
+                "initial_dw_beta": config.initial_dw_beta,
+                "final_dw_beta": config.final_dw_beta,
+                "dw_beta_shape": config.dw_beta_shape,
+                "warmup_epoch_ratio": config.warmup_epoch_ratio,
+                "free_bits": config.free_bits,
+                "focal_loss_alpha": config.focal_loss_alpha,
+                "focal_loss_gamma": config.focal_loss_gamma
+            },
             "adaptive_weighting": {
-                "initial_mi_beta": initial_mi_beta,
-                "final_mi_beta": final_mi_beta,
-                "mi_beta_shape": mi_beta_shape,
-                "initial_tc_beta": initial_tc_beta,
-                "final_tc_beta": final_tc_beta,
-                "tc_beta_shape": tc_beta_shape,
-                "initial_dw_beta": initial_dw_beta,
-                "final_dw_beta": final_dw_beta,
-                "dw_beta_shape": dw_beta_shape,
-                "warmup_epoch_ratio": warmup_epoch_ratio
+                "initial_mi_beta": config.initial_mi_beta,
+                "final_mi_beta": config.final_mi_beta,
+                "mi_beta_shape": config.mi_beta_shape,
+                "initial_tc_beta": config.initial_tc_beta,
+                "final_tc_beta": config.final_tc_beta,
+                "tc_beta_shape": config.tc_beta_shape,
+                "initial_dw_beta": config.initial_dw_beta,
+                "final_dw_beta": config.final_dw_beta,
+                "dw_beta_shape": config.dw_beta_shape,
+                "warmup_epoch_ratio": config.warmup_epoch_ratio
             },
             "regularization": {
-                "dropout_rate": dropout_rate,
-                "enable_dropout_on_latent": enable_dropout_on_latent,
-                "enable_dropout_on_decoder": enable_dropout_on_decoder,
-                "free_bits": free_bits,
-                "focal_loss_alpha": focal_loss_alpha,
-                "focal_loss_gamma": focal_loss_gamma
+                "encoder_dropout": config.encoder_dropout,
+                "decoder_dropout": config.decoder_dropout,
+                "free_bits": config.free_bits,
+                "focal_loss_alpha": config.focal_loss_alpha,
+                "focal_loss_gamma": config.focal_loss_gamma
             },
             "checkpointing": {
                 "save_checkpoints": save_checkpoints,
@@ -337,48 +334,48 @@ def train_multimodalhack_vae(
     logger.info(f"   Data cache: {data_cache_dir}")
     logger.info(f"   Shuffle batches: {shuffle_batches}")
     logger.info(f"   Shuffle within batch: {shuffle_within_batch}")
-    logger.info(f"   Dropout Configuration:")
-    logger.info(f"     - Dropout rate: {dropout_rate}")
-    logger.info(f"     - Enable dropout on latent: {enable_dropout_on_latent}")
-    logger.info(f"     - Enable dropout on decoder: {enable_dropout_on_decoder}")
+    logger.info(f"   VAE Configuration:")
+    logger.info(f"     - Latent dimension: {config.latent_dim}")
+    logger.info(f"     - Encoder dropout: {config.encoder_dropout}")
+    logger.info(f"     - Decoder dropout: {config.decoder_dropout}")
     logger.info(f"   Adaptive Loss Weighting:")
-    logger.info(f"     - MI beta: {initial_mi_beta:.3f} → {final_mi_beta:.3f}")
-    logger.info(f"     - TC beta: {initial_tc_beta:.3f} → {final_tc_beta:.3f}")
-    logger.info(f"     - DW beta: {initial_dw_beta:.3f} → {final_dw_beta:.3f}")
-    logger.info(f"     - Warmup epochs: {int(warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
-    logger.info(f"   Free bits: {free_bits}")
-    logger.info(f"   Focal loss: alpha={focal_loss_alpha}, gamma={focal_loss_gamma}")
+    logger.info(f"     - MI beta: {config.initial_mi_beta:.3f} → {config.final_mi_beta:.3f}")
+    logger.info(f"     - TC beta: {config.initial_tc_beta:.3f} → {config.final_tc_beta:.3f}")
+    logger.info(f"     - DW beta: {config.initial_dw_beta:.3f} → {config.final_dw_beta:.3f}")
+    logger.info(f"     - Warmup epochs: {int(config.warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
+    logger.info(f"   Free bits: {config.free_bits}")
+    logger.info(f"   Focal loss: alpha={config.focal_loss_alpha}, gamma={config.focal_loss_gamma}")
     logger.info(f"   Early Stopping:")
     logger.info(f"     - Enabled: {early_stopping}")
     if early_stopping:
         logger.info(f"     - Patience: {early_stopping_patience} epochs")
         logger.info(f"     - Min delta: {early_stopping_min_delta:.6f}")
 
-    def get_adaptive_weights(global_step: int, total_steps: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float, float, float]:
+    def get_adaptive_weights(global_step: int, total_steps: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current global training step"""
         # Calculate progress based on global step for smoother transitions
         progress = min(global_step / max(total_steps - 1, 1), 1.0)
         
         # Mutual Information beta: very small initially, then gradually increase
-        mi_beta = ramp_weight(initial_weight=initial_mi_beta, 
-            final_weight=final_mi_beta, 
-            shape=mi_beta_shape, 
+        mi_beta = ramp_weight(initial_weight=config.initial_mi_beta, 
+            final_weight=config.final_mi_beta, 
+            shape=config.mi_beta_shape, 
             progress=progress,
             f=f
         )
         
         # Total Correlation beta: very small initially, then gradually increase
-        tc_beta = ramp_weight(initial_weight=initial_tc_beta, 
-            final_weight=final_tc_beta, 
-            shape=tc_beta_shape, 
+        tc_beta = ramp_weight(initial_weight=config.initial_tc_beta, 
+            final_weight=config.final_tc_beta, 
+            shape=config.tc_beta_shape, 
             progress=progress,
             f=f
         )
         
         # Dimension-wise KL beta: very small initially, then gradually increase
-        dw_beta = ramp_weight(initial_weight=initial_dw_beta, 
-            final_weight=final_dw_beta, 
-            shape=dw_beta_shape, 
+        dw_beta = ramp_weight(initial_weight=config.initial_dw_beta, 
+            final_weight=config.final_dw_beta, 
+            shape=config.dw_beta_shape, 
             progress=progress,
             f=f
         )
@@ -438,32 +435,39 @@ def train_multimodalhack_vae(
         logger.info(f"   Resuming from epoch {start_epoch}/{epochs}")
         logger.info(f"   Previous train loss: {checkpoint['final_train_loss']:.4f}")
         logger.info(f"   Previous test loss: {checkpoint['final_test_loss']:.4f}")
-        include_glyph_bag = checkpoint['model_config'].get('bInclude_glyph_bag', True)
-        include_hero = checkpoint['model_config'].get('bInclude_hero', True)
-        dropout_rate = checkpoint['model_config'].get('dropout_rate', dropout_rate)
-        enable_dropout_on_latent = checkpoint['model_config'].get('enable_dropout_on_latent', enable_dropout_on_latent)
-        enable_dropout_on_decoder = checkpoint['model_config'].get('enable_dropout_on_decoder', enable_dropout_on_decoder)
-        model = MultiModalHackVAE(
-            bInclude_glyph_bag=include_glyph_bag,
-            bInclude_hero=include_hero,
-            dropout_rate=dropout_rate,
-            enable_dropout_on_latent=enable_dropout_on_latent,
-            enable_dropout_on_decoder=enable_dropout_on_decoder,
-            logger=logger
-        )
+        
+        # Create VAEConfig from checkpoint data or use provided config
+        if 'config' in checkpoint:
+            # Load config from checkpoint and update with any provided overrides
+            checkpoint_config = checkpoint['config']
+            if config is not None:
+                # Merge provided config with checkpoint config (provided config takes precedence)
+                logger.info("   Merging provided config with checkpoint config...")
+                for field in vars(config):
+                    if hasattr(checkpoint_config, field):
+                        setattr(checkpoint_config, field, getattr(config, field))
+                config = checkpoint_config
+            else:
+                config = checkpoint_config
+                logger.info("   Using config from checkpoint")
+        elif config is None:
+            # Fallback: create default config with deprecated parameters
+            config = VAEConfig()
+            logger.warning("   No config found in checkpoint, using default config")
+        model = MultiModalHackVAE(config=config, logger=logger)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
         
         # Initialize optimizer and step-based scheduler
         optimizer = torch.optim.AdamW(model.parameters(), lr=max_learning_rate, weight_decay=1e-4)
         total_train_steps = len(train_dataset) * epochs
-        warmup_steps = int(warmup_epoch_ratio * total_train_steps) if warmup_epoch_ratio > 0 else 0
+        warmup_steps = int(config.warmup_epoch_ratio * total_train_steps) if config.warmup_epoch_ratio > 0 else 0
 
         scheduler = OneCycleLR(
             optimizer, 
             max_lr=max_learning_rate, 
             total_steps=total_train_steps, 
-            pct_start=warmup_epoch_ratio,
+            pct_start=config.warmup_epoch_ratio,
             anneal_strategy='cos',
             div_factor=2.0,
             final_div_factor=5.0,
@@ -477,27 +481,23 @@ def train_multimodalhack_vae(
         test_losses = checkpoint.get('test_losses', [])
     else:
         start_epoch = 0
-        # Initialize model with dropout configuration
+        # Initialize model with VAEConfig
         # dropout_rate: 0.0 = no dropout, 0.1-0.3 = mild regularization, 0.5+ = strong regularization
         # Dropout is applied to encoder fusion layers and decoder layers when enabled
-        model = MultiModalHackVAE(
-            dropout_rate=dropout_rate,
-            enable_dropout_on_latent=enable_dropout_on_latent,
-            enable_dropout_on_decoder=enable_dropout_on_decoder,
-            logger=logger
-        )
+        config = VAEConfig()
+        model = MultiModalHackVAE(config=config, logger=logger)
         model = model.to(device)
         
         # Initialize optimizer and step-based scheduler
         optimizer = torch.optim.AdamW(model.parameters(), lr=max_learning_rate, weight_decay=1e-4)
         total_train_steps = len(train_dataset) * epochs
-        warmup_steps = int(warmup_epoch_ratio * total_train_steps) if warmup_epoch_ratio > 0 else 0
+        warmup_steps = int(config.warmup_epoch_ratio * total_train_steps) if config.warmup_epoch_ratio > 0 else 0
         
         scheduler = OneCycleLR(
             optimizer, 
             max_lr=max_learning_rate, 
             total_steps=total_train_steps, 
-            pct_start=warmup_epoch_ratio,
+            pct_start=config.warmup_epoch_ratio,
             anneal_strategy='cos',
             div_factor=2.0,
             final_div_factor=5.0,
@@ -531,9 +531,9 @@ def train_multimodalhack_vae(
 
     # Calculate total training steps for step-based adaptive weights and learning rate
     total_train_steps = len(train_dataset) * epochs
-    warmup_steps = int(warmup_epoch_ratio * total_train_steps) if warmup_epoch_ratio > 0 else 0
+    warmup_steps = int(config.warmup_epoch_ratio * total_train_steps) if config.warmup_epoch_ratio > 0 else 0
     
-    logger.info(f"Model has latent dimension: {model.latent_dim} and low-rank dimension: {model.lowrank_dim}")
+    logger.info(f"Model has latent dimension: {config.latent_dim}")
     logger.info(f"🎯 Starting training for {epochs} epochs (starting from epoch {start_epoch})...")
     logger.info(f"   Total training steps: {total_train_steps}")
     logger.info(f"   Warmup steps: {warmup_steps}")
@@ -546,9 +546,6 @@ def train_multimodalhack_vae(
     best_model_state = None
     early_stopping_counter = 0
     best_epoch = -1
-    
-    # for diagnostics
-    bag_char_prob = nn.Sequential(nn.Linear(LATENT_DIM, 256), nn.ReLU(), nn.Linear(256, CHAR_DIM)).to(device)
     
     for epoch in range(start_epoch, epochs):
         logger.info(f"🎯 Epoch {epoch+1}/{epochs} - Starting epoch...")
@@ -607,14 +604,7 @@ def train_multimodalhack_vae(
                 
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
-                    model.set_bag_detach(global_step < warmup_steps)  # Detach bag during warmup phase
-                    model_output = model(
-                        glyph_chars=batch_device['game_chars'],
-                        glyph_colors=batch_device['game_colors'], 
-                        blstats=batch_device['blstats'],
-                        msg_tokens=batch_device['message_chars'],
-                        hero_info=batch_device['hero_info']
-                    )
+                    model_output = model(batch_device)
                     
                     # Calculate adaptive weights for this step
                     mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
@@ -622,17 +612,11 @@ def train_multimodalhack_vae(
                     # Calculate loss
                     train_loss_dict = vae_loss(
                         model_output=model_output,
-                        glyph_chars=batch_device['game_chars'],
-                        glyph_colors=batch_device['game_colors'],
-                        blstats=batch_device['blstats'],
-                        msg_tokens=batch_device['message_chars'],
-                        valid_screen=batch_device['valid_screen'],
+                        batch=batch_device,
+                        config=config,  # Use the VAEConfig object
                         mi_beta=mi_beta,
                         tc_beta=tc_beta,
-                        dw_beta=dw_beta,
-                        free_bits=free_bits,
-                        focal_loss_alpha=focal_loss_alpha,
-                        focal_loss_gamma=focal_loss_gamma
+                        dw_beta=dw_beta
                     )
 
                     train_loss = train_loss_dict['total_loss']
@@ -684,18 +668,24 @@ def train_multimodalhack_vae(
                         "train/global_step": global_step,
                         "train/learning_rate": optimizer.param_groups[0]['lr'],
                         
-                        # Loss components
+                        # Loss components (safely access with .get())
                         "train/raw_loss/total": train_loss_dict['total_raw_loss'].item(),
-                        "train/raw_loss/occupancy": train_loss_dict['raw_losses']['occupy'].item(),
-                        "train/raw_loss/rare_occupancy": train_loss_dict['raw_losses']['rare_occupy'].item(),
-                        "train/raw_loss/common_glyph_chars": train_loss_dict['raw_losses']['common_char'].item(),
-                        "train/raw_loss/common_glyph_colors": train_loss_dict['raw_losses']['common_color'].item(),
-                        "train/raw_loss/rare_glyph_chars": train_loss_dict['raw_losses']['rare_char'].item(),
-                        "train/raw_loss/rare_glyph_colors": train_loss_dict['raw_losses']['rare_color'].item(),
-                        "train/raw_loss/bag_loss": train_loss_dict['raw_losses']['bag'].item(),
-                        "train/raw_loss/hero_loc": train_loss_dict['raw_losses']['hero_loc'].item(),
-                        "train/raw_loss/blstats": train_loss_dict['raw_losses']['stats'].item(),
-                        "train/raw_loss/message": train_loss_dict['raw_losses']['msg'].item(),
+                        "train/raw_loss/occupancy": train_loss_dict['raw_losses'].get('occupy', torch.tensor(0.0)).item(),
+                        "train/raw_loss/bag_loss": train_loss_dict['raw_losses'].get('bag', torch.tensor(0.0)).item(),
+                        "train/raw_loss/hero_loc": train_loss_dict['raw_losses'].get('hero_loc', torch.tensor(0.0)).item(),
+                        "train/raw_loss/blstats": train_loss_dict['raw_losses'].get('stats', torch.tensor(0.0)).item(),
+                        "train/raw_loss/message": train_loss_dict['raw_losses'].get('msg', torch.tensor(0.0)).item(),
+                        "train/raw_loss/ego_char": train_loss_dict['raw_losses'].get('ego_char', torch.tensor(0.0)).item(),
+                        "train/raw_loss/ego_color": train_loss_dict['raw_losses'].get('ego_color', torch.tensor(0.0)).item(),
+                        "train/raw_loss/ego_class": train_loss_dict['raw_losses'].get('ego_class', torch.tensor(0.0)).item(),
+                        "train/raw_loss/passability": train_loss_dict['raw_losses'].get('passability', torch.tensor(0.0)).item(),
+                        "train/raw_loss/reward": train_loss_dict['raw_losses'].get('reward', torch.tensor(0.0)).item(),
+                        "train/raw_loss/done": train_loss_dict['raw_losses'].get('done', torch.tensor(0.0)).item(),
+                        "train/raw_loss/value": train_loss_dict['raw_losses'].get('value', torch.tensor(0.0)).item(),
+                        "train/raw_loss/safety": train_loss_dict['raw_losses'].get('safety', torch.tensor(0.0)).item(),
+                        "train/raw_loss/goal": train_loss_dict['raw_losses'].get('goal', torch.tensor(0.0)).item(),
+                        "train/raw_loss/forward_dynamics": train_loss_dict['raw_losses'].get('forward', torch.tensor(0.0)).item(),
+                        "train/raw_loss/inverse_dynamics": train_loss_dict['raw_losses'].get('inverse', torch.tensor(0.0)).item(),
 
                         "train/kl_loss": train_loss_dict['kl_loss'].item(),
                         "train/kl_loss/dimension_wise": dim_kl,
@@ -773,13 +763,7 @@ def train_multimodalhack_vae(
                 
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
-                    model_output = model(
-                        glyph_chars=batch_device['game_chars'],
-                        glyph_colors=batch_device['game_colors'], 
-                        blstats=batch_device['blstats'],
-                        msg_tokens=batch_device['message_chars'],
-                        hero_info=batch_device['hero_info']
-                    )
+                    model_output = model(batch_device)
                     
                     # Calculate adaptive weights for this step (use current global step for consistency)
                     mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
@@ -787,17 +771,11 @@ def train_multimodalhack_vae(
                     # Calculate loss
                     test_loss_dict = vae_loss(
                         model_output=model_output,
-                        glyph_chars=batch_device['game_chars'],
-                        glyph_colors=batch_device['game_colors'],
-                        blstats=batch_device['blstats'],
-                        msg_tokens=batch_device['message_chars'],
-                        valid_screen=batch_device['valid_screen'],
+                        batch=batch_device,
+                        config=config,
                         mi_beta=mi_beta,
                         tc_beta=tc_beta,
-                        dw_beta=dw_beta,
-                        free_bits=free_bits,
-                        focal_loss_alpha=focal_loss_alpha,
-                        focal_loss_gamma=focal_loss_gamma
+                        dw_beta=dw_beta
                     )
 
                     test_loss = test_loss_dict['total_loss']
@@ -807,17 +785,24 @@ def train_multimodalhack_vae(
                 if use_wandb and WANDB_AVAILABLE and test_batch_count % log_every_n_steps == 0:
                     wandb_log_dict = {
                         "test/loss": test_loss.item(),
-                        
-                        # Loss components
                         "test/raw_loss/total": test_loss_dict['total_raw_loss'].item(),
-                        "test/raw_loss/occupancy": test_loss_dict['raw_losses']['occupy'].item(),
-                        "test/raw_loss/rare_occupancy": test_loss_dict['raw_losses']['rare_occupy'].item(),
-                        "test/raw_loss/common_glyph_chars": test_loss_dict['raw_losses']['common_char'].item(),
-                        "test/raw_loss/common_glyph_colors": test_loss_dict['raw_losses']['common_color'].item(),
-                        "test/raw_loss/rare_glyph_chars": test_loss_dict['raw_losses']['rare_char'].item(),
-                        "test/raw_loss/rare_glyph_colors": test_loss_dict['raw_losses']['rare_color'].item(),
-                        "test/raw_loss/blstats": test_loss_dict['raw_losses']['stats'].item(),
-                        "test/raw_loss/message": test_loss_dict['raw_losses']['msg'].item(),
+                        "test/raw_loss/occupancy": test_loss_dict['raw_losses'].get('occupy', torch.tensor(0.0)).item(),
+                        "test/raw_loss/bag_loss": test_loss_dict['raw_losses'].get('bag', torch.tensor(0.0)).item(),
+                        "test/raw_loss/hero_loc": test_loss_dict['raw_losses'].get('hero_loc', torch.tensor(0.0)).item(),
+                        "test/raw_loss/blstats": test_loss_dict['raw_losses'].get('stats', torch.tensor(0.0)).item(),
+                        "test/raw_loss/message": test_loss_dict['raw_losses'].get('msg', torch.tensor(0.0)).item(),
+                        "test/raw_loss/ego_char": test_loss_dict['raw_losses'].get('ego_char', torch.tensor(0.0)).item(),
+                        "test/raw_loss/ego_color": test_loss_dict['raw_losses'].get('ego_color', torch.tensor(0.0)).item(),
+                        "test/raw_loss/ego_class": test_loss_dict['raw_losses'].get('ego_class', torch.tensor(0.0)).item(),
+                        "test/raw_loss/passability": test_loss_dict['raw_losses'].get('passability', torch.tensor(0.0)).item(),
+                        "test/raw_loss/reward": test_loss_dict['raw_losses'].get('reward', torch.tensor(0.0)).item(),
+                        "test/raw_loss/done": test_loss_dict['raw_losses'].get('done', torch.tensor(0.0)).item(),
+                        "test/raw_loss/value": test_loss_dict['raw_losses'].get('value', torch.tensor(0.0)).item(),
+                        "test/raw_loss/safety": test_loss_dict['raw_losses'].get('safety', torch.tensor(0.0)).item(),
+                        # Additional raw losses that were missing:
+                        "test/raw_loss/goal": test_loss_dict['raw_losses'].get('goal', torch.tensor(0.0)).item(),
+                        "test/raw_loss/forward_dynamics": test_loss_dict['raw_losses'].get('forward', torch.tensor(0.0)).item(),
+                        "test/raw_loss/inverse_dynamics": test_loss_dict['raw_losses'].get('inverse', torch.tensor(0.0)).item(),
 
                         "test/kl_loss": test_loss_dict['kl_loss'].item(),
                     }
@@ -839,6 +824,7 @@ def train_multimodalhack_vae(
                     'model_state_dict': model.state_dict().copy(),
                     'optimizer_state_dict': optimizer.state_dict().copy(),
                     'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'config': config,  # Save VAEConfig
                     'epoch': epoch,
                     'train_loss': avg_train_loss,
                     'test_loss': avg_test_loss,
@@ -947,6 +933,7 @@ def train_multimodalhack_vae(
                 epoch=epoch,
                 train_losses=train_losses,
                 test_losses=test_losses,
+                config=config,  # Pass VAEConfig
                 scheduler=scheduler,
                 scaler=scaler,
                 checkpoint_dir=checkpoint_dir,
@@ -998,24 +985,43 @@ def train_multimodalhack_vae(
                 "sequence_size": sequence_size,
                 "shuffle_batches": shuffle_batches,
                 "shuffle_within_batch": shuffle_within_batch,
-                "adaptive_weighting": {
-                    "initial_mi_beta": initial_mi_beta,
-                    "final_mi_beta": final_mi_beta,
-                    "mi_beta_shape": mi_beta_shape,
-                    "initial_tc_beta": initial_tc_beta,
-                    "final_tc_beta": final_tc_beta,
-                    "tc_beta_shape": tc_beta_shape,
-                    "initial_dw_beta": initial_dw_beta,
-                    "final_dw_beta": final_dw_beta,
-                    "dw_beta_shape": dw_beta_shape,
-                    "warmup_epoch_ratio": warmup_epoch_ratio
+                "vae_config": {
+                    "latent_dim": config.latent_dim,
+                    "encoder_dropout": config.encoder_dropout,
+                    "decoder_dropout": config.decoder_dropout,
+                    "initial_mi_beta": config.initial_mi_beta,
+                    "final_mi_beta": config.final_mi_beta,
+                    "mi_beta_shape": config.mi_beta_shape,
+                    "initial_tc_beta": config.initial_tc_beta,
+                    "final_tc_beta": config.final_tc_beta,
+                    "tc_beta_shape": config.tc_beta_shape,
+                    "initial_dw_beta": config.initial_dw_beta,
+                    "final_dw_beta": config.final_dw_beta,
+                    "dw_beta_shape": config.dw_beta_shape,
+                    "warmup_epoch_ratio": config.warmup_epoch_ratio,
+                    "free_bits": config.free_bits,
+                    "focal_loss_alpha": config.focal_loss_alpha,
+                    "focal_loss_gamma": config.focal_loss_gamma
                 },
-                "free_bits": free_bits,
-                "focal_loss_alpha": focal_loss_alpha,
-                "focal_loss_gamma": focal_loss_gamma,
-                "dropout_rate": dropout_rate,
-                "enable_dropout_on_latent": enable_dropout_on_latent,
-                "enable_dropout_on_decoder": enable_dropout_on_decoder,
+                "adaptive_weighting": {
+                    "initial_mi_beta": config.initial_mi_beta,
+                    "final_mi_beta": config.final_mi_beta,
+                    "mi_beta_shape": config.mi_beta_shape,
+                    "initial_tc_beta": config.initial_tc_beta,
+                    "final_tc_beta": config.final_tc_beta,
+                    "tc_beta_shape": config.tc_beta_shape,
+                    "initial_dw_beta": config.initial_dw_beta,
+                    "final_dw_beta": config.final_dw_beta,
+                    "dw_beta_shape": config.dw_beta_shape,
+                    "warmup_epoch_ratio": config.warmup_epoch_ratio
+                },
+                "regularization": {
+                    "encoder_dropout": config.encoder_dropout,
+                    "decoder_dropout": config.decoder_dropout,
+                    "free_bits": config.free_bits,
+                    "focal_loss_alpha": config.focal_loss_alpha,
+                    "focal_loss_gamma": config.focal_loss_gamma
+                },
                 "early_stopping": {
                     "enabled": early_stopping,
                     "patience": early_stopping_patience,
@@ -1058,13 +1064,14 @@ def train_multimodalhack_vae(
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 torch.save({
                     'model_state_dict': model.state_dict(),
+                    'config': config,  # Save complete VAEConfig
                     'train_losses': train_losses,
                     'test_losses': test_losses,
                     'final_train_loss': final_train_loss,
                     'final_test_loss': final_test_loss,
                     'model_config': {
-                        'latent_dim': getattr(model, 'latent_dim', 96),
-                        'lowrank_dim': getattr(model, 'lowrank_dim', 0),
+                        'latent_dim': config.latent_dim,
+                        'lowrank_dim': config.low_rank,
                     },
                     'training_timestamp': datetime.now().isoformat(),
                 }, save_path)
@@ -1140,13 +1147,14 @@ def train_multimodalhack_vae(
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save({
             'model_state_dict': model.state_dict(),
+            'config': config,  # Save complete VAEConfig
             'train_losses': train_losses,
             'test_losses': test_losses,
             'final_train_loss': final_train_loss,
             'final_test_loss': final_test_loss,
             'model_config': {
-                'latent_dim': getattr(model, 'latent_dim', 96),
-                'lowrank_dim': getattr(model, 'lowrank_dim', 0),
+                'latent_dim': config.latent_dim,
+                'lowrank_dim': config.low_rank,
             },
             'training_timestamp': datetime.now().isoformat(),
         }, save_path)
