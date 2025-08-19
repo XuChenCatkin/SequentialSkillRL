@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
+from enum import IntEnum
 import torch
 import nle.dataset as nld
 from nle.nethack import tty_render
@@ -9,59 +10,369 @@ import numpy as np
 import os
 import pickle
 import re
+from model import PADDING_CHAR, PADDING_COLOR, HERO_CHAR
+from utils.action_utils import ACTION_DIM, batch_keypress_static_map
 
-# ---- Direction / actions -----------------------------------------------------
-DIRS_8 = [(-1,0),(+1,0),(0,+1),(0,-1),(-1,+1),(-1,-1),(+1,+1),(+1,-1)]  # N,S,E,W,NE,NW,SE,SW
-ACTION_NAMES = ["N","S","E","W","NE","NW","SE","SW","WAIT"]
-ACTION_DIM = 9  # 8 moves + wait
-
-VI_KEY_TO_DIR = {
-    ord('k'):(-1,0), ord('j'):(+1,0), ord('l'):(0,+1), ord('h'):(0,-1),
-    ord('u'):(-1,+1), ord('y'):(-1,-1), ord('n'):(+1,+1), ord('b'):(+1,-1),
-}
-WAIT_KEYS = {ord('.'), ord(' '), 13}  # '.', space, Enter
-
-def map_keypress_to_action_index(code: int) -> int:
-    """Map tty key code to action index in 0..8 (8 = WAIT). Unknown → WAIT."""
-    if code in VI_KEY_TO_DIR:
-        dy, dx = VI_KEY_TO_DIR[code]
-    else:
-        # try arrows (optional): you can extend this table if your dataset encodes arrows specially
-        dy, dx = (0,0)
-        if code in WAIT_KEYS:
-            dy, dx = (0,0)
-    # map to index
-    if   (dy,dx)==(-1,0): return 0
-    elif (dy,dx)==(+1,0): return 1
-    elif (dy,dx)==(0,+1): return 2
-    elif (dy,dx)==(0,-1): return 3
-    elif (dy,dx)==(-1,+1): return 4
-    elif (dy,dx)==(-1,-1):return 5
-    elif (dy,dx)==(+1,+1):return 6
-    elif (dy,dx)==(+1,-1):return 7
-    else:                  return 8  # WAIT
+DIRS_8 = [(-1,0),(0,+1),(+1,0),(0,-1),(-1,+1),(+1,+1),(+1,-1),(-1,-1)]  # N,E,S,W,NE,SE,SW,NW
+ACTION_NAMES = ["N","E","S","W","NE","SE","SW","NW"]
 
 def one_hot(indices: torch.Tensor, num_classes: int) -> torch.Tensor:
     out = torch.zeros(*indices.shape, num_classes, dtype=torch.float32)
     out.scatter_(-1, indices.long().unsqueeze(-1), 1.0)
     return out
 
-# ---- Passability / safety rules (ASCII) -------------------------------------
-WALLS       = {ord('|'), ord('-')}
-GROUND      = {ord('.'), ord('#')}
-CLOSED_DOOR = {ord('+')}
-OPEN_DOOR   = {ord('/')}          # if absent in your tty, treat as ground
-STAIRS      = {ord('<'), ord('>')}
-TRAPS       = {ord('^')}
-BOULDER     = {ord('0')}
-WATER_LAVA  = {ord('~')}
-SPECIAL     = {ord('_'), ord('}'), ord('{'), ord('\\')}
-ITEMS       = set(map(ord, list(')$!?"[=*%/,:;')))
+# Color constants
+CLR_BLACK, CLR_RED, CLR_GREEN, CLR_BROWN = 0, 1, 2, 3
+CLR_BLUE, CLR_MAGENTA, CLR_CYAN, CLR_GRAY = 4, 5, 6, 7
+NO_COLOR, CLR_ORANGE, CLR_BRIGHT_GREEN = 8, 9, 10
+CLR_YELLOW, CLR_BRIGHT_BLUE, CLR_BRIGHT_MAGENTA = 11, 12, 13
+CLR_BRIGHT_CYAN, CLR_WHITE = 14, 15
 
-def is_monster(ch: int) -> bool:
-    return (65 <= ch <= 90) or (97 <= ch <= 122)  # A..Z or a..z
 
-PASSABLE = GROUND | OPEN_DOOR | STAIRS | SPECIAL | ITEMS  # monsters treated separately
+class NetHackCategory(IntEnum):
+    """
+    Enum for categorizing NetHack game elements into meaningful groups.
+    
+    Usage:
+        category = categorize_glyph(char_code, color_code)
+        if category == NetHackCategory.WALLS:
+            # handle wall logic
+        
+    Values are designed to be used as indices for:
+    - Neural network outputs
+    - Data analysis and visualization
+    - Game logic categorization
+    """
+    UNKNOWN = 0      # Default/unrecognized elements
+    WALLS = 1        # Walls and barriers
+    DOORS = 2        # Doors
+    FLOORS = 3       # Walkable floor tiles
+    UP_STAIRS = 4    # Stairs and ladders
+    DOWN_STAIRS = 5  # Stairs and ladders
+    WATER_LAVA = 6   # Water and lava
+    TRAPS = 7        # All types of traps
+    ITEMS = 8        # Pickupable items (weapons, armor, etc.)
+    FURNITURE = 9    # Non-movable environment objects
+    PLAYER_OR_HUMAN = 10  # Player character or human-like entities
+    HARMLESS_MONSTERS = 11    # Living creatures that do not pose a threat
+    LOW_THREAT_MONSTERS = 12  # Low-threat monsters (e.g. rats, kobolds)
+    MEDIUM_THREAT_MONSTERS = 13  # Medium-threat monsters (e.g. goblins, orcs)
+    HIGH_THREAT_MONSTERS = 14  # High-threat monsters (e.g. dragons, demons)
+    EXTREME_THREAT_MONSTERS = 15  # Extreme-threat monsters (e.g. demons, liches)
+    UNKNOWN_MONSTERS = 16  # Monsters with unknown threat level
+
+    @classmethod
+    def get_categories(cls) -> List[str]:
+        """Get list of all category names."""
+        return [category.name for category in cls]
+    
+    @classmethod
+    def get_category_count(cls) -> int:
+        """Get total number of categories."""
+        return len(cls)
+
+    def get_category_name(self) -> str:
+        """Get the name of the category."""
+        return self.name
+
+
+# Complete categorization sets (existing structure preserved)
+WALLS = {
+    (ord('|'), CLR_GRAY), 
+    (ord('-'), CLR_GRAY),
+    (ord('#'), CLR_CYAN),    # iron bars
+}
+
+DOORS = {
+    (ord('+'), CLR_BROWN),   # closed door
+    (ord('#'), CLR_GREEN),   # tree
+}
+
+FLOORS = {
+    (ord('.'), CLR_GRAY),    # room floor
+    (ord('.'), CLR_BLACK),   # dark room
+    (ord('#'), CLR_GRAY),    # corridor
+    (ord('.'), CLR_CYAN),    # ice
+    (ord('|'), CLR_BROWN),   # open door horizontal
+    (ord('-'), CLR_BROWN),   # open door vertical
+}
+
+UP_STAIRS = {
+    (ord('<'), CLR_GRAY),    # stairs up
+    (ord('<'), CLR_BROWN)    # ladder up
+}
+
+DOWN_STAIRS = {
+    (ord('>'), CLR_GRAY),    # stairs down
+    (ord('>'), CLR_BROWN),   # ladder down
+}
+
+WATER_LAVA = {
+    (ord('}'), CLR_BLUE),    # water
+    (ord('}'), CLR_RED),     # lava
+}
+
+TRAPS = {
+    (ord('^'), CLR_CYAN),              # metal traps (arrow, dart, bear)
+    (ord('^'), CLR_GRAY),              # stone traps (falling rock, boulder, statue)
+    (ord('^'), CLR_BROWN),             # wooden traps (squeaky board, hole, trap door)
+    (ord('^'), CLR_RED),               # fire traps (land mine, fire)
+    (ord('^'), CLR_BLUE),              # rust traps
+    (ord('^'), CLR_BLACK),             # pit traps
+    (ord('^'), CLR_BRIGHT_BLUE),       # magic traps (sleeping gas, magic, anti-magic)
+    (ord('^'), CLR_MAGENTA),           # teleport traps
+    (ord('^'), CLR_BRIGHT_MAGENTA),    # magic portal
+    (ord('^'), CLR_BRIGHT_GREEN),      # polymorph traps
+    (ord('"'), CLR_GRAY),              # web
+    (ord('~'), CLR_MAGENTA),           # vibrating square
+}
+
+ITEMS = {
+    (ord('$'), CLR_YELLOW),            # gold
+    (ord('"'), CLR_BRIGHT_MAGENTA),    # amulet
+    (ord(')'), CLR_CYAN),              # weapon
+    (ord('['), CLR_BROWN),             # armor
+    (ord('='), CLR_CYAN),              # ring
+    (ord('('), CLR_BROWN),             # tool
+    (ord('%'), CLR_RED),               # food
+    (ord('!'), CLR_BLUE),              # potion
+    (ord('?'), CLR_WHITE),             # scroll
+    (ord('+'), CLR_BROWN),             # spellbook
+    (ord('/'), CLR_BROWN),             # wand
+    (ord('*'), CLR_GRAY),              # gem
+    (ord('`'), CLR_GRAY),              # rock
+}
+
+FURNITURE = {
+    (ord('_'), CLR_GRAY),              # altar
+    (ord('|'), CLR_WHITE),             # grave
+    (ord('\\'), CLR_YELLOW),           # throne
+    (ord('#'), CLR_GRAY),              # sink (when context is furniture)
+    (ord('{'), CLR_BRIGHT_BLUE),       # fountain
+}
+
+def categorize_monster_by_threat_level(char, color):
+    """Categorize monsters by threat level using both character and color."""
+
+    # CLR_BRIGHT_MAGENTA color always indicates extreme threat regardless of character
+    if color == CLR_BRIGHT_MAGENTA:
+        return NetHackCategory.EXTREME_THREAT_MONSTERS
+    
+    # Character-based base threat assessment with color modifiers
+    
+    # Harmless/weak - but color can upgrade threat
+    if char in ['r', 'n', 'y', ':', 'l']:  # rodents, nymphs, lights, lizards, leprechauns
+        if color in [CLR_RED, CLR_BLACK]:  # Aggressive/dark variants
+            return NetHackCategory.LOW_THREAT_MONSTERS  # Upgrade from harmless
+        return NetHackCategory.HARMLESS_MONSTERS
+
+    # Low threat - color can modify
+    if char in ['a', 'b', 'j', 'k', 'f', 'B', 'F', 'e', ';']:  # ants, blobs, jellies, kobolds, cats, bats, fungi, eyes, eels
+        if color == CLR_RED:  # Fire variants (fire ants, hell hounds)
+            return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Upgrade threat
+        elif color == CLR_BLACK:  # Dark/evil variants
+            return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Upgrade threat
+        return NetHackCategory.LOW_THREAT_MONSTERS
+
+    # Medium threat - color can modify significantly
+    if char in ['d', 'o', 'g', 'h', 's', 'G', 'O', 'c', 'p', 'q', 'u', 'C', 'S', 'K', 'Y']:
+        if color == CLR_RED:  # Fire/hell variants (hell hounds, fire giants)
+            return NetHackCategory.HIGH_THREAT_MONSTERS  # Upgrade threat
+        elif color == CLR_BLACK:  # Dark/powerful variants
+            return NetHackCategory.HIGH_THREAT_MONSTERS  # Upgrade threat
+        return NetHackCategory.MEDIUM_THREAT_MONSTERS
+
+    # High threat - color can push to extreme
+    if char in ['D', 'L', 'V', 'H', 'T', 'v', 'w', 'E', 'N', 'P', 'R', 'U', 'X', 'J']:
+        # Special case: Dragons have color-specific threat levels
+        if char == 'D':
+            if color == CLR_RED:    # Red dragon - extremely dangerous
+                return NetHackCategory.EXTREME_THREAT_MONSTERS
+            elif color == CLR_BLACK: # Black dragon - very dangerous
+                return NetHackCategory.EXTREME_THREAT_MONSTERS
+            elif color in [1, 4, 2, 11, 0, 15, 6]:  # All adult dragons are high threat
+                return NetHackCategory.HIGH_THREAT_MONSTERS
+        
+        # Liches with special colors
+        if char == 'L' and color in [CLR_RED, CLR_BLACK]:
+            return NetHackCategory.EXTREME_THREAT_MONSTERS  # Master lich, arch-lich
+
+        # Giants with fire/dark variants
+        if char == 'H' and color in [CLR_RED, CLR_BLACK]:
+            return NetHackCategory.EXTREME_THREAT_MONSTERS  # Fire giants, storm giants
+
+        return NetHackCategory.HIGH_THREAT_MONSTERS
+    
+    # Extreme threat - color confirms or maintains
+    if char in ['&', 'A', 'W', 'Q']:
+        # Demons with CLR_BRIGHT_MAGENTA color are the worst
+        if char == '&' and color == CLR_BRIGHT_MAGENTA:
+            return NetHackCategory.EXTREME_THREAT_MONSTERS  # Demon lords, princes
+        return NetHackCategory.EXTREME_THREAT_MONSTERS
+
+    # Special/variable threat
+    if char == '@':
+        return NetHackCategory.PLAYER_OR_HUMAN  # Could be player OR NPC human
+
+    # Unique/special cases with color consideration
+    if char == ' ':  # ghosts
+        if color == CLR_BLACK:
+            return NetHackCategory.HIGH_THREAT_MONSTERS  # Dark/powerful ghosts
+        return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Regular ghosts
+    
+    if char == "'":  # golems
+        if color in [CLR_RED, CLR_BLACK, NO_COLOR]:  # Iron golems, special golems
+            return NetHackCategory.EXTREME_THREAT_MONSTERS
+        return NetHackCategory.HIGH_THREAT_MONSTERS  # Regular golems
+    
+    if char in ['m', 't', ']']:  # mimics, trappers, mimic_def
+        if color in [CLR_RED, CLR_BLACK]:  # Aggressive/dangerous variants
+            return NetHackCategory.HIGH_THREAT_MONSTERS
+        return NetHackCategory.MEDIUM_THREAT_MONSTERS  # Surprise/ambush monsters
+    
+    if char in ['i', 'x', 'z', 'M', 'Z']:  # imps, xan, zruty, mummies, zombies
+        if color in [CLR_RED, CLR_BLACK]:  # Powerful undead/demons
+            return NetHackCategory.HIGH_THREAT_MONSTERS
+        return NetHackCategory.MEDIUM_THREAT_MONSTERS
+    
+    if char == '~':  # worm tails
+        return NetHackCategory.LOW_THREAT_MONSTERS  # Just tail segments
+
+    return NetHackCategory.UNKNOWN
+
+def is_monster(char_code: int) -> bool:
+    return chr(char_code).isalpha() or chr(char_code) in ['@', ' ', "'", '&', ';', ':', '~', ']']
+
+def categorize_glyph(char_code: int, color_code: int) -> NetHackCategory:
+    """
+    Categorize a (character, color) pair into a NetHackCategory.
+    
+    Args:
+        char_code: ASCII character code (32-127)
+        color_code: Color index (0-15)
+        
+    Returns:
+        NetHackCategory enum value
+        
+    Examples:
+        categorize_glyph(ord('|'), CLR_GRAY) -> NetHackCategory.WALLS
+        categorize_glyph(ord('.'), CLR_GRAY) -> NetHackCategory.FLOORS
+    """
+    pair = (char_code, color_code)
+    
+    # Space/padding
+    if char_code == PADDING_CHAR and color_code == PADDING_COLOR:
+        return NetHackCategory.UNKNOWN
+    
+    # Check predefined categories
+    if pair in WALLS:
+        return NetHackCategory.WALLS
+    elif pair in DOORS:
+        return NetHackCategory.DOORS
+    elif pair in FLOORS:
+        return NetHackCategory.FLOORS
+    elif pair in UP_STAIRS:
+        return NetHackCategory.UP_STAIRS
+    elif pair in DOWN_STAIRS:
+        return NetHackCategory.DOWN_STAIRS
+    elif pair in WATER_LAVA:
+        return NetHackCategory.WATER_LAVA
+    elif pair in TRAPS:
+        return NetHackCategory.TRAPS
+    elif pair in ITEMS:
+        return NetHackCategory.ITEMS
+    elif pair in FURNITURE:
+        return NetHackCategory.FURNITURE
+    elif is_monster(char_code):
+        return categorize_monster_by_threat_level(chr(char_code), color_code)
+    else:
+        return NetHackCategory.UNKNOWN
+
+
+def categorize_glyph_tensor(char_tensor: torch.Tensor, color_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Vectorized categorization for tensors of glyph data.
+    
+    Args:
+        char_tensor: Tensor of character codes, any shape
+        color_tensor: Tensor of color codes, same shape as char_tensor
+        
+    Returns:
+        Tensor of category indices (NetHackCategory values), same shape as input
+        
+    Example:
+        chars = torch.tensor([[ord('.'), ord('|')], [ord('@'), ord(' ')]])
+        colors = torch.tensor([[CLR_GRAY, CLR_GRAY], [CLR_WHITE, CLR_BLACK]])
+        categories = categorize_glyph_tensor(chars, colors)
+        # Returns: [[FLOORS, WALLS], [HERO, SPACE]]
+    """
+    original_shape = char_tensor.shape
+    char_flat = char_tensor.flatten()
+    color_flat = color_tensor.flatten()
+    
+    # Initialize result tensor
+    result = torch.full_like(char_flat, NetHackCategory.UNKNOWN.value, dtype=torch.long)
+    
+    # Vectorized categorization using masks
+    hero_mask = char_flat == HERO_CHAR
+    result[hero_mask] = NetHackCategory.PLAYER_OR_HUMAN.value
+
+    space_mask = (char_flat == PADDING_CHAR) & (color_flat == PADDING_COLOR)
+    
+    # For other categories, we need to check pairs
+    # This is less efficient but more readable - could be optimized if needed
+    for i in range(len(char_flat)):
+        if not (hero_mask[i] or space_mask[i]):
+            category = categorize_glyph(char_flat[i].item(), color_flat[i].item())
+            result[i] = category.value
+    
+    return result.reshape(original_shape)
+
+
+def get_category_distribution(char_tensor: torch.Tensor, color_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Get the distribution of categories in the given tensors.
+    
+    Args:
+        char_tensor: Tensor of character codes
+        color_tensor: Tensor of color codes
+        
+    Returns:
+        Tensor of shape [num_categories] with counts for each category
+    """
+    categories = categorize_glyph_tensor(char_tensor, color_tensor)
+    num_categories = NetHackCategory.get_category_count()
+    
+    # Count occurrences of each category
+    counts = torch.zeros(num_categories, dtype=torch.long)
+    for i in range(num_categories):
+        counts[i] = (categories == i).sum()
+    
+    return counts
+
+
+def print_category_distribution(char_tensor: torch.Tensor, color_tensor: torch.Tensor):
+    """
+    Print a human-readable distribution of categories.
+    
+    Args:
+        char_tensor: Tensor of character codes
+        color_tensor: Tensor of color codes
+    """
+    counts = get_category_distribution(char_tensor, color_tensor)
+    total = counts.sum().item()
+    
+    print("Category Distribution:")
+    print("-" * 40)
+    for category in NetHackCategory:
+        count = counts[category.value].item()
+        percentage = (count / total * 100) if total > 0 else 0
+        print(f"{category.name:<12}: {count:>6} ({percentage:>5.1f}%)")
+    print("-" * 40)
+    print(f"{'TOTAL':<12}: {total:>6} (100.0%)")
+
+
+PASSABLE = FLOORS | UP_STAIRS | DOWN_STAIRS | TRAPS | (ITEMS - {(ord('`'), CLR_GRAY)}) | FURNITURE  # monsters treated separately
 
 def compute_passability_and_safety(chars: torch.Tensor,
                                    colors: torch.Tensor,
@@ -75,10 +386,17 @@ def compute_passability_and_safety(chars: torch.Tensor,
         if not (0 <= y < H and 0 <= x < W):
             pass8[i] = 0.0; safe8[i] = 0.0; continue
         ch = int(chars[y,x])
+        cl = int(colors[y,x])
         # legal to step?
-        legal = (ch in PASSABLE) or is_monster(ch)
+        legal = ((ch, cl) in PASSABLE) or is_monster(ch)
+        if ch == ord('`') and cl == CLR_GRAY:
+            yy, xx = y + dy, x + dx
+            if 0 <= yy < H and 0 <= xx < W:
+                ch2 = int(chars[yy,xx])
+                cl2 = int(colors[yy,xx])
+                legal = (ch2, cl2) not in (WALLS | DOORS)
         # safety: legal AND not a hazard/unknown/monster
-        unsafe = (ch in TRAPS) or (ch in WATER_LAVA) or (ch == ord(' ')) or is_monster(ch)
+        unsafe = ((ch, cl) in TRAPS) or ((ch, cl) in WATER_LAVA) or is_monster(ch)
         pass8[i] = 1.0 if legal else 0.0
         safe8[i] = 1.0 if (legal and not unsafe) else 0.0
     return pass8, safe8
@@ -92,11 +410,7 @@ def nearest_stairs_vector(chars: torch.Tensor,
     goal_ch = ord(prefer)
     ys, xs = (chars == goal_ch).nonzero(as_tuple=True)
     if ys.numel() == 0:
-        # fall back to the other stairs if present
-        alt = ord('<') if prefer == '>' else ord('>')
-        ys, xs = (chars == alt).nonzero(as_tuple=True)
-        if ys.numel() == 0:
-            return None
+        return None
     # choose Euclidean nearest
     dy = ys - hero_y
     dx = xs - hero_x
@@ -105,55 +419,23 @@ def nearest_stairs_vector(chars: torch.Tensor,
     # normalize to [-1,1]
     dxn = max(-1.0, min(1.0, (gx - hero_x) / (W/2)))
     dyn = max(-1.0, min(1.0, (gy - hero_y) / (H/2)))
-    return (dxn, dyn)
+    return (dyn, dxn)
 
 # ---- Ego crop and class mapping ---------------------------------------------
-def crop_ego(chars: torch.Tensor, hero_y: int, hero_x: int, k: int) -> torch.Tensor:
+def crop_ego(chars: torch.Tensor, colors: torch.Tensor, hero_y: int, hero_x: int, k: int) -> torch.Tensor:
     """Return ego crop [k,k] of ASCII codes, padded with spaces 32."""
     H, W = chars.shape
     r = k // 2
-    out = torch.full((k,k), fill_value=32, dtype=chars.dtype)  # spaces
+    out_chars = torch.full((k,k), fill_value=PADDING_CHAR, dtype=chars.dtype)  # spaces
+    out_colors = torch.full((k,k), fill_value=PADDING_COLOR, dtype=colors.dtype)  # padding color
     y0, y1 = max(0, hero_y - r), min(H, hero_y + r + 1)
     x0, x1 = max(0, hero_x - r), min(W, hero_x + r + 1)
     oy0, oy1 = r - (hero_y - y0), r + (y1 - hero_y)
     ox0, ox1 = r - (hero_x - x0), r + (x1 - hero_x)
-    out[oy0:oy1, ox0:ox1] = chars[y0:y1, x0:x1]
-    return out
-
-def map_ego_classes(ego_chars: torch.Tensor, mapper: callable | None) -> torch.Tensor:
-    """
-    Map ego ASCII grid [k,k] -> class ids [k,k].
-    If mapper is None, use a compact affordance palette as fallback.
-    """
-    k = ego_chars.shape[0]
-    out = torch.zeros((k,k), dtype=torch.long)
-    if mapper is not None:
-        # expect mapper(char_int:int) -> class_id:int
-        for y in range(k):
-            for x in range(k):
-                out[y,x] = int(mapper(int(ego_chars[y,x])))
-        return out
-
-    # Fallback coarse palette ~12 classes
-    for y in range(k):
-        for x in range(k):
-            ch = int(ego_chars[y,x])
-            if ch == 32:             cid = 0  # unknown
-            elif ch in WALLS:        cid = 2
-            elif ch in GROUND:       cid = 1
-            elif ch in CLOSED_DOOR:  cid = 3
-            elif ch == ord('<'):     cid = 4
-            elif ch == ord('>'):     cid = 5
-            elif ch in TRAPS:        cid = 8
-            elif ch in BOULDER:      cid = 9
-            elif ch in WATER_LAVA:   cid = 10
-            elif ch in SPECIAL:      cid = 11
-            elif is_monster(ch):     cid = 7
-            elif ch in ITEMS:        cid = 6
-            else:                    cid = 1
-            out[y,x] = cid
-    return out
-
+    out_chars[oy0:oy1, ox0:ox1] = chars[y0:y1, x0:x1]
+    out_colors[oy0:oy1, ox0:ox1] = colors[y0:y1, x0:x1]
+    return out_chars, out_colors
+    
 # ---- Discounted k-step returns ----------------------------------------------
 def discounted_k_step(rewards: np.ndarray, done: np.ndarray, k: int, gamma: float) -> np.ndarray:
     """
@@ -306,13 +588,10 @@ class NetHackDataCollector:
     
     def collect_data_batch(self, dataset_name: str, adapter: callable, max_batches: int = 1000, 
                        batch_size: int = 32, seq_length: int = 32, game_ids: List[int] | None = None,
-                       *,
                        ego_window: int = 11,
                        value_horizons: List[int] = [5, 10],
-                       gamma: float = 0.99,
-                       goal_prefer: str = '>',
-                       ego_class_mapper: callable | None = None,
-                       allow_diagonal: bool = True) -> List[Dict]:
+                       gamma: float = 0.95,
+                       goal_prefer: str = '>') -> List[Dict]:
         """
         Collect data from the dataset for VAE training and build decision-sufficient targets.
 
@@ -365,48 +644,36 @@ class NetHackDataCollector:
             valid_screen_minibatch  = torch.ones((num_games, num_time), dtype=torch.bool)
 
             # New targets
-            action_index_mb    = torch.full((num_games, num_time), fill_value=8, dtype=torch.long)          # default WAIT
             action_onehot_mb   = torch.zeros((num_games, num_time, ACTION_DIM), dtype=torch.float32)
-            reward_target_mb   = torch.zeros((num_games, num_time), dtype=torch.float32)
             done_target_mb     = torch.zeros((num_games, num_time), dtype=torch.float32)
             passability_mb     = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
             safety_mb          = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
             goal_target_mb     = torch.zeros((num_games, num_time, 2), dtype=torch.float32)
             goal_mask_mb       = torch.zeros((num_games, num_time), dtype=torch.float32)
             has_next_mb        = torch.zeros((num_games, num_time), dtype=torch.bool)
-            ego_sem_mb         = torch.zeros((num_games, num_time, ego_window, ego_window), dtype=torch.long)
+            ego_class_mb       = torch.zeros((num_games, num_time, ego_window, ego_window), dtype=torch.long)
+            ego_char_mb        = torch.full((num_games, num_time, ego_window, ego_window), dtype=torch.long) * 32
+            ego_color_mb       = torch.zeros((num_games, num_time, ego_window, ego_window), dtype=torch.long)
 
             # Convenience aliases to raw
             tty_chars = this_batch['tty_chars']    # [G,T, H,W]
             tty_colors= this_batch['tty_colors']   # [G,T, H,W]
             done_raw  = this_batch['done'].astype(bool) if isinstance(this_batch['done'], np.ndarray) else np.array(this_batch['done'], dtype=bool)
             done_raw  = torch.tensor(done_raw)     # [G,T] bool
-            scores    = torch.tensor(this_batch['scores'], dtype=torch.float32) if 'scores' in this_batch else torch.zeros(num_games, num_time)
             keycodes  = torch.tensor(this_batch['keypresses'], dtype=torch.int64)  # [G,T]
             
+            reward_target_mb    = torch.tensor(this_batch['scores'], dtype=torch.float32) if 'scores' in this_batch else torch.zeros(num_games, num_time)
+            action_index_mb = batch_keypress_static_map(keycodes) # [G,T] -> [G,T] with static mapping
             # Process each game in the batch
             for g in range(num_games):
                 last_hero = None
-                # Per-game rewards: r[t] = score[t+1]-score[t]
-                r = torch.zeros(num_time, dtype=torch.float32)
-                if 'scores' in this_batch:
-                    r[:-1] = scores[g,1:] - scores[g,:-1]
-                # Fill scalar targets and actions first (vectorized per game)
-                for t in range(num_time):
-                    kcode = int(keycodes[g,t].item())
-                    ai = map_keypress_to_action_index(kcode)
-                    action_index_mb[g,t] = ai
-                    # done at this timestep (result of previous action)
-                    done_target_mb[g,t]  = float(done_raw[g,t].item())
-                    # reward at this timestep
-                    reward_target_mb[g,t] = float(r[t].item())
-                    has_next_mb[g,t] = (t+1 < num_time) and (not bool(done_raw[g,t].item()))
+                # Fill scalar targets and actions first (vectorized per game)  
                 # One-hot actions
                 action_onehot_mb[g] = one_hot(action_index_mb[g], ACTION_DIM)
 
                 # Build k-step returns per game (stop at done)
                 done_np = done_raw[g].cpu().numpy()
-                r_np    = r.cpu().numpy()
+                r_np    = reward_target_mb[g].cpu().numpy()
                 vals = []
                 for k in value_horizons:
                     vals.append(discounted_k_step(r_np, done_np, k=k, gamma=gamma))
@@ -417,9 +684,12 @@ class NetHackDataCollector:
 
                 # Per-timestep spatial targets (passability/safety/ego/goal)
                 for t in range(num_time):
+                    done_target_mb[g,t]  = float(done_raw[g,t].item())
+                    has_next_mb[g,t] = (t+1 < num_time) and (not bool(done_raw[g,t].item()))
+                    game_id = int(this_batch['gameids'][g,t])
                     chars = tty_chars[g,t]     # [H,W] int
                     colors= tty_colors[g,t]
-                    is_valid_map = detect_valid_map(chars.numpy() if isinstance(chars, torch.Tensor) else chars)
+                    is_valid_map = detect_valid_map(chars)
                     if not is_valid_map:
                         valid_screen_minibatch[g,t] = False
                         continue
@@ -427,6 +697,27 @@ class NetHackDataCollector:
                     game_map = get_game_map(chars, colors)
                     chars_map = game_map['chars']    # torch.[H,W] long
                     colors_map= game_map['colors']   # torch.[H,W] long
+                    
+                    # Extract text information
+                    current_message = get_current_message(chars)
+                    message_chars = torch.tensor([ord(c) for c in current_message.ljust(256, chr(0))], dtype=torch.long)
+                    status_lines = get_status_lines(chars)
+                    status_chars = chars[22:, :]
+                    
+                    hero_info = self.get_hero_info(game_id, current_message)
+                    if hero_info is None:
+                        print(tty_render(chars, colors))
+                        raise Exception(f"⚠️ No hero info found for game {game_id}, skipping sample")
+                    
+                    score = reward_target_mb[g,t].item()
+                    
+                    # Fill in the minibatch tensors
+                    message_chars_minibatch[g, t] = message_chars
+                    game_chars_minibatch[g, t] = game_map['chars']
+                    game_colors_minibatch[g, t] = game_map['colors']
+                    status_chars_minibatch[g, t] = status_chars
+                    hero_info_minibatch[g, t] = hero_info
+                    blstats_minibatch[g, t] = adapter(game_map['chars'], status_lines, score)
 
                     # hero pos: prefer '@', else tty_cursor if within bounds, else last seen
                     ys, xs = (chars_map == ord('@')).nonzero(as_tuple=True)
@@ -455,9 +746,11 @@ class NetHackDataCollector:
                     safety_mb[g,t]      = s8
 
                     # ego semantic classes
-                    ego_chars = crop_ego(chars_map, hy, hx, ego_window)
-                    ego_sem   = map_ego_classes(ego_chars, ego_class_mapper)
-                    ego_sem_mb[g,t] = ego_sem
+                    ego_chars, ego_colors = crop_ego(chars_map, hy, hx, ego_window)
+                    ego_char_mb[g,t] = ego_chars
+                    ego_color_mb[g,t] = ego_colors
+                    ego_class   = categorize_glyph_tensor(ego_chars, ego_colors)  # [k,k] long tensor
+                    ego_class_mb[g,t] = ego_class
 
                     # goal vector
                     goal_vec = nearest_stairs_vector(chars_map, hy, hx, prefer=goal_prefer)
@@ -494,7 +787,9 @@ class NetHackDataCollector:
             this_batch['safety_target']     = safety_mb
             this_batch['goal_target']       = goal_target_mb
             this_batch['goal_mask']         = goal_mask_mb
-            this_batch['ego_sem_target']    = ego_sem_mb
+            this_batch['ego_class']         = ego_class_mb
+            this_batch['ego_char']          = ego_char_mb
+            this_batch['ego_color']         = ego_color_mb
             this_batch['has_next']          = has_next_mb
 
             collected_batches.append(this_batch)
@@ -598,7 +893,9 @@ class NetHackDataCollector:
     
     def collect_or_load_data(self, dataset_name: str, adapter: callable, save_path: str, 
                            max_batches: int = 1000, batch_size: int = 32, seq_length: int = 32,
-                           force_recollect: bool = False, game_ids: List[int] | None = None) -> List[Dict]:
+                           force_recollect: bool = False, game_ids: List[int] | None = None,
+                           ego_window: int = 11, value_horizons: List[int] = [5, 10],
+                           gamma: float = 0.95, goal_prefer: str = '>') -> List[Dict]:
         """
         Collect data from dataset or load from saved file if it exists.
         
@@ -625,7 +922,11 @@ class NetHackDataCollector:
                 max_batches=max_batches,
                 batch_size=batch_size,
                 seq_length=seq_length,
-                game_ids=game_ids
+                game_ids=game_ids,
+                ego_window=ego_window,
+                value_horizons=value_horizons,
+                gamma=gamma,
+                goal_prefer=goal_prefer
             )
             
             # Save for future use

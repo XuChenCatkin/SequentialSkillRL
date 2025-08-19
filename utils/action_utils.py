@@ -10,6 +10,8 @@ from typing import Union, List, TYPE_CHECKING, Dict
 
 if TYPE_CHECKING:
     import torch
+    
+ACTION_DIM = len(nethack.ACTIONS)  # Total number of actions available in Nethack
 
 # Global hash table for efficient keypress to action index mapping
 # This is a dictionary (hash table) that provides O(1) average lookup time
@@ -189,7 +191,7 @@ def batch_keypress_static_map(keypresses: Union[List[int], 'torch.Tensor']) -> '
     lookup_size = max(256, max_keypress + 1)  # Ensure we cover all possible ASCII values
     
     # Initialize with zeros (fallback for invalid keypresses)
-    lookup_table = torch.zeros(lookup_size, dtype=torch.long)
+    lookup_table = torch.zeros(lookup_size, dtype=torch.long, device=keypresses.device)
     
     # Fill the lookup table using the hash table - O(n) where n is number of valid actions
     for keypress_value, action_index in KEYPRESS_INDEX_MAPPING.items():
