@@ -57,6 +57,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 import logging
 import math
 from typing import Optional, List, Dict
@@ -66,10 +67,10 @@ from nle import nethack
 
 # Import NetHackCategory from data_collection
 try:
-    from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor
+    from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step
 except ImportError:
     # Fallback for when running as script
-    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor
+    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
@@ -383,6 +384,10 @@ class VAEConfig:
     value_horizons: List[int] = field(default_factory=lambda: [1, 5, 10])
     # Skill belief (future sticky HMM integration)
     skill_num: int = 0                         # number of skills; 0 disables skill head
+
+    # Goal and value hyperparameters (moved from data collection)
+    gamma: float = 0.95                        # discount factor for k-step returns
+    goal_prefer: str = '>'                     # preferred stairs type ('>' for down, '<' for up)
 
     # KL prior mode
     prior_mode: str = "standard"               # "standard" | "hmm" | "blend"
@@ -1174,14 +1179,11 @@ class MultiModalHackVAE(nn.Module):
         hero_info = batch['hero_info'] # [B, 4]
         enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
         z = self._reparameterise(enc["mu"], enc["logvar"])  # [B,D]
-        if self.latent_forward_model.enabled and ('action_onehot' in batch):
-            action_onehot = batch['action_onehot']
-        else:
-            action_onehot = None
-        if self.inverse_dynamics.enabled and ('z_next_detach' in batch):
-            z_next_detach = batch['z_next_detach']
-        else:
-            z_next_detach = None
+        
+        # Pass dynamics inputs if available - vae_loss will handle the filtering
+        action_onehot = batch.get('action_onehot_for_dynamics') or batch.get('action_onehot')
+        z_next_detach = batch.get('z_next_detached')
+        
         dec = self.decode(z, action_onehot=action_onehot, z_next_detach=z_next_detach)
         return {**enc, **dec}
     
@@ -1346,6 +1348,132 @@ def vae_loss(
     msg_tokens = batch['message_chars']  # [B, 256]
     valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
     
+    # Handle forward/inverse dynamics preparation if needed
+    if (config.use_forward_model or config.use_inverse_dynamics) and 'has_next' in batch:
+        # Determine original batch dimensions from the flattened data
+        # Since we flattened [B, T, ...] to [B*T, ...], we need to recover B and T
+        # We can use has_next to determine this since it should have the original structure
+        total_samples = len(valid_screen)
+        
+        # Try to determine B and T from has_next structure
+        # has_next should still be [B*T] after flattening
+        if 'original_batch_shape' in batch:
+            # If we stored the original shape, use it
+            B, T = batch['original_batch_shape']
+        else:
+            # Try to infer from the data - this is a fallback
+            # For now, assume we have this information somehow, or add it to batch preparation
+            # This is a simplified approach - in practice, we should pass B, T explicitly
+            B = batch.get('batch_size', 1)
+            T = total_samples // B if B > 0 else total_samples
+        
+        if T > 1:
+            # Get current latent representations (already flattened to [B*T, latent_dim])
+            z_current = model_output['z']  # [B*T, latent_dim]
+            
+            # Reshape z to [B, T, latent_dim] to work with sequences
+            z_reshaped = z_current.view(B, T, -1)  # [B, T, latent_dim]
+            
+            # Create z_next by shifting: z_next[t] = z[t+1]
+            # Only valid for t < T-1, so we exclude the last timestep
+            z_next = z_reshaped[:, 1:, :].contiguous()  # [B, T-1, latent_dim]
+            z_current_for_dynamics = z_reshaped[:, :-1, :].contiguous()  # [B, T-1, latent_dim]
+            
+            # Flatten back for the loss computation
+            z_next_flat = z_next.view(-1, z_next.shape[-1])  # [B*(T-1), latent_dim]
+            z_current_flat = z_current_for_dynamics.view(-1, z_current_for_dynamics.shape[-1])  # [B*(T-1), latent_dim]
+            
+            # Get has_next mask to identify valid transitions
+            has_next_reshaped = batch['has_next'].view(B, T)  # [B, T]
+            has_next_valid = has_next_reshaped[:, :-1].contiguous().view(-1)  # [B*(T-1)]
+            
+            # Only keep valid transitions
+            valid_transitions = has_next_valid.bool()
+            if valid_transitions.any():
+                batch['z_next_detached'] = z_next_flat[valid_transitions].detach()
+                
+                # Prepare corresponding action targets for valid transitions
+                if 'action_index' in batch:
+                    action_reshaped = batch['action_index'].view(B, T)[:, 1:]  # [B, T-1] (actions leading to next state)
+                    batch['action_index_for_dynamics'] = action_reshaped.contiguous().view(-1)[valid_transitions]
+                
+                if 'action_onehot' in batch:
+                    action_onehot_reshaped = batch['action_onehot'].view(B, T, -1)[:, 1:]  # [B, T-1, action_dim]
+                    batch['action_onehot_for_dynamics'] = action_onehot_reshaped.contiguous().view(-1, action_onehot_reshaped.shape[-1])[valid_transitions]
+
+    # ============= On-the-fly Goal and Value Target Computation =============
+    # Compute goal_target, goal_mask, and value_k_target on-the-fly using config parameters
+    if 'game_chars' in batch and 'game_colors' in batch and 'reward_target' in batch and 'done_target' in batch:
+        # Determine batch dimensions
+        total_samples = len(valid_screen)
+        if 'original_batch_shape' in batch:
+            B, T = batch['original_batch_shape']
+        else:
+            # Fallback: try to infer from data
+            B = batch.get('batch_size', 1)
+            T = total_samples // B if B > 0 else total_samples
+        
+        if T > 1:
+            # Reshape data back to [B, T, ...] for goal and value computation
+            game_chars_reshaped = batch['game_chars'].view(B, T, 21, 79)  # [B, T, H, W]
+            game_colors_reshaped = batch['game_colors'].view(B, T, 21, 79)  # [B, T, H, W]
+            hero_info_reshaped = batch['hero_info'].view(B, T, 4)  # [B, T, 4]
+            reward_reshaped = batch['reward_target'].view(B, T)  # [B, T]
+            done_reshaped = batch['done_target'].view(B, T)  # [B, T]
+            
+            # Initialize goal and value targets
+            goal_target_flat = torch.zeros(total_samples, 2, dtype=torch.float32, device=batch['game_chars'].device)
+            goal_mask_flat = torch.zeros(total_samples, dtype=torch.float32, device=batch['game_chars'].device)
+            value_k_target_flat = torch.zeros(total_samples, len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
+            
+            # Process each game sequence
+            for g in range(B):
+                # Compute k-step value returns for this game sequence
+                rewards_np = reward_reshaped[g].cpu().numpy()
+                done_np = done_reshaped[g].cpu().numpy().astype(bool)
+                
+                value_targets = []
+                for k in config.value_horizons:
+                    k_step_returns = discounted_k_step(rewards_np, done_np, k=k, gamma=config.gamma)
+                    value_targets.append(k_step_returns)
+                
+                # Stack and convert to tensor [T, num_horizons]
+                value_targets = torch.tensor(np.stack(value_targets, axis=1), dtype=torch.float32, device=batch['game_chars'].device)
+                
+                # Fill value targets for this game
+                start_idx = g * T
+                end_idx = start_idx + T
+                value_k_target_flat[start_idx:end_idx] = value_targets
+                
+                # Compute goal targets for each timestep in this game
+                for t in range(T):
+                    flat_idx = g * T + t
+                    
+                    # Skip if not a valid screen
+                    if not valid_screen[flat_idx]:
+                        continue
+                        
+                    chars_map = game_chars_reshaped[g, t]  # [H, W]
+                    colors_map = game_colors_reshaped[g, t]  # [H, W]
+                    
+                    # Find hero position
+                    hero_pos = (chars_map == ord('@')).nonzero(as_tuple=True)
+                    if len(hero_pos[0]) > 0:
+                        hero_y, hero_x = int(hero_pos[0][0]), int(hero_pos[1][0])
+                        
+                        # Compute goal vector using config parameters
+                        goal_vec = nearest_stairs_vector(chars_map, hero_y, hero_x, prefer=config.goal_prefer)
+                        if goal_vec is not None:
+                            goal_target_flat[flat_idx, 0] = goal_vec[0]  # dy
+                            goal_target_flat[flat_idx, 1] = goal_vec[1]  # dx
+                            goal_mask_flat[flat_idx] = 1.0
+                        # else: goal_target remains zero, goal_mask remains 0.0
+            
+            # Add computed targets to batch
+            batch['goal_target'] = goal_target_flat
+            batch['goal_mask'] = goal_mask_flat  
+            batch['value_k_target'] = value_k_target_flat
+    
     # stats
     pre = model_output['stats_encoder'].preprocessor
     pre = pre.to(blstats.device)
@@ -1377,7 +1505,6 @@ def vae_loss(
     done_logits = model_output['done_logits'][valid_screen]  # [B, 1]
     value = model_output['value'][valid_screen]  # [B, NUM_HORIZONS]
     safety_logits = model_output['safety_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
-    goal_pred = model_output.get('goal_pred', None)  # [B, GOAL_DIR_DIM] if applicable
     skill_logits = model_output.get('skill_logits', None)  # [B, SKILL_NUM] if applicable
     
     # latent forward model
@@ -1497,37 +1624,49 @@ def vae_loss(
     raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, ego_class_targets, reduction='mean')
 
     if 'passability_target' in batch:
-        raw_losses['passability'] = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'], reduction='mean')
+        raw_losses['passability'] = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'][valid_screen], reduction='mean')
 
     if 'reward_target' in batch:
-        raw_losses['reward'] = F.mse_loss(reward, batch['reward_target'], reduction='mean')
+        raw_losses['reward'] = F.mse_loss(reward, batch['reward_target'][valid_screen], reduction='mean')
 
     if 'done_target' in batch:
-        raw_losses['done'] = F.binary_cross_entropy_with_logits(done_logits, batch['done_target'], reduction='mean')
+        raw_losses['done'] = F.binary_cross_entropy_with_logits(done_logits, batch['done_target'][valid_screen], reduction='mean')
         
     if 'value_k_target' in batch:
-        raw_losses['value'] = F.mse_loss(value, batch['value_k_target'], reduction='mean')
+        raw_losses['value'] = F.mse_loss(value, batch['value_k_target'][valid_screen], reduction='mean')
 
     # --- Safety risk (8 dirs) ---
     if 'safety_target' in batch:
-        raw_losses['safety'] = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'], reduction='mean')
+        raw_losses['safety'] = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'][valid_screen], reduction='mean')
 
     # --- Goal direction ---
     if ('goal_target' in batch) and ('goal_pred' in model_output):
-        raw_losses['goal'] = F.mse_loss(goal_pred, batch['goal_target'], reduction='mean')
+        goal_pred_filtered = model_output['goal_pred'][valid_screen] if 'goal_pred' in model_output else None
+        if goal_pred_filtered is not None:
+            raw_losses['goal'] = F.mse_loss(goal_pred_filtered, batch['goal_target'][valid_screen], reduction='mean')
 
     # --- Dynamics ---
-    if (latent_pred is not None) and ('z_next_detached' in batch) and ('action_onehot' in batch):
+    # Forward dynamics: predict z_next from z_current and action
+    if (latent_pred is not None) and ('z_next_detached' in batch):
+        # latent_pred should already be filtered to valid transitions in the model
         z_next_tgt = batch['z_next_detached']
         mse = F.mse_loss(latent_pred, z_next_tgt, reduction='mean')
         cos = 1.0 - F.cosine_similarity(latent_pred, z_next_tgt, dim=1).mean()
         raw_losses['forward'] = (0.5 * (mse + cos))
 
+    # Inverse dynamics: predict action from z_current and z_next
     if inverse_dynamics_logits is not None:
-        if 'action_index' in batch:
-            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_index'].long(), reduction='mean')
+        # inverse_dynamics_logits should already be filtered to valid transitions in the model
+        if 'action_index_for_dynamics' in batch:
+            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_index_for_dynamics'].long(), reduction='mean')
+        elif 'action_index' in batch:
+            # Fallback: use all actions (but this shouldn't happen with proper dynamics setup)
+            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_index'][valid_screen].long(), reduction='mean')
+        elif 'action_onehot_for_dynamics' in batch:
+            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_onehot_for_dynamics'].argmax(dim=1).long(), reduction='mean')
         elif 'action_onehot' in batch:
-            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_onehot'].argmax(dim=1).long(), reduction='mean')
+            # Fallback: use all actions (but this shouldn't happen with proper dynamics setup)
+            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_onehot'][valid_screen].argmax(dim=1).long(), reduction='mean')
         else:
             ce = inverse_dynamics_logits.sum() * 0.0  # no target; zero loss
         raw_losses['inverse'] = ce

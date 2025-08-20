@@ -593,6 +593,12 @@ def train_multimodalhack_vae(
                     else:
                         batch_device[key] = value
                 
+                # Store original batch dimensions for dynamics processing
+                if 'game_chars' in batch:
+                    B, T = batch['game_chars'].shape[:2]
+                    batch_device['original_batch_shape'] = (B, T)
+                    batch_device['batch_size'] = B
+                
                 # Optional: shuffle within batch (ignore temporal order for VAE training)
                 if shuffle_within_batch:
                     batch_size = batch_device['game_chars'].shape[0]  # B*T
@@ -609,7 +615,7 @@ def train_multimodalhack_vae(
                     # Calculate adaptive weights for this step
                     mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
                     
-                    # Calculate loss
+                    # Calculate loss (vae_loss will handle dynamics internally)
                     train_loss_dict = vae_loss(
                         model_output=model_output,
                         batch=batch_device,
@@ -751,6 +757,12 @@ def train_multimodalhack_vae(
                         batch_device[key] = value_device.view(B * T, *remaining_dims)
                     else:
                         batch_device[key] = value
+                
+                # Store original batch dimensions for dynamics processing
+                if 'game_chars' in batch:
+                    B, T = batch['game_chars'].shape[:2]
+                    batch_device['original_batch_shape'] = (B, T)
+                    batch_device['batch_size'] = B
                 
                 # Optional: shuffle within batch (ignore temporal order for VAE training)
                 if shuffle_within_batch:

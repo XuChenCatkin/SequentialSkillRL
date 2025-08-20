@@ -591,23 +591,20 @@ class NetHackDataCollector:
         return None
     
     def collect_data_batch(self, dataset_name: str, adapter: callable, max_batches: int = 1000, 
-                       batch_size: int = 32, seq_length: int = 32, game_ids: List[int] | None = None,
-                       value_horizons: List[int] = [5, 10],
-                       gamma: float = 0.95,
-                       goal_prefer: str = '>') -> List[Dict]:
+                       batch_size: int = 32, seq_length: int = 32, game_ids: List[int] | None = None) -> List[Dict]:
         """
         Collect data from the dataset for VAE training and build decision-sufficient targets.
 
-        - Adds: action_index, action_onehot, reward_target, done_target, value_k_target,
-                passability_target, safety_target, goal_target (+goal_mask), has_next.
+        - Adds: action_index, action_onehot, reward_target, done_target,
+                passability_target, safety_target, has_next.
         - Shapes are [num_games, num_time, ...], consistent with your current pipeline.
         - z_next_detached is produced later during training by encoding obs_{t+1}; here we prepare has_next masks.
         - Ego view data (ego_char, ego_color, ego_class) is computed on-the-fly in vae_loss function for flexibility.
+        - Goal and value targets are computed on-the-fly in vae_loss using VAEConfig parameters for flexibility.
         """
         print(f"Collecting {max_batches} batches from {dataset_name} for VAE training...")
         print(f"  - Batch size: {batch_size}, Sequence length: {seq_length}")
-        print(f"  - Value horizons: {value_horizons}, Gamma: {gamma}")
-        print(f"  - Goal preference: '{goal_prefer}', Game IDs: {len(game_ids) if game_ids else 'All'}")
+        print(f"  - Game IDs: {len(game_ids) if game_ids else 'All'}")
         
         dataset = nld.TtyrecDataset(
             dataset_name,
@@ -654,8 +651,6 @@ class NetHackDataCollector:
             done_target_mb     = torch.zeros((num_games, num_time), dtype=torch.float32)
             passability_mb     = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
             safety_mb          = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
-            goal_target_mb     = torch.zeros((num_games, num_time, 2), dtype=torch.float32)
-            goal_mask_mb       = torch.zeros((num_games, num_time), dtype=torch.float32)
             has_next_mb        = torch.zeros((num_games, num_time), dtype=torch.bool)
 
             # Convenience aliases to raw
@@ -674,18 +669,7 @@ class NetHackDataCollector:
                 # One-hot actions
                 action_onehot_mb[g] = one_hot(action_index_mb[g], ACTION_DIM)
 
-                # Build k-step returns per game (stop at done)
-                done_np = done_raw[g].cpu().numpy()
-                r_np    = reward_target_mb[g].cpu().numpy()
-                vals = []
-                for k in value_horizons:
-                    vals.append(discounted_k_step(r_np, done_np, k=k, gamma=gamma))
-                # [M,T] -> [T,M]
-                vals = np.stack(vals, axis=0).transpose(1,0)
-                vals = torch.tensor(vals, dtype=torch.float32)
-                this_val = vals  # [T,M]
-
-                # Per-timestep spatial targets (passability/safety/ego/goal)
+                # Per-timestep spatial targets (passability/safety)
                 for t in range(num_time):
                     done_target_mb[g,t]  = float(done_raw[g,t].item())
                     has_next_mb[g,t] = (t+1 < num_time) and (not bool(done_raw[g,t].item()))
@@ -752,21 +736,7 @@ class NetHackDataCollector:
                     passability_mb[g,t] = p8
                     safety_mb[g,t]      = s8
 
-                    # goal vector
-                    goal_vec = nearest_stairs_vector(chars_map, hy, hx, prefer=goal_prefer)
-                    if goal_vec is not None:
-                        goal_target_mb[g,t,0] = goal_vec[0]
-                        goal_target_mb[g,t,1] = goal_vec[1]
-                        goal_mask_mb[g,t]     = 1.0
-                    else:
-                        goal_target_mb[g,t].zero_()
-                        goal_mask_mb[g,t] = 0.0
-
-                # attach value targets (same T for the game)
-                # allocate on first assignment, then fill
-                if 'value_k_target' not in this_batch:
-                    this_batch['value_k_target'] = torch.zeros((num_games, num_time, len(value_horizons)), dtype=torch.float32)
-                this_batch['value_k_target'][g] = this_val
+                # Note: goal_target, goal_mask, and value_k_target are now computed on-the-fly in vae_loss
 
             # Pack up everything
             this_batch['message_chars']   = message_chars_minibatch
@@ -782,11 +752,9 @@ class NetHackDataCollector:
             this_batch['action_onehot']     = action_onehot_mb
             this_batch['reward_target']     = reward_target_mb
             this_batch['done_target']       = done_target_mb
-            # value_k_target already set per-game above
+            # value_k_target, goal_target, and goal_mask are now computed on-the-fly in vae_loss
             this_batch['passability_target']= passability_mb
             this_batch['safety_target']     = safety_mb
-            this_batch['goal_target']       = goal_target_mb
-            this_batch['goal_mask']         = goal_mask_mb
             this_batch['has_next']          = has_next_mb
 
             collected_batches.append(this_batch)
@@ -896,9 +864,7 @@ class NetHackDataCollector:
     
     def collect_or_load_data(self, dataset_name: str, adapter: callable, save_path: str, 
                            max_batches: int = 1000, batch_size: int = 32, seq_length: int = 32,
-                           force_recollect: bool = False, game_ids: List[int] | None = None,
-                           value_horizons: List[int] = [5, 10],
-                           gamma: float = 0.95, goal_prefer: str = '>') -> List[Dict]:
+                           force_recollect: bool = False, game_ids: List[int] | None = None) -> List[Dict]:
         """
         Collect data from dataset or load from saved file if it exists.
         
@@ -925,10 +891,7 @@ class NetHackDataCollector:
                 max_batches=max_batches,
                 batch_size=batch_size,
                 seq_length=seq_length,
-                game_ids=game_ids,
-                value_horizons=value_horizons,
-                gamma=gamma,
-                goal_prefer=goal_prefer
+                game_ids=game_ids
             )
             
             # Save for future use
