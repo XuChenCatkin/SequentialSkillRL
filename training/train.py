@@ -196,7 +196,7 @@ def train_multimodalhack_vae(
         data_cache_dir: Directory to cache processed data
         force_recollect: Force data recollection even if cache exists
         shuffle_batches: Whether to shuffle training batches at the start of each epoch
-        shuffle_within_batch: Whether to shuffle samples within each batch (ignores temporal order)
+        shuffle_within_batch: Whether to shuffle games within each batch (preserves temporal order within each game)
         use_bf16: Whether to use BF16 mixed precision training for memory efficiency
         custom_kl_beta_function: Optional custom function for KL beta ramping (overrides config beta curves)
         free_bits: Target free bits for KL loss (0.0 disables)
@@ -596,30 +596,35 @@ def train_multimodalhack_vae(
                 batch_device = {}
                 for key, value in batch.items():
                     if value is not None and isinstance(value, torch.Tensor):
-                        value_device = value.to(device)
-                        # Reshape tensors from [B, T, ...] to [B*T, ...]
-                        # Multi-dimensional tensors (game_chars, game_colors, etc.)
-                        B, T = value_device.shape[:2]
-                        remaining_dims = value_device.shape[2:]
-                        batch_device[key] = value_device.view(B * T, *remaining_dims)
-                        
+                        batch_device[key] = value.to(device)
                     else:
                         batch_device[key] = value
+                
+                # Optional: shuffle within batch (shuffle games but keep temporal order)
+                if shuffle_within_batch:
+                    # Shuffle across B dimension (games) while preserving T dimension (temporal order)
+                    # Do this before reshaping to [B*T, ...]
+                    if 'game_chars' in batch_device:
+                        B, T = batch_device['game_chars'].shape[:2]
+                        game_shuffle_indices = torch.randperm(B)
+                        
+                        for key, value in batch_device.items():
+                            if value is not None and isinstance(value, torch.Tensor) and len(value.shape) >= 2:
+                                # Shuffle across B dimension (games)
+                                batch_device[key] = value[game_shuffle_indices]
+                
+                # Now reshape tensors from [B, T, ...] to [B*T, ...]
+                for key, value in batch_device.items():
+                    if value is not None and isinstance(value, torch.Tensor) and len(value.shape) >= 2:
+                        B, T = value.shape[:2]
+                        remaining_dims = value.shape[2:]
+                        batch_device[key] = value.view(B * T, *remaining_dims)
                 
                 # Store original batch dimensions for dynamics processing
                 if 'game_chars' in batch:
                     B, T = batch['game_chars'].shape[:2]
                     batch_device['original_batch_shape'] = (B, T)
                     batch_device['batch_size'] = B
-                
-                # Optional: shuffle within batch (ignore temporal order for VAE training)
-                if shuffle_within_batch:
-                    batch_size = batch_device['game_chars'].shape[0]  # B*T
-                    shuffle_indices = torch.randperm(batch_size)
-                    
-                    for key, value in batch_device.items():
-                        if value is not None and isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
-                            batch_device[key] = value[shuffle_indices]
                 
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
@@ -762,29 +767,35 @@ def train_multimodalhack_vae(
                 batch_device = {}
                 for key, value in batch.items():
                     if value is not None and isinstance(value, torch.Tensor):
-                        value_device = value.to(device)
-                        # Reshape tensors from [B, T, ...] to [B*T, ...]
-                        # Multi-dimensional tensors (game_chars, game_colors, etc.)
-                        B, T = value_device.shape[:2]
-                        remaining_dims = value_device.shape[2:]
-                        batch_device[key] = value_device.view(B * T, *remaining_dims)
+                        batch_device[key] = value.to(device)
                     else:
                         batch_device[key] = value
+                
+                # Optional: shuffle within batch (shuffle games but keep temporal order)
+                if shuffle_within_batch:
+                    # Shuffle across B dimension (games) while preserving T dimension (temporal order)
+                    # Do this before reshaping to [B*T, ...]
+                    if 'game_chars' in batch_device:
+                        B, T = batch_device['game_chars'].shape[:2]
+                        game_shuffle_indices = torch.randperm(B)
+                        
+                        for key, value in batch_device.items():
+                            if value is not None and isinstance(value, torch.Tensor) and len(value.shape) >= 2:
+                                # Shuffle across B dimension (games)
+                                batch_device[key] = value[game_shuffle_indices]
+                
+                # Now reshape tensors from [B, T, ...] to [B*T, ...]
+                for key, value in batch_device.items():
+                    if value is not None and isinstance(value, torch.Tensor) and len(value.shape) >= 2:
+                        B, T = value.shape[:2]
+                        remaining_dims = value.shape[2:]
+                        batch_device[key] = value.view(B * T, *remaining_dims)
                 
                 # Store original batch dimensions for dynamics processing
                 if 'game_chars' in batch:
                     B, T = batch['game_chars'].shape[:2]
                     batch_device['original_batch_shape'] = (B, T)
                     batch_device['batch_size'] = B
-                
-                # Optional: shuffle within batch (ignore temporal order for VAE training)
-                if shuffle_within_batch:
-                    batch_size = batch_device['game_chars'].shape[0]  # B*T
-                    shuffle_indices = torch.randperm(batch_size)
-                    
-                    for key, value in batch_device.items():
-                        if value is not None and isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
-                            batch_device[key] = value[shuffle_indices]
                 
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
@@ -2178,11 +2189,28 @@ if __name__ == "__main__":
                 "NetHack gameplay analysis"
             ],
         }
-        
+
+        vae_config = VAEConfig(
+            initial_mi_beta=0.0,
+            final_mi_beta=0.0,
+            mi_beta_shape='constant',
+            initial_tc_beta=5.0,
+            final_tc_beta=5.0,
+            tc_beta_shape='constant',
+            initial_dw_beta=0.02,
+            final_dw_beta=1.0,
+            dw_beta_shape='linear',
+            warmup_epoch_ratio=0.2,
+            free_bits=0.15,
+            encoder_dropout=0.1,
+            decoder_dropout=0.1
+        )
+
         print(f"\n🧪 Starting train_multimodalhack_vae...")
         model, train_losses, test_losses = train_multimodalhack_vae(
             train_file=train_file,
             test_file=test_file,
+            config=vae_config,
             epochs=15,          
             batch_size=batch_size,
             sequence_size=sequence_size,    
@@ -2198,25 +2226,8 @@ if __name__ == "__main__":
             force_recollect=False,  # Use the data we just collected
             shuffle_batches=True,  # Shuffle training batches each epoch for better training
             shuffle_within_batch=True,  # Shuffle within each batch for more variety
-            initial_mi_beta=0.0,
-            final_mi_beta=0.0,
-            mi_beta_shape='constant',
-            initial_tc_beta=5.0,
-            final_tc_beta=5.0,
-            tc_beta_shape='constant',
-            initial_dw_beta=0.02,
-            final_dw_beta=1.0,
-            dw_beta_shape='linear',
+            
             custom_kl_beta_function = lambda init, end, progress: init + (end - init) * min(progress, 0.2) * 5.0, 
-            warmup_epoch_ratio = 0.2,
-            free_bits=0.15,
-            focal_loss_alpha=0.75,
-            focal_loss_gamma=2.0,
-
-            # Dropout and regularization settings
-            dropout_rate=0.1,  # Set to 0.1 for mild regularization
-            enable_dropout_on_latent=True,
-            enable_dropout_on_decoder=True,
             
             # Early stopping settings
             early_stopping = False,

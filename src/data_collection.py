@@ -441,23 +441,41 @@ def crop_ego(chars: torch.Tensor, colors: torch.Tensor, hero_y: int, hero_x: int
     return out_chars, out_colors
     
 # ---- Discounted k-step returns ----------------------------------------------
-def discounted_k_step(rewards: np.ndarray, done: np.ndarray, k: int, gamma: float) -> np.ndarray:
+def discounted_k_step_multi_with_mask(
+    rewards: np.ndarray,      # [T] float
+    done: np.ndarray,         # [T] bool  (True if episode terminates AT timestep t)
+    horizons: list[int],      # e.g., [5, 10]
+    gamma: float
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    rewards: [T] float, done: [T] bool for the *result* at timestep t (i.e., episode ends at t if done[t])
-    Returns G^{(k)}_t = sum_{i=0}^{k-1} gamma^i r_{t+i}, stopping at done.
+    Returns:
+      vals: [T, M] where vals[t,m] = sum_{i=0}^{k-1} gamma^i r_{t+i}
+            computed ONLY if all r_{t..t+k-1} exist and done[u]==False for u in [t..t+k-1]
+      mask: [T, M] where mask[t,m] = 1.0 if above condition holds, else 0.0
+    Notes:
+      - This avoids cross-batch leakage; steps whose k-window crosses the segment end are masked 0.
+      - If an episode ends at t (done[t]==True), then no horizon starting at t is valid.
     """
-    T = rewards.shape[0]
-    out = np.zeros(T, dtype=np.float32)
-    for t in range(T):
-        g, w = 0.0, 1.0
-        for i in range(k):
-            ti = t + i
-            if ti >= T or done[ti]:
-                break
-            g += w * rewards[ti]
-            w *= gamma
-        out[t] = g
-    return out
+    T = int(rewards.shape[0])
+    M = len(horizons)
+    vals = np.zeros((T, M), dtype=np.float32)
+    mask = np.zeros((T, M), dtype=np.float32)
+
+    for m, k in enumerate(horizons):
+        for t in range(T):
+            g, w = 0.0, 1.0
+            ok = True
+            for i in range(k):
+                ti = t + i
+                if ti >= T or done[ti]:
+                    ok = False
+                    break
+                g += w * rewards[ti]
+                w *= gamma
+            vals[t, m] = g
+            mask[t, m] = 1.0 if ok else 0.0
+    return vals, mask
+
 
 
 class NetHackDataCollector:

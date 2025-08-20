@@ -67,10 +67,10 @@ from nle import nethack
 
 # Import NetHackCategory from data_collection
 try:
-    from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step
+    from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step_multi_with_mask
 except ImportError:
     # Fallback for when running as script
-    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step
+    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step_multi_with_mask
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
@@ -400,7 +400,7 @@ class VAEConfig:
         'safety': 0.8,
         'reward': 1.0,
         'done': 1.0,
-        'value': 1.0,
+        'value_k': 1.0,
         'bag': 8.0,
         'stats': 0.5,
         'msg': 0.5,
@@ -954,7 +954,7 @@ class ActionValueHead(nn.Module):
         self.passability = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 2, cfg.decoder_dropout)
         self.reward = MLP(cfg.latent_dim, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
         self.done = MLP(cfg.latent_dim, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
-        self.value = MLP(cfg.latent_dim, cfg.forward_hidden, len(cfg.value_horizons), 2, cfg.decoder_dropout)
+        self.value_k = MLP(cfg.latent_dim, cfg.forward_hidden, len(cfg.value_horizons), 2, cfg.decoder_dropout)
         self.safety = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 2, cfg.decoder_dropout)
         self.goal = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.goal_dir_dim, 2, cfg.decoder_dropout) if cfg.goal_dir_dim > 0 else None
         self.skill_belief = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.skill_num, 2, cfg.decoder_dropout) if cfg.skill_num > 0 else None
@@ -971,7 +971,7 @@ class ActionValueHead(nn.Module):
             - passability: [B, passability_dirs]
             - reward: [B, 1]
             - done: [B, 1]
-            - value: [B, num_horizons]
+            - value_k: [B, num_horizons]
             - safety: [B, passability_dirs]
             - goal: [B, goal_dir_dim] (if applicable)
             - skill_belief: [B, skill_num] (if applicable)
@@ -980,7 +980,7 @@ class ActionValueHead(nn.Module):
             "passability_logits": self.passability(z),
             "reward": self.reward(z),
             "done_logits": self.done(z),
-            "value": self.value(z),
+            "value_k": self.value_k(z),
             "safety_logits": self.safety(z),
         }
         if self.goal is not None:
@@ -1425,6 +1425,7 @@ def vae_loss(
             goal_target_flat = torch.zeros(total_samples, 2, dtype=torch.float32, device=batch['game_chars'].device)
             goal_mask_flat = torch.zeros(total_samples, dtype=torch.float32, device=batch['game_chars'].device)
             value_k_target_flat = torch.zeros(total_samples, len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
+            value_k_mask_flat = torch.zeros(total_samples, len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
             
             # Process each game sequence
             for g in range(B):
@@ -1432,18 +1433,17 @@ def vae_loss(
                 rewards_np = reward_reshaped[g].cpu().numpy()
                 done_np = done_reshaped[g].cpu().numpy().astype(bool)
                 
-                value_targets = []
-                for k in config.value_horizons:
-                    k_step_returns = discounted_k_step(rewards_np, done_np, k=k, gamma=config.gamma)
-                    value_targets.append(k_step_returns)
-                
+                value_targets, value_masks = discounted_k_step_multi_with_mask(rewards_np, done_np, config.value_horizons, config.gamma)
+
                 # Stack and convert to tensor [T, num_horizons]
-                value_targets = torch.tensor(np.stack(value_targets, axis=1), dtype=torch.float32, device=batch['game_chars'].device)
-                
+                value_targets = torch.tensor(value_targets, dtype=torch.float32, device=batch['game_chars'].device)
+                value_masks = torch.tensor(value_masks, dtype=torch.float32, device=batch['game_chars'].device)
+
                 # Fill value targets for this game
                 start_idx = g * T
                 end_idx = start_idx + T
                 value_k_target_flat[start_idx:end_idx] = value_targets
+                value_k_mask_flat[start_idx:end_idx] = value_masks
                 
                 # Compute goal targets for each timestep in this game
                 for t in range(T):
@@ -1473,7 +1473,8 @@ def vae_loss(
             batch['goal_target'] = goal_target_flat
             batch['goal_mask'] = goal_mask_flat  
             batch['value_k_target'] = value_k_target_flat
-    
+            batch['value_k_mask'] = value_k_mask_flat
+
     # stats
     pre = model_output['stats_encoder'].preprocessor
     pre = pre.to(blstats.device)
@@ -1503,7 +1504,7 @@ def vae_loss(
     passibility_logits = model_output['passability_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
     reward = model_output['reward'][valid_screen]
     done_logits = model_output['done_logits'][valid_screen]  # [B, 1]
-    value = model_output['value'][valid_screen]  # [B, NUM_HORIZONS]
+    value_k = model_output['value_k'][valid_screen]  # [B, NUM_HORIZONS]
     safety_logits = model_output['safety_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
     skill_logits = model_output.get('skill_logits', None)  # [B, SKILL_NUM] if applicable
     
@@ -1633,7 +1634,9 @@ def vae_loss(
         raw_losses['done'] = F.binary_cross_entropy_with_logits(done_logits, batch['done_target'][valid_screen], reduction='mean')
         
     if 'value_k_target' in batch:
-        raw_losses['value'] = F.mse_loss(value, batch['value_k_target'][valid_screen], reduction='mean')
+        tgt = batch['value_k_target'][valid_screen]
+        mask = batch['value_k_mask'][valid_screen]
+        raw_losses['value_k'] = ((value_k - tgt)**2 * mask).sum() / mask.sum().clamp_min(1.0)  # Mean over valid samples
 
     # --- Safety risk (8 dirs) ---
     if 'safety_target' in batch:
