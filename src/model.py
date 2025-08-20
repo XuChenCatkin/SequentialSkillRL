@@ -378,6 +378,7 @@ class VAEConfig:
     # Dynamics heads
     action_dim: int = len(nethack.ACTIONS)     # one‑hot; 0 disables forward/inverse
     forward_hidden: int = 256
+    use_forward_model: bool = True
     use_inverse_dynamics: bool = True
     goal_dir_dim: int = 2                      # 0 disables (set 2 for (dx,dy) regression)
     passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
@@ -392,6 +393,9 @@ class VAEConfig:
     # KL prior mode
     prior_mode: str = "standard"               # "standard" | "hmm" | "blend"
     prior_blend_alpha: float = 0.5
+    
+    focal_loss_alpha = 0.5
+    focal_loss_gamma = 2.0
 
     # Loss weights
     raw_modality_weights: Dict[str, float] = field(default_factory=lambda: {
@@ -1185,7 +1189,7 @@ class MultiModalHackVAE(nn.Module):
         z_next_detach = batch.get('z_next_detached')
         
         dec = self.decode(z, action_onehot=action_onehot, z_next_detach=z_next_detach)
-        return {**enc, **dec}
+        return {**enc, **dec, 'z': z}  # include z in the output
     
     @torch.no_grad()
     def sample(

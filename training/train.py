@@ -2241,7 +2241,7 @@ if __name__ == "__main__":
             keep_last_n_checkpoints=2,
             
             # Wandb integration example
-            use_wandb=True,
+            use_wandb=False,
             wandb_project="nethack-vae",
             wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
             wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
@@ -2252,7 +2252,7 @@ if __name__ == "__main__":
             log_gradients=True,
             
             # HuggingFace integration example
-            upload_to_hf=True, 
+            upload_to_hf=False, 
             hf_repo_name="CatkinChen/nethack-vae",
             hf_upload_directly=True,  # Upload directly without extra local save
             hf_upload_checkpoints=True,  # Also upload checkpoints
