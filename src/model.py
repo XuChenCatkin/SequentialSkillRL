@@ -378,7 +378,7 @@ class VAEConfig:
     # Dynamics heads
     action_dim: int = len(nethack.ACTIONS)     # one‑hot; 0 disables forward/inverse
     forward_hidden: int = 256
-    use_forward_model: bool = True
+    use_latent_forward_model: bool = True
     use_inverse_dynamics: bool = True
     goal_dir_dim: int = 2                      # 0 disables (set 2 for (dx,dy) regression)
     passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
@@ -996,7 +996,7 @@ class ActionValueHead(nn.Module):
 class LatentForwardModel(nn.Module):
     def __init__(self, cfg: VAEConfig):
         super().__init__()
-        self.enabled = cfg.action_dim > 0
+        self.enabled = (cfg.action_dim > 0) and cfg.use_latent_forward_model
         self.skill_num = cfg.skill_num
         if not self.enabled:
             return
@@ -1154,7 +1154,7 @@ class MultiModalHackVAE(nn.Module):
             z += lowrank_std
         return z    # [B, LATENT_DIM]
 
-    def decode(self, z, action_onehot=None, z_next_detach=None):
+    def decode(self, z, action_onehot=None, z_next_detach=None, z_current_for_dynamics=None):
         # split z -> [z_bag | z_core]
         z_bag  = z[:, :self.z_bag_dim]
         z_core = z[:, self.z_bag_dim:]
@@ -1164,7 +1164,10 @@ class MultiModalHackVAE(nn.Module):
         msg_logits = self.msg_decoder(z_core)
         out_action = self.action_value_head(z)
         latent_pred = self.latent_forward_model(z, action_onehot) if action_onehot is not None and self.latent_forward_model.enabled else None
-        inverse_dynamics_logits = self.inverse_dynamics(z, z_next_detach) if z_next_detach is not None and self.inverse_dynamics.enabled else None
+        
+        # Use z_current_for_dynamics if available, otherwise fall back to z for inverse dynamics
+        z_for_inverse = z_current_for_dynamics if z_current_for_dynamics is not None else z
+        inverse_dynamics_logits = self.inverse_dynamics(z_for_inverse, z_next_detach) if z_next_detach is not None and self.inverse_dynamics.enabled else None
         
         return {
             **out_map,
@@ -1184,11 +1187,36 @@ class MultiModalHackVAE(nn.Module):
         enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
         z = self._reparameterise(enc["mu"], enc["logvar"])  # [B,D]
         
-        # Pass dynamics inputs if available - vae_loss will handle the filtering
-        action_onehot = batch.get('action_onehot_for_dynamics') or batch.get('action_onehot')
-        z_next_detach = batch.get('z_next_detached')
+        # Calculate z_next_detach if we have sequential data and save to batch
+        if 'has_next' in batch and 'original_batch_shape' in batch:
+            B, T = batch['original_batch_shape']
+            if T > 1:
+                # Reshape z to [B, T, latent_dim] to work with sequences
+                z_reshaped = z.view(B, T, -1)  # [B, T, latent_dim]
+                
+                # Create z_next by shifting: z_next[t] = z[t+1]
+                # Only valid for t < T-1, so we exclude the last timestep
+                z_next = z_reshaped[:, 1:, :].contiguous()  # [B, T-1, latent_dim]
+                z_current_for_dynamics = z_reshaped[:, :-1, :].contiguous()  # [B, T-1, latent_dim]
+                
+                # Flatten back - save whole tensors and let vae_loss use has_next mask
+                z_next_flat = z_next.view(-1, z_next.shape[-1])  # [B*(T-1), latent_dim]
+                z_current_flat = z_current_for_dynamics.view(-1, z_current_for_dynamics.shape[-1])  # [B*(T-1), latent_dim]
+                
+                # Save whole tensors to batch - let vae_loss handle masking with has_next
+                batch['z_next_detached'] = z_next_flat.detach()  # [B*(T-1), latent_dim]
+                batch['z_current_for_dynamics'] = z_current_flat  # [B*(T-1), latent_dim]
+                
+                # Get has_next mask for dynamics
+                has_next_reshaped = batch['has_next'].view(B, T)  # [B, T]
+                batch['has_next_for_dynamics'] = has_next_reshaped[:, :-1].contiguous().view(-1)  # [B*(T-1)]
         
-        dec = self.decode(z, action_onehot=action_onehot, z_next_detach=z_next_detach)
+        # Get action_onehot for dynamics (available from batch)
+        action_onehot = batch.get('action_onehot_for_dynamics')
+        z_next_detach = batch.get('z_next_detached')
+        z_current_for_dynamics = batch.get('z_current_for_dynamics')
+        
+        dec = self.decode(z, action_onehot=action_onehot, z_next_detach=z_next_detach, z_current_for_dynamics=z_current_for_dynamics)
         return {**enc, **dec, 'z': z}  # include z in the output
     
     @torch.no_grad()
@@ -1353,40 +1381,21 @@ def vae_loss(
     valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
     
     # Handle forward/inverse dynamics preparation if needed
-    if (config.use_forward_model or config.use_inverse_dynamics) and 'has_next' in batch:
+    if (config.use_latent_forward_model or config.use_inverse_dynamics) and 'has_next' in batch:
+        # z_next_detach is now calculated in forward() method and passed via model_output
+        # We just need to prepare action targets for valid transitions
+        
         # Determine original batch dimensions from the flattened data
-        # Since we flattened [B, T, ...] to [B*T, ...], we need to recover B and T
-        # We can use has_next to determine this since it should have the original structure
         total_samples = len(valid_screen)
         
-        # Try to determine B and T from has_next structure
-        # has_next should still be [B*T] after flattening
         if 'original_batch_shape' in batch:
-            # If we stored the original shape, use it
             B, T = batch['original_batch_shape']
         else:
-            # Try to infer from the data - this is a fallback
-            # For now, assume we have this information somehow, or add it to batch preparation
-            # This is a simplified approach - in practice, we should pass B, T explicitly
+            # Fallback
             B = batch.get('batch_size', 1)
             T = total_samples // B if B > 0 else total_samples
         
         if T > 1:
-            # Get current latent representations (already flattened to [B*T, latent_dim])
-            z_current = model_output['z']  # [B*T, latent_dim]
-            
-            # Reshape z to [B, T, latent_dim] to work with sequences
-            z_reshaped = z_current.view(B, T, -1)  # [B, T, latent_dim]
-            
-            # Create z_next by shifting: z_next[t] = z[t+1]
-            # Only valid for t < T-1, so we exclude the last timestep
-            z_next = z_reshaped[:, 1:, :].contiguous()  # [B, T-1, latent_dim]
-            z_current_for_dynamics = z_reshaped[:, :-1, :].contiguous()  # [B, T-1, latent_dim]
-            
-            # Flatten back for the loss computation
-            z_next_flat = z_next.view(-1, z_next.shape[-1])  # [B*(T-1), latent_dim]
-            z_current_flat = z_current_for_dynamics.view(-1, z_current_for_dynamics.shape[-1])  # [B*(T-1), latent_dim]
-            
             # Get has_next mask to identify valid transitions
             has_next_reshaped = batch['has_next'].view(B, T)  # [B, T]
             has_next_valid = has_next_reshaped[:, :-1].contiguous().view(-1)  # [B*(T-1)]
@@ -1394,8 +1403,6 @@ def vae_loss(
             # Only keep valid transitions
             valid_transitions = has_next_valid.bool()
             if valid_transitions.any():
-                batch['z_next_detached'] = z_next_flat[valid_transitions].detach()
-                
                 # Prepare corresponding action targets for valid transitions
                 if 'action_index' in batch:
                     action_reshaped = batch['action_index'].view(B, T)[:, 1:]  # [B, T-1] (actions leading to next state)
@@ -1655,27 +1662,48 @@ def vae_loss(
     # --- Dynamics ---
     # Forward dynamics: predict z_next from z_current and action
     if (latent_pred is not None) and ('z_next_detached' in batch):
-        # latent_pred should already be filtered to valid transitions in the model
-        z_next_tgt = batch['z_next_detached']
-        mse = F.mse_loss(latent_pred, z_next_tgt, reduction='mean')
-        cos = 1.0 - F.cosine_similarity(latent_pred, z_next_tgt, dim=1).mean()
+        # Apply has_next mask if available for proper filtering
+        if 'has_next_for_dynamics' in batch:
+            has_next_mask = batch['has_next_for_dynamics']  # [B*(T-1)]
+            z_next_tgt = batch['z_next_detached'][has_next_mask]
+            latent_pred_filtered = latent_pred[has_next_mask]
+        else:
+            # Fallback: use all predictions (shouldn't happen with proper dynamics setup)
+            z_next_tgt = batch['z_next_detached']
+            latent_pred_filtered = latent_pred
+        
+        mse = F.mse_loss(latent_pred_filtered, z_next_tgt, reduction='mean')
+        cos = 1.0 - F.cosine_similarity(latent_pred_filtered, z_next_tgt, dim=1).mean()
         raw_losses['forward'] = (0.5 * (mse + cos))
 
     # Inverse dynamics: predict action from z_current and z_next
     if inverse_dynamics_logits is not None:
-        # inverse_dynamics_logits should already be filtered to valid transitions in the model
+        # Apply has_next mask if available for proper filtering
+        if 'has_next_for_dynamics' in batch:
+            has_next_mask = batch['has_next_for_dynamics']  # [B*(T-1)]
+            inverse_logits_filtered = inverse_dynamics_logits[has_next_mask]
+        else:
+            # Fallback: use all predictions (shouldn't happen with proper dynamics setup)
+            inverse_logits_filtered = inverse_dynamics_logits
+        
         if 'action_index_for_dynamics' in batch:
-            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_index_for_dynamics'].long(), reduction='mean')
+            action_tgt = batch['action_index_for_dynamics']
+            if 'has_next_for_dynamics' in batch:
+                action_tgt = action_tgt[has_next_mask]
+            ce = F.cross_entropy(inverse_logits_filtered, action_tgt.long(), reduction='mean')
         elif 'action_index' in batch:
             # Fallback: use all actions (but this shouldn't happen with proper dynamics setup)
-            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_index'][valid_screen].long(), reduction='mean')
+            ce = F.cross_entropy(inverse_logits_filtered, batch['action_index'][valid_screen].long(), reduction='mean')
         elif 'action_onehot_for_dynamics' in batch:
-            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_onehot_for_dynamics'].argmax(dim=1).long(), reduction='mean')
+            action_tgt = batch['action_onehot_for_dynamics']
+            if 'has_next_for_dynamics' in batch:
+                action_tgt = action_tgt[has_next_mask]
+            ce = F.cross_entropy(inverse_logits_filtered, action_tgt.argmax(dim=1).long(), reduction='mean')
         elif 'action_onehot' in batch:
             # Fallback: use all actions (but this shouldn't happen with proper dynamics setup)
-            ce = F.cross_entropy(inverse_dynamics_logits, batch['action_onehot'][valid_screen].argmax(dim=1).long(), reduction='mean')
+            ce = F.cross_entropy(inverse_logits_filtered, batch['action_onehot'][valid_screen].argmax(dim=1).long(), reduction='mean')
         else:
-            ce = inverse_dynamics_logits.sum() * 0.0  # no target; zero loss
+            ce = inverse_logits_filtered.sum() * 0.0  # no target; zero loss
         raw_losses['inverse'] = ce
 
     # Sum raw reconstruction losses
