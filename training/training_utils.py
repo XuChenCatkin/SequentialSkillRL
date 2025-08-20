@@ -3,9 +3,7 @@ import os
 import json
 import torch
 from datetime import datetime
-from huggingface_hub import HfApi, login, RepositoryNotFoundError
-from huggingface_hub import hf_hub_download
-from huggingface_hub import HfFileSystem
+from huggingface_hub import HfApi, login, hf_hub_download, HfFileSystem
 from matplotlib import pyplot as plt
 from src.model import MultiModalHackVAE
 
@@ -20,11 +18,22 @@ except ImportError:
 # HuggingFace integration imports
 try:
     from huggingface_hub import HfApi, Repository, upload_file, create_repo, login
-    from huggingface_hub.utils import RepositoryNotFoundError
+    # Try to import RepositoryNotFoundError from different locations
+    try:
+        from huggingface_hub.utils import RepositoryNotFoundError
+    except ImportError:
+        try:
+            from huggingface_hub import RepositoryNotFoundError
+        except ImportError:
+            # Fallback for newer versions - use generic HTTP error
+            from requests.exceptions import HTTPError as RepositoryNotFoundError
     HF_AVAILABLE = True
 except ImportError:
     print("⚠️  HuggingFace Hub not available. Install with: pip install huggingface_hub")
     HF_AVAILABLE = False
+    # Define a dummy exception for when HF is not available
+    class RepositoryNotFoundError(Exception):
+        pass
 
 # Scikit-learn availability check
 try:
@@ -208,9 +217,13 @@ def save_model_to_huggingface(
         try:
             repo_info = api.repo_info(repo_id=repo_name, repo_type="model")
             print(f"📁 Repository {repo_name} already exists")
-        except RepositoryNotFoundError:
-            print(f"🆕 Creating new repository: {repo_name}")
-            api.create_repo(repo_id=repo_name, private=private, repo_type="model")
+        except Exception as e:
+            # Handle both RepositoryNotFoundError and other HTTP errors
+            if "404" in str(e) or "not found" in str(e).lower() or isinstance(e, RepositoryNotFoundError):
+                print(f"🆕 Creating new repository: {repo_name}")
+                api.create_repo(repo_id=repo_name, private=private, repo_type="model")
+            else:
+                raise e
     
         # Handle direct upload vs local file upload
         temp_model_file = None
@@ -506,7 +519,7 @@ def load_model_from_huggingface(
     try:
         # Download config
         print(f"📥 Downloading model config from {repo_name}...")
-        config_path = api.hf_hub_download(
+        config_path = hf_hub_download(
             repo_id=repo_name,
             filename="config.json",
             repo_type="model",
@@ -520,7 +533,7 @@ def load_model_from_huggingface(
         
         # Download model file
         print(f"📥 Downloading model weights from {repo_name}...")
-        model_path = api.hf_hub_download(
+        model_path = hf_hub_download(
             repo_id=repo_name,
             filename="pytorch_model.bin",
             repo_type="model",
