@@ -66,10 +66,10 @@ from nle import nethack
 
 # Import NetHackCategory from data_collection
 try:
-    from .data_collection import NetHackCategory
+    from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor
 except ImportError:
     # Fallback for when running as script
-    from src.data_collection import NetHackCategory
+    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
@@ -1464,14 +1464,37 @@ def vae_loss(
     raw_losses['msg'] = msg_loss
     
     # --- Core heads ---
-    if 'ego_char' in batch:
-        raw_losses['ego_char'] = F.cross_entropy(ego_char_logits, batch['ego_char'].long(), reduction='mean')
+    # Compute ego targets on-the-fly from game map data
+    valid_glyph_chars = glyph_chars[valid_screen]   # [valid_B, H, W]
+    valid_glyph_colors = glyph_colors[valid_screen] # [valid_B, H, W]
+    valid_blstats = blstats[valid_screen]           # [valid_B, BLSTATS_DIM]
     
-    if 'ego_color' in batch:
-        raw_losses['ego_color'] = F.cross_entropy(ego_color_logits, batch['ego_color'].long(), reduction='mean')
-
-    if 'ego_class' in batch:
-        raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, batch['ego_class'].long(), reduction='mean')
+    # Get hero positions for ego cropping
+    _, hero_centroids = hero_presence_and_centroid(valid_glyph_chars, valid_blstats)  # [valid_B, 2]
+    
+    # Compute ego view data on-the-fly for each valid sample
+    valid_B = valid_screen.sum().item()
+    ego_window = config.ego_window  # Get ego window size from config
+    ego_char_targets = torch.full((valid_B, ego_window, ego_window), 32, dtype=torch.long, device=glyph_chars.device)
+    ego_color_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)
+    ego_class_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)
+    
+    for i in range(valid_B):
+        # Get hero position (centroids are in [y, x] format)
+        hero_y, hero_x = int(hero_centroids[i, 0].item()), int(hero_centroids[i, 1].item())
+        
+        # Crop ego view
+        ego_chars, ego_colors = crop_ego(valid_glyph_chars[i], valid_glyph_colors[i], hero_y, hero_x, ego_window)
+        ego_class = categorize_glyph_tensor(ego_chars, ego_colors)
+        
+        ego_char_targets[i] = ego_chars
+        ego_color_targets[i] = ego_colors  
+        ego_class_targets[i] = ego_class
+    
+    # Compute ego losses using on-the-fly targets
+    raw_losses['ego_char'] = F.cross_entropy(ego_char_logits, ego_char_targets, reduction='mean')
+    raw_losses['ego_color'] = F.cross_entropy(ego_color_logits, ego_color_targets, reduction='mean')
+    raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, ego_class_targets, reduction='mean')
 
     if 'passability_target' in batch:
         raw_losses['passability'] = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'], reduction='mean')

@@ -592,7 +592,6 @@ class NetHackDataCollector:
     
     def collect_data_batch(self, dataset_name: str, adapter: callable, max_batches: int = 1000, 
                        batch_size: int = 32, seq_length: int = 32, game_ids: List[int] | None = None,
-                       ego_window: int = 11,
                        value_horizons: List[int] = [5, 10],
                        gamma: float = 0.95,
                        goal_prefer: str = '>') -> List[Dict]:
@@ -600,15 +599,15 @@ class NetHackDataCollector:
         Collect data from the dataset for VAE training and build decision-sufficient targets.
 
         - Adds: action_index, action_onehot, reward_target, done_target, value_k_target,
-                passability_target, safety_target, goal_target (+goal_mask), ego_sem_target, has_next.
+                passability_target, safety_target, goal_target (+goal_mask), has_next.
         - Shapes are [num_games, num_time, ...], consistent with your current pipeline.
         - z_next_detached is produced later during training by encoding obs_{t+1}; here we prepare has_next masks.
-
-        ego_class_mapper: optional callable(int ascii_code) -> class_id.
-                        If None, a compact fallback mapping is used.
+        - Ego view data (ego_char, ego_color, ego_class) is computed on-the-fly in vae_loss function for flexibility.
         """
         print(f"Collecting {max_batches} batches from {dataset_name} for VAE training...")
         print(f"  - Batch size: {batch_size}, Sequence length: {seq_length}")
+        print(f"  - Value horizons: {value_horizons}, Gamma: {gamma}")
+        print(f"  - Goal preference: '{goal_prefer}', Game IDs: {len(game_ids) if game_ids else 'All'}")
         
         dataset = nld.TtyrecDataset(
             dataset_name,
@@ -621,15 +620,18 @@ class NetHackDataCollector:
         
         collected_batches = []
         batch_count = 0
+        total_samples = 0
+        valid_samples = 0
         
         for batch_idx, minibatch in enumerate(dataset):
             if batch_count >= max_batches:
                 break
                 
-            print(f"Processing batch {batch_idx + 1}...")
+            print(f"Processing batch {batch_idx + 1}/{max_batches}...")
             
             this_batch: Dict[str, torch.Tensor] = {}
             num_games, num_time = minibatch['tty_chars'].shape[:2]
+            total_samples += num_games * num_time
             
             # Copy raw arrays -> torch
             for key, item in minibatch.items():
@@ -655,9 +657,6 @@ class NetHackDataCollector:
             goal_target_mb     = torch.zeros((num_games, num_time, 2), dtype=torch.float32)
             goal_mask_mb       = torch.zeros((num_games, num_time), dtype=torch.float32)
             has_next_mb        = torch.zeros((num_games, num_time), dtype=torch.bool)
-            ego_class_mb       = torch.zeros((num_games, num_time, ego_window, ego_window), dtype=torch.long)
-            ego_char_mb        = torch.full((num_games, num_time, ego_window, ego_window), dtype=torch.long) * 32
-            ego_color_mb       = torch.zeros((num_games, num_time, ego_window, ego_window), dtype=torch.long)
 
             # Convenience aliases to raw
             tty_chars = this_batch['tty_chars']    # [G,T, H,W]
@@ -710,8 +709,12 @@ class NetHackDataCollector:
                     
                     hero_info = self.get_hero_info(game_id, current_message)
                     if hero_info is None:
-                        print(tty_render(chars, colors))
-                        raise Exception(f"⚠️ No hero info found for game {game_id}, skipping sample")
+                        print(f"⚠️ Warning: No hero info found for game {game_id}, skipping sample")
+                        # print(tty_render(chars, colors))  # Only print TTY for debugging when needed
+                        valid_screen_minibatch[g,t] = False
+                        continue
+                    
+                    valid_samples += 1
                     
                     score = reward_target_mb[g,t].item()
                     
@@ -749,13 +752,6 @@ class NetHackDataCollector:
                     passability_mb[g,t] = p8
                     safety_mb[g,t]      = s8
 
-                    # ego semantic classes
-                    ego_chars, ego_colors = crop_ego(chars_map, hy, hx, ego_window)
-                    ego_char_mb[g,t] = ego_chars
-                    ego_color_mb[g,t] = ego_colors
-                    ego_class   = categorize_glyph_tensor(ego_chars, ego_colors)  # [k,k] long tensor
-                    ego_class_mb[g,t] = ego_class
-
                     # goal vector
                     goal_vec = nearest_stairs_vector(chars_map, hy, hx, prefer=goal_prefer)
                     if goal_vec is not None:
@@ -791,15 +787,18 @@ class NetHackDataCollector:
             this_batch['safety_target']     = safety_mb
             this_batch['goal_target']       = goal_target_mb
             this_batch['goal_mask']         = goal_mask_mb
-            this_batch['ego_class']         = ego_class_mb
-            this_batch['ego_char']          = ego_char_mb
-            this_batch['ego_color']         = ego_color_mb
             this_batch['has_next']          = has_next_mb
 
             collected_batches.append(this_batch)
             batch_count += 1
+            
+            # Optional: Clean up intermediate tensors to save memory
+            if batch_count % 10 == 0:
+                print(f"   💾 Processed {batch_count}/{max_batches} batches, {valid_samples}/{total_samples} valid samples ({100*valid_samples/total_samples:.1f}%)")
 
         print(f"✅ Successfully collected {len(collected_batches)} batches from {batch_count} processed batches")
+        print(f"   📊 Total samples: {total_samples}, Valid samples: {valid_samples} ({100*valid_samples/total_samples:.1f}%)")
+        print(f"   🎯 Average batch size: {total_samples/len(collected_batches):.1f} samples")
         return collected_batches
 
     
@@ -898,7 +897,7 @@ class NetHackDataCollector:
     def collect_or_load_data(self, dataset_name: str, adapter: callable, save_path: str, 
                            max_batches: int = 1000, batch_size: int = 32, seq_length: int = 32,
                            force_recollect: bool = False, game_ids: List[int] | None = None,
-                           ego_window: int = 11, value_horizons: List[int] = [5, 10],
+                           value_horizons: List[int] = [5, 10],
                            gamma: float = 0.95, goal_prefer: str = '>') -> List[Dict]:
         """
         Collect data from dataset or load from saved file if it exists.
@@ -927,7 +926,6 @@ class NetHackDataCollector:
                 batch_size=batch_size,
                 seq_length=seq_length,
                 game_ids=game_ids,
-                ego_window=ego_window,
                 value_horizons=value_horizons,
                 gamma=gamma,
                 goal_prefer=goal_prefer
