@@ -192,10 +192,16 @@ def detect_valid_map(tty_chars):
 
     # Check for required characters in the map
     required_chars = {'.', '@', '-', '|'}
-    if not required_chars.issubset(map_chars):
-        return False
-
-    return True
+    if required_chars.issubset(map_chars):
+        return True
+    else:
+        bin_count = np.bincount(game_map.flatten())
+        non_empty_sum = np.sum(bin_count) - bin_count[ord(' ')]
+        required_chars_count = sum(bin_count[ord(c)] for c in required_chars if ord(c) < len(bin_count))
+        if required_chars_count > 0.5 * non_empty_sum:
+            return True
+    
+    return False
 
 if __name__ == "__main__":
     import gymnasium as gym

@@ -29,6 +29,11 @@ import tempfile  # Add tempfile import
 from torch.optim.lr_scheduler import OneCycleLR
 warnings.filterwarnings('ignore')
 
+# Add project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 # Weights & Biases integration
 try:
     import wandb
@@ -40,7 +45,15 @@ except ImportError:
 # HuggingFace integration imports
 try:
     from huggingface_hub import HfApi, Repository, upload_file, create_repo, login
-    from huggingface_hub.utils import RepositoryNotFoundError
+    # Try to import RepositoryNotFoundError from different locations
+    try:
+        from huggingface_hub.utils import RepositoryNotFoundError
+    except ImportError:
+        try:
+            from huggingface_hub import RepositoryNotFoundError
+        except ImportError:
+            # Fallback for newer versions - use generic HTTP error
+            from requests.exceptions import HTTPError as RepositoryNotFoundError
     HF_AVAILABLE = True
 except ImportError:
     print("⚠️  HuggingFace Hub not available. Install with: pip install huggingface_hub")
