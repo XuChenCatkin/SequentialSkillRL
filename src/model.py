@@ -1163,19 +1163,16 @@ class MultiModalHackVAE(nn.Module):
         stats_pred = self.stats_decoder(z_core)
         msg_logits = self.msg_decoder(z_core)
         out_action = self.action_value_head(z)
-        latent_pred = self.latent_forward_model(z, action_onehot) if action_onehot is not None and self.latent_forward_model.enabled else None
-        
-        # Use z_current_for_dynamics if available, otherwise fall back to z for inverse dynamics
-        z_for_inverse = z_current_for_dynamics if z_current_for_dynamics is not None else z
-        inverse_dynamics_logits = self.inverse_dynamics(z_for_inverse, z_next_detach) if z_next_detach is not None and self.inverse_dynamics.enabled else None
+        latent_pred = self.latent_forward_model(z_current_for_dynamics, action_onehot) if action_onehot is not None and z_current_for_dynamics is not None and self.latent_forward_model.enabled else None
+        inverse_dynamics_logits = self.inverse_dynamics(z_current_for_dynamics, z_next_detach) if z_next_detach is not None and z_current_for_dynamics is not None and self.inverse_dynamics.enabled else None
         
         return {
             **out_map,
             "stats_pred": stats_pred, 
             "msg_logits": msg_logits, 
             **out_action,
-            "latent_pred": latent_pred,  # [B, LATENT_DIM] or None
-            "inverse_dynamics_logits": inverse_dynamics_logits,  # [B, A + skill_num] or None
+            "latent_pred": latent_pred,  # [B * (T-1), LATENT_DIM] or None
+            "inverse_dynamics_logits": inverse_dynamics_logits,  # [B * (T-1), A + skill_num] or None
         }
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1201,22 +1198,24 @@ class MultiModalHackVAE(nn.Module):
                 
                 # Flatten back - save whole tensors and let vae_loss use has_next mask
                 z_next_flat = z_next.view(-1, z_next.shape[-1])  # [B*(T-1), latent_dim]
-                z_current_flat = z_current_for_dynamics.view(-1, z_current_for_dynamics.shape[-1])  # [B*(T-1), latent_dim]
+                z_current_for_dynamics_flat = z_current_for_dynamics.view(-1, z_current_for_dynamics.shape[-1])  # [B*(T-1), latent_dim]
                 
                 # Save whole tensors to batch - let vae_loss handle masking with has_next
-                batch['z_next_detached'] = z_next_flat.detach()  # [B*(T-1), latent_dim]
-                batch['z_current_for_dynamics'] = z_current_flat  # [B*(T-1), latent_dim]
+                z_next_flat_detach = z_next_flat.detach()  # [B*(T-1), latent_dim]
                 
-                # Get has_next mask for dynamics
-                has_next_reshaped = batch['has_next'].view(B, T)  # [B, T]
-                batch['has_next_for_dynamics'] = has_next_reshaped[:, :-1].contiguous().view(-1)  # [B*(T-1)]
+                action_onehot = batch.get('action_onehot')
+                action_onehot_reshaped = action_onehot.view(B, T, -1) if action_onehot is not None else None
+                action_onehot_for_dynamics = action_onehot_reshaped[:, :-1, :].contiguous() if action_onehot_reshaped is not None else None  # [B, T-1, A]
+                action_onehot_for_dynamics_flat = action_onehot_for_dynamics.view(-1, action_onehot_for_dynamics.shape[-1]) if action_onehot_for_dynamics is not None else None  # [B*(T-1), A]
+            else:
+                z_next_flat_detach = None  # No next state if T <= 1
+                z_current_for_dynamics_flat = None  # No current state if T <= 1
+                action_onehot_for_dynamics_flat = None  # No action if T <= 1
+                
+        batch['z_next_detached'] = z_next_flat_detach  # [B*(T-1), latent_dim]
+        batch['action_onehot_for_dynamics'] = action_onehot_for_dynamics_flat  # [B*(T-1), A]
         
-        # Get action_onehot for dynamics (available from batch)
-        action_onehot = batch.get('action_onehot_for_dynamics')
-        z_next_detach = batch.get('z_next_detached')
-        z_current_for_dynamics = batch.get('z_current_for_dynamics')
-        
-        dec = self.decode(z, action_onehot=action_onehot, z_next_detach=z_next_detach, z_current_for_dynamics=z_current_for_dynamics)
+        dec = self.decode(z, action_onehot=action_onehot_for_dynamics_flat, z_next_detach=z_next_flat_detach, z_current_for_dynamics=z_current_for_dynamics_flat)
         return {**enc, **dec, 'z': z}  # include z in the output
     
     @torch.no_grad()
@@ -1373,6 +1372,14 @@ def vae_loss(
     """
     VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
     """
+    
+    if 'original_batch_shape' in batch:
+        B, T = batch['original_batch_shape']
+    else:
+        # Fallback: try to infer from data
+        B = batch.get('batch_size', 1)
+        T = total_samples // B if B > 0 else total_samples
+            
     # Extract inputs from batch
     glyph_chars = batch['game_chars']  # [B, 21, 79]
     glyph_colors = batch['game_colors']  # [B, 21, 79]
@@ -1380,49 +1387,11 @@ def vae_loss(
     msg_tokens = batch['message_chars']  # [B, 256]
     valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
     
-    # Handle forward/inverse dynamics preparation if needed
-    if (config.use_latent_forward_model or config.use_inverse_dynamics) and 'has_next' in batch:
-        # z_next_detach is now calculated in forward() method and passed via model_output
-        # We just need to prepare action targets for valid transitions
-        
-        # Determine original batch dimensions from the flattened data
-        total_samples = len(valid_screen)
-        
-        if 'original_batch_shape' in batch:
-            B, T = batch['original_batch_shape']
-        else:
-            # Fallback
-            B = batch.get('batch_size', 1)
-            T = total_samples // B if B > 0 else total_samples
-        
-        if T > 1:
-            # Get has_next mask to identify valid transitions
-            has_next_reshaped = batch['has_next'].view(B, T)  # [B, T]
-            has_next_valid = has_next_reshaped[:, :-1].contiguous().view(-1)  # [B*(T-1)]
-            
-            # Only keep valid transitions
-            valid_transitions = has_next_valid.bool()
-            if valid_transitions.any():
-                # Prepare corresponding action targets for valid transitions
-                if 'action_index' in batch:
-                    action_reshaped = batch['action_index'].view(B, T)[:, 1:]  # [B, T-1] (actions leading to next state)
-                    batch['action_index_for_dynamics'] = action_reshaped.contiguous().view(-1)[valid_transitions]
-                
-                if 'action_onehot' in batch:
-                    action_onehot_reshaped = batch['action_onehot'].view(B, T, -1)[:, 1:]  # [B, T-1, action_dim]
-                    batch['action_onehot_for_dynamics'] = action_onehot_reshaped.contiguous().view(-1, action_onehot_reshaped.shape[-1])[valid_transitions]
-
     # ============= On-the-fly Goal and Value Target Computation =============
     # Compute goal_target, goal_mask, and value_k_target on-the-fly using config parameters
     if 'game_chars' in batch and 'game_colors' in batch and 'reward_target' in batch and 'done_target' in batch:
         # Determine batch dimensions
         total_samples = len(valid_screen)
-        if 'original_batch_shape' in batch:
-            B, T = batch['original_batch_shape']
-        else:
-            # Fallback: try to infer from data
-            B = batch.get('batch_size', 1)
-            T = total_samples // B if B > 0 else total_samples
         
         if T > 1:
             # Reshape data back to [B, T, ...] for goal and value computation
