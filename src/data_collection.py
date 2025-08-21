@@ -682,7 +682,6 @@ class NetHackDataCollector:
             action_index_mb = batch_keypress_static_map(keycodes) # [G,T] -> [G,T] with static mapping
             # Process each game in the batch
             for g in range(num_games):
-                last_hero = None
                 # Fill scalar targets and actions first (vectorized per game)  
                 # One-hot actions
                 action_onehot_mb[g] = one_hot(action_index_mb[g], ACTION_DIM)
@@ -716,8 +715,6 @@ class NetHackDataCollector:
                         valid_screen_minibatch[g,t] = False
                         continue
                     
-                    valid_samples += 1
-                    
                     score = reward_target_mb[g,t].item()
                     
                     # Fill in the minibatch tensors
@@ -732,22 +729,11 @@ class NetHackDataCollector:
                     ys, xs = (chars_map == ord('@')).nonzero(as_tuple=True)
                     if ys.numel() > 0:
                         hy, hx = int(ys[0].item()), int(xs[0].item())
-                        last_hero = (hy, hx)
-                    elif 'tty_cursor' in this_batch:
-                        cy, cx = int(this_batch['tty_cursor'][g,t,0]), int(this_batch['tty_cursor'][g,t,1])
-                        if 0 <= cy < chars_map.shape[0] and 0 <= cx < chars_map.shape[1]:
-                            hy, hx = cy, cx
-                            last_hero = (hy, hx)
-                        elif last_hero is not None:
-                            hy, hx = last_hero
-                        else:
-                            valid_screen_minibatch[g,t] = False
-                            continue
-                    elif last_hero is not None:
-                        hy, hx = last_hero
                     else:
                         valid_screen_minibatch[g,t] = False
                         continue
+                    
+                    valid_samples += 1
 
                     # passability & safety
                     p8, s8 = compute_passability_and_safety(chars_map, colors_map, hy, hx)

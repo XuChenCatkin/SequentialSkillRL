@@ -198,12 +198,15 @@ def hero_presence_and_centroid(glyph_chars: torch.Tensor, blstats: torch.Tensor)
     Presence p in {0,1} and centroid (y,x) in [-1,1]^2 for '@'.
     If absent, centroid is (0,0) and p=0 (loss masked by p).
     """
-    B, H, W = glyph_chars.shape
+    B= glyph_chars.shape[0]
 
     y_coord, x_coord = blstats[:, 0], blstats[:, 1]
-    present = (glyph_chars[torch.arange(B), y_coord, x_coord] == HERO_CHAR).float()  # [B]
-    cy = (y_coord / MAX_Y_COORD * 2 - 1).view(B, 1)  # y coordinate in [-1,1]
-    cx = (x_coord / MAX_X_COORD * 2 - 1).view(B, 1)  # x coordinate in [-1,1]
+    # Convert coordinates to long for indexing and clamp to valid range
+    y_coord_idx = torch.clamp(y_coord.long(), 0, MAX_Y_COORD)
+    x_coord_idx = torch.clamp(x_coord.long(), 0, MAX_X_COORD)
+    present = (glyph_chars[torch.arange(B, device=glyph_chars.device), y_coord_idx, x_coord_idx] == HERO_CHAR).float()  # [B]
+    cy = y_coord / MAX_Y_COORD * 2 - 1  # y coordinate in [-1,1]
+    cx = x_coord / MAX_X_COORD * 2 - 1  # x coordinate in [-1,1]
     centroid = torch.stack([cy, cx], dim=1)                      # [B,2]
     return present, centroid
 
@@ -1207,13 +1210,19 @@ class MultiModalHackVAE(nn.Module):
                 action_onehot_reshaped = action_onehot.view(B, T, -1) if action_onehot is not None else None
                 action_onehot_for_dynamics = action_onehot_reshaped[:, :-1, :].contiguous() if action_onehot_reshaped is not None else None  # [B, T-1, A]
                 action_onehot_for_dynamics_flat = action_onehot_for_dynamics.view(-1, action_onehot_for_dynamics.shape[-1]) if action_onehot_for_dynamics is not None else None  # [B*(T-1), A]
+                has_next = batch.get('has_next')
+                has_next_reshaped = has_next.view(B, T)
+                has_next_for_dynamics = has_next_reshaped[:, :-1].contiguous()
+                has_next_for_dynamics_flat = has_next_for_dynamics.view(-1)  # [B*(T-1)]
             else:
                 z_next_flat_detach = None  # No next state if T <= 1
                 z_current_for_dynamics_flat = None  # No current state if T <= 1
                 action_onehot_for_dynamics_flat = None  # No action if T <= 1
+                has_next_for_dynamics_flat = None  # No has_next if T <= 1
                 
         batch['z_next_detached'] = z_next_flat_detach  # [B*(T-1), latent_dim]
         batch['action_onehot_for_dynamics'] = action_onehot_for_dynamics_flat  # [B*(T-1), A]
+        batch['has_next_for_dynamics'] = has_next_for_dynamics_flat  # [B*(T-1)]
         
         dec = self.decode(z, action_onehot=action_onehot_for_dynamics_flat, z_next_detach=z_next_flat_detach, z_current_for_dynamics=z_current_for_dynamics_flat)
         return {**enc, **dec, 'z': z}  # include z in the output
@@ -1487,12 +1496,21 @@ def vae_loss(
     value_k = model_output['value_k'][valid_screen]  # [B, NUM_HORIZONS]
     safety_logits = model_output['safety_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
     skill_logits = model_output.get('skill_logits', None)  # [B, SKILL_NUM] if applicable
+    if skill_logits is not None:
+        skill_logits = skill_logits[valid_screen]  # [B, SKILL_NUM]
     
     # latent forward model
     latent_pred = model_output.get('latent_pred', None)
+    valid_screen_reshape = valid_screen.view(B, T)
+    valid_screen_for_dynamics = valid_screen_reshape[:, :-1].contiguous()  # [B, T-1]
+    valid_screen_for_dynamics = valid_screen_for_dynamics.view(-1)
+    if latent_pred is not None:
+        latent_pred = latent_pred[valid_screen_for_dynamics]
     
     # inverse dynamics logits
     inverse_dynamics_logits = model_output.get('inverse_dynamics_logits', None)
+    if inverse_dynamics_logits is not None:
+        inverse_dynamics_logits = inverse_dynamics_logits[valid_screen_for_dynamics]  # [B*(T-1), A + skill_num]
     
     valid_B = valid_screen.sum().item()  # Number of valid samples
     assert valid_B > 0, "No valid samples for loss calculation. Check valid_screen mask."
@@ -1577,9 +1595,6 @@ def vae_loss(
     valid_glyph_colors = glyph_colors[valid_screen] # [valid_B, H, W]
     valid_blstats = blstats[valid_screen]           # [valid_B, BLSTATS_DIM]
     
-    # Get hero positions for ego cropping
-    _, hero_centroids = hero_presence_and_centroid(valid_glyph_chars, valid_blstats)  # [valid_B, 2]
-    
     # Compute ego view data on-the-fly for each valid sample
     valid_B = valid_screen.sum().item()
     ego_window = config.ego_window  # Get ego window size from config
@@ -1589,7 +1604,7 @@ def vae_loss(
     
     for i in range(valid_B):
         # Get hero position (centroids are in [y, x] format)
-        hero_y, hero_x = int(hero_centroids[i, 0].item()), int(hero_centroids[i, 1].item())
+        hero_y, hero_x = int(valid_blstats[i, 0].item()), int(valid_blstats[i, 1].item())
         
         # Crop ego view
         ego_chars, ego_colors = crop_ego(valid_glyph_chars[i], valid_glyph_colors[i], hero_y, hero_x, ego_window)
@@ -1629,17 +1644,11 @@ def vae_loss(
             raw_losses['goal'] = F.mse_loss(goal_pred_filtered, batch['goal_target'][valid_screen], reduction='mean')
 
     # --- Dynamics ---
+    has_next_mask = batch['has_next_for_dynamics']  # [B*(T-1)]
     # Forward dynamics: predict z_next from z_current and action
     if (latent_pred is not None) and ('z_next_detached' in batch):
-        # Apply has_next mask if available for proper filtering
-        if 'has_next_for_dynamics' in batch:
-            has_next_mask = batch['has_next_for_dynamics']  # [B*(T-1)]
-            z_next_tgt = batch['z_next_detached'][has_next_mask]
-            latent_pred_filtered = latent_pred[has_next_mask]
-        else:
-            # Fallback: use all predictions (shouldn't happen with proper dynamics setup)
-            z_next_tgt = batch['z_next_detached']
-            latent_pred_filtered = latent_pred
+        z_next_tgt = batch['z_next_detached'][has_next_mask]
+        latent_pred_filtered = latent_pred[has_next_mask]
         
         mse = F.mse_loss(latent_pred_filtered, z_next_tgt, reduction='mean')
         cos = 1.0 - F.cosine_similarity(latent_pred_filtered, z_next_tgt, dim=1).mean()
@@ -1648,31 +1657,9 @@ def vae_loss(
     # Inverse dynamics: predict action from z_current and z_next
     if inverse_dynamics_logits is not None:
         # Apply has_next mask if available for proper filtering
-        if 'has_next_for_dynamics' in batch:
-            has_next_mask = batch['has_next_for_dynamics']  # [B*(T-1)]
-            inverse_logits_filtered = inverse_dynamics_logits[has_next_mask]
-        else:
-            # Fallback: use all predictions (shouldn't happen with proper dynamics setup)
-            inverse_logits_filtered = inverse_dynamics_logits
-        
-        if 'action_index_for_dynamics' in batch:
-            action_tgt = batch['action_index_for_dynamics']
-            if 'has_next_for_dynamics' in batch:
-                action_tgt = action_tgt[has_next_mask]
-            ce = F.cross_entropy(inverse_logits_filtered, action_tgt.long(), reduction='mean')
-        elif 'action_index' in batch:
-            # Fallback: use all actions (but this shouldn't happen with proper dynamics setup)
-            ce = F.cross_entropy(inverse_logits_filtered, batch['action_index'][valid_screen].long(), reduction='mean')
-        elif 'action_onehot_for_dynamics' in batch:
-            action_tgt = batch['action_onehot_for_dynamics']
-            if 'has_next_for_dynamics' in batch:
-                action_tgt = action_tgt[has_next_mask]
-            ce = F.cross_entropy(inverse_logits_filtered, action_tgt.argmax(dim=1).long(), reduction='mean')
-        elif 'action_onehot' in batch:
-            # Fallback: use all actions (but this shouldn't happen with proper dynamics setup)
-            ce = F.cross_entropy(inverse_logits_filtered, batch['action_onehot'][valid_screen].argmax(dim=1).long(), reduction='mean')
-        else:
-            ce = inverse_logits_filtered.sum() * 0.0  # no target; zero loss
+        inverse_logits_filtered = inverse_dynamics_logits[has_next_mask]
+        action_tgt = batch['action_onehot_for_dynamics'][has_next_mask]
+        ce = F.cross_entropy(inverse_logits_filtered, action_tgt.argmax(dim=1).long(), reduction='mean')
         raw_losses['inverse'] = ce
 
     # Sum raw reconstruction losses
