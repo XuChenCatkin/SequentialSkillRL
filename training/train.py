@@ -454,12 +454,8 @@ def train_multimodalhack_vae(
             # Load config from checkpoint and update with any provided overrides
             checkpoint_config = checkpoint['config']
             if config is not None:
-                # Merge provided config with checkpoint config (provided config takes precedence)
-                logger.info("   Merging provided config with checkpoint config...")
-                for field in vars(config):
-                    if hasattr(checkpoint_config, field):
-                        setattr(checkpoint_config, field, getattr(config, field))
-                config = checkpoint_config
+                # Override checkpoint config with provided config (provided config takes precedence)
+                logger.info("   Overriding checkpoint config with provided config")
             else:
                 config = checkpoint_config
                 logger.info("   Using config from checkpoint")
@@ -494,10 +490,10 @@ def train_multimodalhack_vae(
         test_losses = checkpoint.get('test_losses', [])
     else:
         start_epoch = 0
-        # Initialize model with VAEConfig
-        # dropout_rate: 0.0 = no dropout, 0.1-0.3 = mild regularization, 0.5+ = strong regularization
-        # Dropout is applied to encoder fusion layers and decoder layers when enabled
-        config = VAEConfig()
+        if config is None:
+            # If no config provided and not resuming, create default config
+            logger.info("   No config provided, using default VAEConfig")
+            config = VAEConfig()
         model = MultiModalHackVAE(config=config, logger=logger)
         model = model.to(device)
         
@@ -705,7 +701,7 @@ def train_multimodalhack_vae(
                         "train/raw_loss/passability": train_loss_dict['raw_losses'].get('passability', torch.tensor(0.0)).item(),
                         "train/raw_loss/reward": train_loss_dict['raw_losses'].get('reward', torch.tensor(0.0)).item(),
                         "train/raw_loss/done": train_loss_dict['raw_losses'].get('done', torch.tensor(0.0)).item(),
-                        "train/raw_loss/value": train_loss_dict['raw_losses'].get('value', torch.tensor(0.0)).item(),
+                        "train/raw_loss/value_k": train_loss_dict['raw_losses'].get('value_k', torch.tensor(0.0)).item(),
                         "train/raw_loss/safety": train_loss_dict['raw_losses'].get('safety', torch.tensor(0.0)).item(),
                         "train/raw_loss/goal": train_loss_dict['raw_losses'].get('goal', torch.tensor(0.0)).item(),
                         "train/raw_loss/forward_dynamics": train_loss_dict['raw_losses'].get('forward', torch.tensor(0.0)).item(),
@@ -720,9 +716,6 @@ def train_multimodalhack_vae(
                         "adaptive_weights/mi_beta": mi_beta,
                         "adaptive_weights/tc_beta": tc_beta,
                         "adaptive_weights/dw_beta": dw_beta,
-                        
-                        # Dropout status
-                        "dropout/rate": model.dropout_rate,
                         
                         # Model diagnostics
                         "model/mu_var": safe_tensor_for_wandb(mu.var(dim=0)),
@@ -833,7 +826,7 @@ def train_multimodalhack_vae(
                         "test/raw_loss/passability": test_loss_dict['raw_losses'].get('passability', torch.tensor(0.0)).item(),
                         "test/raw_loss/reward": test_loss_dict['raw_losses'].get('reward', torch.tensor(0.0)).item(),
                         "test/raw_loss/done": test_loss_dict['raw_losses'].get('done', torch.tensor(0.0)).item(),
-                        "test/raw_loss/value": test_loss_dict['raw_losses'].get('value', torch.tensor(0.0)).item(),
+                        "test/raw_loss/value_k": test_loss_dict['raw_losses'].get('value_k', torch.tensor(0.0)).item(),
                         "test/raw_loss/safety": test_loss_dict['raw_losses'].get('safety', torch.tensor(0.0)).item(),
                         # Additional raw losses that were missing:
                         "test/raw_loss/goal": test_loss_dict['raw_losses'].get('goal', torch.tensor(0.0)).item(),
@@ -2194,10 +2187,10 @@ if __name__ == "__main__":
             initial_mi_beta=0.0,
             final_mi_beta=0.0,
             mi_beta_shape='constant',
-            initial_tc_beta=5.0,
-            final_tc_beta=5.0,
+            initial_tc_beta=10.0,
+            final_tc_beta=10.0,
             tc_beta_shape='constant',
-            initial_dw_beta=0.02,
+            initial_dw_beta=0.2,
             final_dw_beta=1.0,
             dw_beta_shape='linear',
             warmup_epoch_ratio=0.2,
@@ -2241,7 +2234,7 @@ if __name__ == "__main__":
             keep_last_n_checkpoints=2,
             
             # Wandb integration example
-            use_wandb=False,
+            use_wandb=True,
             wandb_project="nethack-vae",
             wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
             wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
@@ -2252,7 +2245,7 @@ if __name__ == "__main__":
             log_gradients=True,
             
             # HuggingFace integration example
-            upload_to_hf=False, 
+            upload_to_hf=True, 
             hf_repo_name="CatkinChen/nethack-vae",
             hf_upload_directly=True,  # Upload directly without extra local save
             hf_upload_checkpoints=True,  # Also upload checkpoints

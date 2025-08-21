@@ -403,21 +403,21 @@ class VAEConfig:
     # Loss weights
     raw_modality_weights: Dict[str, float] = field(default_factory=lambda: {
         'ego_class': 3.5,
-        'passability': 1.8,
-        'safety': 0.8,
-        'reward': 1.0,
-        'done': 1.0,
-        'value_k': 1.0,
-        'bag': 8.0,
+        'passability': 20,
+        'safety': 20.0,
+        'reward': 0.3,
+        'done': 10,
+        'value_k': 0.3,
+        'bag': 3.0,
         'stats': 0.5,
-        'msg': 0.5,
-        'goal': 1.0,
-        'occupy': 0.3,
-        'forward': 1.0,
-        'inverse': 0.8,
-        'ego_char': 0.3,
-        'ego_color': 0.3,
-        'hero_loc': 1.0,
+        'msg': 1.0,
+        'goal': 3.0,
+        'occupy': 0.5,
+        'forward': 5.0,
+        'inverse': 10,
+        'ego_char': 1.0,
+        'ego_color': 1.0,
+        'hero_loc': 20.0,
     })
     
     # KL Beta parameters for adaptive loss weighting
@@ -1368,15 +1368,15 @@ def _message_ce_loss(logits: torch.Tensor, tgt: torch.Tensor, pad_id: int = MSG_
             mask = pad_mask
     ce = F.cross_entropy(logits.reshape(B*L, V), tgt.reshape(B*L), reduction='none').view(B, L)
     keep = (~mask).float()
-    return (ce * keep).sum() / keep.sum().clamp_min(1.0)
+    return (ce * keep).sum() / B
 
 def vae_loss(
-    model_output,
-    batch, 
-    config,
-    mi_beta=1.0,
-    tc_beta=1.0,
-    dw_beta=1.0
+    model_output: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    config: VAEConfig,
+    mi_beta: float = 1.0,
+    tc_beta: float = 1.0,
+    dw_beta: float = 1.0
     ):
     """
     VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
@@ -1491,8 +1491,8 @@ def vae_loss(
     
     # action related outputs
     passibility_logits = model_output['passability_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
-    reward = model_output['reward'][valid_screen]
-    done_logits = model_output['done_logits'][valid_screen]  # [B, 1]
+    reward = model_output['reward'][valid_screen].squeeze(1)  # [B]
+    done_logits = model_output['done_logits'][valid_screen].squeeze(1)  # [B]
     value_k = model_output['value_k'][valid_screen]  # [B, NUM_HORIZONS]
     safety_logits = model_output['safety_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
     skill_logits = model_output.get('skill_logits', None)  # [B, SKILL_NUM] if applicable
@@ -1576,11 +1576,11 @@ def vae_loss(
     
     var = sp_filtered['logvar'].exp().clamp_min(1e-6)
     nll_cont = 0.5 * (((t['cont'] - sp_filtered['mu'])**2 / var) + sp_filtered['logvar'] + math.log(2*math.pi))
-    nll_cont = nll_cont.mean()
-    hung_loss = F.cross_entropy(sp_filtered['hunger'], t['hunger'])
-    dung_loss = F.cross_entropy(sp_filtered['dungeon'], t['dungeon'])
-    level_loss = F.cross_entropy(sp_filtered['level'], t['level'])
-    cond_loss = F.binary_cross_entropy_with_logits(sp_filtered['cond'], t['cond'])
+    nll_cont = nll_cont.sum(dim=1).mean()
+    hung_loss = F.cross_entropy(sp_filtered['hunger'], t['hunger'], reduction='mean')
+    dung_loss = F.cross_entropy(sp_filtered['dungeon'], t['dungeon'], reduction='mean')
+    level_loss = F.cross_entropy(sp_filtered['level'], t['level'], reduction='mean')
+    cond_loss = F.binary_cross_entropy_with_logits(sp_filtered['cond'], t['cond'], reduction='none').sum(dim=1).mean()
     stats_loss = nll_cont + hung_loss + dung_loss + level_loss + cond_loss
     raw_losses['stats'] = stats_loss
 
@@ -1598,7 +1598,7 @@ def vae_loss(
     # Compute ego view data on-the-fly for each valid sample
     valid_B = valid_screen.sum().item()
     ego_window = config.ego_window  # Get ego window size from config
-    ego_char_targets = torch.full((valid_B, ego_window, ego_window), 32, dtype=torch.long, device=glyph_chars.device)
+    ego_char_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)  # Start with 0s
     ego_color_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)
     ego_class_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)
     
@@ -1610,17 +1610,18 @@ def vae_loss(
         ego_chars, ego_colors = crop_ego(valid_glyph_chars[i], valid_glyph_colors[i], hero_y, hero_x, ego_window)
         ego_class = categorize_glyph_tensor(ego_chars, ego_colors)
         
-        ego_char_targets[i] = ego_chars
+        # Convert ASCII characters to model space (32-127 -> 0-95)
+        ego_char_targets[i] = torch.clamp(ego_chars - 32, 0, CHAR_DIM - 1)
         ego_color_targets[i] = ego_colors  
         ego_class_targets[i] = ego_class
     
     # Compute ego losses using on-the-fly targets
-    raw_losses['ego_char'] = F.cross_entropy(ego_char_logits, ego_char_targets, reduction='mean')
-    raw_losses['ego_color'] = F.cross_entropy(ego_color_logits, ego_color_targets, reduction='mean')
-    raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, ego_class_targets, reduction='mean')
+    raw_losses['ego_char'] = F.cross_entropy(ego_char_logits, ego_char_targets, reduction='none').sum(dim=[1,2]).mean()
+    raw_losses['ego_color'] = F.cross_entropy(ego_color_logits, ego_color_targets, reduction='none').sum(dim=[1,2]).mean()
+    raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, ego_class_targets, reduction='none').sum(dim=[1,2]).mean()
 
     if 'passability_target' in batch:
-        raw_losses['passability'] = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'][valid_screen], reduction='mean')
+        raw_losses['passability'] = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
 
     if 'reward_target' in batch:
         raw_losses['reward'] = F.mse_loss(reward, batch['reward_target'][valid_screen], reduction='mean')
@@ -1635,22 +1636,22 @@ def vae_loss(
 
     # --- Safety risk (8 dirs) ---
     if 'safety_target' in batch:
-        raw_losses['safety'] = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'][valid_screen], reduction='mean')
+        raw_losses['safety'] = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
 
     # --- Goal direction ---
     if ('goal_target' in batch) and ('goal_pred' in model_output):
         goal_pred_filtered = model_output['goal_pred'][valid_screen] if 'goal_pred' in model_output else None
         if goal_pred_filtered is not None:
-            raw_losses['goal'] = F.mse_loss(goal_pred_filtered, batch['goal_target'][valid_screen], reduction='mean')
+            raw_losses['goal'] = F.mse_loss(goal_pred_filtered, batch['goal_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
 
     # --- Dynamics ---
-    has_next_mask = batch['has_next_for_dynamics']  # [B*(T-1)]
+    has_next_mask = batch['has_next_for_dynamics'][valid_screen_for_dynamics]  # [B*(T-1)]
     # Forward dynamics: predict z_next from z_current and action
     if (latent_pred is not None) and ('z_next_detached' in batch):
-        z_next_tgt = batch['z_next_detached'][has_next_mask]
+        z_next_tgt = batch['z_next_detached'][valid_screen_for_dynamics][has_next_mask]
         latent_pred_filtered = latent_pred[has_next_mask]
         
-        mse = F.mse_loss(latent_pred_filtered, z_next_tgt, reduction='mean')
+        mse = F.mse_loss(latent_pred_filtered, z_next_tgt, reduction='none').sum(dim=1).mean()  # Mean over valid samples
         cos = 1.0 - F.cosine_similarity(latent_pred_filtered, z_next_tgt, dim=1).mean()
         raw_losses['forward'] = (0.5 * (mse + cos))
 
@@ -1658,7 +1659,7 @@ def vae_loss(
     if inverse_dynamics_logits is not None:
         # Apply has_next mask if available for proper filtering
         inverse_logits_filtered = inverse_dynamics_logits[has_next_mask]
-        action_tgt = batch['action_onehot_for_dynamics'][has_next_mask]
+        action_tgt = batch['action_onehot_for_dynamics'][valid_screen_for_dynamics][has_next_mask]
         ce = F.cross_entropy(inverse_logits_filtered, action_tgt.argmax(dim=1).long(), reduction='mean')
         raw_losses['inverse'] = ce
 
