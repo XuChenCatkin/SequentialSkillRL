@@ -515,7 +515,7 @@ def visualize_reconstructions(
     map_occ_thresh=0.5,
     bag_presence_thresh=0.5,
     hero_presence_thresh=0.5,
-    passibility_thresh=0.5,
+    passability_thresh=0.5,
     safety_thresh=0.5,
     map_deterministic=True,
     glyph_top_k=0,
@@ -553,7 +553,7 @@ def visualize_reconstructions(
         map_occ_thresh: Threshold for occupancy prediction
         bag_presence_thresh: Threshold for bag presence prediction
         hero_presence_thresh: Threshold for hero presence prediction
-        passibility_thresh: Threshold for passability prediction
+        passability_thresh: Threshold for passability prediction
         safety_thresh: Threshold for safety prediction
         map_deterministic: If True, use deterministic (argmax) sampling for map
         glyph_top_k: Top-k filtering for glyph character sampling (0 = disabled)
@@ -694,7 +694,7 @@ def visualize_reconstructions(
                 map_occ_thresh=map_occ_thresh,
                 bag_presence_thresh=bag_presence_thresh,
                 hero_presence_thresh=hero_presence_thresh,
-                passibility_thresh=passibility_thresh,
+                passability_thresh=passability_thresh,
                 safety_thresh=safety_thresh,
                 map_deterministic=map_deterministic,
                 glyph_top_k=glyph_top_k,
@@ -747,13 +747,13 @@ def visualize_reconstructions(
                 hero_y_coord, hero_x_coord = int(model_inputs['blstats'][0, 0].item()), int(model_inputs['blstats'][0, 1].item())
                 pass_grid_recon = model_output['passability_grid'][0].cpu()  # [3, 3]
                 safe_grid_recon = model_output['safety_grid'][0].cpu()       # [3, 3]
-                pass_presence_orig, safe_presence_orig = compute_passability_and_safety(
+                pass_presence_orig, safe_presence_orig, hard_mask_orig, weight_orig = compute_passability_and_safety(
                     sample['game_chars'], sample['game_colors'],
                     hero_y_coord, hero_x_coord
                 )
-                pass_grid_orig, safe_grid_orig = MapDecoder.format_passability_safety(pass_presence_orig.unsqueeze(0), safe_presence_orig.unsqueeze(0))
-                pass_data.append((pass_grid_orig.squeeze(0).cpu(), pass_grid_recon))
-                safe_data.append((safe_grid_orig.squeeze(0).cpu(), safe_grid_recon))
+                pass_safe_dict = MapDecoder.format_passability_safety(pass_presence_orig.unsqueeze(0), safe_presence_orig.unsqueeze(0))
+                pass_data.append((pass_safe_dict['passability_grid'].squeeze(0).cpu(), pass_grid_recon))
+                safe_data.append((pass_safe_dict['safety_grid'].squeeze(0).cpu(), safe_grid_recon))
             else:
                 pass_data.append(None)
                 safe_data.append(None)
@@ -787,7 +787,7 @@ def visualize_reconstructions(
             'map_occ_thresh': map_occ_thresh,
             'hero_presence_thresh': hero_presence_thresh,
             'bag_presence_thresh': bag_presence_thresh,
-            'passibility_thresh': passibility_thresh,
+            'passability_thresh': passability_thresh,
             'safety_thresh': safety_thresh,
             'map_deterministic': map_deterministic,
             'glyph_top_k': glyph_top_k,

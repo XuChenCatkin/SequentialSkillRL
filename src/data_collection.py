@@ -378,32 +378,55 @@ def print_category_distribution(char_tensor: torch.Tensor, color_tensor: torch.T
 
 PASSABLE = FLOORS | UP_STAIRS | DOWN_STAIRS | TRAPS | (ITEMS - {(ord('`'), CLR_GRAY)}) | FURNITURE  # monsters treated separately
 
-def compute_passability_and_safety(chars: torch.Tensor,
-                                   colors: torch.Tensor,
-                                   hero_y: int, hero_x: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (pass8, safe8) as float tensors of shape [8]."""
+def compute_passability_and_safety(
+    chars: torch.Tensor,   # [H,W] long
+    colors: torch.Tensor,  # [H,W] long
+    hero_y: int, hero_x: int,
+    unknown_weight: float = 0.5,   # how much to trust unknown in-map tiles
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      pass8:      [8] float targets in {0,1} or 0.5 for unknown
+      safe8:      [8] float targets in {0,1} or 0.5 for unknown
+      hard_mask8: [8] {0,1}  -> 0 for off-map neighbors (don’t train/eval)
+      weight8:    [8] >=0    -> per-dir weight (unknown gets 'unknown_weight')
+    """
     H, W = chars.shape
-    pass8 = torch.zeros(8, dtype=torch.float32)
-    safe8 = torch.zeros(8, dtype=torch.float32)
+    device = chars.device
+    pass8      = torch.zeros(8, dtype=torch.float32, device=device)
+    safe8      = torch.zeros(8, dtype=torch.float32, device=device)
+    hard_mask8 = torch.zeros(8, dtype=torch.float32, device=device)
+    weight8    = torch.zeros(8, dtype=torch.float32, device=device)
     for i,(dy,dx) in enumerate(DIRS_8):
         y, x = hero_y + dy, hero_x + dx
         if not (0 <= y < H and 0 <= x < W):
-            pass8[i] = 0.0; safe8[i] = 0.0; continue
+            continue
         ch = int(chars[y,x])
         cl = int(colors[y,x])
+        hard_mask8[i] = 1.0
+        
+        # --- unknown in-map (screen shows padding pair inside the map)
+        if ch == PADDING_CHAR and cl == PADDING_COLOR:
+            pass8[i] = 0.5     # uncertain target
+            safe8[i] = 0.5
+            weight8[i] = unknown_weight
+            continue
         # legal to step?
-        legal = ((ch, cl) in PASSABLE) or (ch == PADDING_CHAR and cl == PADDING_COLOR) or is_monster(ch)
+        legal = ((ch, cl) in PASSABLE) or is_monster(ch)
         if ch == ord('`') and cl == CLR_GRAY:
             yy, xx = y + dy, x + dx
             if 0 <= yy < H and 0 <= xx < W:
                 ch2 = int(chars[yy,xx])
                 cl2 = int(colors[yy,xx])
                 legal = (ch2, cl2) not in (WALLS | DOORS)
+            else:
+                legal = False
         # safety: legal AND not a hazard/unknown/monster
-        unsafe = ((ch, cl) in TRAPS) or ((ch, cl) in WATER_LAVA) or (ch == PADDING_CHAR and cl == PADDING_COLOR) or is_monster(ch)
+        unsafe = ((ch, cl) in TRAPS) or ((ch, cl) in WATER_LAVA) or is_monster(ch)
         pass8[i] = 1.0 if legal else 0.0
         safe8[i] = 1.0 if (legal and not unsafe) else 0.0
-    return pass8, safe8
+        weight8[i] = 1.0
+    return pass8, safe8, hard_mask8, weight8
 
 # ---- Goal vector (nearest stairs) -------------------------------------------
 def nearest_stairs_vector(chars: torch.Tensor,
@@ -669,6 +692,8 @@ class NetHackDataCollector:
             done_target_mb     = torch.zeros((num_games, num_time), dtype=torch.float32)
             passability_mb     = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
             safety_mb          = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
+            hard_mask_mb       = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
+            weight_mb          = torch.zeros((num_games, num_time, 8), dtype=torch.float32)
             has_next_mb        = torch.zeros((num_games, num_time), dtype=torch.bool)
 
             # Convenience aliases to raw
@@ -736,9 +761,11 @@ class NetHackDataCollector:
                     valid_samples += 1
 
                     # passability & safety
-                    p8, s8 = compute_passability_and_safety(chars_map, colors_map, hy, hx)
+                    p8, s8, hm8, w8 = compute_passability_and_safety(chars_map, colors_map, hy, hx)
                     passability_mb[g,t] = p8
                     safety_mb[g,t]      = s8
+                    hard_mask_mb[g,t]   = hm8
+                    weight_mb[g,t]      = w8
 
                 # Note: goal_target, goal_mask, and value_k_target are now computed on-the-fly in vae_loss
 
@@ -759,6 +786,8 @@ class NetHackDataCollector:
             # value_k_target, goal_target, and goal_mask are now computed on-the-fly in vae_loss
             this_batch['passability_target']= passability_mb
             this_batch['safety_target']     = safety_mb
+            this_batch['hard_mask']         = hard_mask_mb
+            this_batch['weight']            = weight_mb
             this_batch['has_next']          = has_next_mb
 
             collected_batches.append(this_batch)
@@ -994,10 +1023,10 @@ class BLStatsAdapter:
         for y in range(height):
             for x in range(width):
                 if chars[y, x] == ord('@'):
-                    return (y, x)
+                    return (x, y)
         
         # If '@' not found, return center of map as fallback
-        return (height // 2, width // 2)
+        return (width // 2, height // 2)
 
     def _parse_status_comprehensive(self, status_lines: List[str]) -> Dict:
         """Comprehensive status line parsing with multiple format support"""
@@ -1159,7 +1188,7 @@ class BLStatsAdapter:
         player_x, player_y = self._find_player_position(game_chars)
         blstats[0] = player_x  # NLE_BL_X - x coordinate
         blstats[1] = player_y  # NLE_BL_Y - y coordinate
-        
+
         # Use exact NLE blstats mapping from nle/include/nletypes.h
         blstats[2] = parsed_stats.get('strength', 16)     # NLE_BL_STR25 - strength 3..25
         blstats[3] = blstats[2]  # NLE_BL_STR125 - strength 3..125 (not available from tty_chars)

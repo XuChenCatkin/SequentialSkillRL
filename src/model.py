@@ -249,6 +249,18 @@ def hero_presence_and_centroid(glyph_chars: torch.Tensor, blstats: torch.Tensor)
     centroid = torch.stack([cy, cx], dim=1)                      # [B,2]
     return present, centroid
 
+def _broadcast_nk(x: torch.Tensor | None, N: int, K: int, device) -> torch.Tensor | None:
+    if x is None:
+        return None
+    x = x.to(device)
+    if x.dim() == 1 and x.shape[0] == N:
+        x = x.unsqueeze(1).expand(N, K)
+    elif x.dim() == 2 and x.shape == (N, K):
+        pass
+    else:
+        raise ValueError(f"mask/weight must be [N] or [N,{K}], got {tuple(x.shape)}")
+    return x
+
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden: int, out_dim: int, num_layers: int = 2, dropout: float = 0.0):
         super().__init__()
@@ -693,52 +705,90 @@ class MapDecoder(nn.Module):
 
     @staticmethod
     def format_passability_safety(
-        passability_presence: torch.Tensor,
-        safety_presence: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        passability_presence: torch.Tensor,           # [B, 8]
+        safety_presence: torch.Tensor,                # [B, 8]
+        pass_mask: torch.Tensor | None = None,        # [B] or [B,8], 0 = ignore (OOB, etc.)
+        safe_mask: torch.Tensor | None = None,        # [B] or [B,8]
+        pass_weight: torch.Tensor | None = None,      # [B] or [B,8], e.g. 0.2 for unknown tiles
+        safe_weight: torch.Tensor | None = None,      # [B] or [B,8]
+        masked_value: float | None = None             # e.g., float('nan') to visualize masked spots
+    ) -> Dict[str, torch.Tensor]:
         """
-        Format passability and safety presence into 3x3 grids for visualization.
-        
-        Args:
-            passability_presence: [B, 8] passability in 8 directions (N,E,S,W,NE,SE,SW,NW)
-            safety_presence: [B, 8] safety in 8 directions
+        Format passability/safety + (optional) masks & weights into 3x3 hero-centric grids.
 
-        Returns:
-            Dict with:
-            - passability_grid: [B, 3, 3] arranged as spatial grid
-            - safety_grid: [B, 3, 3] arranged as spatial grid
+        Direction order expected: (N, E, S, W, NE, SE, SW, NW)
+        Returns a dict with keys:
+        - 'pass_grid', 'safe_grid'              -> [B,3,3] values
+        - 'pass_mask_grid', 'safe_mask_grid'    -> [B,3,3] {0,1}
+        - 'pass_weight_grid', 'safe_weight_grid'-> [B,3,3] >=0
+        The hero center cell [1,1] is set to -1 in value grids, 1 in mask grids, 0 in weight grids.
         """
-        batch_size = passability_presence.shape[0]
-        
-        # Create 3x3 grids (center = hero position '@')
-        pass_grid = torch.zeros(batch_size, 3, 3, device=passability_presence.device)
-        safe_grid = torch.zeros(batch_size, 3, 3, device=safety_presence.device)
+        device = passability_presence.device
+        B, K = passability_presence.shape
+        assert safety_presence.shape == (B, K)
+        assert K == 8, "Expected 8 directions (N,E,S,W,NE,SE,SW,NW)."
 
-        # Direction mapping: (N,E,S,W,NE,SE,SW,NW) -> grid positions
-        # Grid layout:
-        # 0,0  0,1  0,2    NW   N   NE
-        # 1,0  1,1  1,2     W   @    E  
-        # 2,0  2,1  2,2    SW   S   SE
-        direction_positions = [
-            (0, 1),  # N
-            (1, 2),  # E
-            (2, 1),  # S
-            (1, 0),  # W
-            (0, 2),  # NE  
-            (2, 2),  # SE
-            (2, 0),  # SW
-            (0, 0),  # NW
-        ]
-        
-        for i, (row, col) in enumerate(direction_positions):
-            pass_grid[:, row, col] = passability_presence[:, i]
-            safe_grid[:, row, col] = safety_presence[:, i]
+        # Broadcast mask/weight to [B,8] if provided
+        pass_mask   = _broadcast_nk(pass_mask,   B, K, device)
+        safe_mask   = _broadcast_nk(safe_mask,   B, K, device)
+        pass_weight = _broadcast_nk(pass_weight, B, K, device)
+        safe_weight = _broadcast_nk(safe_weight, B, K, device)
 
-        # Center position (hero) gets special value (e.g., -1 to indicate '@')
-        pass_grid[:, 1, 1] = -1  # Special marker for hero position
-        safe_grid[:, 1, 1] = -1  # Special marker for hero position
-        
-        return pass_grid, safe_grid
+        # Allocate grids
+        pass_grid       = torch.zeros(B, 3, 3, device=device, dtype=passability_presence.dtype)
+        safe_grid       = torch.zeros(B, 3, 3, device=device, dtype=safety_presence.dtype)
+        pass_mask_grid  = torch.ones(B, 3, 3, device=device)   # center marked valid by default
+        safe_mask_grid  = torch.ones(B, 3, 3, device=device)
+        pass_w_grid     = torch.zeros(B, 3, 3, device=device)
+        safe_w_grid     = torch.zeros(B, 3, 3, device=device)
+
+        # Direction -> grid mapping
+        # Grid:
+        #  (0,0)=NW  (0,1)=N  (0,2)=NE
+        #  (1,0)=W   (1,1)=@  (1,2)=E
+        #  (2,0)=SW  (2,1)=S  (2,2)=SE
+        dir_pos = [(0,1), (1,2), (2,1), (1,0), (0,2), (2,2), (2,0), (0,0)]  # N,E,S,W,NE,SE,SW,NW
+
+        for i, (r, c) in enumerate(dir_pos):
+            pass_grid[:, r, c] = passability_presence[:, i]
+            safe_grid[:, r, c] = safety_presence[:, i]
+
+            if pass_mask is not None:
+                pass_mask_grid[:, r, c] = pass_mask[:, i].to(pass_mask_grid.dtype)
+            if safe_mask is not None:
+                safe_mask_grid[:, r, c] = safe_mask[:, i].to(safe_mask_grid.dtype)
+
+            if pass_weight is not None:
+                pass_w_grid[:, r, c] = pass_weight[:, i].to(pass_w_grid.dtype)
+            if safe_weight is not None:
+                safe_w_grid[:, r, c] = safe_weight[:, i].to(safe_w_grid.dtype)
+
+        # Center (hero)
+        pass_grid[:, 1, 1] = -1.0
+        safe_grid[:, 1, 1] = -1.0
+        pass_mask_grid[:, 1, 1] = 1.0
+        safe_mask_grid[:, 1, 1] = 1.0
+        pass_w_grid[:, 1, 1] = 0.0
+        safe_w_grid[:, 1, 1] = 0.0
+
+        # Optionally visualize masked cells as NaN (or any sentinel)
+        if masked_value is not None:
+            mv = torch.tensor(masked_value, device=device, dtype=pass_grid.dtype)
+            if pass_mask is not None:
+                pm = (pass_mask_grid[:, :, :] < 0.5)
+                pass_grid[pm] = mv
+            if safe_mask is not None:
+                sm = (safe_mask_grid[:, :, :] < 0.5)
+                safe_grid[sm] = mv
+                
+        return {
+            'passability_grid': pass_grid,
+            'safety_grid': safe_grid,
+            'pass_mask_grid': pass_mask_grid,
+            'safe_mask_grid': safe_mask_grid,
+            'pass_weight_grid': pass_w_grid,
+            'safe_weight_grid': safe_w_grid,
+        }
 
     def generate(self, z: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convenience: z -> logits -> hard maps."""
@@ -806,8 +856,8 @@ class BlstatsPreprocessor(nn.Module):
                     proc[:, j] = torch.log1p(proc[:, j].clamp(min=0))
             hp_idx = self.cont.index(10); maxhp_idx = self.cont.index(11)
             en_idx = self.cont.index(14); maxen_idx = self.cont.index(15)
-            proc[:, hp_idx] = cont[:, 10] / torch.clamp(cont[:, 11], min=1)
-            proc[:, en_idx] = cont[:, 14] / torch.clamp(cont[:, 15], min=1)
+            proc[:, hp_idx] = cont[:, hp_idx] / torch.clamp(cont[:, maxhp_idx], min=1)
+            proc[:, en_idx] = cont[:, en_idx] / torch.clamp(cont[:, maxen_idx], min=1)
             keep = [i for i in range(proc.size(1)) if i not in [maxhp_idx, maxen_idx]]
             # Apply keep filtering BEFORE batch norm, same as in forward()
             proc = proc[:, keep]
@@ -1336,7 +1386,7 @@ class MultiModalHackVAE(nn.Module):
         map_occ_thresh: float = 0.5,
         bag_presence_thresh: float = 0.5,
         hero_presence_thresh: float = 0.5,
-        passibility_thresh: float = 0.5,
+        passability_thresh: float = 0.5,
         safety_thresh: float = 0.5,
         map_deterministic: bool = True,
         glyph_top_k: int = 0,
@@ -1385,24 +1435,24 @@ class MultiModalHackVAE(nn.Module):
         occupy_logit = dec["occupy_logits"]
         hero_presence_logit = dec["hero_presence_logits"]
         bag_presence_logit = dec["bag_logits"]
-        passibility_logit = dec["passability_logits"]
+        passability_logit = dec["passability_logits"]
         safety_logit = dec["safety_logits"]
         hero_centroid = dec["hero_centroid"]
         if map_deterministic:
             occupy = (torch.sigmoid(occupy_logit) > map_occ_thresh).float()  # [B,1,21,79]
             has_hero = (torch.sigmoid(hero_presence_logit) > hero_presence_thresh)  # [B]
             bag_presence = (torch.sigmoid(bag_presence_logit) > bag_presence_thresh)  # [B, GLYPH_DIM]
-            passibility_presence = (torch.sigmoid(passibility_logit) > passibility_thresh).float()  # [B, 8]
+            passability_presence = (torch.sigmoid(passability_logit) > passability_thresh).float()  # [B, 8]
             safety_presence = (torch.sigmoid(safety_logit) > safety_thresh).float()  # [B, 8]
         else:
             occupy = torch.bernoulli(torch.sigmoid(occupy_logit))  # [B,1,21,79]
             has_hero = torch.bernoulli(torch.sigmoid(hero_presence_logit))  # [B]
             bag_presence = torch.bernoulli(torch.sigmoid(bag_presence_logit))  # [B, GLYPH_DIM]
-            passibility_presence = torch.bernoulli(torch.sigmoid(passibility_logit))  # [B, 8]
+            passability_presence = torch.bernoulli(torch.sigmoid(passability_logit))  # [B, 8]
             safety_presence = torch.bernoulli(torch.sigmoid(safety_logit))  # [B, 8]
         
         bag_sets = bag_presence_to_glyph_sets(bag_presence)  # [B, bag_dim]
-        pass_grid, safe_grid = MapDecoder.format_passability_safety(passibility_presence, safety_presence)  # [B, 21, 79], [B, 21, 79]
+        pass_safety_dict = MapDecoder.format_passability_safety(passability_presence, safety_presence)  # [B, 21, 79], [B, 21, 79]
 
         # --- Message sampling ---
         msg_tokens_out = MessageDecoder.sample_from_logits(
@@ -1434,9 +1484,8 @@ class MultiModalHackVAE(nn.Module):
             "msg_tokens": msg_tokens_out,
             "stats_point": stats_point,
             "bag_sets": bag_sets,
-            "passability_grid": pass_grid,
-            "safety_grid": safe_grid,
             "z": z,
+            **pass_safety_dict
         }
         if include_logits:
             out.update({
@@ -1448,7 +1497,7 @@ class MultiModalHackVAE(nn.Module):
                 "hero_centroid": hero_centroid,
                 "msg_logits": dec["msg_logits"],
                 "bag_logits": bag_presence_logit,
-                "passability_logits": passibility_logit,
+                "passability_logits": passability_logit,
                 "safety_logits": safety_presence,
             })
         return out
@@ -1593,28 +1642,56 @@ def ego_metrics_from_logits(
 
 @torch.no_grad()
 def binary_accuracy_from_logits(
-    logits: torch.Tensor,          # [N, K]  (K=8 for N,S,E,W,NE,NW,SE,SW)
-    targets: torch.Tensor,         # [N, K]  float/bool {0,1}
-    mask: torch.Tensor | None = None,  # [N] bool (optional)
-    threshold: float = 0.5
+    logits: torch.Tensor,              # [N, K]
+    targets: torch.Tensor,             # [N, K] in {0,1}
+    mask: torch.Tensor | None = None,  # [N] or [N,K] (0=ignore)
+    weight: torch.Tensor | None = None,# [N] or [N,K] (importance)
+    threshold: float = 0.5,
 ) -> dict:
     """
-    Returns: {'acc': ..., 'acc_per_dim': Tensor[K]}
+    Weighted + masked binary accuracy.
+    - mask: elements with mask==0 are ignored (hard mask).
+    - weight: per-element importance (e.g., down-weight 'unknown' tiles).
+    Returns:
+        {
+          'acc': float,               # micro accuracy over all elements
+          'acc_per_dim': Tensor[K],   # weighted accuracy per direction
+          'support_per_dim': Tensor[K]# effective weight per direction
+        }
     """
+    # predictions
     probs = torch.sigmoid(logits)
-    preds = (probs >= threshold).to(targets.dtype)
+    preds = (probs >= threshold).to(torch.float32)
+    tgt   = targets.to(torch.float32)
+
+    # build combined weights W: same shape as logits [N,K]
+    W = torch.ones_like(preds, dtype=torch.float32)
     if mask is not None:
-        m = mask.view(-1, 1).float()
-        denom = m.sum().clamp_min(1.0)
-        correct = ((preds == targets).float() * m).sum()
-        acc_per_dim = ((preds == targets).float() * m).sum(dim=0) / m.sum(dim=0).clamp_min(1.0)
-    else:
-        denom = torch.tensor(float(logits.shape[0]), device=logits.device)
-        correct = (preds == targets).float().sum()
-        acc_per_dim = (preds == targets).float().mean(dim=0)
+        m = mask.to(torch.float32)
+        if m.dim() == 1: m = m.unsqueeze(1)           # [N,1] -> [N,K] by broadcast
+        W = W * m
+    if weight is not None:
+        w = weight.to(torch.float32)
+        if w.dim() == 1: w = w.unsqueeze(1)
+        W = W * w
+
+    # correctness matrix
+    corr = (preds == tgt).to(torch.float32)
+
+    # micro accuracy
+    num = (corr * W).sum()
+    den = W.sum().clamp_min(1e-6)
+    acc_micro = (num / den).item()
+
+    # per-dimension accuracy
+    num_d = (corr * W).sum(dim=0)                 # [K]
+    den_d = W.sum(dim=0).clamp_min(1e-6)          # [K]
+    acc_per_dim = (num_d / den_d).detach().cpu()
+
     return {
-        'acc': (correct / (denom * logits.shape[1])).item(),
-        'acc_per_dim': acc_per_dim.detach().cpu()
+        'acc': acc_micro,
+        'acc_per_dim': acc_per_dim,
+        'support_per_dim': den_d.detach().cpu(),
     }
     
 @torch.no_grad()
@@ -1825,7 +1902,7 @@ def vae_loss(
     msg_logits = model_output['msg_logits'][valid_screen]  # [B, 256, MSG_VSIZE]
     
     # action related outputs
-    passibility_logits = model_output['passability_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
+    passability_logits = model_output['passability_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
     reward = model_output['reward'][valid_screen].squeeze(1)  # [B]
     done_logits = model_output['done_logits'][valid_screen].squeeze(1)  # [B]
     value_k = model_output['value_k'][valid_screen]  # [B, NUM_HORIZONS]
@@ -1977,8 +2054,22 @@ def vae_loss(
     metrics.update({f'metrics/ego_class/{k}': v for k, v in ego_class_metrics.items()})
 
     if 'passability_target' in batch:
-        raw_losses['passability'] = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
-        pass_metrics = binary_accuracy_from_logits(passibility_logits, batch['passability_target'][valid_screen])
+        loss = F.binary_cross_entropy_with_logits(passability_logits, batch['passability_target'][valid_screen], reduction='none')  # [B, PASSABILITY_DIRS]
+        if 'hard_mask' in batch:
+            m = batch['hard_mask'][valid_screen].float()  # [B, PASSABILITY_DIRS]
+            loss = loss * m
+        else:
+            m = None
+        if 'weight' in batch:
+            w = batch['weight'][valid_screen].float()  # [B, PASSABILITY_DIRS]
+            loss = loss * w
+        else:
+            w = None
+        denom = (m if m is not None else torch.ones_like(loss))
+        denom = denom * (w if w is not None else 1.0)
+        denom = denom.sum(dim=1).clamp_min(1.0)  # [B]
+        raw_losses['passability'] = (loss.sum(dim=1) / denom).mean()  # Mean over valid samples
+        pass_metrics = binary_accuracy_from_logits(passability_logits, batch['passability_target'][valid_screen], m, w)
         metrics.update({f'metrics/passability/{k}': v for k, v in pass_metrics.items()})
 
     if 'reward_target' in batch:
@@ -1994,8 +2085,22 @@ def vae_loss(
 
     # --- Safety risk (8 dirs) ---
     if 'safety_target' in batch:
-        raw_losses['safety'] = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
-        safety_metrics = binary_accuracy_from_logits(safety_logits, batch['safety_target'][valid_screen])
+        loss = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'][valid_screen], reduction='none')  # [B, PASSABILITY_DIRS]
+        if 'hard_mask' in batch:
+            m = batch['hard_mask'][valid_screen].float()  # [B, PASSABILITY_DIRS]
+            loss = loss * m
+        else:
+            m = None
+        if 'weight' in batch:
+            w = batch['weight'][valid_screen].float()  # [B, PASSABILITY_DIRS]
+            loss = loss * w
+        else:
+            w = None
+        denom = (m if m is not None else torch.ones_like(loss))
+        denom = denom * (w if w is not None else 1.0)
+        denom = denom.sum(dim=1).clamp_min(1.0)  # [B]
+        raw_losses['safety'] = (loss.sum(dim=1) / denom).mean()  # Mean over valid samples
+        safety_metrics = binary_accuracy_from_logits(safety_logits, batch['safety_target'][valid_screen], m, w)
         metrics.update({f'metrics/safety/{k}': v for k, v in safety_metrics.items()})
 
     # --- Goal direction ---

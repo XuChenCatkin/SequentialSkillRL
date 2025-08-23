@@ -1250,7 +1250,7 @@ def create_visualization_demo(
     map_occ_thresh: float = 0.5,
     bag_presence_thresh: float = 0.5,
     hero_presence_thresh: float = 0.5,
-    passibility_thresh: float = 0.5,
+    passability_thresh: float = 0.5,
     safety_thresh: float = 0.5,
     map_deterministic: bool = True,
     glyph_top_k: int = 0,
@@ -1402,7 +1402,7 @@ def create_visualization_demo(
             map_occ_thresh=map_occ_thresh,
             bag_presence_thresh=bag_presence_thresh,
             hero_presence_thresh=hero_presence_thresh,
-            passibility_thresh=passibility_thresh,
+            passability_thresh=passability_thresh,
             safety_thresh=safety_thresh,
             map_deterministic=map_deterministic,
             glyph_top_k=glyph_top_k,  # Legacy: top_k -> glyph_top_k
@@ -1442,7 +1442,7 @@ def create_visualization_demo(
             map_occ_thresh=map_occ_thresh,
             bag_presence_thresh=bag_presence_thresh,
             hero_presence_thresh=hero_presence_thresh,
-            passibility_thresh=passibility_thresh,
+            passability_thresh=passability_thresh,
             safety_thresh=safety_thresh,
             map_deterministic=map_deterministic,
             glyph_top_k=glyph_top_k,  # Legacy: top_k -> glyph_top_k
@@ -2008,7 +2008,7 @@ if __name__ == "__main__":
                 map_occ_thresh=0.5,
                 bag_presence_thresh=0.5,
                 hero_presence_thresh=0.2,
-                passibility_thresh=0.5,
+                passability_thresh=0.5,
                 safety_thresh=0.5,
                 map_temperature=1.0,
                 map_deterministic=False,  # Use deterministic sampling for maps
