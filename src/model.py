@@ -2035,27 +2035,33 @@ def vae_loss(
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
     # KL divergence for low-rank approximation
-    eps = 1e-6
+    eps = 1e-8
+    logvar = logvar.clamp(min=-10.0, max=10.0)  # Prevent extreme values
     var = torch.exp(logvar).clamp_min(eps)  # [valid_B, LATENT_DIM]
     mu2 = mu.square().sum(dim=1)  # mu^T * mu # [valid_B,]
     d = mu.size(1)
     if lowrank_factors is not None:
-        U = lowrank_factors  # [valid_B, LATENT_DIM, LOW_RANK]
-        UUT_bar = torch.zeros(d, d, device=mu.device, dtype=mu.dtype)  # [LATENT_DIM, LATENT_DIM]
+        r = lowrank_factors.size(2)
+        U = lowrank_factors.to(torch.float64)  # [valid_B, LATENT_DIM, LOW_RANK]
+        UUT_bar = torch.zeros(d, d, device=mu.device, dtype=torch.float64)  # [LATENT_DIM, LATENT_DIM]
         UUT_bar += torch.einsum('bik,bjk->ij', U, U) / valid_B # [LATENT_DIM, LATENT_DIM]
-        Sigma_q_bar = UUT_bar + torch.diag(var.mean(dim=0))  # [LATENT_DIM, LATENT_DIM]
+        diag_E_Sigma = var.mean(dim=0, dtype=torch.float64) + (U * U).mean(dim=(0,2))  # E[diag(Sigma_q)], [LATENT_DIM]
+        Sigma_q_bar = UUT_bar + torch.diag(diag_E_Sigma) - torch.diag((U * U).mean(dim=(0,2)))  # [LATENT_DIM, LATENT_DIM]
+        Sigma_q_bar.fill_diagonal_(0.0)
+        Sigma_q_bar = Sigma_q_bar + torch.diag(diag_E_Sigma)  # [LATENT_DIM, LATENT_DIM]
         tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))  # Trace of Sigma_q
         Dinvu = U / var.unsqueeze(-1)  # [valid_B, LATENT_DIM, LOW_RANK]
-        I_plus = torch.bmm(U.transpose(1, 2), Dinvu)  # [valid_B, LATENT_DIM, LATENT_DIM]
-        eye_d = torch.eye(d, device=mu.device, dtype=mu.dtype).unsqueeze(0)  # [1, LATENT_DIM, LATENT_DIM]
-        I_plus = I_plus + eye_d  # [valid_B, LATENT_DIM, LATENT_DIM]
+        I_plus = torch.bmm(U.transpose(1, 2), Dinvu)  # [valid_B, LOW_RANK, LOW_RANK]
+        eye_r = torch.eye(r, device=mu.device, dtype=torch.float64).unsqueeze(0)  # [1, LOW_RANK, LOW_RANK]
+        I_plus = I_plus + eye_r  # [valid_B, LOW_RANK, LOW_RANK]
         sign2, logdet_small = torch.linalg.slogdet(I_plus)  # log(det(I + U^T * diag(1/var) * U))
         if not torch.all(sign2 > 0):
             raise ValueError("Matrix I + U^T * diag(1/var) * U is not positive definite.")
-        log_det_Sigma_q = logdet_small + logvar.sum(dim=1)  # log(det(Sigma_q)) [valid_B,]
+        log_det_Sigma_q = logdet_small + logvar.sum(dim=1).to(torch.float64)  # log(det(Sigma_q)) [valid_B,]
+        log_det_Sigma_q = log_det_Sigma_q.to(mu.dtype)
     else:
         # If no low-rank factors, just use diagonal covariance
-        Sigma_q_bar = torch.diag(var.mean(dim=0))  # [LATENT_DIM, LATENT_DIM]
+        Sigma_q_bar = torch.diag(var.mean(dim=0, dtype=torch.float64))  # [LATENT_DIM, LATENT_DIM]
         tr_Sigma_q = var.sum(dim=1)  # Trace of Sigma_q
         log_det_Sigma_q = logvar.sum(dim=1)  # log(det(Sigma_q)) [valid_B,]
     # KL divergence: D_KL(q(z|x) || p(z)) =
@@ -2066,30 +2072,29 @@ def vae_loss(
     kl_loss = kl_per_sample.mean()  # Average over batch
 
     # Cov(mu) = E[mu * mu^T] - E[mu] * E[mu]^T
-    mu_bar = mu.mean(dim=0)  # Average mean vector over batch
-    mu_c = mu - mu_bar
+    mu64 = mu.to(torch.float64)
+    mu_bar = mu64.mean(dim=0)  # Average mean vector over batch
+    mu_c = mu64 - mu_bar
     S_mu = (mu_c.t() @ mu_c) / valid_B  # Covariance matrix of the posterior distribution
     assert S_mu.shape == (d, d), f"Covariance matrix of mu shape mismatch: {S_mu.shape} != {(d, d)}"
     total_S = Sigma_q_bar + S_mu  # Total covariance matrix of the posterior distribution
     # Ensure the covariance matrix is symmetric
     total_S = (total_S + total_S.T) / 2 # [LATENT_DIM, LATENT_DIM]
+    total_S = total_S + eps * torch.eye(d, device=mu.device, dtype=torch.float64)  # Numerical stability
     
     # Dimension-wise KL divergence with free bits regularization
     diag_S_bar = torch.diag(total_S).clamp_min(eps)  # Diagonal of the covariance matrix, [LATENT_DIM]
     dwkl_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())  # [LATENT_DIM]
     dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - config.free_bits, min=0)  # Free bits regularization
-    dwkl = dwkl_per_dim.sum()  # Sum over dimensions
-    dwkl_fb = dwkl_fb_per_dim.sum()  # Free bits regularization sum
+    dwkl = dwkl_per_dim.sum().to(mu.dtype)  # Sum over dimensions
+    dwkl_fb = dwkl_fb_per_dim.sum().to(mu.dtype)  # Free bits regularization sum
     
     # total correlation term - use FP32 for linear algebra operations
     with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for numerical stability
         # Convert to FP32 for linear algebra operations
-        diag_S_bar_fp32 = diag_S_bar.float()
-        total_S_fp32 = total_S.float()
-        
-        inv_sqrt = torch.diag(diag_S_bar_fp32.sqrt().reciprocal())  # Inverse square root of diagonal covariance
-        R = inv_sqrt @ total_S_fp32 @ inv_sqrt  # R = inv_sqrt * total_S * inv_sqrt
-        R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=torch.float32)  # Ensure symmetry and positive definiteness
+        D_sqrt_inv = torch.diag(1.0 / torch.sqrt(diag_S_bar)).to(torch.float64) 
+        R = D_sqrt_inv @ total_S @ D_sqrt_inv  # R = inv_sqrt * total_S * inv_sqrt
+        R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=torch.float64)  # Ensure symmetry and positive definiteness
         sign, logabsdet_R = torch.linalg.slogdet(R)  # log(det(R))
         if not torch.all(sign > 0):
             raise ValueError("Covariance matrix R is not positive definite.")
