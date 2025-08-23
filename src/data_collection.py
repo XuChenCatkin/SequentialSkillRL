@@ -392,7 +392,7 @@ def compute_passability_and_safety(chars: torch.Tensor,
         ch = int(chars[y,x])
         cl = int(colors[y,x])
         # legal to step?
-        legal = ((ch, cl) in PASSABLE) or is_monster(ch)
+        legal = ((ch, cl) in PASSABLE) or (ch == PADDING_CHAR and cl == PADDING_COLOR) or is_monster(ch)
         if ch == ord('`') and cl == CLR_GRAY:
             yy, xx = y + dy, x + dx
             if 0 <= yy < H and 0 <= xx < W:
@@ -400,7 +400,7 @@ def compute_passability_and_safety(chars: torch.Tensor,
                 cl2 = int(colors[yy,xx])
                 legal = (ch2, cl2) not in (WALLS | DOORS)
         # safety: legal AND not a hazard/unknown/monster
-        unsafe = ((ch, cl) in TRAPS) or ((ch, cl) in WATER_LAVA) or is_monster(ch)
+        unsafe = ((ch, cl) in TRAPS) or ((ch, cl) in WATER_LAVA) or (ch == PADDING_CHAR and cl == PADDING_COLOR) or is_monster(ch)
         pass8[i] = 1.0 if legal else 0.0
         safe8[i] = 1.0 if (legal and not unsafe) else 0.0
     return pass8, safe8
@@ -421,8 +421,8 @@ def nearest_stairs_vector(chars: torch.Tensor,
     i = (dy*dy + dx*dx).argmin().item()
     gx, gy = int(xs[i].item()), int(ys[i].item())
     # normalize to [-1,1]
-    dxn = max(-1.0, min(1.0, (gx - hero_x) / (W/2)))
-    dyn = max(-1.0, min(1.0, (gy - hero_y) / (H/2)))
+    dxn = max(-1.0, min(1.0, (gx - hero_x) / (W - 1)))
+    dyn = max(-1.0, min(1.0, (gy - hero_y) / (H - 1)))
     return (dyn, dxn)
 
 # ---- Ego crop and class mapping ---------------------------------------------

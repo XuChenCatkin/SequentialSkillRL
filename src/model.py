@@ -54,6 +54,7 @@ Architecture
 """
 
 from __future__ import annotations
+from unittest import result
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -145,8 +146,8 @@ BLSTATS_CAT = [
     "alignment",         # 26: Alignment (-1 to 1, -1=chaotic, 0=neutral, 1=lawful)
 ]
 
-COMMON_CHARS = [ord('#'), ord('.'), ord('-'), ord('|')]
-COMMON_GLYPHS = [(a, 7) for a in COMMON_CHARS] # (char, color) pairs for common glyphs
+COMMON_CHARS = [ord('#'), ord('.'), ord('-'), ord('|'), ord('>'), ord('<'), ord('@')]
+COMMON_GLYPHS = [(a, c) for a in COMMON_CHARS for c in range(COLOR_DIM)] # (char, color) pairs for common glyphs
 HERO_CHAR = ord('@')  # hero character code (ASCII 64)
 
 def _gn_groups(c: int) -> int:
@@ -164,6 +165,14 @@ def _pair_index(char_ascii: torch.Tensor, color_id: torch.Tensor) -> torch.Tenso
     ch = (char_ascii - 32).clamp(0, CHAR_DIM - 1)
     co = color_id.clamp(0, COLOR_DIM - 1)
     return ch * COLOR_DIM + co
+
+def _to_pair_idx(pair_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Inverse of _pair_index: flat pair index [0..GLYPH_DIM-1] -> (char_ascii [32..127], color_id [0..15])
+    """
+    ch = (pair_idx // COLOR_DIM) + 32
+    co = pair_idx % COLOR_DIM
+    return ch, co
 
 def make_pair_bag(glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> torch.Tensor:
     """
@@ -192,6 +201,36 @@ def bag_marginals(bag_pairs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     char_pres  = 1.0 - torch.prod(1.0 - pairs, dim=2)
     color_pres = 1.0 - torch.prod(1.0 - pairs, dim=1)
     return char_pres, color_pres
+
+def bag_presence_to_glyph_sets(bag_presence: torch.Tensor) -> list[set[tuple[int, int]]]:
+    """
+    Convert bag_presence tensor to list of sets containing (char, color) pairs.
+    
+    Args:
+        bag_presence: [B, GLYPH_DIM] tensor with 1s indicating presence of glyph pairs
+        
+    Returns:
+        List of length B, where each element is a set containing (char_ascii, color_id) tuples
+        for glyphs that are present in the bag (bag_presence == 1)
+    """
+    B = bag_presence.shape[0]
+    result = []
+    
+    for b in range(B):
+        # Get indices where bag_presence is 1 for this batch element
+        # exclude padding (32,0) which is at index 0
+        present_indices = torch.where(bag_presence[b] == 1)[0]  # [num_present]
+        present_indices = present_indices[present_indices != 0]  # Exclude padding index
+
+        # Convert flat indices to (char, color) pairs using _to_pair_idx
+        bag_set = set()
+        for idx in present_indices:
+            char_ascii, color_id = _to_pair_idx(idx)
+            bag_set.add((char_ascii.item(), color_id.item()))
+        
+        result.append(bag_set)
+    
+    return result
 
 def hero_presence_and_centroid(glyph_chars: torch.Tensor, blstats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -652,6 +691,55 @@ class MapDecoder(nn.Module):
 
         return {"ego_chars": ego_chars, "ego_colors": ego_colors, "ego_class": ego_class}
 
+    @staticmethod
+    def format_passability_safety(
+        passability_presence: torch.Tensor,
+        safety_presence: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Format passability and safety presence into 3x3 grids for visualization.
+        
+        Args:
+            passability_presence: [B, 8] passability in 8 directions (N,E,S,W,NE,SE,SW,NW)
+            safety_presence: [B, 8] safety in 8 directions
+
+        Returns:
+            Dict with:
+            - passability_grid: [B, 3, 3] arranged as spatial grid
+            - safety_grid: [B, 3, 3] arranged as spatial grid
+        """
+        batch_size = passability_presence.shape[0]
+        
+        # Create 3x3 grids (center = hero position '@')
+        pass_grid = torch.zeros(batch_size, 3, 3, device=passability_presence.device)
+        safe_grid = torch.zeros(batch_size, 3, 3, device=safety_presence.device)
+
+        # Direction mapping: (N,E,S,W,NE,SE,SW,NW) -> grid positions
+        # Grid layout:
+        # 0,0  0,1  0,2    NW   N   NE
+        # 1,0  1,1  1,2     W   @    E  
+        # 2,0  2,1  2,2    SW   S   SE
+        direction_positions = [
+            (0, 1),  # N
+            (1, 2),  # E
+            (2, 1),  # S
+            (1, 0),  # W
+            (0, 2),  # NE  
+            (2, 2),  # SE
+            (2, 0),  # SW
+            (0, 0),  # NW
+        ]
+        
+        for i, (row, col) in enumerate(direction_positions):
+            pass_grid[:, row, col] = passability_presence[:, i]
+            safe_grid[:, row, col] = safety_presence[:, i]
+
+        # Center position (hero) gets special value (e.g., -1 to indicate '@')
+        pass_grid[:, 1, 1] = -1  # Special marker for hero position
+        safe_grid[:, 1, 1] = -1  # Special marker for hero position
+        
+        return pass_grid, safe_grid
+
     def generate(self, z: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convenience: z -> logits -> hard maps."""
         out = self.forward(z)
@@ -991,7 +1079,7 @@ class ActionValueHead(nn.Module):
             "safety_logits": self.safety(z),
         }
         if self.goal is not None:
-            out["goal_pred"] = self.goal(z)
+            out["goal_pred"] = torch.tanh(self.goal(z))  # in [-1,1]
         if self.skill_belief is not None:
             out["skill_logits"] = self.skill_belief(z)
         return out
@@ -1219,6 +1307,11 @@ class MultiModalHackVAE(nn.Module):
                 z_current_for_dynamics_flat = None  # No current state if T <= 1
                 action_onehot_for_dynamics_flat = None  # No action if T <= 1
                 has_next_for_dynamics_flat = None  # No has_next if T <= 1
+        else:
+            z_next_flat_detach = None  # No next state if T <= 1
+            z_current_for_dynamics_flat = None  # No current state if T <= 1
+            action_onehot_for_dynamics_flat = None  # No action if T <= 1
+            has_next_for_dynamics_flat = None  # No has_next if T <= 1
                 
         batch['z_next_detached'] = z_next_flat_detach  # [B*(T-1), latent_dim]
         batch['action_onehot_for_dynamics'] = action_onehot_for_dynamics_flat  # [B*(T-1), A]
@@ -1241,7 +1334,10 @@ class MultiModalHackVAE(nn.Module):
         # map sampling
         map_temperature: float = 1.0,
         map_occ_thresh: float = 0.5,
+        bag_presence_thresh: float = 0.5,
         hero_presence_thresh: float = 0.5,
+        passibility_thresh: float = 0.5,
+        safety_thresh: float = 0.5,
         map_deterministic: bool = True,
         glyph_top_k: int = 0,
         glyph_top_p: float = 1.0,
@@ -1272,6 +1368,8 @@ class MultiModalHackVAE(nn.Module):
         else:
             enc = None
 
+        B = z.size(0)
+        
         dec = self.decode(z)
 
         # --- Map sampling ---
@@ -1284,15 +1382,27 @@ class MultiModalHackVAE(nn.Module):
             class_top_k=class_top_k, class_top_p=class_top_p
         )
         
-        # Occupancy mask
-        occupy = (torch.sigmoid(dec["occupy_logits"]) > map_occ_thresh).float()  # [B,1,21,79]
-        
+        occupy_logit = dec["occupy_logits"]
         hero_presence_logit = dec["hero_presence_logits"]
-        if map_deterministic:
-            has_hero = (torch.sigmoid(hero_presence_logit) > hero_presence_thresh)  # [B]
-        else:
-            has_hero = torch.bernoulli(torch.sigmoid(hero_presence_logit))  # [B]
+        bag_presence_logit = dec["bag_logits"]
+        passibility_logit = dec["passability_logits"]
+        safety_logit = dec["safety_logits"]
         hero_centroid = dec["hero_centroid"]
+        if map_deterministic:
+            occupy = (torch.sigmoid(occupy_logit) > map_occ_thresh).float()  # [B,1,21,79]
+            has_hero = (torch.sigmoid(hero_presence_logit) > hero_presence_thresh)  # [B]
+            bag_presence = (torch.sigmoid(bag_presence_logit) > bag_presence_thresh)  # [B, GLYPH_DIM]
+            passibility_presence = (torch.sigmoid(passibility_logit) > passibility_thresh).float()  # [B, 8]
+            safety_presence = (torch.sigmoid(safety_logit) > safety_thresh).float()  # [B, 8]
+        else:
+            occupy = torch.bernoulli(torch.sigmoid(occupy_logit))  # [B,1,21,79]
+            has_hero = torch.bernoulli(torch.sigmoid(hero_presence_logit))  # [B]
+            bag_presence = torch.bernoulli(torch.sigmoid(bag_presence_logit))  # [B, GLYPH_DIM]
+            passibility_presence = torch.bernoulli(torch.sigmoid(passibility_logit))  # [B, 8]
+            safety_presence = torch.bernoulli(torch.sigmoid(safety_logit))  # [B, 8]
+        
+        bag_sets = bag_presence_to_glyph_sets(bag_presence)  # [B, bag_dim]
+        pass_grid, safe_grid = MapDecoder.format_passability_safety(passibility_presence, safety_presence)  # [B, 21, 79], [B, 21, 79]
 
         # --- Message sampling ---
         msg_tokens_out = MessageDecoder.sample_from_logits(
@@ -1323,17 +1433,23 @@ class MultiModalHackVAE(nn.Module):
             **ego_samples,
             "msg_tokens": msg_tokens_out,
             "stats_point": stats_point,
+            "bag_sets": bag_sets,
+            "passability_grid": pass_grid,
+            "safety_grid": safe_grid,
             "z": z,
         }
         if include_logits:
             out.update({
-                "occupy_logits": dec["occupy_logits"],
+                "occupy_logits": occupy_logit,
                 "ego_char_logits": dec["ego_char_logits"],
                 "ego_color_logits": dec["ego_color_logits"],
                 "ego_class_logits": dec["ego_class_logits"],
                 "hero_presence_logits": hero_presence_logit,
                 "hero_centroid": hero_centroid,
                 "msg_logits": dec["msg_logits"],
+                "bag_logits": bag_presence_logit,
+                "passability_logits": passibility_logit,
+                "safety_logits": safety_presence,
             })
         return out
         
@@ -1369,6 +1485,225 @@ def _message_ce_loss(logits: torch.Tensor, tgt: torch.Tensor, pad_id: int = MSG_
     ce = F.cross_entropy(logits.reshape(B*L, V), tgt.reshape(B*L), reduction='none').view(B, L)
     keep = (~mask).float()
     return (ce * keep).sum() / B
+
+@torch.no_grad()
+def jaccard_index_from_logits(
+    logits: torch.Tensor,          # [N, 1, H, W]
+    targets: torch.Tensor,         # [N, 1, H, W] float/bool {0,1}
+    mask: torch.Tensor | None = None,  # [N, 1, H, W] bool (optional)
+    threshold: float = 0.5
+) -> float:
+    """
+    Returns: Jaccard index (float)
+    """
+    probs = torch.sigmoid(logits)
+    preds = (probs >= threshold).float()
+    if mask is not None:
+        m = mask.float()
+        intersection = ((preds * targets).float() * m).sum()
+        union = (((preds + targets) >= 1.0).float() * m).sum()
+    else:
+        intersection = (preds * targets).float().sum()
+        union = ((preds + targets) >= 1.0).float().sum()
+    return intersection / union.clamp_min(1.0e-8)
+
+@torch.no_grad()
+def ego_metrics_from_logits(
+    logits: torch.Tensor,          # [N, C, k, k]
+    targets: torch.Tensor,         # [N, k, k] (long)
+    mask: torch.Tensor | None = None,  # [N] or [N,k,k] or [N,1,k,k] (bool)
+    ignore_index: int | None = None,
+    topk: tuple[int, ...] = (1, 3),
+    ece_bins: int = 15,
+) -> dict:
+    """
+    Computes robust multi-class metrics for imbalanced pixel labels.
+
+    Returns scalars:
+      - acc_top1, acc_topK (for K in topk)
+      - ece
+    """
+    assert logits.dim() == 4 and targets.dim() == 3, "Shapes: logits [N,C,k,k], targets [N,k,k]"
+    N, C, k, k2 = logits.shape
+    assert k == k2 and targets.shape == (N, k, k)
+
+    # --- build a pixel mask ---
+    if mask is None:
+        pix_mask = torch.ones((N, 1, k, k), dtype=torch.bool, device=logits.device)
+    else:
+        if mask.dim() == 1:      # [N]
+            pix_mask = mask.view(N, 1, 1, 1).expand(N, 1, k, k)
+        elif mask.dim() == 3:    # [N,k,k]
+            pix_mask = mask.unsqueeze(1).to(dtype=torch.bool)
+        elif mask.dim() == 4:    # [N,1,k,k] or [N,?,k,k]
+            pix_mask = mask[:, :1].to(dtype=torch.bool)
+        else:
+            raise ValueError(f"Bad mask shape: {tuple(mask.shape)}")
+
+    # Ignore index mask
+    if ignore_index is not None:
+        ig = (targets == ignore_index).unsqueeze(1)  # [N,1,k,k]
+        pix_mask = pix_mask & (~ig)
+
+    valid = pix_mask.squeeze(1)                      # [N,k,k] bool
+    num_valid = valid.sum()
+    if num_valid == 0:
+        returned_metrics = {}
+        for K in topk:
+            if K <= 1:
+                returned_metrics['acc_top1'] = 0.0
+            else:
+                returned_metrics[f'acc_top{K}'] = 0.0
+        returned_metrics['ece'] = 0.0
+        return returned_metrics
+
+    # --- flatten valid pixels ---
+    t = targets[valid]                               # [M]
+    l = logits.permute(0, 2, 3, 1)[valid]            # [M,C]
+    probs = F.softmax(l, dim=1)                      # [M,C]
+    pred_top1 = probs.argmax(dim=1)                  # [M]               
+
+    # --- top-k accuracy ---
+    metrics = {}
+    for K in topk:
+        if K <= 1:
+            acc = (pred_top1 == t).float().mean().item()
+            metrics[f'acc_top1'] = acc
+        else:
+            topk_idx = probs.topk(K, dim=1).indices   # [M,K]
+            correct = (topk_idx == t.view(-1,1)).any(dim=1).float().mean().item()
+            metrics[f'acc_top{K}'] = correct
+    
+    # --- ECE (Expected Calibration Error) on top-1 probs ---
+    conf, pred = probs.max(dim=1)            # [M]
+    correct = (pred == t).float()
+    # bin by confidence
+    bin_ids = torch.clamp((conf * ece_bins).long(), min=0, max=ece_bins-1)
+    ece = torch.tensor(0.0, device=logits.device)
+    for b in range(ece_bins):
+        m = (bin_ids == b)
+        n_b = m.sum()
+        if n_b > 0:
+            acc_b = correct[m].mean()
+            conf_b = conf[m].mean()
+            ece += (n_b.float() / conf.numel()) * (acc_b - conf_b).abs()
+    metrics['ego/ece'] = ece.item()
+
+    return metrics
+
+@torch.no_grad()
+def binary_accuracy_from_logits(
+    logits: torch.Tensor,          # [N, K]  (K=8 for N,S,E,W,NE,NW,SE,SW)
+    targets: torch.Tensor,         # [N, K]  float/bool {0,1}
+    mask: torch.Tensor | None = None,  # [N] bool (optional)
+    threshold: float = 0.5
+) -> dict:
+    """
+    Returns: {'acc': ..., 'acc_per_dim': Tensor[K]}
+    """
+    probs = torch.sigmoid(logits)
+    preds = (probs >= threshold).to(targets.dtype)
+    if mask is not None:
+        m = mask.view(-1, 1).float()
+        denom = m.sum().clamp_min(1.0)
+        correct = ((preds == targets).float() * m).sum()
+        acc_per_dim = ((preds == targets).float() * m).sum(dim=0) / m.sum(dim=0).clamp_min(1.0)
+    else:
+        denom = torch.tensor(float(logits.shape[0]), device=logits.device)
+        correct = (preds == targets).float().sum()
+        acc_per_dim = (preds == targets).float().mean(dim=0)
+    return {
+        'acc': (correct / (denom * logits.shape[1])).item(),
+        'acc_per_dim': acc_per_dim.detach().cpu()
+    }
+    
+@torch.no_grad()
+def goal_metrics(
+    pred_vec: torch.Tensor,     # [N, 2] (x,y) in [-1,1], typically tanh output
+    tgt_vec: torch.Tensor,      # [N, 2] (x,y) in [-1,1]
+    mask: torch.Tensor | None = None,  # [N] bool
+    map_W: int = 79, map_H: int = 21
+) -> dict:
+    """
+    Computes:
+      - mae_tiles_x/y: per-axis MAE in *tiles*
+      - mae_tiles_L2: Euclidean MAE in tiles
+      - angle_mae_deg / angle_med_deg: angular error in degrees
+    """
+    p = pred_vec
+    t = tgt_vec
+    if mask is not None:
+        m = mask.view(-1,1).float()
+        denom = m.sum().clamp_min(1.0)
+        p = p * m; t = t * m
+    else:
+        denom = torch.tensor(float(p.shape[0]), device=p.device)
+
+    # scale normalized [-1,1] vectors to tile units (half-extent = W/2, H/2)
+    dx_tiles = (p[:,0] - t[:,0]) * (map_W - 1)
+    dy_tiles = (p[:,1] - t[:,1]) * (map_H - 1)
+
+    mae_x = dx_tiles.abs().sum() / denom
+    mae_y = dy_tiles.abs().sum() / denom
+    mae_L2 = torch.sqrt(dx_tiles**2 + dy_tiles**2).sum() / denom
+
+    # angle error (wrap to [-180, 180])
+    ang_p = torch.atan2(p[:,1].clamp(-1,1), p[:,0].clamp(-1,1))  # radians
+    ang_t = torch.atan2(t[:,1].clamp(-1,1), t[:,0].clamp(-1,1))
+    d = (ang_p - ang_t) * (180.0 / math.pi)
+    d = ( (d + 180.0) % 360.0 ) - 180.0
+    if mask is not None:
+        m1 = mask.float()
+        angle_mae = d.abs().sum() / m1.sum().clamp_min(1.0)
+        angle_med = d.abs()[m1.bool()].median() if m1.sum() > 0 else torch.tensor(0.0)
+    else:
+        angle_mae = d.abs().mean()
+        angle_med = d.abs().median()
+
+    return {
+        'goal_mae_tiles_x': mae_x.item(),
+        'goal_mae_tiles_y': mae_y.item(),
+        'goal_mae_tiles_L2': mae_L2.item(),
+        'goal_angle_mae_deg': angle_mae.item(),
+        'goal_angle_med_deg': angle_med.item(),
+    }
+    
+@torch.no_grad()
+def dynamics_metrics(
+    z_next_pred: torch.Tensor,   # [P, Z]
+    z_next_true: torch.Tensor,   # [P, Z] (detached target)
+) -> dict:
+    """
+    Returns mean/median cosine similarity and R^2 (overall and per-dim mean).
+    """
+    # cosine per pair
+    cos = F.cosine_similarity(z_next_pred, z_next_true, dim=1)  # [P]
+    cos_mean = cos.mean().item()
+    cos_median = cos.median().item()
+
+    # R^2 overall (flatten across dims)
+    y = z_next_true
+    y_hat = z_next_pred
+    y_bar = y.mean()
+    ss_res = ((y - y_hat)**2).sum()
+    ss_tot = ((y - y_bar)**2).sum().clamp_min(1e-8)
+    r2_overall = (1.0 - ss_res / ss_tot).item()
+
+    # R^2 per-dimension then averaged (more robust to dim scaling)
+    y_mean_dim = y.mean(dim=0, keepdim=True)
+    ss_res_d = ((y - y_hat)**2).sum(dim=0)
+    ss_tot_d = ((y - y_mean_dim)**2).sum(dim=0).clamp_min(1e-8)
+    r2_per_dim = (1.0 - ss_res_d / ss_tot_d)
+    r2_mean_dim = r2_per_dim.mean().item()
+    r2_median_dim = r2_per_dim.median().item()
+
+    return {
+        'dyn_cosine_mean': cos_mean,
+        'dyn_cosine_median': cos_median,
+        'dyn_r2_overall': r2_overall,
+        'dyn_r2_mean_dim': r2_mean_dim,
+        'dyn_r2_median_dim': r2_median_dim
+    }
 
 def vae_loss(
     model_output: Dict[str, torch.Tensor],
@@ -1517,6 +1852,7 @@ def vae_loss(
     
     # ============= Raw Reconstruction Losses =============
     raw_losses = {}
+    metrics = {}
     
     # Glyph reconstruction (chars + colors)
     H, W = glyph_chars.shape[1], glyph_chars.shape[2]
@@ -1529,21 +1865,22 @@ def vae_loss(
     hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen], blstats[valid_screen]) # [valid_B], [valid_B,2]
     
     # ---- hero presence + centroid ----
-    hero_bce = F.binary_cross_entropy_with_logits(hero_presence_logits, hero_p_t, pos_weight=torch.full_like(hero_presence_logits, 10))  # [valid_B]
-    hero_mse = ((hero_centroid - hero_c_t) ** 2).sum(dim=1) # [valid_B,2] -> [valid_B]
+    hero_bce = F.binary_cross_entropy_with_logits(hero_presence_logits, hero_p_t, pos_weight=torch.full_like(hero_presence_logits, 10), reduction='none')  # [valid_B]
+    hero_mse = ((hero_centroid - hero_c_t) ** 2).sum(dim=1) * hero_p_t # [valid_B,2] -> [valid_B]
     hero_loss = hero_bce + 5.0 * hero_mse
     raw_losses['hero_loc'] = hero_loss.mean()  # Average over valid samples
 
     # occupancy focal BCE (mean over pixels)
     #occ_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), occ_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
-    fg_rate = 0.25
     with torch.no_grad():
         pos = occ_t.sum()
         neg = occ_t.numel() - pos
         pos_weight = (neg / pos).clamp(max=10.0)
+    pos_weight = torch.tensor(10.0, device=occupy_logits.device)
     occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, occ_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2,3])  # [valid_B]
     assert occ_loss_per_sample.shape == (valid_B,), f"occupy loss shape mismatch: {occ_loss_per_sample.shape} != ({valid_B},)"
     raw_losses['occupy'] = occ_loss_per_sample.mean()  # Average over valid samples
+    metrics['metrics/occupy_jaccard'] = jaccard_index_from_logits(occupy_logits, occ_t, threshold=0.5)
     
     # ---- bag presence BCE (weighted) ----
     # weights: de-emphasize very common chars
@@ -1564,6 +1901,7 @@ def vae_loss(
     bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='none').sum(dim=1).mean()
     
     raw_losses['bag'] = bag_bce
+    metrics['metrics/bag_jaccard'] = jaccard_index_from_logits(bag_logits.unsqueeze(1), bag_t.unsqueeze(1), threshold=0.5)
     
     sp = model_output['stats_pred']
     # Filter stats_pred by valid_screen to match target dimensions
@@ -1616,12 +1954,32 @@ def vae_loss(
         ego_class_targets[i] = ego_class
     
     # Compute ego losses using on-the-fly targets
-    raw_losses['ego_char'] = F.cross_entropy(ego_char_logits, ego_char_targets, reduction='none').sum(dim=[1,2]).mean()
-    raw_losses['ego_color'] = F.cross_entropy(ego_color_logits, ego_color_targets, reduction='none').sum(dim=[1,2]).mean()
-    raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, ego_class_targets, reduction='none').sum(dim=[1,2]).mean()
+    ego_char_weight = torch.ones(CHAR_DIM, device=ego_char_targets.device)
+    for ch in COMMON_CHARS:
+        ci = ch - 32
+        if 0 <= ci < CHAR_DIM:
+            ego_char_weight[ci] = 0.1
+    ego_char_weight[0] = 0.01  # downweight space char even more
+    raw_losses['ego_char'] = F.cross_entropy(ego_char_logits, ego_char_targets, weight=ego_char_weight, reduction='none').sum(dim=[1,2]).mean()
+    ego_color_weight = torch.ones(COLOR_DIM, device=ego_color_targets.device)
+    ego_color_weight[7] = 0.5  # downweight common color (gray)
+    raw_losses['ego_color'] = F.cross_entropy(ego_color_logits, ego_color_targets, weight=ego_color_weight, reduction='none').sum(dim=[1,2]).mean()
+    ego_class_weight = torch.ones(NetHackCategory.get_category_count(), device=ego_class_targets.device)
+    ego_class_weight[:4] = 0.1  # downweight very common classes (space, wall, door, floor)
+    raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, ego_class_targets, weight=ego_class_weight, reduction='none').sum(dim=[1,2]).mean()
+
+    ego_char_metrics = ego_metrics_from_logits(ego_char_logits, ego_char_targets, topk=(1,3))
+    ego_color_metrics = ego_metrics_from_logits(ego_color_logits, ego_color_targets, topk=(1,3))
+    ego_class_metrics = ego_metrics_from_logits(ego_class_logits, ego_class_targets, topk=(1,3))
+    
+    metrics.update({f'metrics/ego_char/{k}': v for k, v in ego_char_metrics.items()})
+    metrics.update({f'metrics/ego_color/{k}': v for k, v in ego_color_metrics.items()})
+    metrics.update({f'metrics/ego_class/{k}': v for k, v in ego_class_metrics.items()})
 
     if 'passability_target' in batch:
         raw_losses['passability'] = F.binary_cross_entropy_with_logits(passibility_logits, batch['passability_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
+        pass_metrics = binary_accuracy_from_logits(passibility_logits, batch['passability_target'][valid_screen])
+        metrics.update({f'metrics/passability/{k}': v for k, v in pass_metrics.items()})
 
     if 'reward_target' in batch:
         raw_losses['reward'] = F.mse_loss(reward, batch['reward_target'][valid_screen], reduction='mean')
@@ -1637,12 +1995,16 @@ def vae_loss(
     # --- Safety risk (8 dirs) ---
     if 'safety_target' in batch:
         raw_losses['safety'] = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
+        safety_metrics = binary_accuracy_from_logits(safety_logits, batch['safety_target'][valid_screen])
+        metrics.update({f'metrics/safety/{k}': v for k, v in safety_metrics.items()})
 
     # --- Goal direction ---
     if ('goal_target' in batch) and ('goal_pred' in model_output):
         goal_pred_filtered = model_output['goal_pred'][valid_screen] if 'goal_pred' in model_output else None
         if goal_pred_filtered is not None:
             raw_losses['goal'] = F.mse_loss(goal_pred_filtered, batch['goal_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
+            goal_metrics_dict = goal_metrics(goal_pred_filtered, batch['goal_target'][valid_screen], mask=batch.get('goal_mask')[valid_screen], map_W=79, map_H=21)
+            metrics.update({f'metrics/goal/{k}': v for k, v in goal_metrics_dict.items()})
 
     # --- Dynamics ---
     has_next_mask = batch['has_next_for_dynamics'][valid_screen_for_dynamics]  # [B*(T-1)]
@@ -1654,6 +2016,8 @@ def vae_loss(
         mse = F.mse_loss(latent_pred_filtered, z_next_tgt, reduction='none').sum(dim=1).mean()  # Mean over valid samples
         cos = 1.0 - F.cosine_similarity(latent_pred_filtered, z_next_tgt, dim=1).mean()
         raw_losses['forward'] = (0.5 * (mse + cos))
+        forward_metrics = dynamics_metrics(latent_pred_filtered, z_next_tgt)
+        metrics.update({f'metrics/forward/{k}': v for k, v in forward_metrics.items()})
 
     # Inverse dynamics: predict action from z_current and z_next
     if inverse_dynamics_logits is not None:
@@ -1662,6 +2026,8 @@ def vae_loss(
         action_tgt = batch['action_onehot_for_dynamics'][valid_screen_for_dynamics][has_next_mask]
         ce = F.cross_entropy(inverse_logits_filtered, action_tgt.argmax(dim=1).long(), reduction='mean')
         raw_losses['inverse'] = ce
+        inv_metrics = ego_metrics_from_logits(inverse_logits_filtered.view(*inverse_logits_filtered.shape, 1, 1), action_tgt.argmax(dim=1).long().view(*action_tgt.argmax(dim=1).shape, 1, 1), topk=(1,3))
+        metrics.update({f'metrics/inverse/{k}': v for k, v in inv_metrics.items()})
 
     # Sum raw reconstruction losses
     total_raw_loss = sum(raw_losses[k] * config.raw_modality_weights.get(k, 1.0) for k in raw_losses)
@@ -1757,5 +2123,6 @@ def vae_loss(
         'total_raw_loss': total_raw_loss,
         'kl_loss': kl_loss,
         'raw_losses': raw_losses,
-        'kl_diagnosis': kl_diagnosis
+        'kl_diagnosis': kl_diagnosis,
+        'metrics': metrics
     }

@@ -444,20 +444,40 @@ def load_model_from_local(
         print(f"📥 Loading model from local checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
-        # Extract model configuration from checkpoint
-        model_config = {
-            "bInclude_glyph_bag": checkpoint.get('model_config', {}).get('bInclude_glyph_bag', True),
-            "bInclude_hero": checkpoint.get('model_config', {}).get('bInclude_hero', True),
-            "dropout_rate": checkpoint.get('model_config', {}).get('dropout_rate', 0.1),
-            "enable_dropout_on_latent": checkpoint.get('model_config', {}).get('enable_dropout_on_latent', True),
-            "enable_dropout_on_decoder": checkpoint.get('model_config', {}).get('enable_dropout_on_decoder', True),
-        }
+        # Check if we have a modern VAEConfig in the checkpoint
+        if 'config' in checkpoint and hasattr(checkpoint['config'], 'latent_dim'):
+            # Modern checkpoint with VAEConfig
+            config = checkpoint['config']
+            print(f"🏗️  Using saved VAEConfig from checkpoint")
+        else:
+            # Legacy checkpoint - create VAEConfig from old parameters
+            print(f"🔄 Converting legacy checkpoint to VAEConfig")
+            from src.model import VAEConfig
+            
+            # Extract legacy parameters with defaults
+            model_config_dict = checkpoint.get('model_config', {})
+            
+            # Create VAEConfig with legacy parameter mapping
+            config = VAEConfig(
+                latent_dim=model_config_dict.get('latent_dim', 96),
+                encoder_dropout=model_config_dict.get('dropout_rate', 0.1),
+                decoder_dropout=model_config_dict.get('dropout_rate', 0.1),
+                low_rank=model_config_dict.get('lowrank_dim', 0),
+                # Use defaults for other parameters
+            )
+            print(f"🏗️  Created VAEConfig from legacy parameters")
         
-        # Override with any provided kwargs
-        model_config.update(model_kwargs)
+        # Apply any overrides from model_kwargs
+        if model_kwargs:
+            print(f"🔧 Applying config overrides: {model_kwargs}")
+            for key, value in model_kwargs.items():
+                if hasattr(config, key):
+                    setattr(config, key, value)
+                else:
+                    print(f"⚠️  Unknown config parameter ignored: {key}={value}")
         
-        print(f"🏗️  Initializing model with config: {model_config}")
-        model = MultiModalHackVAE(**model_config)
+        print(f"🏗️  Initializing model with VAEConfig (latent_dim={config.latent_dim})")
+        model = MultiModalHackVAE(config=config)
         
         # Load state dict
         print(f"⚡ Loading model weights...")
@@ -540,24 +560,53 @@ def load_model_from_huggingface(
             revision=revision_name
         )
         
-        # Initialize model with config (allow kwargs to override)
-        model_config = {
-            "bInclude_glyph_bag": config.get("bInclude_glyph_bag", True),
-            "bInclude_hero": config.get("bInclude_hero", True),
-            "dropout_rate": config.get("dropout_rate", 0.1),
-            "enable_dropout_on_latent": config.get("enable_dropout_on_latent", True),
-            "enable_dropout_on_decoder": config.get("enable_dropout_on_decoder", True),
-        }
+        # Load checkpoint to check format
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         
-        # Override with any provided kwargs
-        model_config.update(model_kwargs)
+        # Check if we have a modern VAEConfig in the config or checkpoint
+        if 'config' in checkpoint and hasattr(checkpoint['config'], 'latent_dim'):
+            # Modern checkpoint with VAEConfig
+            vae_config = checkpoint['config']
+            print(f"🏗️  Using saved VAEConfig from checkpoint")
+        elif 'latent_dim' in config:
+            # Modern config format
+            from src.model import VAEConfig
+            vae_config = VAEConfig(
+                latent_dim=config.get('latent_dim', 96),
+                encoder_dropout=config.get('encoder_dropout', 0.1),
+                decoder_dropout=config.get('decoder_dropout', 0.1),
+                low_rank=config.get('low_rank', 0),
+            )
+            print(f"🏗️  Created VAEConfig from modern config format")
+        else:
+            # Legacy config format - create VAEConfig from old parameters
+            print(f"🔄 Converting legacy HuggingFace config to VAEConfig")
+            from src.model import VAEConfig
+            
+            # Create VAEConfig with legacy parameter mapping
+            vae_config = VAEConfig(
+                latent_dim=config.get('latent_dim', 96),
+                encoder_dropout=config.get('dropout_rate', 0.1),
+                decoder_dropout=config.get('dropout_rate', 0.1),
+                low_rank=config.get('lowrank_dim', 0),
+                # Use defaults for other parameters
+            )
+            print(f"🏗️  Created VAEConfig from legacy parameters")
         
-        print(f"🏗️  Initializing model with config: {model_config}")
-        model = MultiModalHackVAE(**model_config)
+        # Apply any overrides from model_kwargs
+        if model_kwargs:
+            print(f"🔧 Applying config overrides: {model_kwargs}")
+            for key, value in model_kwargs.items():
+                if hasattr(vae_config, key):
+                    setattr(vae_config, key, value)
+                else:
+                    print(f"⚠️  Unknown config parameter ignored: {key}={value}")
+        
+        print(f"🏗️  Initializing model with VAEConfig (latent_dim={vae_config.latent_dim})")
+        model = MultiModalHackVAE(config=vae_config)
         
         # Load state dict
         print(f"⚡ Loading model weights...")
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         
         # Handle different checkpoint formats
         if 'model_state_dict' in checkpoint:

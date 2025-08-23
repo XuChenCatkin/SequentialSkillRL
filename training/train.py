@@ -735,7 +735,10 @@ def train_multimodalhack_vae(
                         "model/kl_eigenval": safe_tensor_for_wandb(kl_eig),
                         "model/kl_eigenval_max": kl_eig.max().item(),
                         "model/kl_eigenval_min": kl_eig.min().item(),
-                        "model/kl_eigenval_exceed_0.2": (kl_eig > 0.2).sum().item() / kl_eig.numel()
+                        "model/kl_eigenval_exceed_0.2": (kl_eig > 0.2).sum().item() / kl_eig.numel(),
+                        
+                        # Metrics
+                        **{f"train/{k}": v for k, v in train_loss_dict.get('metrics', {}).items()}
                     }
                     wandb.log(wandb_log_dict)
 
@@ -834,6 +837,9 @@ def train_multimodalhack_vae(
                         "test/raw_loss/inverse_dynamics": test_loss_dict['raw_losses'].get('inverse', torch.tensor(0.0)).item(),
 
                         "test/kl_loss": test_loss_dict['kl_loss'].item(),
+                        
+                        # Metrics
+                        **{f"test/{k}": v for k, v in test_loss_dict.get('metrics', {}).items()}
                     }
                     wandb.log(wandb_log_dict)
         
@@ -1242,13 +1248,17 @@ def create_visualization_demo(
     # Map sampling parameters
     map_temperature: float = 1.0,
     map_occ_thresh: float = 0.5,
-    rare_occ_thresh: float = 0.5,
+    bag_presence_thresh: float = 0.5,
     hero_presence_thresh: float = 0.5,
+    passibility_thresh: float = 0.5,
+    safety_thresh: float = 0.5,
     map_deterministic: bool = True,
     glyph_top_k: int = 0,
     glyph_top_p: float = 1.0,
     color_top_k: int = 0,
     color_top_p: float = 1.0,
+    class_top_k: int = 0,
+    class_top_p: float = 1.0,
     # Message sampling parameters
     msg_temperature: float = 1.0,
     msg_top_k: int = 0,
@@ -1390,13 +1400,17 @@ def create_visualization_demo(
             # Map sampling parameters (map legacy params)
             map_temperature=map_temperature,  # Legacy: temperature -> map_temperature
             map_occ_thresh=map_occ_thresh,
-            rare_occ_thresh=rare_occ_thresh,
+            bag_presence_thresh=bag_presence_thresh,
             hero_presence_thresh=hero_presence_thresh,
+            passibility_thresh=passibility_thresh,
+            safety_thresh=safety_thresh,
             map_deterministic=map_deterministic,
             glyph_top_k=glyph_top_k,  # Legacy: top_k -> glyph_top_k
             glyph_top_p=glyph_top_p,  # Legacy: top_p -> glyph_top_p
             color_top_k=color_top_k,
             color_top_p=color_top_p,
+            class_top_k=class_top_k,
+            class_top_p=class_top_p,
             # Message sampling parameters
             msg_temperature=msg_temperature,
             msg_top_k=msg_top_k,
@@ -1426,13 +1440,17 @@ def create_visualization_demo(
             # Map sampling parameters (map legacy params)
             map_temperature=map_temperature,  # Legacy: temperature -> map_temperature
             map_occ_thresh=map_occ_thresh,
-            rare_occ_thresh=rare_occ_thresh,
+            bag_presence_thresh=bag_presence_thresh,
             hero_presence_thresh=hero_presence_thresh,
+            passibility_thresh=passibility_thresh,
+            safety_thresh=safety_thresh,
             map_deterministic=map_deterministic,
             glyph_top_k=glyph_top_k,  # Legacy: top_k -> glyph_top_k
             glyph_top_p=glyph_top_p,  # Legacy: top_p -> glyph_top_p
             color_top_k=color_top_k,
             color_top_p=color_top_p,
+            class_top_k=class_top_k,
+            class_top_p=class_top_p,
             # Message sampling parameters
             msg_temperature=msg_temperature,
             msg_top_k=msg_top_k,
@@ -1988,9 +2006,18 @@ if __name__ == "__main__":
                 random_seed=50,  # For reproducible results
                 use_mean=True,  # Use mean for latent space
                 map_occ_thresh=0.5,
-                rare_occ_thresh=0.5,
+                bag_presence_thresh=0.5,
                 hero_presence_thresh=0.2,
-                map_deterministic=True  # Use deterministic sampling for maps
+                passibility_thresh=0.5,
+                safety_thresh=0.5,
+                map_temperature=1.0,
+                map_deterministic=False,  # Use deterministic sampling for maps
+                glyph_top_k=5,
+                glyph_top_p=0.9,
+                color_top_k=5,
+                color_top_p=0.9,
+                class_top_k=5,
+                class_top_p=0.9,
             )
             print(f"✅ Demo completed successfully!")
             print(f"📁 Results saved to: {results['save_dir']}")
@@ -2184,15 +2211,15 @@ if __name__ == "__main__":
         }
 
         vae_config = VAEConfig(
-            initial_mi_beta=0.0,
-            final_mi_beta=0.0,
+            initial_mi_beta=1.0,
+            final_mi_beta=1.0,
             mi_beta_shape='constant',
-            initial_tc_beta=10.0,
-            final_tc_beta=10.0,
+            initial_tc_beta=5.0,
+            final_tc_beta=5.0,
             tc_beta_shape='constant',
             initial_dw_beta=0.2,
             final_dw_beta=1.0,
-            dw_beta_shape='linear',
+            dw_beta_shape='custom',
             warmup_epoch_ratio=0.2,
             free_bits=0.15,
             encoder_dropout=0.1,

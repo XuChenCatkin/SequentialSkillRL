@@ -3,6 +3,8 @@ import numpy as np
 import torch
 from nle.nethack import tty_render
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import seaborn as sns
 import math
 import datetime as dt
 from pathlib import Path
@@ -10,6 +12,18 @@ from PIL import Image, ImageDraw, ImageFont
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import random
+from typing import List, Tuple, Dict
+
+from src.model import bag_presence_to_glyph_sets, make_pair_bag, MapDecoder
+
+# Import NetHackCategory from data_collection
+try:
+    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, compute_passability_and_safety
+except ImportError:
+    try:
+        from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, compute_passability_and_safety
+    except ImportError:
+        raise ImportError("Could not import NetHackCategory from data_collection module.")
 
 # xterm-ish 16-color palette (0–7 normal, 8–15 bright)
 ANSI_16_RGB = [
@@ -124,6 +138,369 @@ def save_maps_and_markdown(
 
     print(f"Wrote Markdown: {md_path}")
 
+def _render_ego_class_grid(ego_class: torch.Tensor, save_path: str = None) -> np.ndarray:
+    """
+    Render ego class predictions as a colored grid.
+    
+    Args:
+        ego_class: [k, k] tensor with class indices
+        save_path: Optional path to save the image
+        
+    Returns:
+        Rendered image as numpy array
+    """
+    k = ego_class.shape[0]
+    ego_class_np = ego_class.cpu().numpy()
+    
+    # Create a colormap for the classes
+    num_classes = NetHackCategory.get_category_count()
+    colors = plt.cm.tab20(np.linspace(0, 1, num_classes))
+    
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))  # Slightly wider to accommodate colorbar better
+    
+    # Create colored grid
+    colored_grid = np.zeros((k, k, 3))
+    for i in range(k):
+        for j in range(k):
+            class_idx = ego_class_np[i, j]
+            if 0 <= class_idx < num_classes:
+                colored_grid[i, j] = colors[class_idx][:3]
+    
+    im = ax.imshow(colored_grid, interpolation='nearest', vmin=0, vmax=num_classes-1)
+    
+    # Add text annotations with class numbers
+    for i in range(k):
+        for j in range(k):
+            class_idx = ego_class_np[i, j]
+            color = 'white' if np.mean(colored_grid[i, j]) < 0.5 else 'black'
+            ax.text(j, i, str(class_idx), ha='center', va='center', 
+                   color=color, fontsize=10, fontweight='bold')
+    
+    ax.set_title(f'Ego Class Predictions ({k}x{k})', fontsize=14)
+    ax.set_xticks(range(k))
+    ax.set_yticks(range(k))
+    ax.grid(True, alpha=0.3)
+    
+    # Add colorbar with fixed range to ensure consistency
+    import matplotlib.colors as mcolors
+    cmap = plt.cm.tab20
+    norm = mcolors.Normalize(vmin=0, vmax=num_classes-1)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, shrink=0.8, aspect=20)
+    cbar.set_label('Class Categories', fontsize=12)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        return None
+    
+    # Convert to numpy array for return (only if not saving)
+    fig.canvas.draw()
+    # Use modern matplotlib method for getting canvas data
+    buf = fig.canvas.buffer_rgba()
+    img_array = np.asarray(buf)
+    # Convert RGBA to RGB by dropping alpha channel
+    img_array = img_array[:, :, :3]
+    plt.close()
+    return img_array
+
+def _render_passability_safety_grid(
+    passability_grid: torch.Tensor, 
+    safety_grid: torch.Tensor, 
+    save_path: str = None
+) -> np.ndarray:
+    """
+    Render passability and safety as 3x3 grids with '@' in center.
+    
+    Args:
+        passability_grid: [3, 3] tensor with passability probabilities
+        safety_grid: [3, 3] tensor with safety probabilities  
+        save_path: Optional path to save the image
+        
+    Returns:
+        Rendered image as numpy array
+    """
+    pass_np = passability_grid.cpu().numpy()
+    safe_np = safety_grid.cpu().numpy()
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    
+    # Passability grid
+    im1 = ax1.imshow(pass_np, cmap='summer', vmin=0, vmax=1, interpolation='nearest')
+    ax1.set_title('Passability')
+    
+    # Add text annotations
+    for i in range(3):
+        for j in range(3):
+            if i == 1 and j == 1:  # Center position
+                ax1.text(j, i, '@', ha='center', va='center', 
+                        color='black', fontsize=20, fontweight='bold')
+            else:
+                value = pass_np[i, j]
+                color = 'white' if value < 0.5 else 'black'
+                ax1.text(j, i, f'{value:.2f}', ha='center', va='center', 
+                        color=color, fontsize=12, fontweight='bold')
+    
+    ax1.set_xticks(range(3))
+    ax1.set_yticks(range(3))
+    ax1.grid(True, alpha=0.3)
+    
+    # Safety grid
+    im2 = ax2.imshow(safe_np, cmap='summer', vmin=0, vmax=1, interpolation='nearest')
+    ax2.set_title('Safety')
+    
+    # Add text annotations
+    for i in range(3):
+        for j in range(3):
+            if i == 1 and j == 1:  # Center position
+                ax2.text(j, i, '@', ha='center', va='center', 
+                        color='black', fontsize=20, fontweight='bold')
+            else:
+                value = safe_np[i, j]
+                color = 'white' if value < 0.5 else 'black'
+                ax2.text(j, i, f'{value:.2f}', ha='center', va='center', 
+                        color=color, fontsize=12, fontweight='bold')
+    
+    ax2.set_xticks(range(3))
+    ax2.set_yticks(range(3))
+    ax2.grid(True, alpha=0.3)
+    
+    # Add colorbars
+    plt.colorbar(im1, ax=ax1, shrink=0.6)
+    plt.colorbar(im2, ax=ax2, shrink=0.6)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    # Convert to numpy array for return
+    fig.canvas.draw()
+    # Use modern matplotlib method for getting canvas data
+    buf = fig.canvas.buffer_rgba()
+    img_array = np.asarray(buf)
+    # Convert RGBA to RGB by dropping alpha channel
+    img_array = img_array[:, :, :3]
+    
+    if not save_path:
+        plt.close()
+    
+    return img_array
+
+def _format_bag_reconstruction(bag_data: Tuple) -> str:
+    """
+    Format bag reconstruction data into readable text.
+    
+    Args:
+        bag_data: Tuple of (bag_original, bag_reconstruction) where each is a set of (char_ascii, color_idx) tuples
+        
+    Returns:
+        Formatted string representation
+    """
+    if not bag_data or len(bag_data) != 2:
+        return "No bag data available"
+    
+    bag_original, bag_reconstruction = bag_data
+    
+    if not bag_original and not bag_reconstruction:
+        return "Both original and reconstructed bags are empty"
+    
+    lines = [f"Bag Analysis:"]
+    lines.append("=" * 40)
+    
+    # Format original bag
+    lines.append(f"\nOriginal Bag ({len(bag_original)} items):")
+    lines.append("-" * 30)
+    if bag_original:
+        for char_ascii, color_idx in sorted(bag_original):
+            char_str = chr(char_ascii) if 32 <= char_ascii <= 126 else f"\\x{char_ascii:02x}"
+            lines.append(f"  '{char_str}' (color {color_idx:2d})")
+    else:
+        lines.append("  (empty)")
+    
+    # Format reconstructed bag
+    lines.append(f"\nReconstructed Bag ({len(bag_reconstruction)} items):")
+    lines.append("-" * 30)
+    if bag_reconstruction:
+        for char_ascii, color_idx in sorted(bag_reconstruction):
+            char_str = chr(char_ascii) if 32 <= char_ascii <= 126 else f"\\x{char_ascii:02x}"
+            lines.append(f"  '{char_str}' (color {color_idx:2d})")
+    else:
+        lines.append("  (empty)")
+    
+    # Calculate accuracy metrics
+    lines.append(f"\nAccuracy Metrics:")
+    lines.append("-" * 30)
+    
+    # Items in both (correct predictions)
+    correct_items = bag_original & bag_reconstruction
+    lines.append(f"  Correctly predicted: {len(correct_items)} items")
+    if correct_items:
+        for char_ascii, color_idx in sorted(correct_items):
+            char_str = chr(char_ascii) if 32 <= char_ascii <= 126 else f"\\x{char_ascii:02x}"
+            lines.append(f"    '{char_str}' (color {color_idx:2d})")
+    
+    # Items only in original (missed items)
+    missed_items = bag_original - bag_reconstruction
+    lines.append(f"  Missed items: {len(missed_items)} items")
+    if missed_items:
+        for char_ascii, color_idx in sorted(missed_items):
+            char_str = chr(char_ascii) if 32 <= char_ascii <= 126 else f"\\x{char_ascii:02x}"
+            lines.append(f"    '{char_str}' (color {color_idx:2d})")
+    
+    # Items only in reconstruction (false positives)
+    false_positive_items = bag_reconstruction - bag_original
+    lines.append(f"  False positives: {len(false_positive_items)} items")
+    if false_positive_items:
+        for char_ascii, color_idx in sorted(false_positive_items):
+            char_str = chr(char_ascii) if 32 <= char_ascii <= 126 else f"\\x{char_ascii:02x}"
+            lines.append(f"    '{char_str}' (color {color_idx:2d})")
+    
+    # Calculate accuracy percentages
+    total_unique_items = len(bag_original | bag_reconstruction)
+    if total_unique_items > 0:
+        precision = len(correct_items) / len(bag_reconstruction) if bag_reconstruction else 0.0
+        recall = len(correct_items) / len(bag_original) if bag_original else 1.0 if not bag_reconstruction else 0.0
+        f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        lines.append(f"\nPerformance Summary:")
+        lines.append("-" * 30)
+        lines.append(f"  Precision: {precision:.3f} ({len(correct_items)}/{len(bag_reconstruction)})")
+        lines.append(f"  Recall: {recall:.3f} ({len(correct_items)}/{len(bag_original)})")
+        lines.append(f"  F1-Score: {f1_score:.3f}")
+        lines.append(f"  Total unique items: {total_unique_items}")
+    
+    return "\n".join(lines)
+
+def save_enhanced_reconstructions(
+    originals, 
+    reconstructions, 
+    bag_data, 
+    pass_data,
+    safe_data,
+    out_dir="vae_analysis",
+    md_filename="enhanced_recon_comparison.md",
+    img_file_prefix="",
+    font_path=None,
+    font_size=18,
+    bg=(0,0,0),
+    title="Enhanced VAE Reconstruction Comparison",
+):
+    """
+    Save enhanced reconstructions including ego, bag, and passability/safety data.
+    
+    Args:
+        originals: List of (char_orig, color_orig) pairs
+        reconstructions: List of (char_recon, color_recon) pairs  
+        ego_data: List of ego reconstruction data per sample
+        bag_data: List of bag reconstruction data per sample
+        pass_data: List of passability data per sample
+        safe_data: List of safety data per sample
+        ... (other args same as save_maps_and_markdown)
+    """
+    out_dir = Path(out_dir)
+    img_dir = out_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write enhanced markdown
+    md_path = out_dir / md_filename
+    with md_path.open("w", encoding="utf-8") as md:
+        md.write(f"# {title}\n\n")
+        md.write(f"_Generated: {dt.datetime.now().isoformat(timespec='seconds')}_\n\n")
+        md.write("This analysis includes the following reconstructions:\n")
+        md.write("- **Ego View**: Character, color, and class predictions in ego-centric window\n")
+        md.write("- **Bag Elements**: High-probability glyph elements\n")
+        md.write("- **Passability/Safety**: 3x3 grids around hero position\n\n")
+
+        for i, (orig, recon) in enumerate(zip(originals, reconstructions)):
+            char_orig, color_orig, class_orig = orig
+            char_recon, color_recon, class_recon = recon
+
+            # Main map reconstruction
+            img_o = _render_map_image(char_orig, color_orig, font_path=font_path, font_size=font_size, bg=bg)
+            img_r = _render_map_image(char_recon, color_recon, font_path=font_path, font_size=font_size, bg=bg)
+
+            fn_o = f"{img_file_prefix}sample_{i:03d}_orig.png"
+            fn_r = f"{img_file_prefix}sample_{i:03d}_recon.png"
+            img_o.save(img_dir / fn_o)
+            img_r.save(img_dir / fn_r)
+
+            # Ego class grid
+            fn_ego_class_orig = f"{img_file_prefix}sample_{i:03d}_ego_class_orig.png"
+            _render_ego_class_grid(class_orig, save_path=str(img_dir / fn_ego_class_orig))
+
+            # Ego class grid
+            fn_ego_class_recon = f"{img_file_prefix}sample_{i:03d}_ego_class_recon.png"
+            _render_ego_class_grid(class_recon, save_path=str(img_dir / fn_ego_class_recon))
+
+            # Passability/Safety grids
+            if i < len(pass_data) and pass_data[i] is not None and i < len(safe_data) and safe_data[i] is not None:
+                pass_grid, pass_grid_recon = pass_data[i]
+                safe_grid, safe_grid_recon = safe_data[i]
+                fn_pass_safe_orig = f"{img_file_prefix}sample_{i:03d}_pass_safe_orig.png"
+                fn_pass_safe_recon = f"{img_file_prefix}sample_{i:03d}_pass_safe_recon.png"
+                _render_passability_safety_grid(pass_grid, safe_grid, save_path=str(img_dir / fn_pass_safe_orig))
+                _render_passability_safety_grid(pass_grid_recon, safe_grid_recon, save_path=str(img_dir / fn_pass_safe_recon))
+
+            # Markdown section
+            md.write(f"## Sample {i+1}\n\n")
+            
+            # Main reconstruction table
+            md.write("### Ego Map Reconstruction\n\n")
+            md.write("| Original | Reconstruction |\n")
+            md.write("|---|---|\n")
+            md.write(f"| ![orig {i}](images/{fn_o}) | ![recon {i}](images/{fn_r}) |\n\n")
+            
+            # Calculate and display accuracy
+            char_matches = (char_orig == char_recon).float()
+            color_matches = (color_orig == color_recon).float()
+            char_accuracy = char_matches.mean().item()
+            color_accuracy = color_matches.mean().item()
+
+            md.write(f"**Accuracy**: Character: {char_accuracy:.3f}, Color: {color_accuracy:.3f}\n\n")
+
+            md.write("### Ego Class Reconstruction\n\n")
+            md.write("| Original | Reconstruction |\n")
+            md.write("|---|---|\n")
+            md.write(f"| ![orig class {i}](images/{fn_ego_class_orig}) | ![recon class {i}](images/{fn_ego_class_recon}) |\n\n")
+            
+            class_matches = (class_orig == class_recon).float()
+            class_accuracy = class_matches.mean().item()
+            md.write(f"**Class Accuracy**: {class_accuracy:.3f}\n\n")
+
+            # Bag reconstruction section
+            if i < len(bag_data) and bag_data[i] and len(bag_data[i]) == 2:
+                md.write("### Bag Reconstruction\n\n")
+                bag_text = _format_bag_reconstruction(bag_data[i])
+                md.write("```\n")
+                md.write(bag_text)
+                md.write("\n```\n\n")
+
+            # Passability/Safety section
+            if i < len(pass_data) and pass_data[i] is not None and i < len(safe_data) and safe_data[i] is not None:
+                md.write("### Passability & Safety\n\n")
+                md.write("| Original | Reconstruction |\n")
+                md.write("|---|---|\n")
+                md.write(f"| ![orig pass safe {i}](images/{fn_pass_safe_orig}) | ![recon pass safe {i}](images/{fn_pass_safe_recon}) |\n\n")
+
+            if i < len(reconstructions) - 1:
+                md.write("=" * 80 + "\n\n")
+        
+        # Overall statistics
+        md.write("## Overall Statistics\n\n")
+        char_accuracy = sum((orig[0] == recon[0]).float().mean().item() for orig, recon in zip(originals, reconstructions)) / len(originals)
+        color_accuracy = sum((orig[1] == recon[1]).float().mean().item() for orig, recon in zip(originals, reconstructions)) / len(originals)
+
+        md.write(f"- **Average Character Accuracy**: {char_accuracy:.3f}\n")
+        md.write(f"- **Average Color Accuracy**: {color_accuracy:.3f}\n")
+        md.write(f"- **Total Samples**: {len(reconstructions)}\n")
+
+    print(f"Wrote Enhanced Markdown: {md_path}")
+
 def visualize_reconstructions(
     model, dataset, device, 
     num_samples=4, 
@@ -136,13 +513,17 @@ def visualize_reconstructions(
     # map sampling parameters
     map_temperature=1.0,
     map_occ_thresh=0.5,
-    rare_occ_thresh=0.5,
+    bag_presence_thresh=0.5,
     hero_presence_thresh=0.5,
+    passibility_thresh=0.5,
+    safety_thresh=0.5,
     map_deterministic=True,
     glyph_top_k=0,
     glyph_top_p=1.0,
     color_top_k=0,
     color_top_p=1.0,
+    class_top_k=0,
+    class_top_p=1.0,
     # message sampling parameters
     msg_temperature=1.0,
     msg_top_k=0,
@@ -170,11 +551,17 @@ def visualize_reconstructions(
         # Map sampling parameters
         map_temperature: Temperature for map sampling (higher = more random)
         map_occ_thresh: Threshold for occupancy prediction
+        bag_presence_thresh: Threshold for bag presence prediction
+        hero_presence_thresh: Threshold for hero presence prediction
+        passibility_thresh: Threshold for passability prediction
+        safety_thresh: Threshold for safety prediction
         map_deterministic: If True, use deterministic (argmax) sampling for map
         glyph_top_k: Top-k filtering for glyph character sampling (0 = disabled)
         glyph_top_p: Top-p (nucleus) filtering for glyph character sampling
         color_top_k: Top-k filtering for color sampling (0 = disabled)
         color_top_p: Top-p (nucleus) filtering for color sampling
+        class_top_k: Top-k filtering for class sampling (0 = disabled)
+        class_top_p: Top-p (nucleus) filtering for class sampling
         
         # Message sampling parameters
         msg_temperature: Temperature for message token sampling
@@ -216,8 +603,11 @@ def visualize_reconstructions(
     
     reconstructions = []
     originals = []
+    bag_data = []
+    pass_data = []
+    safe_data = []
     output_lines = []
-    output_lines.append(f"NetHack VAE Reconstructions - {dataset_name} Dataset")
+    output_lines.append(f"Enhanced NetHack VAE Reconstructions - {dataset_name} Dataset")
     output_lines.append("=" * 80)
     output_lines.append("")
     
@@ -278,7 +668,7 @@ def visualize_reconstructions(
     else:
         selected_samples = all_samples[:num_samples]
     
-    print(f"🎯 Processing {len(selected_samples)} samples for reconstruction...")
+    print(f"🎯 Processing {len(selected_samples)} samples for enhanced reconstruction...")
     
     with torch.no_grad():
         for i, sample in enumerate(selected_samples):
@@ -302,13 +692,17 @@ def visualize_reconstructions(
                 # Map sampling parameters
                 map_temperature=map_temperature,
                 map_occ_thresh=map_occ_thresh,
-                rare_occ_thresh=rare_occ_thresh,
+                bag_presence_thresh=bag_presence_thresh,
                 hero_presence_thresh=hero_presence_thresh,
+                passibility_thresh=passibility_thresh,
+                safety_thresh=safety_thresh,
                 map_deterministic=map_deterministic,
                 glyph_top_k=glyph_top_k,
                 glyph_top_p=glyph_top_p,
                 color_top_k=color_top_k,
                 color_top_p=color_top_p,
+                class_top_k=class_top_k,
+                class_top_p=class_top_p,
                 # Message sampling parameters
                 msg_temperature=msg_temperature,
                 msg_top_k=msg_top_k,
@@ -319,30 +713,70 @@ def visualize_reconstructions(
                 allow_pad=allow_pad
             )
             
-            # Get reconstructed characters and colors
-            char_recon = model_output['chars'][0].cpu()  # [H, W]
-            color_recon = model_output['colors'][0].cpu()  # [H, W]
+            # === Extract traditional map reconstruction ===
+            # The new model focuses on ego-centric view, not full map reconstruction
+            # Use ego data as the main "reconstructed" view for comparison
+            if 'ego_chars' in model_output and 'ego_colors' in model_output and 'ego_class' in model_output:
+                char_recon = model_output['ego_chars'][0].cpu()  # [k, k]
+                color_recon = model_output['ego_colors'][0].cpu()  # [k, k]
+                class_recon = model_output['ego_class'][0].cpu()  # [k, k]
+                hero_y_coord, hero_x_coord = int(model_inputs['blstats'][0, 0].item()), int(model_inputs['blstats'][0, 1].item())
+                k = char_recon.shape[0]  # ego window size
+                # Also extract original ego view for fair comparison
+                # We need to crop the original map to the ego window size
+                char_orig_ego, color_orig_ego = crop_ego(sample['game_chars'], sample['game_colors'], hero_y_coord, hero_x_coord, k)  # [k, k]
+                char_orig_ego = char_orig_ego.cpu()
+                color_orig_ego = color_orig_ego.cpu()
+                class_orig_ego = categorize_glyph_tensor(char_orig_ego, color_orig_ego)
+                class_orig_ego = class_orig_ego.cpu()
+
+            reconstructions.append((char_recon, color_recon, class_recon))
+            originals.append((char_orig_ego, color_orig_ego, class_orig_ego))
             
-            # Get original data
-            char_orig = sample['game_chars'].cpu()  # [H, W]
-            color_orig = sample['game_colors'].cpu()  # [H, W]
+            # === Extract bag reconstruction data ===
+            if 'bag_sets' in model_output:
+                bag_recon = model_output['bag_sets'][0]
+                bag_presence_orig = make_pair_bag(sample['game_chars'].unsqueeze(0), sample['game_colors'].unsqueeze(0))
+                bag_orig = bag_presence_to_glyph_sets(bag_presence_orig)[0]
+                bag_data.append((bag_orig, bag_recon))
+            else:
+                bag_data.append([])
             
-            reconstructions.append((char_recon, color_recon))
-            originals.append((char_orig, color_orig))
+            # === Extract passability and safety data ===
+            if 'passability_grid' in model_output and 'safety_grid' in model_output:
+                hero_y_coord, hero_x_coord = int(model_inputs['blstats'][0, 0].item()), int(model_inputs['blstats'][0, 1].item())
+                pass_grid_recon = model_output['passability_grid'][0].cpu()  # [3, 3]
+                safe_grid_recon = model_output['safety_grid'][0].cpu()       # [3, 3]
+                pass_presence_orig, safe_presence_orig = compute_passability_and_safety(
+                    sample['game_chars'], sample['game_colors'],
+                    hero_y_coord, hero_x_coord
+                )
+                pass_grid_orig, safe_grid_orig = MapDecoder.format_passability_safety(pass_presence_orig.unsqueeze(0), safe_presence_orig.unsqueeze(0))
+                pass_data.append((pass_grid_orig.squeeze(0).cpu(), pass_grid_recon))
+                safe_data.append((safe_grid_orig.squeeze(0).cpu(), safe_grid_recon))
+            else:
+                pass_data.append(None)
+                safe_data.append(None)
+
+    # Use enhanced save function
+    save_enhanced_reconstructions(
+        originals, reconstructions, bag_data, pass_data, safe_data,
+        out_dir=out_dir,
+        md_filename=save_path,
+        img_file_prefix=img_file_prefix,
+        font_path="DejaVuSansMono.ttf",  # optional
+        font_size=18
+    )
     
-    save_maps_and_markdown(originals, reconstructions,
-                            out_dir=out_dir,
-                            md_filename=save_path,
-                            img_file_prefix=img_file_prefix,
-                            font_path="DejaVuSansMono.ttf",  # optional
-                            font_size=18)
-    
-    print(f"✅ {dataset_name} reconstruction visualization saved to {out_dir}/{save_path}")
+    print(f"✅ {dataset_name} enhanced reconstruction visualization saved to {out_dir}/{save_path}")
 
     return {
         'num_samples': len(reconstructions),
         'originals': originals,
         'reconstructions': reconstructions,
+        'bag_data': bag_data,
+        'pass_data': pass_data,
+        'safe_data': safe_data,
         'save_path': save_path,
         'dataset_name': dataset_name,
         'random_sampling': random_sampling,
@@ -351,11 +785,17 @@ def visualize_reconstructions(
             'include_logits': include_logits,
             'map_temperature': map_temperature,
             'map_occ_thresh': map_occ_thresh,
+            'hero_presence_thresh': hero_presence_thresh,
+            'bag_presence_thresh': bag_presence_thresh,
+            'passibility_thresh': passibility_thresh,
+            'safety_thresh': safety_thresh,
             'map_deterministic': map_deterministic,
             'glyph_top_k': glyph_top_k,
             'glyph_top_p': glyph_top_p,
             'color_top_k': color_top_k,
             'color_top_p': color_top_p,
+            'class_top_k': class_top_k,
+            'class_top_p': class_top_p,
             'msg_temperature': msg_temperature,
             'msg_top_k': msg_top_k,
             'msg_top_p': msg_top_p,
@@ -486,13 +926,16 @@ def analyze_latent_space(
                 perm = torch.randperm(len(valid_indices))
                 valid_indices = valid_indices[perm][:samples_to_process]
                 
-                model_output = model(
-                    glyph_chars=batch_device['game_chars'][valid_indices],
-                    glyph_colors=batch_device['game_colors'][valid_indices],
-                    blstats=batch_device['blstats'][valid_indices],
-                    msg_tokens=batch_device['message_chars'][valid_indices],
-                    hero_info=batch_device['hero_info'][valid_indices]
-                )
+                # Create batch structure for model forward pass
+                batch_for_model = {
+                    'game_chars': batch_device['game_chars'][valid_indices],
+                    'game_colors': batch_device['game_colors'][valid_indices],
+                    'blstats': batch_device['blstats'][valid_indices],
+                    'message_chars': batch_device['message_chars'][valid_indices],
+                    'hero_info': batch_device['hero_info'][valid_indices]
+                }
+                
+                model_output = model(batch_for_model)
                 
                 mu = model_output['mu']  # [samples_to_process, latent_dim]
                 
@@ -709,19 +1152,24 @@ def analyze_latent_space(
     
     with torch.no_grad():
         decode_output = model.sample(z=latent_grid.to(device))
-        chars = decode_output['chars'].cpu()
-        colors = decode_output['colors'].cpu()
+        # Use ego data instead of full map chars/colors
+        if 'ego_chars' in decode_output and 'ego_colors' in decode_output:
+            chars = decode_output['ego_chars'].cpu()
+            colors = decode_output['ego_colors'].cpu()
+        else:
+            print("⚠️ No ego_chars/ego_colors in decode output, creating dummy data")
+            chars = torch.full((latent_grid.shape[0], 8, 8), 32)  # 8x8 grid of spaces
+            colors = torch.zeros((latent_grid.shape[0], 8, 8))   # Black colors
 
     # Create TTY grid visualization
-    from utils.analysis import _render_map_image
-    tty_fig, tty_axes = plt.subplots(num_per_axis, num_per_axis, figsize=(30, 10))
-    tty_fig.suptitle('Generated NetHack States from PCA Latent Space Grid (5x5)', fontsize=20, y=0.98)
+    tty_fig, tty_axes = plt.subplots(num_per_axis, num_per_axis, figsize=(20, 20))
+    tty_fig.suptitle('Generated NetHack Ego-Centric Views from PCA Latent Space Grid (5x5)', fontsize=16, y=0.98)
 
-    print(f"🎨 Rendering {num_per_axis * num_per_axis} NetHack states...")
+    print(f"🎨 Rendering {num_per_axis * num_per_axis} NetHack ego-centric views...")
     n = min(len(chars), num_per_axis * num_per_axis)
     imgs = [
         _render_map_image(chars[i], colors[i],
-                          font_path="DejaVuSansMono.ttf", font_size=18, bg=(0,0,0))
+                          font_path="DejaVuSansMono.ttf", font_size=12, bg=(0,0,0))
         for i in range(n)
     ]
     tty_axes = tty_axes.ravel()
