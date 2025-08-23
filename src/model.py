@@ -239,7 +239,7 @@ def hero_presence_and_centroid(glyph_chars: torch.Tensor, blstats: torch.Tensor)
     """
     B= glyph_chars.shape[0]
 
-    y_coord, x_coord = blstats[:, 0], blstats[:, 1]
+    x_coord, y_coord = blstats[:, 0], blstats[:, 1]
     # Convert coordinates to long for indexing and clamp to valid range
     y_coord_idx = torch.clamp(y_coord.long(), 0, MAX_Y_COORD)
     x_coord_idx = torch.clamp(x_coord.long(), 0, MAX_X_COORD)
@@ -402,7 +402,7 @@ class VAEConfig:
     decoder_dropout: float = 0.0    # dropout rate for all decoder blocks
 
     # --- Latent space
-    latent_dim: int = 96     # z‑dim for VAE
+    latent_dim: int = 128    # z‑dim for VAE
     bag_dim: int = 16        # bag embedding dim (for glyph-bag)
     core_dim: int = field(init=False)  # core embedding dim (for map encoder)
     low_rank: int = 0        # low-rank factorisation rank for covariance
@@ -453,12 +453,12 @@ class VAEConfig:
 
     # Loss weights
     raw_modality_weights: Dict[str, float] = field(default_factory=lambda: {
-        'ego_class': 3.5,
-        'passability': 20,
+        'ego_class': 5.0,
+        'passability': 20.0,
         'safety': 20.0,
-        'reward': 0.3,
-        'done': 10,
-        'value_k': 0.3,
+        'reward': 0.5,
+        'done': 1.0,
+        'value_k': 1.0,
         'bag': 3.0,
         'stats': 0.5,
         'msg': 1.0,
@@ -466,8 +466,8 @@ class VAEConfig:
         'occupy': 0.5,
         'forward': 5.0,
         'inverse': 10,
-        'ego_char': 1.0,
-        'ego_color': 1.0,
+        'ego_char': 0.5,
+        'ego_color': 0.5,
         'hero_loc': 20.0,
     })
     
@@ -2018,8 +2018,8 @@ def vae_loss(
     ego_class_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)
     
     for i in range(valid_B):
-        # Get hero position (centroids are in [y, x] format)
-        hero_y, hero_x = int(valid_blstats[i, 0].item()), int(valid_blstats[i, 1].item())
+        # Get hero position (centroids are in [x, y] format)
+        hero_x, hero_y = int(valid_blstats[i, 0].item()), int(valid_blstats[i, 1].item())
         
         # Crop ego view
         ego_chars, ego_colors = crop_ego(valid_glyph_chars[i], valid_glyph_colors[i], hero_y, hero_x, ego_window)
@@ -2140,7 +2140,7 @@ def vae_loss(
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
     # KL divergence for low-rank approximation
-    eps = 1e-8
+    eps = 1e-6
     logvar = logvar.clamp(min=-10.0, max=10.0)  # Prevent extreme values
     var = torch.exp(logvar).clamp_min(eps)  # [valid_B, LATENT_DIM]
     mu2 = mu.square().sum(dim=1)  # mu^T * mu # [valid_B,]
