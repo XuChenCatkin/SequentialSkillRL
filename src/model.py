@@ -84,9 +84,8 @@ MSG_EOS = MSG_VOCAB + 1  # end-of-sequence token id
 MSG_VSIZE = MSG_VOCAB + 2  # vocab size including SOS/EOS
 MSG_MAXLEN = 256  # max length of message text (padded/truncated)
 GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
-PADDING_IDX = [32, 0]  # padding index for glyphs (blank space char, black color)
-PADDING_CHAR = 32      # padding character (blank space)
-PADDING_COLOR = 0       # padding color (black)
+BLANK_CHAR = 32        # blank space
+BLACK_COLOR = 0        # black color (background)
 # NetHack map dimensions (from NetHack source: include/config.h)
 MAP_HEIGHT = 21     # ROWNO - number of rows in the map
 MAP_WIDTH = 79      # COLNO-1 - playable columns (COLNO=80, but rightmost is UI)
@@ -184,7 +183,7 @@ def make_pair_bag(glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> torc
     bag = torch.zeros(B, GLYPH_DIM, device=glyph_chars.device, dtype=torch.float32)
     bag.scatter_add_(1, flat_idx.view(B, -1), torch.ones(B, H*W, device=glyph_chars.device))
     # remove the padding pair (space, black)
-    pad_idx = _pair_index(torch.full_like(glyph_chars, PADDING_CHAR), torch.zeros_like(glyph_colors))
+    pad_idx = _pair_index(torch.full_like(glyph_chars, BLANK_CHAR), torch.zeros_like(glyph_colors))
     pad_counts = torch.zeros(B, GLYPH_DIM, device=glyph_chars.device).scatter_add_(
         1, pad_idx.view(B, -1), torch.ones(B, H*W, device=glyph_chars.device)
     )
@@ -402,7 +401,7 @@ class VAEConfig:
     decoder_dropout: float = 0.0    # dropout rate for all decoder blocks
 
     # --- Latent space
-    latent_dim: int = 128    # z‑dim for VAE
+    latent_dim: int = 96     # z‑dim for VAE
     bag_dim: int = 16        # bag embedding dim (for glyph-bag)
     core_dim: int = field(init=False)  # core embedding dim (for map encoder)
     low_rank: int = 0        # low-rank factorisation rank for covariance
@@ -507,8 +506,8 @@ class MapEncoder(nn.Module):
     """
     def __init__(self, config: VAEConfig):
         super().__init__()
-        self.char_emb = nn.Embedding(CHAR_DIM + 1, config.char_emb, padding_idx=0)
-        self.col_emb  = nn.Embedding(COLOR_DIM + 1, config.color_emb, padding_idx=0)
+        self.char_emb = nn.Embedding(CHAR_DIM , config.char_emb)
+        self.col_emb  = nn.Embedding(COLOR_DIM, config.color_emb)
         in_ch = config.char_emb + config.color_emb + 1  # + foreground mask
         in_ch += 2 # +2 for CoordConv (x,y in [-1,1])
 
@@ -540,11 +539,11 @@ class MapEncoder(nn.Module):
         return yy, xx
 
     def forward(self, glyph_chars: torch.IntTensor, glyph_colors: torch.IntTensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # glyph_chars in ASCII [32..127]; shift to [0..95]; space -> 0 (padding_idx)
+        # glyph_chars in ASCII [32..127]; shift to [0..95];
         gc = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)
         B, H, W = gc.shape
         device = gc.device
-        fg = (gc != 0).unsqueeze(1).float()  # [B,1,H,W]
+        fg = ((gc != 0) & (glyph_colors != 0)).unsqueeze(1).float()  # [B,1,H,W]
         ce = self.char_emb(gc).permute(0,3,1,2)         # [B,16,H,W]
         co = self.col_emb(glyph_colors).permute(0,3,1,2)# [B, 4,H,W]
         yy, xx = self._coords(B, H, W, device, ce.dtype)
@@ -789,14 +788,6 @@ class MapDecoder(nn.Module):
             'pass_weight_grid': pass_w_grid,
             'safe_weight_grid': safe_w_grid,
         }
-
-    def generate(self, z: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convenience: z -> logits -> hard maps."""
-        out = self.forward(z)
-        ego_char_logits = out['ego_char_logits']  # [B, CHAR_DIM, k, k]
-        ego_color_logits = out['ego_color_logits']
-        ego_class_logits = out['ego_class_logits']  # [B, C, k, k]
-        return self.sample_from_logits(ego_char_logits, ego_color_logits, ego_class_logits, **kwargs)
 
 class BlstatsPreprocessor(nn.Module):
     def __init__(self, stats_dim=BLSTATS_DIM):
@@ -1205,6 +1196,7 @@ class MultiModalHackVAE(nn.Module):
         self.logvar_diag_head = nn.Linear(256, self.latent_dim)  # diagonal part
         self.lowrank_factor_head = nn.Linear(256, self.latent_dim * self.lowrank_dim) if self.lowrank_dim else None # low-rank factors
 
+        self.z_norm_for_decoder = torch.nn.LayerNorm(self.latent_dim, elementwise_affine=False)
         self.map_decoder  = MapDecoder(config)
         self.stats_decoder = StatsDecoder(config)
         self.msg_decoder   = MessageDecoder(config)
@@ -1218,8 +1210,8 @@ class MultiModalHackVAE(nn.Module):
         Encodes the input features into a latent space.
         
         Args:
-            glyph_chars: [B, 20, 21, 79] - character glyphs
-            glyph_colors: [B, 4, 21, 79] - color glyphs
+            glyph_chars: [B, 21, 79] - character glyphs
+            glyph_colors: [B, 21, 79] - color glyphs
             blstats: [B, BLSTATS_DIM] - baseline stats
             msg_tokens: [B, 256] - message tokens (padded)
             hero_info: [B, 4] - hero information
@@ -1263,6 +1255,7 @@ class MultiModalHackVAE(nn.Module):
             raise ValueError("hero_info must have the same batch size as glyph_chars and glyph_colors.")
         if hero_info.size(1) != 4:
             raise ValueError("hero_info must have shape [B, 4]")
+        hero_info = hero_info.long()
         role, race, gend, align = hero_info[:, 0], hero_info[:, 1], hero_info[:, 2], hero_info[:, 3]
         hero_feat = self.hero_emb(role, race, gend, align)  # [B,16], dict
         features = [glyph_feat, rare_glyph_feat, stats_feat, msg_feat, hero_feat]
@@ -1296,7 +1289,6 @@ class MultiModalHackVAE(nn.Module):
 
     def decode(self, z, action_onehot=None, z_next_detach=None, z_current_for_dynamics=None):
         # split z -> [z_bag | z_core]
-        z_bag  = z[:, :self.z_bag_dim]
         z_core = z[:, self.z_bag_dim:]
 
         out_map = self.map_decoder(z)  # decode map features
@@ -1306,14 +1298,18 @@ class MultiModalHackVAE(nn.Module):
         out_world = self.world_model(z_current_for_dynamics, action_onehot) if action_onehot is not None and z_current_for_dynamics is not None and self.world_model.enabled else None
         inverse_dynamics_logits = self.inverse_dynamics(z_current_for_dynamics, z_next_detach) if z_next_detach is not None and z_current_for_dynamics is not None and self.inverse_dynamics.enabled else None
         
-        return {
+        out = {
             **out_map,
             "stats_pred": stats_pred, 
             "msg_logits": msg_logits, 
             **out_aux,
-            **out_world,
             "inverse_dynamics_logits": inverse_dynamics_logits,  # [B * (T-1), A + skill_num] or None
         }
+        
+        if out_world is not None:
+            out.update(out_world)
+
+        return out
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         glyph_chars = batch['game_chars'] # [B, 21, 79]
@@ -1355,23 +1351,30 @@ class MultiModalHackVAE(nn.Module):
                 rewards_reshaped = rewards.view(B, T)
                 rewards_for_dynamics = rewards_reshaped[:, 1:].contiguous()
                 rewards_for_dynamics_flat = rewards_for_dynamics.view(-1)  # [B*(T-1)]
+                dones = batch.get('done')
+                dones_reshaped = dones.view(B, T)
+                dones_for_dynamics = dones_reshaped[:, 1:].contiguous()
+                dones_for_dynamics_flat = dones_for_dynamics.view(-1)  # [B*(T-1)]
             else:
                 z_next_flat_detach = None  # No next state if T <= 1
                 z_current_for_dynamics_flat = None  # No current state if T <= 1
                 action_onehot_for_dynamics_flat = None  # No action if T <= 1
                 has_next_for_dynamics_flat = None  # No has_next if T <= 1
                 rewards_for_dynamics_flat = None  # No rewards if T <= 1
+                dones_for_dynamics_flat = None  # No dones if T <= 1
         else:
             z_next_flat_detach = None  # No next state if T <= 1
             z_current_for_dynamics_flat = None  # No current state if T <= 1
             action_onehot_for_dynamics_flat = None  # No action if T <= 1
             has_next_for_dynamics_flat = None  # No has_next if T <= 1
             rewards_for_dynamics_flat = None  # No rewards if T <= 1
+            dones_for_dynamics_flat = None  # No dones if T <= 1
                 
         batch['z_next_detached'] = z_next_flat_detach  # [B*(T-1), latent_dim]
         batch['action_onehot_for_dynamics'] = action_onehot_for_dynamics_flat  # [B*(T-1), A]
         batch['has_next_for_dynamics'] = has_next_for_dynamics_flat  # [B*(T-1)]
         batch['rewards_for_dynamics'] = rewards_for_dynamics_flat  # [B*(T-1)]
+        batch['dones_for_dynamics'] = dones_for_dynamics_flat  # [B*(T-1)]
         
         dec = self.decode(z, action_onehot=action_onehot_for_dynamics_flat, z_next_detach=z_next_flat_detach, z_current_for_dynamics=z_current_for_dynamics_flat)
         return {**enc, **dec, 'z': z}  # include z in the output
@@ -1504,7 +1507,7 @@ class MultiModalHackVAE(nn.Module):
                 "msg_logits": dec["msg_logits"],
                 "bag_logits": bag_presence_logit,
                 "passability_logits": passability_logit,
-                "safety_logits": safety_presence,
+                "safety_logits": safety_logit,
             })
         return out
         
@@ -1799,6 +1802,14 @@ def vae_loss(
     """
     VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
     """
+    # Extract inputs from batch
+    glyph_chars = batch['game_chars']  # [B, 21, 79]
+    glyph_colors = batch['game_colors']  # [B, 21, 79]
+    blstats = batch['blstats'] # [B, BLSTATS_DIM]
+    msg_tokens = batch['message_chars']  # [B, 256]
+    valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
+    # Determine batch dimensions
+    total_samples = len(valid_screen)
     
     if 'original_batch_shape' in batch:
         B, T = batch['original_batch_shape']
@@ -1806,20 +1817,10 @@ def vae_loss(
         # Fallback: try to infer from data
         B = batch.get('batch_size', 1)
         T = total_samples // B if B > 0 else total_samples
-            
-    # Extract inputs from batch
-    glyph_chars = batch['game_chars']  # [B, 21, 79]
-    glyph_colors = batch['game_colors']  # [B, 21, 79]
-    blstats = batch['blstats'] # [B, BLSTATS_DIM]
-    msg_tokens = batch['message_chars']  # [B, 256]
-    valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
     
     # ============= On-the-fly Goal and Value Target Computation =============
     # Compute goal_target, goal_mask, and value_k_target on-the-fly using config parameters
     if 'game_chars' in batch and 'game_colors' in batch and 'reward_target' in batch and 'done_target' in batch:
-        # Determine batch dimensions
-        total_samples = len(valid_screen)
-        
         if T > 1:
             # Reshape data back to [B, T, ...] for goal and value computation
             game_chars_reshaped = batch['game_chars'].view(B, T, 21, 79)  # [B, T, H, W]
@@ -1831,8 +1832,8 @@ def vae_loss(
             # Initialize goal and value targets
             goal_target_flat = torch.zeros(total_samples, 2, dtype=torch.float32, device=batch['game_chars'].device)
             goal_mask_flat = torch.zeros(total_samples, dtype=torch.float32, device=batch['game_chars'].device)
-            value_k_target_flat = torch.zeros(total_samples, len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
-            value_k_mask_flat = torch.zeros(total_samples, len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
+            value_k_target_flat = torch.zeros(B*(T-1), len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
+            value_k_mask_flat = torch.zeros(B*(T-1), len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
             
             # Process each game sequence
             for g in range(B):
@@ -1847,10 +1848,10 @@ def vae_loss(
                 value_masks = torch.tensor(value_masks, dtype=torch.float32, device=batch['game_chars'].device)
 
                 # Fill value targets for this game
-                start_idx = g * T
-                end_idx = start_idx + T
-                value_k_target_flat[start_idx:end_idx] = value_targets
-                value_k_mask_flat[start_idx:end_idx] = value_masks
+                start_idx = g * (T-1)
+                end_idx = start_idx + (T-1)
+                value_k_target_flat[start_idx:end_idx] = value_targets[:-1,:]  # Exclude last timestep which has no next
+                value_k_mask_flat[start_idx:end_idx] = value_masks[:-1,:]
                 
                 # Compute goal targets for each timestep in this game
                 for t in range(T):
@@ -1909,9 +1910,6 @@ def vae_loss(
     
     # action related outputs
     passability_logits = model_output['passability_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
-    reward = model_output['reward'][valid_screen].squeeze(1)  # [B]
-    done_logits = model_output['done_logits'][valid_screen].squeeze(1)  # [B]
-    value_k = model_output['value_k'][valid_screen]  # [B, NUM_HORIZONS]
     safety_logits = model_output['safety_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
     skill_logits = model_output.get('skill_logits', None)  # [B, SKILL_NUM] if applicable
     if skill_logits is not None:
@@ -1922,6 +1920,9 @@ def vae_loss(
     valid_screen_reshape = valid_screen.view(B, T)  # [B, T]
     valid_screen_for_dynamics = valid_screen_reshape[:, :-1].contiguous()  # [B, T-1]
     valid_screen_for_dynamics = valid_screen_for_dynamics.view(-1)
+    reward = model_output['reward'][valid_screen_for_dynamics].squeeze(1)  # [B]
+    done_logits = model_output['done_logits'][valid_screen_for_dynamics].squeeze(1)  # [B]
+    value_k = model_output['value_k'][valid_screen_for_dynamics]  # [B, NUM_HORIZONS]
     if latent_pred is not None:
         latent_pred = latent_pred[valid_screen_for_dynamics]
     
@@ -1959,7 +1960,6 @@ def vae_loss(
         pos = occ_t.sum()
         neg = occ_t.numel() - pos
         pos_weight = (neg / pos).clamp(max=10.0)
-    pos_weight = torch.tensor(10.0, device=occupy_logits.device)
     occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, occ_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2,3])  # [valid_B]
     assert occ_loss_per_sample.shape == (valid_B,), f"occupy loss shape mismatch: {occ_loss_per_sample.shape} != ({valid_B},)"
     raw_losses['occupy'] = occ_loss_per_sample.mean()  # Average over valid samples
@@ -2086,12 +2086,13 @@ def vae_loss(
         total_weight = weights.sum()
         raw_losses['reward'] = weighted_loss / total_weight.clamp_min(1.0)
 
-    if 'done_target' in batch:
-        raw_losses['done'] = F.binary_cross_entropy_with_logits(done_logits, batch['done_target'][valid_screen], reduction='mean')
-        
+    if 'dones_for_dynamics' in batch:
+        done_target = batch['dones_for_dynamics'][valid_screen_for_dynamics].float()  # Convert bool to float
+        raw_losses['done'] = F.binary_cross_entropy_with_logits(done_logits, done_target, reduction='mean')
+
     if 'value_k_target' in batch:
-        tgt = batch['value_k_target'][valid_screen]
-        mask = batch['value_k_mask'][valid_screen]
+        tgt = batch['value_k_target'][valid_screen_for_dynamics]
+        mask = batch['value_k_mask'][valid_screen_for_dynamics]
         raw_losses['value_k'] = ((value_k - tgt)**2 * mask).sum() / mask.sum().clamp_min(1.0)  # Mean over valid samples
 
     # --- Safety risk (8 dirs) ---

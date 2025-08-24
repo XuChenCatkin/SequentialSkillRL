@@ -13,8 +13,8 @@ import re
 from utils.action_utils import ACTION_DIM, batch_keypress_static_map
 
 # Constants (avoid circular import)
-PADDING_CHAR = 32      # padding character (blank space)
-PADDING_COLOR = 0       # padding color (black)  
+BLANK_CHAR = 32      # blank space
+BLACK_COLOR = 0       # black for blank space (background)
 HERO_CHAR = ord('@')  # hero character code (ASCII 64)
 
 DIRS_8 = [(-1,0),(0,+1),(+1,0),(0,-1),(-1,+1),(+1,+1),(+1,-1),(-1,-1)]  # N,E,S,W,NE,SE,SW,NW
@@ -265,7 +265,7 @@ def categorize_glyph(char_code: int, color_code: int) -> NetHackCategory:
     pair = (char_code, color_code)
     
     # Space/padding
-    if char_code == PADDING_CHAR and color_code == PADDING_COLOR:
+    if char_code == BLANK_CHAR and color_code == BLACK_COLOR:
         return NetHackCategory.UNKNOWN
     
     # Check predefined categories
@@ -321,7 +321,7 @@ def categorize_glyph_tensor(char_tensor: torch.Tensor, color_tensor: torch.Tenso
     hero_mask = char_flat == HERO_CHAR
     result[hero_mask] = NetHackCategory.PLAYER_OR_HUMAN.value
 
-    space_mask = (char_flat == PADDING_CHAR) & (color_flat == PADDING_COLOR)
+    space_mask = (char_flat == BLANK_CHAR) & (color_flat == BLACK_COLOR)
     
     # For other categories, we need to check pairs
     # This is less efficient but more readable - could be optimized if needed
@@ -406,7 +406,7 @@ def compute_passability_and_safety(
         hard_mask8[i] = 1.0
         
         # --- unknown in-map (screen shows padding pair inside the map)
-        if ch == PADDING_CHAR and cl == PADDING_COLOR:
+        if ch == BLANK_CHAR and cl == BLACK_COLOR:
             pass8[i] = 0.5     # uncertain target
             safe8[i] = 0.5
             weight8[i] = unknown_weight
@@ -453,8 +453,8 @@ def crop_ego(chars: torch.Tensor, colors: torch.Tensor, hero_y: int, hero_x: int
     """Return ego crop [k,k] of ASCII codes, padded with spaces 32."""
     H, W = chars.shape
     r = k // 2
-    out_chars = torch.full((k,k), fill_value=PADDING_CHAR, dtype=chars.dtype)  # spaces
-    out_colors = torch.full((k,k), fill_value=PADDING_COLOR, dtype=colors.dtype)  # padding color
+    out_chars = torch.full((k,k), fill_value=BLANK_CHAR, dtype=chars.dtype)  # spaces
+    out_colors = torch.full((k,k), fill_value=BLACK_COLOR, dtype=colors.dtype)  # padding color
     y0, y1 = max(0, hero_y - r), min(H, hero_y + r + 1)
     x0, x1 = max(0, hero_x - r), min(W, hero_x + r + 1)
     oy0, oy1 = r - (hero_y - y0), r + (y1 - hero_y)
@@ -473,7 +473,7 @@ def discounted_k_step_multi_with_mask(
     """
     Returns:
       vals: [T, M] where vals[t,m] = sum_{i=1}^{k} gamma^{i-1} r_{t+i}
-            computed ONLY if all r_{t+1...t+k} exist and done[u]==False for u in [t+1...t+k]
+            computed ONLY if all r_{t+1...t+k} exist and done[u]==False for u in [t+1...t+k-1]
       mask: [T, M] where mask[t,m] = 1.0 if above condition holds, else 0.0
     Notes:
       - This avoids cross-batch leakage; steps whose k-window crosses the segment end are masked 0.
@@ -490,7 +490,7 @@ def discounted_k_step_multi_with_mask(
             ok = True
             for i in range(k):
                 ti = t + i + 1
-                if ti >= T or done[ti]:
+                if ti >= T or (done[ti] and i < k - 1):
                     ok = False
                     break
                 g += w * rewards[ti]
