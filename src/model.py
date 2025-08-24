@@ -432,7 +432,7 @@ class VAEConfig:
     # Dynamics heads
     action_dim: int = len(nethack.ACTIONS)     # one‑hot; 0 disables forward/inverse
     forward_hidden: int = 256
-    use_latent_forward_model: bool = True
+    use_world_model: bool = True
     use_inverse_dynamics: bool = True
     goal_dir_dim: int = 2                      # 0 disables (set 2 for (dx,dy) regression)
     passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
@@ -1092,17 +1092,13 @@ class HeroEmbedding(nn.Module):
         """Returns the number of output channels for hero embedding."""
         return self.out_dim  # 16
 
-class ActionValueHead(nn.Module):
-    """Action value head for VAE."""
+class ActionAuxHead(nn.Module):
+    """Action auxiliary head for VAE."""
     def __init__(self, cfg: VAEConfig):
         super().__init__()
         self.passability = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 2, cfg.decoder_dropout)
-        self.reward = MLP(cfg.latent_dim, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
-        self.done = MLP(cfg.latent_dim, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
-        self.value_k = MLP(cfg.latent_dim, cfg.forward_hidden, len(cfg.value_horizons), 2, cfg.decoder_dropout)
         self.safety = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 2, cfg.decoder_dropout)
         self.goal = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.goal_dir_dim, 2, cfg.decoder_dropout) if cfg.goal_dir_dim > 0 else None
-        self.skill_belief = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.skill_num, 2, cfg.decoder_dropout) if cfg.skill_num > 0 else None
 
     def forward(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -1114,34 +1110,29 @@ class ActionValueHead(nn.Module):
         Returns:
             Dictionary with outputs:
             - passability: [B, passability_dirs]
-            - reward: [B, 1]
-            - done: [B, 1]
-            - value_k: [B, num_horizons]
             - safety: [B, passability_dirs]
             - goal: [B, goal_dir_dim] (if applicable)
-            - skill_belief: [B, skill_num] (if applicable)
         """
         out = {
             "passability_logits": self.passability(z),
-            "reward": self.reward(z),
-            "done_logits": self.done(z),
-            "value_k": self.value_k(z),
             "safety_logits": self.safety(z),
         }
         if self.goal is not None:
             out["goal_pred"] = torch.tanh(self.goal(z))  # in [-1,1]
-        if self.skill_belief is not None:
-            out["skill_logits"] = self.skill_belief(z)
         return out
 
-class LatentForwardModel(nn.Module):
+class WorldModel(nn.Module):
     def __init__(self, cfg: VAEConfig):
         super().__init__()
-        self.enabled = (cfg.action_dim > 0) and cfg.use_latent_forward_model
+        self.enabled = (cfg.action_dim > 0) and cfg.use_world_model
         self.skill_num = cfg.skill_num
         if not self.enabled:
             return
-        self.net = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, cfg.latent_dim, num_layers=3)
+        self.skill_belief = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.skill_num, 2, cfg.decoder_dropout) if cfg.skill_num > 0 else None
+        self.reward = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
+        self.done = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
+        self.value_k = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, len(cfg.value_horizons), 2, cfg.decoder_dropout)
+        self.z_pred = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, cfg.latent_dim, num_layers=3)
 
     def forward(self, z: torch.Tensor, action_onehot: torch.Tensor, h_onehot: torch.Tensor = None) -> torch.Tensor:
         if not self.enabled:
@@ -1151,7 +1142,15 @@ class LatentForwardModel(nn.Module):
                 f"Expected h_onehot of shape [B, {self.skill_num}], got {h_onehot.shape}"
             action_onehot = torch.cat([action_onehot, h_onehot], dim=1)  # [B, A + skill_num]
         x = torch.cat([z, action_onehot], dim=1)
-        return self.net(x)
+        out = {
+            "reward": self.reward(x),
+            "done_logits": self.done(x),
+            "value_k": self.value_k(x),
+            "latent_pred" : self.z_pred(x),
+        }
+        if self.skill_belief is not None:
+            out["skill_logits"] = self.skill_belief(z)
+        return out
 
 
 class InverseDynamics(nn.Module):
@@ -1209,8 +1208,8 @@ class MultiModalHackVAE(nn.Module):
         self.map_decoder  = MapDecoder(config)
         self.stats_decoder = StatsDecoder(config)
         self.msg_decoder   = MessageDecoder(config)
-        self.action_value_head = ActionValueHead(config)
-        self.latent_forward_model = LatentForwardModel(config)
+        self.action_aux_head = ActionAuxHead(config)
+        self.world_model = WorldModel(config)
         self.inverse_dynamics = InverseDynamics(config)
         
 
@@ -1303,16 +1302,16 @@ class MultiModalHackVAE(nn.Module):
         out_map = self.map_decoder(z)  # decode map features
         stats_pred = self.stats_decoder(z_core)
         msg_logits = self.msg_decoder(z_core)
-        out_action = self.action_value_head(z)
-        latent_pred = self.latent_forward_model(z_current_for_dynamics, action_onehot) if action_onehot is not None and z_current_for_dynamics is not None and self.latent_forward_model.enabled else None
+        out_aux = self.action_aux_head(z)
+        out_world = self.world_model(z_current_for_dynamics, action_onehot) if action_onehot is not None and z_current_for_dynamics is not None and self.world_model.enabled else None
         inverse_dynamics_logits = self.inverse_dynamics(z_current_for_dynamics, z_next_detach) if z_next_detach is not None and z_current_for_dynamics is not None and self.inverse_dynamics.enabled else None
         
         return {
             **out_map,
             "stats_pred": stats_pred, 
             "msg_logits": msg_logits, 
-            **out_action,
-            "latent_pred": latent_pred,  # [B * (T-1), LATENT_DIM] or None
+            **out_aux,
+            **out_world,
             "inverse_dynamics_logits": inverse_dynamics_logits,  # [B * (T-1), A + skill_num] or None
         }
 
@@ -1352,20 +1351,27 @@ class MultiModalHackVAE(nn.Module):
                 has_next_reshaped = has_next.view(B, T)
                 has_next_for_dynamics = has_next_reshaped[:, :-1].contiguous()
                 has_next_for_dynamics_flat = has_next_for_dynamics.view(-1)  # [B*(T-1)]
+                rewards = batch.get('reward_target')
+                rewards_reshaped = rewards.view(B, T)
+                rewards_for_dynamics = rewards_reshaped[:, 1:].contiguous()
+                rewards_for_dynamics_flat = rewards_for_dynamics.view(-1)  # [B*(T-1)]
             else:
                 z_next_flat_detach = None  # No next state if T <= 1
                 z_current_for_dynamics_flat = None  # No current state if T <= 1
                 action_onehot_for_dynamics_flat = None  # No action if T <= 1
                 has_next_for_dynamics_flat = None  # No has_next if T <= 1
+                rewards_for_dynamics_flat = None  # No rewards if T <= 1
         else:
             z_next_flat_detach = None  # No next state if T <= 1
             z_current_for_dynamics_flat = None  # No current state if T <= 1
             action_onehot_for_dynamics_flat = None  # No action if T <= 1
             has_next_for_dynamics_flat = None  # No has_next if T <= 1
+            rewards_for_dynamics_flat = None  # No rewards if T <= 1
                 
         batch['z_next_detached'] = z_next_flat_detach  # [B*(T-1), latent_dim]
         batch['action_onehot_for_dynamics'] = action_onehot_for_dynamics_flat  # [B*(T-1), A]
         batch['has_next_for_dynamics'] = has_next_for_dynamics_flat  # [B*(T-1)]
+        batch['rewards_for_dynamics'] = rewards_for_dynamics_flat  # [B*(T-1)]
         
         dec = self.decode(z, action_onehot=action_onehot_for_dynamics_flat, z_next_detach=z_next_flat_detach, z_current_for_dynamics=z_current_for_dynamics_flat)
         return {**enc, **dec, 'z': z}  # include z in the output
@@ -1913,7 +1919,7 @@ def vae_loss(
     
     # latent forward model
     latent_pred = model_output.get('latent_pred', None)
-    valid_screen_reshape = valid_screen.view(B, T)
+    valid_screen_reshape = valid_screen.view(B, T)  # [B, T]
     valid_screen_for_dynamics = valid_screen_reshape[:, :-1].contiguous()  # [B, T-1]
     valid_screen_for_dynamics = valid_screen_for_dynamics.view(-1)
     if latent_pred is not None:
@@ -2072,8 +2078,13 @@ def vae_loss(
         pass_metrics = binary_accuracy_from_logits(passability_logits, batch['passability_target'][valid_screen], m, w)
         metrics.update({f'metrics/passability/{k}': v for k, v in pass_metrics.items()})
 
-    if 'reward_target' in batch:
-        raw_losses['reward'] = F.mse_loss(reward, batch['reward_target'][valid_screen], reduction='mean')
+    if 'rewards_for_dynamics' in batch:
+        rewards_for_dynamics = batch['rewards_for_dynamics'][valid_screen_for_dynamics]  # [B*(T-1)]
+        # Higher weight for non-zero rewards (20x weight)
+        weights = torch.where(rewards_for_dynamics != 0, 20.0, 1.0)
+        weighted_loss = ((reward - rewards_for_dynamics)**2 * weights).sum()
+        total_weight = weights.sum()
+        raw_losses['reward'] = weighted_loss / total_weight.clamp_min(1.0)
 
     if 'done_target' in batch:
         raw_losses['done'] = F.binary_cross_entropy_with_logits(done_logits, batch['done_target'][valid_screen], reduction='mean')

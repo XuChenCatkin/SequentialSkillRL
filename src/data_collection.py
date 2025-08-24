@@ -472,8 +472,8 @@ def discounted_k_step_multi_with_mask(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Returns:
-      vals: [T, M] where vals[t,m] = sum_{i=0}^{k-1} gamma^i r_{t+i}
-            computed ONLY if all r_{t..t+k-1} exist and done[u]==False for u in [t..t+k-1]
+      vals: [T, M] where vals[t,m] = sum_{i=1}^{k} gamma^{i-1} r_{t+i}
+            computed ONLY if all r_{t+1...t+k} exist and done[u]==False for u in [t+1...t+k]
       mask: [T, M] where mask[t,m] = 1.0 if above condition holds, else 0.0
     Notes:
       - This avoids cross-batch leakage; steps whose k-window crosses the segment end are masked 0.
@@ -489,7 +489,7 @@ def discounted_k_step_multi_with_mask(
             g, w = 0.0, 1.0
             ok = True
             for i in range(k):
-                ti = t + i
+                ti = t + i + 1
                 if ti >= T or done[ti]:
                     ok = False
                     break
@@ -703,7 +703,14 @@ class NetHackDataCollector:
             done_raw  = torch.tensor(done_raw)     # [G,T] bool
             keycodes  = torch.tensor(this_batch['keypresses'], dtype=torch.int64)  # [G,T]
             
-            reward_target_mb    = torch.tensor(this_batch['scores'], dtype=torch.float32) if 'scores' in this_batch else torch.zeros(num_games, num_time)
+            # Calculate step-wise rewards from cumulative scores
+            scores = torch.tensor(this_batch['scores'], dtype=torch.float32)  # [G,T] cumulative scores
+            reward_target_mb = torch.zeros_like(scores)  # [G,T] step rewards
+            # First timestep: reward = score (no previous score to subtract)
+            reward_target_mb[:, 0] = scores[:, 0]
+            # Subsequent timesteps: reward = score_t - score_{t-1}
+            reward_target_mb[:, 1:] = scores[:, 1:] - scores[:, :-1]
+            
             action_index_mb = batch_keypress_static_map(keycodes) # [G,T] -> [G,T] with static mapping
             # Process each game in the batch
             for g in range(num_games):
