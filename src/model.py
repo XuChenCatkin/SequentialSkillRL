@@ -583,11 +583,15 @@ class MapDecoder(nn.Module):
 
         # project z to a broadcast feature map
         self.z_core_to_map = nn.Sequential(nn.Linear(self.z_core_dim, config.map_dec_base_ch), nn.ReLU(inplace=True), nn.Linear(config.map_dec_base_ch, config.map_dec_base_ch))
-        self.head_occ = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, 1, 1))
+        self.head_occ = nn.Sequential(
+            nn.Conv2d(config.map_dec_base_ch + 2, config.map_dec_base_ch//2, 1),  # +2 for coordinate channels
+            nn.ReLU(inplace=True), 
+            nn.Conv2d(config.map_dec_base_ch//2, 1, 1)
+        )
 
         self.z_to_ego_map = nn.Sequential(nn.Linear(self.latent_dim, config.map_dec_base_ch), nn.ReLU(inplace=True), nn.Linear(config.map_dec_base_ch, config.map_dec_base_ch))
         # FiLM-conditioned residual body (anisotropic to cover width)
-        self.core_block = ResBlockFiLM(config.map_dec_base_ch, config.map_dec_base_ch, (1,9),  config.decoder_dropout, z_dim=self.latent_dim)
+        self.core_block = ResBlockFiLM(config.map_dec_base_ch + 2, config.map_dec_base_ch, (1,9),  config.decoder_dropout, z_dim=self.latent_dim)  # +2 for coordinate channels
 
         # heads
         self.head_chr = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, CHAR_DIM, 1))
@@ -615,11 +619,21 @@ class MapDecoder(nn.Module):
         ego_logits = self.ego_head(z).view(-1, self.ego_classes, self.ego_window, self.ego_window)  # [B, C, k, k]
         
         z_core_map = self.z_core_to_map(z_core).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, MAP_HEIGHT, MAP_WIDTH)  # [B, C, H, W]
-        coords_full = torch.cat([self.full_yy.expand(B,-1,-1,-1), self.full_xx.expand(B,-1,-1,-1)], dim=1)
+        
+        # Properly expand coordinate tensors to full map size
+        full_yy_expanded = self.full_yy.expand(B, 1, MAP_HEIGHT, MAP_WIDTH)  # [B, 1, 21, 79]
+        full_xx_expanded = self.full_xx.expand(B, 1, MAP_HEIGHT, MAP_WIDTH)  # [B, 1, 21, 79]
+        
+        coords_full = torch.cat([full_yy_expanded, full_xx_expanded], dim=1)
         x_full = torch.cat([z_core_map, coords_full], dim=1)
         occ = self.head_occ(x_full) # [B, 1, H, W]
         z_ego_map = self.z_to_ego_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.ego_window, self.ego_window)  # [B, C, k, k]
-        coords_ego = torch.cat([self.ego_yy.expand(B,-1,-1,-1), self.ego_xx.expand(B,-1,-1,-1)], dim=1)
+        
+        # Properly expand ego coordinate tensors to full ego window size
+        ego_yy_expanded = self.ego_yy.expand(B, 1, self.ego_window, self.ego_window)  # [B, 1, k, k]
+        ego_xx_expanded = self.ego_xx.expand(B, 1, self.ego_window, self.ego_window)  # [B, 1, k, k]
+        coords_ego = torch.cat([ego_yy_expanded, ego_xx_expanded], dim=1)
+        
         x_ego_in = torch.cat([z_ego_map, coords_ego], dim=1)
         x_ego = self.core_block(x_ego_in, z) # [B, C, k, k]
         g_logits = self.head_chr(x_ego)  # [B, CHAR_DIM, k, k]

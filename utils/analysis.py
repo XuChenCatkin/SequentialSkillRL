@@ -720,7 +720,7 @@ def visualize_reconstructions(
                 char_recon = model_output['ego_chars'][0].cpu()  # [k, k]
                 color_recon = model_output['ego_colors'][0].cpu()  # [k, k]
                 class_recon = model_output['ego_class'][0].cpu()  # [k, k]
-                hero_y_coord, hero_x_coord = int(model_inputs['blstats'][0, 0].item()), int(model_inputs['blstats'][0, 1].item())
+                hero_x_coord, hero_y_coord = int(model_inputs['blstats'][0, 0].item()), int(model_inputs['blstats'][0, 1].item())
                 k = char_recon.shape[0]  # ego window size
                 # Also extract original ego view for fair comparison
                 # We need to crop the original map to the ego window size
