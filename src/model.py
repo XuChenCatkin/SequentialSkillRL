@@ -482,7 +482,10 @@ class VAEConfig:
     dw_beta_shape: str = 'cosine'
     warmup_epoch_ratio: float = 0.3
     free_bits: float = 0.0
-    
+    # Contrastive addition for world model (mild by default)
+    nce_weight: float = 0.1
+    nce_temperature: float = 0.2
+
     def __post_init__(self):
         self.glyph_emb = self.char_emb + self.color_emb
         self.core_dim = self.latent_dim - self.bag_dim
@@ -567,6 +570,10 @@ class MapDecoder(nn.Module):
         self.ego_window = config.ego_window
         self.ego_classes = config.ego_classes
         self.base_ch = config.map_dec_base_ch
+        self.register_buffer("full_yy", torch.linspace(-1, 1, MAP_HEIGHT).view(1,1,MAP_HEIGHT,1))
+        self.register_buffer("full_xx", torch.linspace(-1, 1, MAP_WIDTH ).view(1,1,1,MAP_WIDTH))
+        self.register_buffer("ego_yy",  torch.linspace(-1, 1, self.ego_window).view(1,1,self.ego_window,1))
+        self.register_buffer("ego_xx",  torch.linspace(-1, 1, self.ego_window).view(1,1,1,self.ego_window))
         
         self.bag_head = MLP(self.z_bag_dim, 128, GLYPH_DIM, num_layers=2, dropout=config.decoder_dropout)
         
@@ -608,9 +615,13 @@ class MapDecoder(nn.Module):
         ego_logits = self.ego_head(z).view(-1, self.ego_classes, self.ego_window, self.ego_window)  # [B, C, k, k]
         
         z_core_map = self.z_core_to_map(z_core).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, MAP_HEIGHT, MAP_WIDTH)  # [B, C, H, W]
-        occ = self.head_occ(z_core_map)  # [B, 1, H, W]
+        coords_full = torch.cat([self.full_yy.expand(B,-1,-1,-1), self.full_xx.expand(B,-1,-1,-1)], dim=1)
+        x_full = torch.cat([z_core_map, coords_full], dim=1)
+        occ = self.head_occ(x_full) # [B, 1, H, W]
         z_ego_map = self.z_to_ego_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.ego_window, self.ego_window)  # [B, C, k, k]
-        x_ego = self.core_block(z_ego_map, z)  # [B, C, k, k]
+        coords_ego = torch.cat([self.ego_yy.expand(B,-1,-1,-1), self.ego_xx.expand(B,-1,-1,-1)], dim=1)
+        x_ego_in = torch.cat([z_ego_map, coords_ego], dim=1)
+        x_ego = self.core_block(x_ego_in, z) # [B, C, k, k]
         g_logits = self.head_chr(x_ego)  # [B, CHAR_DIM, k, k]
         c_logits = self.head_col(x_ego)  # [B, COLOR_DIM, k, k]
         
@@ -1087,8 +1098,8 @@ class ActionAuxHead(nn.Module):
     """Action auxiliary head for VAE."""
     def __init__(self, cfg: VAEConfig):
         super().__init__()
-        self.passability = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 2, cfg.decoder_dropout)
-        self.safety = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 2, cfg.decoder_dropout)
+        self.passability = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 3, cfg.decoder_dropout)
+        self.safety = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 3, cfg.decoder_dropout)
         self.goal = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.goal_dir_dim, 2, cfg.decoder_dropout) if cfg.goal_dir_dim > 0 else None
 
     def forward(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -1119,11 +1130,13 @@ class WorldModel(nn.Module):
         self.skill_num = cfg.skill_num
         if not self.enabled:
             return
+        self.residual_alpha = nn.Parameter(torch.tensor(0.5))  # learnable residual scale
         self.skill_belief = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.skill_num, 2, cfg.decoder_dropout) if cfg.skill_num > 0 else None
         self.reward = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
         self.done = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
         self.value_k = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, len(cfg.value_horizons), 2, cfg.decoder_dropout)
-        self.z_pred = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, cfg.latent_dim, num_layers=3)
+        # predict delta; final pred = z + alpha * tanh(delta)
+        self.z_delta = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, cfg.latent_dim, num_layers=3)
 
     def forward(self, z: torch.Tensor, action_onehot: torch.Tensor, h_onehot: torch.Tensor = None) -> torch.Tensor:
         if not self.enabled:
@@ -1133,11 +1146,13 @@ class WorldModel(nn.Module):
                 f"Expected h_onehot of shape [B, {self.skill_num}], got {h_onehot.shape}"
             action_onehot = torch.cat([action_onehot, h_onehot], dim=1)  # [B, A + skill_num]
         x = torch.cat([z, action_onehot], dim=1)
+        delta = torch.tanh(self.z_delta(x))
+        latent_pred = z + self.residual_alpha * delta
         out = {
             "reward": self.reward(x),
             "done_logits": self.done(x),
             "value_k": self.value_k(x),
-            "latent_pred" : self.z_pred(x),
+            "latent_pred" : latent_pred,
         }
         if self.skill_belief is not None:
             out["skill_logits"] = self.skill_belief(z)
@@ -1196,7 +1211,7 @@ class MultiModalHackVAE(nn.Module):
         self.logvar_diag_head = nn.Linear(256, self.latent_dim)  # diagonal part
         self.lowrank_factor_head = nn.Linear(256, self.latent_dim * self.lowrank_dim) if self.lowrank_dim else None # low-rank factors
 
-        self.z_norm_for_decoder = torch.nn.LayerNorm(self.latent_dim, elementwise_affine=False)
+        self.z_norm = torch.nn.LayerNorm(self.latent_dim, elementwise_affine=False)
         self.map_decoder  = MapDecoder(config)
         self.stats_decoder = StatsDecoder(config)
         self.msg_decoder   = MessageDecoder(config)
@@ -1289,14 +1304,18 @@ class MultiModalHackVAE(nn.Module):
 
     def decode(self, z, action_onehot=None, z_next_detach=None, z_current_for_dynamics=None):
         # split z -> [z_bag | z_core]
-        z_core = z[:, self.z_bag_dim:]
+        z_n    = self.z_norm(z)
+        z_core = z_n[:, self.z_bag_dim:]
 
-        out_map = self.map_decoder(z)  # decode map features
+        out_map = self.map_decoder(z_n)  # decode map features
         stats_pred = self.stats_decoder(z_core)
         msg_logits = self.msg_decoder(z_core)
-        out_aux = self.action_aux_head(z)
-        out_world = self.world_model(z_current_for_dynamics, action_onehot) if action_onehot is not None and z_current_for_dynamics is not None and self.world_model.enabled else None
-        inverse_dynamics_logits = self.inverse_dynamics(z_current_for_dynamics, z_next_detach) if z_next_detach is not None and z_current_for_dynamics is not None and self.inverse_dynamics.enabled else None
+        out_aux = self.action_aux_head(z_n)
+        # Keep dynamics in the same normalized coordinate system
+        z_cur_n  = self.z_norm(z_current_for_dynamics) if z_current_for_dynamics is not None else None
+        z_next_n = self.z_norm(z_next_detach)          if z_next_detach is not None else None
+        out_world = self.world_model(z_cur_n, action_onehot) if action_onehot is not None and z_cur_n is not None and self.world_model.enabled else None
+        inverse_dynamics_logits = self.inverse_dynamics(z_cur_n, z_next_n) if z_next_n is not None and z_cur_n is not None and self.inverse_dynamics.enabled else None
         
         out = {
             **out_map,
@@ -1655,7 +1674,7 @@ def binary_accuracy_from_logits(
     targets: torch.Tensor,             # [N, K] in {0,1}
     mask: torch.Tensor | None = None,  # [N] or [N,K] (0=ignore)
     weight: torch.Tensor | None = None,# [N] or [N,K] (importance)
-    threshold: float = 0.5,
+    threshold: List[float] = [0.4, 0.6],
 ) -> dict:
     """
     Weighted + masked binary accuracy.
@@ -1670,7 +1689,9 @@ def binary_accuracy_from_logits(
     """
     # predictions
     probs = torch.sigmoid(logits)
-    preds = (probs >= threshold).to(torch.float32)
+    preds = torch.where(probs <= threshold[0], torch.zeros_like(probs),
+            torch.where(probs >= threshold[1], torch.ones_like(probs),
+                torch.full_like(probs, 0.5))).to(torch.float32)
     tgt   = targets.to(torch.float32)
 
     # build combined weights W: same shape as logits [N,K]
@@ -1790,6 +1811,14 @@ def dynamics_metrics(
         'dyn_r2_mean_dim': r2_mean_dim,
         'dyn_r2_median_dim': r2_median_dim
     }
+
+def _info_nce(q: torch.Tensor, k: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
+    """Batch InfoNCE with in-batch negatives; q and k are [N,D]."""
+    q = F.normalize(q, dim=1)
+    k = F.normalize(k.detach(), dim=1)   # stop-grad on targets
+    logits = (q @ k.t()) / max(temperature, 1e-6)  # [N,N]
+    labels = torch.arange(q.size(0), device=q.device)
+    return F.cross_entropy(logits, labels)
 
 def vae_loss(
     model_output: Dict[str, torch.Tensor],
@@ -2117,9 +2146,12 @@ def vae_loss(
 
     # --- Goal direction ---
     if ('goal_target' in batch) and ('goal_pred' in model_output):
-        goal_pred_filtered = model_output['goal_pred'][valid_screen] if 'goal_pred' in model_output else None
+        goal_pred_filtered = model_output['goal_pred'][valid_screen]
+        g_tgt  = batch['goal_target'][valid_screen]
+        g_m    = batch['goal_mask'][valid_screen].unsqueeze(1)  # [B,1]
+        num    = g_m.sum().clamp_min(1.0)
         if goal_pred_filtered is not None:
-            raw_losses['goal'] = F.mse_loss(goal_pred_filtered, batch['goal_target'][valid_screen], reduction='none').sum(dim=1).mean()  # Mean over valid samples
+            raw_losses['goal'] = ((goal_pred_filtered - g_tgt)**2 * g_m).sum() / num
             goal_metrics_dict = goal_metrics(goal_pred_filtered, batch['goal_target'][valid_screen], mask=batch.get('goal_mask')[valid_screen], map_W=79, map_H=21)
             metrics.update({f'metrics/goal/{k}': v for k, v in goal_metrics_dict.items()})
 
@@ -2132,9 +2164,11 @@ def vae_loss(
         
         mse = F.mse_loss(latent_pred_filtered, z_next_tgt, reduction='none').sum(dim=1).mean()  # Mean over valid samples
         cos = 1.0 - F.cosine_similarity(latent_pred_filtered, z_next_tgt, dim=1).mean()
-        raw_losses['forward'] = (0.5 * (mse + cos))
+        nce = _info_nce(latent_pred_filtered, z_next_tgt, temperature=config.nce_temperature)
+        raw_losses['forward'] = (0.5 * (mse + cos)) + config.nce_weight * nce
         forward_metrics = dynamics_metrics(latent_pred_filtered, z_next_tgt)
         metrics.update({f'metrics/forward/{k}': v for k, v in forward_metrics.items()})
+        metrics['metrics/forward/nce'] = float(nce.item())
 
     # Inverse dynamics: predict action from z_current and z_next
     if inverse_dynamics_logits is not None:
