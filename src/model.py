@@ -69,10 +69,10 @@ from utils.math_utils import kl_gaussian_lowrank_q_p
 
 # Import NetHackCategory from data_collection
 try:
-    from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step_multi_with_mask
+    from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step_multi_with_mask, DIRS_8
 except ImportError:
     # Fallback for when running as script
-    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step_multi_with_mask
+    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step_multi_with_mask, DIRS_8
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
@@ -436,7 +436,7 @@ class VAEConfig:
     gru_hidden: int = 256
     use_inverse_dynamics: bool = True
     goal_dir_dim: int = 2                      # 0 disables (set 2 for (dx,dy) regression)
-    passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
+    passability_dirs: int = 8  # number of passability directions
     value_horizons: List[int] = field(default_factory=lambda: [1, 5, 10])
     # Skill belief (future sticky HMM integration)
     skill_num: int = 40                         # number of skills; 0 disables skill head
@@ -1114,16 +1114,63 @@ class ActionAuxHead(nn.Module):
     """Action auxiliary head for VAE."""
     def __init__(self, cfg: VAEConfig):
         super().__init__()
-        self.passability = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 3, cfg.decoder_dropout)
-        self.safety = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.passability_dirs, 3, cfg.decoder_dropout)
-        self.goal = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.goal_dir_dim, 2, cfg.decoder_dropout) if cfg.goal_dir_dim > 0 else None
+        self.k = cfg.ego_window
+        self.dirs = cfg.passability_dirs
+        self.num_classes = cfg.ego_classes
+        
+        # Directional offsets around the center (N,E,S,W,NE,SE,SW,NW)
+        self.dir_offsets = DIRS_8  # (dy, dx) in (y,x)
+        # map into tensor indices (col, row)
+        self.dir_cr = [(self.k//2 + dy, self.k//2 + dx) for (dy, dx) in self.dir_offsets]
 
-    def forward(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
+        # Class → passable/safe mapping (can refine if you change NetHackCategory)
+        # Safe ⊂ Passable. Monsters/water/traps are not safe.
+        PASSABLE = {
+            NetHackCategory.FLOORS, NetHackCategory.UP_STAIRS, 
+            NetHackCategory.DOWN_STAIRS, NetHackCategory.TRAPS, 
+            NetHackCategory.ITEMS, NetHackCategory.FURNITURE,
+            NetHackCategory.PLAYER_OR_HUMAN, NetHackCategory.HARMLESS_MONSTERS,
+            NetHackCategory.LOW_THREAT_MONSTERS, NetHackCategory.MEDIUM_THREAT_MONSTERS,
+            NetHackCategory.HIGH_THREAT_MONSTERS, NetHackCategory.EXTREME_THREAT_MONSTERS,
+            NetHackCategory.UNKNOWN_MONSTERS
+        }
+        SAFE = {
+            NetHackCategory.FLOORS, NetHackCategory.UP_STAIRS, 
+            NetHackCategory.DOWN_STAIRS, NetHackCategory.ITEMS, 
+            NetHackCategory.FURNITURE
+        }
+
+        self.register_buffer("class_to_pass",
+                             torch.zeros(self.num_classes, dtype=torch.float32))
+        self.register_buffer("class_to_safe",
+                             torch.zeros(self.num_classes, dtype=torch.float32))
+        for c in PASSABLE:
+            self.class_to_pass[c.value] = 1.0
+        for c in SAFE:
+            self.class_to_safe[c.value] = 1.0
+
+        # Latent-gated correction
+        self.gate = nn.Sequential(
+            nn.LayerNorm(cfg.latent_dim),
+            nn.Linear(cfg.latent_dim, cfg.forward_hidden), nn.ReLU(),
+            nn.Dropout(cfg.decoder_dropout),
+            nn.Linear(cfg.forward_hidden, 2 * cfg.passability_dirs)  # pass & safe deltas
+        )
+        
+        self.goal = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.goal_dir_dim, 2, cfg.decoder_dropout) if cfg.goal_dir_dim > 0 else None
+        
+    @staticmethod
+    def _logit(p, eps=1e-5):
+        p = p.clamp(eps, 1.0 - eps)
+        return torch.log(p) - torch.log(1.0 - p)
+
+    def forward(self, z: torch.Tensor, ego_class_logits: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Forward pass for action value head.
         
         Args:
             z: [B, latent_dim] latent vector
+            ego_class_logits: [B, num_classes, k, k] per-pixel class logits
         
         Returns:
             Dictionary with outputs:
@@ -1131,9 +1178,31 @@ class ActionAuxHead(nn.Module):
             - safety: [B, passability_dirs]
             - goal: [B, goal_dir_dim] (if applicable)
         """
+        B, C, k, _ = ego_class_logits.shape
+        assert C == self.num_classes and k == self.k, f"expect [B,{self.num_classes},{self.k},{self.k}]"
+
+        probs = F.softmax(ego_class_logits, dim=1)   # [B,C,k,k]
+
+        # Collect class distributions at 8 neighbor locations
+        neigh = []
+        for (c, r) in self.dir_cr:
+            neigh.append(probs[:, :, c, r])         # [B,C]
+        neigh = torch.stack(neigh, dim=1)            # [B,8,C]
+
+        # Priors from class maps
+        pass_prior = torch.matmul(neigh, self.class_to_pass)  # [B,8]
+        safe_prior = torch.matmul(neigh, self.class_to_safe)  # [B,8]
+
+        # Latent-gated corrections (per direction)
+        delta = self.gate(z).view(B, 2, self.dirs)            # [B,2,8]
+        pass_logits = self._logit(pass_prior) + delta[:, 0, :]
+        safe_logits = self._logit(safe_prior) + delta[:, 1, :]
+
         out = {
-            "passability_logits": self.passability(z),
-            "safety_logits": self.safety(z),
+            "passability_logits": pass_logits,
+            "safety_logits": safe_logits,
+            "pass_prior": pass_prior.detach(),
+            "safe_prior": safe_prior.detach()
         }
         if self.goal is not None:
             out["goal_pred"] = torch.tanh(self.goal(z))  # in [-1,1]
@@ -1194,7 +1263,6 @@ class WorldModel(nn.Module):
         s = self.initial_state(B, device)
         prior_mu, prior_logvar, prior_lowrank = [], [], []
         rew, done, valk = [], [], []
-        mu_res = []
 
         for t in range(T_minus_1):
             x_in = torch.cat([z_seq[:, t].detach(), self._pack_a(a_seq[:, t], h_seq[:, t] if h_seq is not None else None)], dim=-1)
@@ -1209,7 +1277,6 @@ class WorldModel(nn.Module):
             rew.append(self.reward(s))
             done.append(self.done(s))
             valk.append(self.value_k(s))
-            mu_res.append(z_seq[:, t].detach() + self.residual_alpha * torch.tanh(self.mu_delta(s)))
 
             # reset state where there is no next frame (episode boundary)
             if has_next is not None:
@@ -1418,7 +1485,7 @@ class MultiModalHackVAE(nn.Module):
         out_map = self.map_decoder(z_n)  # decode map features
         stats_pred = self.stats_decoder(z_core)
         msg_logits = self.msg_decoder(z_core)
-        out_aux = self.action_aux_head(z_n)
+        out_aux = self.action_aux_head(z_n, out_map['ego_class_logits'])
         # Keep dynamics in the same normalized coordinate system
         z_cur_n  = self.z_norm(z_current_for_dynamics.view(B*T_minus_1, -1)) if z_current_for_dynamics is not None else None
         z_next_n = self.z_norm(z_next_detach.view(B*T_minus_1, -1))          if z_next_detach is not None else None
@@ -2313,10 +2380,10 @@ def vae_loss(
         kl_wm = kl_gaussian_lowrank_q_p(
             mu_q=mu_next_detach,
             logvar_q=logvar_next_detach,
-            lowrank_q=lowrank_next_detach,
+            F_q=lowrank_next_detach,
             mu_p=latent_pred_mu_filtered,
             logvar_p=latent_pred_logvar_filtered,
-            lowrank_p=latent_pred_lowrank_filtered
+            F_p=latent_pred_lowrank_filtered
         )
 
         raw_losses['forward'] = kl_wm.mean()  # Mean over valid samples

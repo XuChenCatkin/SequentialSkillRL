@@ -388,7 +388,7 @@ def compute_passability_and_safety(
     Returns:
       pass8:      [8] float targets in {0,1} or 0.5 for unknown
       safe8:      [8] float targets in {0,1} or 0.5 for unknown
-      hard_mask8: [8] {0,1}  -> 0 for off-map neighbors (don’t train/eval)
+      hard_mask8: [8] {0,1}  -> 0 for off-map neighbors (don't train/eval)
       weight8:    [8] >=0    -> per-dir weight (unknown gets 'unknown_weight')
     """
     H, W = chars.shape
