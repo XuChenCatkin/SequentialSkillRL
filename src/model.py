@@ -65,6 +65,7 @@ from typing import Optional, List, Dict
 from enum import IntEnum
 from dataclasses import dataclass, field
 from nle import nethack
+from utils.math_utils import kl_gaussian_lowrank_q_p
 
 # Import NetHackCategory from data_collection
 try:
@@ -432,6 +433,7 @@ class VAEConfig:
     action_dim: int = len(nethack.ACTIONS)     # one‑hot; 0 disables forward/inverse
     forward_hidden: int = 256
     use_world_model: bool = True
+    gru_hidden: int = 256
     use_inverse_dynamics: bool = True
     goal_dir_dim: int = 2                      # 0 disables (set 2 for (dx,dy) regression)
     passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
@@ -1138,38 +1140,92 @@ class ActionAuxHead(nn.Module):
         return out
 
 class WorldModel(nn.Module):
+    """
+    Deterministic GRU state s_t with Gaussian prior over z_{t+1}.
+    roll_out(...) expects sequences [B,T,...] and returns flattened heads for loss.
+    """
     def __init__(self, cfg: VAEConfig):
         super().__init__()
         self.enabled = (cfg.action_dim > 0) and cfg.use_world_model
         self.skill_num = cfg.skill_num
+        self.z_dim = cfg.latent_dim
+        self.a_dim = cfg.action_dim + cfg.skill_num  # action + skill
+        self.s_dim = cfg.gru_hidden
         if not self.enabled:
             return
-        self.residual_alpha = nn.Parameter(torch.tensor(0.5))  # learnable residual scale
-        self.skill_belief = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.skill_num, 2, cfg.decoder_dropout) if cfg.skill_num > 0 else None
-        self.reward = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
-        self.done = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, 1, 2, cfg.decoder_dropout)
-        self.value_k = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, len(cfg.value_horizons), 2, cfg.decoder_dropout)
-        # predict delta; final pred = z + alpha * tanh(delta)
-        self.z_delta = MLP(cfg.latent_dim + cfg.action_dim + cfg.skill_num, cfg.forward_hidden, cfg.latent_dim, num_layers=3)
+        self.in_norm  = nn.LayerNorm(self.z_dim + self.a_dim)
+        self.gru      = nn.GRUCell(self.z_dim + self.a_dim, self.s_dim)
+        self.out_norm = nn.LayerNorm(self.s_dim)
 
-    def forward(self, z: torch.Tensor, action_onehot: torch.Tensor, h_onehot: torch.Tensor = None) -> torch.Tensor:
+        hid = cfg.forward_hidden
+        # Prior over z_{t+1}
+        self.prior_mu     = nn.Linear(self.s_dim, self.z_dim)
+        self.prior_logvar = nn.Linear(self.s_dim, self.z_dim)
+        self.prior_lowrank = nn.Linear(self.s_dim, self.z_dim * cfg.low_rank) if cfg.low_rank > 0 else None
+        
+        # Predictors from s_t (reward/done/value)
+        self.reward   = MLP(self.s_dim, hid, 1, num_layers=2, dropout=cfg.decoder_dropout)
+        self.done     = MLP(self.s_dim, hid, 1, num_layers=2, dropout=cfg.decoder_dropout)
+        self.value_k  = MLP(self.s_dim, hid, len(cfg.value_horizons), num_layers=2, dropout=cfg.decoder_dropout)
+        
+    def initial_state(self, B: int, device=None):
+        return torch.zeros(B, self.s_dim, device=device)
+    
+    @torch.no_grad()
+    def _pack_a(self, a_onehot: torch.Tensor, h_onehot: torch.Tensor | None):
+        if h_onehot is None:
+            h_onehot = torch.zeros(a_onehot.size(0), self.skill_num, device=a_onehot.device) if self.skill_num > 0 else None
+        return torch.cat([a_onehot, h_onehot], dim=-1) if self.skill_num > 0 else a_onehot
+
+    def forward(self,
+                z_seq: torch.Tensor,            # [B,T-1,Z] (posterior samples or means)
+                a_seq: torch.Tensor,            # [B,T-1,A]
+                has_next: torch.Tensor,         # [B,T-1] bool
+                h_seq: torch.Tensor | None = None # [B,T-1,K] or None
+                ) -> dict[str, torch.Tensor]:
+        """
+        Computes s_t = GRU(s_{t-1}, [stopgrad(z_t), a_t(, h_t)]) and heads at times t=0..T-2.
+        Returns flattened outputs aligned to pairs (t, t+1).
+        """
         if not self.enabled:
             raise RuntimeError("Forward model disabled (action_dim=0).")
-        if self.skill_num > 0:
-            assert h_onehot is not None and h_onehot.size(1) == self.skill_num, \
-                f"Expected h_onehot of shape [B, {self.skill_num}], got {h_onehot.shape}"
-            action_onehot = torch.cat([action_onehot, h_onehot], dim=1)  # [B, A + skill_num]
-        x = torch.cat([z, action_onehot], dim=1)
-        delta = torch.tanh(self.z_delta(x))
-        latent_pred = z + self.residual_alpha * delta
+        B, T_minus_1, _ = z_seq.shape
+        device = z_seq.device
+        s = self.initial_state(B, device)
+        prior_mu, prior_logvar, prior_lowrank = [], [], []
+        rew, done, valk = [], [], []
+        mu_res = []
+
+        for t in range(T_minus_1):
+            x_in = torch.cat([z_seq[:, t].detach(), self._pack_a(a_seq[:, t], h_seq[:, t] if h_seq is not None else None)], dim=-1)
+            x_in = self.in_norm(x_in)
+            s = self.gru(x_in, s)
+            s = self.out_norm(s)
+
+            prior_mu.append(self.prior_mu(s))
+            prior_logvar.append(self.prior_logvar(s))
+            if self.prior_lowrank is not None:
+                prior_lowrank.append(self.prior_lowrank(s)) 
+            rew.append(self.reward(s))
+            done.append(self.done(s))
+            valk.append(self.value_k(s))
+            mu_res.append(z_seq[:, t].detach() + self.residual_alpha * torch.tanh(self.mu_delta(s)))
+
+            # reset state where there is no next frame (episode boundary)
+            if has_next is not None:
+                mask = has_next[:, t].view(B, 1).float()
+                s = s * mask  # simple reset
+
+        # stack and flatten to [B*(T-1), ...]
+        def _flat(xs): return torch.stack(xs, dim=1).reshape(-1, xs[0].shape[-1])
         out = {
-            "reward": self.reward(x),
-            "done_logits": self.done(x),
-            "value_k": self.value_k(x),
-            "latent_pred" : latent_pred,
+            "prior_mu": _flat(prior_mu),            # [B*(T-1), Z]
+            "prior_logvar": _flat(prior_logvar),    # [B*(T-1), Z]
+            "prior_lowrank": _flat(prior_lowrank) if self.prior_lowrank is not None else None,  # [B*(T-1), Z*R] or None
+            "reward": _flat(rew),                   # [B*(T-1), 1]
+            "done_logits": _flat(done),             # [B*(T-1), 1]
+            "value_k": _flat(valk)                  # [B*(T-1), len(K)]
         }
-        if self.skill_belief is not None:
-            out["skill_logits"] = self.skill_belief(z)
         return out
 
 
@@ -1316,7 +1372,45 @@ class MultiModalHackVAE(nn.Module):
             z += lowrank_std
         return z    # [B, LATENT_DIM]
 
-    def decode(self, z, action_onehot=None, z_next_detach=None, z_current_for_dynamics=None):
+    def decode(
+        self, 
+        z,  # [B*T, latent_dim]
+        action_onehot=None, # [B, T-1, A]
+        has_next=None,    # [B, T-1] bool
+        skill_onehot=None, # [B, T-1, K]
+        z_next_detach=None, # [B, T-1, latent_dim]
+        z_current_for_dynamics=None # [B, T-1, latent_dim]
+        ) -> Dict[str, torch.Tensor]: 
+        
+        B, T_minus_1 = None, None
+        if action_onehot is not None:
+            B = action_onehot.size(0)
+            T_minus_1 = action_onehot.size(1)
+        elif has_next is not None:
+            B = has_next.size(0)
+            T_minus_1 = has_next.size(1)
+        elif skill_onehot is not None:
+            B = skill_onehot.size(0)
+            T_minus_1 = skill_onehot.size(1)
+        elif z_next_detach is not None:
+            B = z_next_detach.size(0)
+            T_minus_1 = z_next_detach.size(1)
+        elif z_current_for_dynamics is not None:
+            B = z_current_for_dynamics.size(0)
+            T_minus_1 = z_current_for_dynamics.size(1)
+        if B is not None and T_minus_1 is not None:
+            if z.size(0) != B * (T_minus_1 + 1):
+                raise ValueError("z must have shape [B*T, latent_dim] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if action_onehot is not None and (action_onehot.size(0) != B or action_onehot.size(1) != T_minus_1):
+                raise ValueError("action_onehot must have shape [B, T-1, A] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if has_next is not None and (has_next.size(0) != B or has_next.size(1) != T_minus_1):
+                raise ValueError("has_next must have shape [B, T-1] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if skill_onehot is not None and (skill_onehot.size(0) != B or skill_onehot.size(1) != T_minus_1):
+                raise ValueError("skill_onehot must have shape [B, T-1, K] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if z_next_detach is not None and (z_next_detach.size(0) != B or z_next_detach.size(1) != T_minus_1):
+                raise ValueError("z_next_detach must have shape [B, T-1, latent_dim] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if z_current_for_dynamics is not None and (z_current_for_dynamics.size(0) != B or z_current_for_dynamics.size(1) != T_minus_1):
+                raise ValueError("z_current_for_dynamics must have shape [B, T-1, latent_dim] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
         # split z -> [z_bag | z_core]
         z_n    = self.z_norm(z)
         z_core = z_n[:, self.z_bag_dim:]
@@ -1326,9 +1420,9 @@ class MultiModalHackVAE(nn.Module):
         msg_logits = self.msg_decoder(z_core)
         out_aux = self.action_aux_head(z_n)
         # Keep dynamics in the same normalized coordinate system
-        z_cur_n  = self.z_norm(z_current_for_dynamics) if z_current_for_dynamics is not None else None
-        z_next_n = self.z_norm(z_next_detach)          if z_next_detach is not None else None
-        out_world = self.world_model(z_cur_n, action_onehot) if action_onehot is not None and z_cur_n is not None and self.world_model.enabled else None
+        z_cur_n  = self.z_norm(z_current_for_dynamics.view(B*T_minus_1, -1)) if z_current_for_dynamics is not None else None
+        z_next_n = self.z_norm(z_next_detach.view(B*T_minus_1, -1))          if z_next_detach is not None else None
+        out_world = self.world_model(z_cur_n.view(B, T_minus_1, -1), action_onehot, has_next, skill_onehot) if action_onehot is not None and z_cur_n is not None and self.world_model.enabled else None
         inverse_dynamics_logits = self.inverse_dynamics(z_cur_n, z_next_n) if z_next_n is not None and z_cur_n is not None and self.inverse_dynamics.enabled else None
         
         out = {
@@ -1351,7 +1445,7 @@ class MultiModalHackVAE(nn.Module):
         msg_tokens = batch['message_chars'] # [B, 256]
         hero_info = batch['hero_info'] # [B, 4]
         enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
-        z = self._reparameterise(enc["mu"], enc["logvar"])  # [B,D]
+        z = self._reparameterise(enc["mu"], enc["logvar"], enc["lowrank_factors"])  # [B,D]
         
         # Calculate z_next_detach if we have sequential data and save to batch
         if 'has_next' in batch and 'original_batch_shape' in batch:
@@ -1365,51 +1459,81 @@ class MultiModalHackVAE(nn.Module):
                 z_next = z_reshaped[:, 1:, :].contiguous()  # [B, T-1, latent_dim]
                 z_current_for_dynamics = z_reshaped[:, :-1, :].contiguous()  # [B, T-1, latent_dim]
                 
-                # Flatten back - save whole tensors and let vae_loss use has_next mask
-                z_next_flat = z_next.view(-1, z_next.shape[-1])  # [B*(T-1), latent_dim]
-                z_current_for_dynamics_flat = z_current_for_dynamics.view(-1, z_current_for_dynamics.shape[-1])  # [B*(T-1), latent_dim]
-                
                 # Save whole tensors to batch - let vae_loss handle masking with has_next
-                z_next_flat_detach = z_next_flat.detach()  # [B*(T-1), latent_dim]
+                z_next_detach = z_next.detach()  # [B, T-1, latent_dim]
+                
+                mu_reshaped = enc['mu'].view(B, T, -1)
+                mu_next_detach = mu_reshaped[:, 1:, :].contiguous().detach()  # [B, T-1, latent_dim]
+                mu_next_flat_detach = mu_next_detach.view(-1, mu_next_detach.shape[-1])  # [B*(T-1), latent_dim]
+                logvar_reshaped = enc['logvar'].view(B, T, -1)
+                logvar_next_detach = logvar_reshaped[:, 1:, :].contiguous().detach()  # [B, T-1, latent_dim]
+                logvar_next_flat_detach = logvar_next_detach.view(-1, logvar_next_detach.shape[-1])  # [B*(T-1), latent_dim]
+                lowrank_reshaped = enc['lowrank_factors'].view(B, T, self.latent_dim, self.lowrank_dim) if enc['lowrank_factors'] is not None else None
+                lowrank_next_detach = lowrank_reshaped[:, 1:, :, :].contiguous().detach() if lowrank_reshaped is not None else None  # [B, T-1, latent_dim, low_rank] or None
+                lowrank_next_flat_detach = lowrank_next_detach.view(-1, lowrank_next_detach.shape[-2], lowrank_next_detach.shape[-1]) if lowrank_next_detach is not None else None
                 
                 action_onehot = batch.get('action_onehot')
                 action_onehot_reshaped = action_onehot.view(B, T, -1) if action_onehot is not None else None
                 action_onehot_for_dynamics = action_onehot_reshaped[:, :-1, :].contiguous() if action_onehot_reshaped is not None else None  # [B, T-1, A]
                 action_onehot_for_dynamics_flat = action_onehot_for_dynamics.view(-1, action_onehot_for_dynamics.shape[-1]) if action_onehot_for_dynamics is not None else None  # [B*(T-1), A]
+                
+                skill_onehot = batch.get('skill_onehot')
+                skill_onehot_reshaped = skill_onehot.view(B, T, -1) if skill_onehot is not None else None
+                skill_onehot_for_dynamics = skill_onehot_reshaped[:, :-1, :].contiguous() if skill_onehot_reshaped is not None else None  # [B, T-1, K]
+                skill_onehot_for_dynamics_flat = skill_onehot_for_dynamics.view(-1, skill_onehot_for_dynamics.shape[-1]) if skill_onehot_for_dynamics is not None else None  # [B*(T-1), K]
+                
                 has_next = batch.get('has_next')
                 has_next_reshaped = has_next.view(B, T)
                 has_next_for_dynamics = has_next_reshaped[:, :-1].contiguous()
                 has_next_for_dynamics_flat = has_next_for_dynamics.view(-1)  # [B*(T-1)]
+                
                 rewards = batch.get('reward_target')
                 rewards_reshaped = rewards.view(B, T)
                 rewards_for_dynamics = rewards_reshaped[:, 1:].contiguous()
                 rewards_for_dynamics_flat = rewards_for_dynamics.view(-1)  # [B*(T-1)]
+                
                 dones = batch.get('done')
                 dones_reshaped = dones.view(B, T)
                 dones_for_dynamics = dones_reshaped[:, 1:].contiguous()
                 dones_for_dynamics_flat = dones_for_dynamics.view(-1)  # [B*(T-1)]
             else:
-                z_next_flat_detach = None  # No next state if T <= 1
-                z_current_for_dynamics_flat = None  # No current state if T <= 1
+                z_next_detach = None  # No next state if T <= 1
+                z_current_for_dynamics = None  # No current state if T <= 1
+                mu_next_flat_detach = None  # No next mu if T <= 1
+                logvar_next_flat_detach = None  # No next logvar if T <=
+                lowrank_next_flat_detach = None  # No next lowrank if T <= 1
+                action_onehot_for_dynamics = None
                 action_onehot_for_dynamics_flat = None  # No action if T <= 1
+                skill_onehot_for_dynamics = None
+                skill_onehot_for_dynamics_flat = None  # No skill if T <= 1
+                has_next_for_dynamics = None
                 has_next_for_dynamics_flat = None  # No has_next if T <= 1
                 rewards_for_dynamics_flat = None  # No rewards if T <= 1
                 dones_for_dynamics_flat = None  # No dones if T <= 1
         else:
-            z_next_flat_detach = None  # No next state if T <= 1
-            z_current_for_dynamics_flat = None  # No current state if T <= 1
+            z_next_detach = None
+            z_current_for_dynamics = None
+            mu_next_flat_detach = None  # No next mu if T <= 1
+            logvar_next_flat_detach = None  # No next logvar if T <= 1
+            lowrank_next_flat_detach = None  # No next lowrank if T <= 1
             action_onehot_for_dynamics_flat = None  # No action if T <= 1
+            skill_onehot_for_dynamics = None
+            skill_onehot_for_dynamics_flat = None  # No skill if T <= 1
+            has_next_for_dynamics = None  # No has_next if T <= 1
             has_next_for_dynamics_flat = None  # No has_next if T <= 1
             rewards_for_dynamics_flat = None  # No rewards if T <= 1
             dones_for_dynamics_flat = None  # No dones if T <= 1
                 
-        batch['z_next_detached'] = z_next_flat_detach  # [B*(T-1), latent_dim]
+        batch['mu_next_detach'] = mu_next_flat_detach  # [B*(T-1), latent_dim] or None
+        batch['logvar_next_detach'] = logvar_next_flat_detach  # [B*(T-1), latent_dim] or None
+        batch['lowrank_next_detach'] = lowrank_next_flat_detach  # [B*(T-1), latent_dim, low_rank] or None
         batch['action_onehot_for_dynamics'] = action_onehot_for_dynamics_flat  # [B*(T-1), A]
+        batch['skill_onehot_for_dynamics'] = skill_onehot_for_dynamics_flat  # [B*(T-1), K]
         batch['has_next_for_dynamics'] = has_next_for_dynamics_flat  # [B*(T-1)]
         batch['rewards_for_dynamics'] = rewards_for_dynamics_flat  # [B*(T-1)]
         batch['dones_for_dynamics'] = dones_for_dynamics_flat  # [B*(T-1)]
-        
-        dec = self.decode(z, action_onehot=action_onehot_for_dynamics_flat, z_next_detach=z_next_flat_detach, z_current_for_dynamics=z_current_for_dynamics_flat)
+
+        dec = self.decode(z, action_onehot=action_onehot_for_dynamics, has_next=has_next_for_dynamics, skill_onehot=skill_onehot_for_dynamics, z_next_detach=z_next_detach, z_current_for_dynamics=z_current_for_dynamics)
         return {**enc, **dec, 'z': z}  # include z in the output
     
     @torch.no_grad()
@@ -1688,7 +1812,7 @@ def binary_accuracy_from_logits(
     targets: torch.Tensor,             # [N, K] in {0,1}
     mask: torch.Tensor | None = None,  # [N] or [N,K] (0=ignore)
     weight: torch.Tensor | None = None,# [N] or [N,K] (importance)
-    threshold: List[float] = [0.4, 0.6],
+    threshold: float = 0.5,
 ) -> dict:
     """
     Weighted + masked binary accuracy.
@@ -1703,9 +1827,7 @@ def binary_accuracy_from_logits(
     """
     # predictions
     probs = torch.sigmoid(logits)
-    preds = torch.where(probs <= threshold[0], torch.zeros_like(probs),
-            torch.where(probs >= threshold[1], torch.ones_like(probs),
-                torch.full_like(probs, 0.5))).to(torch.float32)
+    preds = (probs >= threshold).to(torch.float32)
     tgt   = targets.to(torch.float32)
 
     # build combined weights W: same shape as logits [N,K]
@@ -1720,6 +1842,10 @@ def binary_accuracy_from_logits(
         W = W * w
 
     # correctness matrix
+    # drop "unknown" labels (tgt==0.5) from the metric
+    unknown = (tgt == 0.5)
+    if unknown.any():
+        W = W * (~unknown).to(torch.float32)
     corr = (preds == tgt).to(torch.float32)
 
     # micro accuracy
@@ -1868,7 +1994,6 @@ def vae_loss(
             # Reshape data back to [B, T, ...] for goal and value computation
             game_chars_reshaped = batch['game_chars'].view(B, T, 21, 79)  # [B, T, H, W]
             game_colors_reshaped = batch['game_colors'].view(B, T, 21, 79)  # [B, T, H, W]
-            hero_info_reshaped = batch['hero_info'].view(B, T, 4)  # [B, T, 4]
             reward_reshaped = batch['reward_target'].view(B, T)  # [B, T]
             done_reshaped = batch['done_target'].view(B, T)  # [B, T]
             
@@ -1905,7 +2030,6 @@ def vae_loss(
                         continue
                         
                     chars_map = game_chars_reshaped[g, t]  # [H, W]
-                    colors_map = game_colors_reshaped[g, t]  # [H, W]
                     
                     # Find hero position
                     hero_pos = (chars_map == ord('@')).nonzero(as_tuple=True)
@@ -1959,15 +2083,20 @@ def vae_loss(
         skill_logits = skill_logits[valid_screen]  # [B, SKILL_NUM]
     
     # latent forward model
-    latent_pred = model_output.get('latent_pred', None)
+    latent_pred_mu = model_output.get('prior_mu', None)
+    latent_pred_logvar = model_output.get('prior_logvar', None)
+    latent_pred_lowrank = model_output.get('prior_lowrank', None)
     valid_screen_reshape = valid_screen.view(B, T)  # [B, T]
     valid_screen_for_dynamics = valid_screen_reshape[:, :-1].contiguous()  # [B, T-1]
     valid_screen_for_dynamics = valid_screen_for_dynamics.view(-1)
     reward = model_output['reward'][valid_screen_for_dynamics].squeeze(1)  # [B]
     done_logits = model_output['done_logits'][valid_screen_for_dynamics].squeeze(1)  # [B]
     value_k = model_output['value_k'][valid_screen_for_dynamics]  # [B, NUM_HORIZONS]
-    if latent_pred is not None:
-        latent_pred = latent_pred[valid_screen_for_dynamics]
+    if latent_pred_mu is not None and latent_pred_logvar is not None:
+        latent_pred_mu = latent_pred_mu[valid_screen_for_dynamics] # [B*(T-1), LATENT_DIM]
+        latent_pred_logvar = latent_pred_logvar[valid_screen_for_dynamics] # [B*(T-1), LATENT_DIM]
+    if latent_pred_lowrank is not None:
+        latent_pred_lowrank = latent_pred_lowrank[valid_screen_for_dynamics] # [B*(T-1), LATENT_DIM, LOW_RANK]
     
     # inverse dynamics logits
     inverse_dynamics_logits = model_output.get('inverse_dynamics_logits', None)
@@ -1982,12 +2111,9 @@ def vae_loss(
     metrics = {}
     
     # Glyph reconstruction (chars + colors)
-    H, W = glyph_chars.shape[1], glyph_chars.shape[2]
     gc = glyph_chars[valid_screen]
-    col_t = glyph_colors[valid_screen]
     fg = (gc != ord(' '))                 # [valid_B,H,W]
     occ_t = fg.float().unsqueeze(1)           # [valid_B,1,H,W]
-    char_t = torch.clamp(gc - 32, 0, CHAR_DIM - 1)  # [valid_B,H,W]
     bag_t = make_pair_bag(glyph_chars[valid_screen], glyph_colors[valid_screen])  # [valid_B,GLYPH_DIM]
     hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen], blstats[valid_screen]) # [valid_B], [valid_B,2]
     
@@ -2172,17 +2298,28 @@ def vae_loss(
     # --- Dynamics ---
     has_next_mask = batch['has_next_for_dynamics'][valid_screen_for_dynamics]  # [B*(T-1)]
     # Forward dynamics: predict z_next from z_current and action
-    if (latent_pred is not None) and ('z_next_detached' in batch):
-        z_next_tgt = batch['z_next_detached'][valid_screen_for_dynamics][has_next_mask]
-        latent_pred_filtered = latent_pred[has_next_mask]
+    if (latent_pred_mu is not None) and (latent_pred_logvar is not None) and ('mu_next_detach' in batch) and ('logvar_next_detach' in batch):
+        mu_next_detach = batch['mu_next_detach'][valid_screen_for_dynamics][has_next_mask]
+        logvar_next_detach = batch['logvar_next_detach'][valid_screen_for_dynamics][has_next_mask]
+        latent_pred_mu_filtered = latent_pred_mu[has_next_mask]
+        latent_pred_logvar_filtered = latent_pred_logvar[has_next_mask]
+        if latent_pred_lowrank is not None and ('lowrank_next_detach' in batch) and (batch['lowrank_next_detach'] is not None):
+            lowrank_next_detach = batch['lowrank_next_detach'][valid_screen_for_dynamics][has_next_mask]
+            latent_pred_lowrank_filtered = latent_pred_lowrank[has_next_mask]
+        else:
+            lowrank_next_detach = None
+            latent_pred_lowrank_filtered = None
         
-        mse = F.mse_loss(latent_pred_filtered, z_next_tgt, reduction='none').sum(dim=1).mean()  # Mean over valid samples
-        cos = 1.0 - F.cosine_similarity(latent_pred_filtered, z_next_tgt, dim=1).mean()
-        nce = _info_nce(latent_pred_filtered, z_next_tgt, temperature=config.nce_temperature)
-        raw_losses['forward'] = (0.5 * (mse + cos)) + config.nce_weight * nce
-        forward_metrics = dynamics_metrics(latent_pred_filtered, z_next_tgt)
-        metrics.update({f'metrics/forward/{k}': v for k, v in forward_metrics.items()})
-        metrics['metrics/forward/nce'] = float(nce.item())
+        kl_wm = kl_gaussian_lowrank_q_p(
+            mu_q=mu_next_detach,
+            logvar_q=logvar_next_detach,
+            lowrank_q=lowrank_next_detach,
+            mu_p=latent_pred_mu_filtered,
+            logvar_p=latent_pred_logvar_filtered,
+            lowrank_p=latent_pred_lowrank_filtered
+        )
+
+        raw_losses['forward'] = kl_wm.mean()  # Mean over valid samples
 
     # Inverse dynamics: predict action from z_current and z_next
     if inverse_dynamics_logits is not None:
