@@ -1583,6 +1583,7 @@ class MultiModalHackVAE(nn.Module):
             mu_next_flat_detach = None  # No next mu if T <= 1
             logvar_next_flat_detach = None  # No next logvar if T <= 1
             lowrank_next_flat_detach = None  # No next lowrank if T <= 1
+            action_onehot_for_dynamics = None  # No action if T <= 1
             action_onehot_for_dynamics_flat = None  # No action if T <= 1
             skill_onehot_for_dynamics = None
             skill_onehot_for_dynamics_flat = None  # No skill if T <= 1

@@ -1,6 +1,6 @@
 # Enhanced VAE Reconstruction Comparison
 
-_Generated: 2025-08-25T15:38:21_
+_Generated: 2025-08-26T12:18:41_
 
 This analysis includes the following reconstructions:
 - **Ego View**: Character, color, and class predictions in ego-centric window
@@ -15,7 +15,7 @@ This analysis includes the following reconstructions:
 |---|---|
 | ![orig 0](images/test_sample_000_orig.png) | ![recon 0](images/test_sample_000_recon.png) |
 
-**Accuracy**: Character: 0.264, Color: 0.380
+**Accuracy**: Character: 0.223, Color: 0.388
 
 ### Ego Class Reconstruction
 
@@ -23,7 +23,7 @@ This analysis includes the following reconstructions:
 |---|---|
 | ![orig class 0](images/test_sample_000_ego_class_orig.png) | ![recon class 0](images/test_sample_000_ego_class_recon.png) |
 
-**Class Accuracy**: 0.413
+**Class Accuracy**: 0.455
 
 ### Bag Reconstruction
 
@@ -44,25 +44,27 @@ Original Bag (10 items):
   'f' (color 15)
   '|' (color  7)
 
-Reconstructed Bag (11 items):
+Reconstructed Bag (14 items):
 ------------------------------
   '#' (color  7)
-  ')' (color  6)
-  '+' (color  3)
+  '(' (color  3)
   '-' (color  3)
   '-' (color  7)
   '.' (color  7)
   '.' (color  8)
   '<' (color  7)
+  '>' (color  7)
   '@' (color 15)
+  '[' (color  3)
+  '[' (color  8)
+  '`' (color  7)
   '|' (color  3)
   '|' (color  7)
 
 Accuracy Metrics:
 ------------------------------
-  Correctly predicted: 9 items
+  Correctly predicted: 8 items
     '#' (color  7)
-    ')' (color  6)
     '-' (color  3)
     '-' (color  7)
     '.' (color  7)
@@ -70,18 +72,23 @@ Accuracy Metrics:
     '<' (color  7)
     '@' (color 15)
     '|' (color  7)
-  Missed items: 1 items
+  Missed items: 2 items
+    ')' (color  6)
     'f' (color 15)
-  False positives: 2 items
-    '+' (color  3)
+  False positives: 6 items
+    '(' (color  3)
+    '>' (color  7)
+    '[' (color  3)
+    '[' (color  8)
+    '`' (color  7)
     '|' (color  3)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.818 (9/11)
-  Recall: 0.900 (9/10)
-  F1-Score: 0.857
-  Total unique items: 12
+  Precision: 0.571 (8/14)
+  Recall: 0.800 (8/10)
+  F1-Score: 0.667
+  Total unique items: 16
 ```
 
 ### Passability & Safety
@@ -100,7 +107,7 @@ Performance Summary:
 |---|---|
 | ![orig 1](images/test_sample_001_orig.png) | ![recon 1](images/test_sample_001_recon.png) |
 
-**Accuracy**: Character: 0.364, Color: 0.942
+**Accuracy**: Character: 0.215, Color: 0.868
 
 ### Ego Class Reconstruction
 
@@ -108,7 +115,7 @@ Performance Summary:
 |---|---|
 | ![orig class 1](images/test_sample_001_ego_class_orig.png) | ![recon class 1](images/test_sample_001_ego_class_recon.png) |
 
-**Class Accuracy**: 0.835
+**Class Accuracy**: 0.826
 
 ### Bag Reconstruction
 
@@ -129,20 +136,17 @@ Original Bag (10 items):
   '|' (color  3)
   '|' (color  7)
 
-Reconstructed Bag (13 items):
+Reconstructed Bag (10 items):
 ------------------------------
   '#' (color  7)
-  '%' (color  3)
-  ')' (color  6)
-  '*' (color  1)
   '-' (color  3)
   '-' (color  7)
   '.' (color  7)
   '.' (color  8)
   '<' (color  7)
+  '>' (color  7)
   '@' (color 15)
-  '^' (color  8)
-  '|' (color  3)
+  'd' (color 15)
   '|' (color  7)
 
 Accuracy Metrics:
@@ -154,24 +158,21 @@ Accuracy Metrics:
     '.' (color  8)
     '<' (color  7)
     '@' (color 15)
-    '|' (color  3)
+    'd' (color 15)
     '|' (color  7)
   Missed items: 2 items
     '*' (color  7)
-    'd' (color 15)
-  False positives: 5 items
-    '%' (color  3)
-    ')' (color  6)
-    '*' (color  1)
+    '|' (color  3)
+  False positives: 2 items
     '-' (color  3)
-    '^' (color  8)
+    '>' (color  7)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.615 (8/13)
+  Precision: 0.800 (8/10)
   Recall: 0.800 (8/10)
-  F1-Score: 0.696
-  Total unique items: 15
+  F1-Score: 0.800
+  Total unique items: 12
 ```
 
 ### Passability & Safety
@@ -190,7 +191,7 @@ Performance Summary:
 |---|---|
 | ![orig 2](images/test_sample_002_orig.png) | ![recon 2](images/test_sample_002_recon.png) |
 
-**Accuracy**: Character: 0.223, Color: 0.661
+**Accuracy**: Character: 0.248, Color: 0.620
 
 ### Ego Class Reconstruction
 
@@ -198,7 +199,7 @@ Performance Summary:
 |---|---|
 | ![orig class 2](images/test_sample_002_ego_class_orig.png) | ![recon class 2](images/test_sample_002_ego_class_recon.png) |
 
-**Class Accuracy**: 0.661
+**Class Accuracy**: 0.645
 
 ### Bag Reconstruction
 
@@ -221,9 +222,10 @@ Original Bag (12 items):
   '|' (color  3)
   '|' (color  7)
 
-Reconstructed Bag (11 items):
+Reconstructed Bag (14 items):
 ------------------------------
   '#' (color  7)
+  ')' (color  6)
   '-' (color  3)
   '-' (color  7)
   '.' (color  7)
@@ -231,14 +233,17 @@ Reconstructed Bag (11 items):
   '<' (color  7)
   '>' (color  7)
   '@' (color 15)
+  '^' (color  3)
   '`' (color  7)
+  '{' (color 12)
   '|' (color  3)
   '|' (color  7)
 
 Accuracy Metrics:
 ------------------------------
-  Correctly predicted: 9 items
+  Correctly predicted: 10 items
     '#' (color  7)
+    ')' (color  6)
     '-' (color  3)
     '-' (color  7)
     '.' (color  7)
@@ -247,20 +252,21 @@ Accuracy Metrics:
     '@' (color 15)
     '|' (color  3)
     '|' (color  7)
-  Missed items: 3 items
+  Missed items: 2 items
     '%' (color  3)
-    ')' (color  6)
     '+' (color  3)
-  False positives: 2 items
+  False positives: 4 items
     '>' (color  7)
+    '^' (color  3)
     '`' (color  7)
+    '{' (color 12)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.818 (9/11)
-  Recall: 0.750 (9/12)
-  F1-Score: 0.783
-  Total unique items: 14
+  Precision: 0.714 (10/14)
+  Recall: 0.833 (10/12)
+  F1-Score: 0.769
+  Total unique items: 16
 ```
 
 ### Passability & Safety
@@ -279,7 +285,7 @@ Performance Summary:
 |---|---|
 | ![orig 3](images/test_sample_003_orig.png) | ![recon 3](images/test_sample_003_recon.png) |
 
-**Accuracy**: Character: 0.099, Color: 0.678
+**Accuracy**: Character: 0.231, Color: 0.752
 
 ### Ego Class Reconstruction
 
@@ -287,7 +293,7 @@ Performance Summary:
 |---|---|
 | ![orig class 3](images/test_sample_003_ego_class_orig.png) | ![recon class 3](images/test_sample_003_ego_class_recon.png) |
 
-**Class Accuracy**: 0.686
+**Class Accuracy**: 0.628
 
 ### Bag Reconstruction
 
@@ -308,28 +314,27 @@ Original Bag (10 items):
   '|' (color  3)
   '|' (color  7)
 
-Reconstructed Bag (16 items):
+Reconstructed Bag (15 items):
 ------------------------------
   '#' (color  7)
-  '%' (color  3)
-  ')' (color  3)
-  '+' (color  3)
+  '(' (color  3)
+  ')' (color  6)
   '-' (color  3)
   '-' (color  7)
   '.' (color  7)
   '.' (color  8)
   '<' (color  7)
-  '>' (color  7)
   '@' (color 15)
-  'F' (color 15)
-  '^' (color  3)
   '`' (color  7)
+  'd' (color 15)
+  'f' (color 15)
   '{' (color 12)
+  '|' (color  3)
   '|' (color  7)
 
 Accuracy Metrics:
 ------------------------------
-  Correctly predicted: 8 items
+  Correctly predicted: 10 items
     '#' (color  7)
     '-' (color  3)
     '-' (color  7)
@@ -337,26 +342,23 @@ Accuracy Metrics:
     '.' (color  8)
     '<' (color  7)
     '@' (color 15)
-    '|' (color  7)
-  Missed items: 2 items
     'd' (color 15)
     '|' (color  3)
-  False positives: 8 items
-    '%' (color  3)
-    ')' (color  3)
-    '+' (color  3)
-    '>' (color  7)
-    'F' (color 15)
-    '^' (color  3)
+    '|' (color  7)
+  Missed items: 0 items
+  False positives: 5 items
+    '(' (color  3)
+    ')' (color  6)
     '`' (color  7)
+    'f' (color 15)
     '{' (color 12)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.500 (8/16)
-  Recall: 0.800 (8/10)
-  F1-Score: 0.615
-  Total unique items: 18
+  Precision: 0.667 (10/15)
+  Recall: 1.000 (10/10)
+  F1-Score: 0.800
+  Total unique items: 15
 ```
 
 ### Passability & Safety
@@ -375,7 +377,7 @@ Performance Summary:
 |---|---|
 | ![orig 4](images/test_sample_004_orig.png) | ![recon 4](images/test_sample_004_recon.png) |
 
-**Accuracy**: Character: 0.355, Color: 0.628
+**Accuracy**: Character: 0.322, Color: 0.603
 
 ### Ego Class Reconstruction
 
@@ -383,7 +385,7 @@ Performance Summary:
 |---|---|
 | ![orig class 4](images/test_sample_004_ego_class_orig.png) | ![recon class 4](images/test_sample_004_ego_class_recon.png) |
 
-**Class Accuracy**: 0.653
+**Class Accuracy**: 0.620
 
 ### Bag Reconstruction
 
@@ -403,25 +405,27 @@ Original Bag (9 items):
   '`' (color  7)
   '|' (color  7)
 
-Reconstructed Bag (12 items):
+Reconstructed Bag (13 items):
 ------------------------------
   '#' (color  7)
+  '%' (color  3)
+  '-' (color  3)
   '-' (color  7)
   '.' (color  7)
   '.' (color  8)
   '<' (color  7)
   '>' (color  7)
   '@' (color 15)
-  '[' (color  3)
-  '^' (color 12)
+  '[' (color  8)
   '`' (color  7)
   '|' (color  3)
   '|' (color  7)
 
 Accuracy Metrics:
 ------------------------------
-  Correctly predicted: 8 items
+  Correctly predicted: 9 items
     '#' (color  7)
+    '-' (color  3)
     '-' (color  7)
     '.' (color  7)
     '.' (color  8)
@@ -429,19 +433,18 @@ Accuracy Metrics:
     '@' (color 15)
     '`' (color  7)
     '|' (color  7)
-  Missed items: 1 items
-    '-' (color  3)
+  Missed items: 0 items
   False positives: 4 items
+    '%' (color  3)
     '>' (color  7)
-    '[' (color  3)
-    '^' (color 12)
+    '[' (color  8)
     '|' (color  3)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.667 (8/12)
-  Recall: 0.889 (8/9)
-  F1-Score: 0.762
+  Precision: 0.692 (9/13)
+  Recall: 1.000 (9/9)
+  F1-Score: 0.818
   Total unique items: 13
 ```
 
@@ -461,7 +464,7 @@ Performance Summary:
 |---|---|
 | ![orig 5](images/test_sample_005_orig.png) | ![recon 5](images/test_sample_005_recon.png) |
 
-**Accuracy**: Character: 0.174, Color: 0.479
+**Accuracy**: Character: 0.223, Color: 0.479
 
 ### Ego Class Reconstruction
 
@@ -495,9 +498,10 @@ Original Bag (15 items):
   '|' (color  3)
   '|' (color  7)
 
-Reconstructed Bag (11 items):
+Reconstructed Bag (12 items):
 ------------------------------
   '#' (color  7)
+  ')' (color  6)
   '-' (color  3)
   '-' (color  7)
   '.' (color  7)
@@ -505,7 +509,7 @@ Reconstructed Bag (11 items):
   '<' (color  7)
   '>' (color  7)
   '@' (color 15)
-  '`' (color  7)
+  '{' (color 12)
   '|' (color  3)
   '|' (color  7)
 
@@ -513,30 +517,31 @@ Accuracy Metrics:
 ------------------------------
   Correctly predicted: 10 items
     '#' (color  7)
+    ')' (color  6)
     '-' (color  3)
     '-' (color  7)
     '.' (color  7)
     '.' (color  8)
     '<' (color  7)
     '@' (color 15)
-    '`' (color  7)
     '|' (color  3)
     '|' (color  7)
   Missed items: 5 items
     ')' (color  3)
-    ')' (color  6)
     '+' (color  3)
     '+' (color  5)
+    '`' (color  7)
     'f' (color 15)
-  False positives: 1 items
+  False positives: 2 items
     '>' (color  7)
+    '{' (color 12)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.909 (10/11)
+  Precision: 0.833 (10/12)
   Recall: 0.667 (10/15)
-  F1-Score: 0.769
-  Total unique items: 16
+  F1-Score: 0.741
+  Total unique items: 17
 ```
 
 ### Passability & Safety
@@ -555,7 +560,7 @@ Performance Summary:
 |---|---|
 | ![orig 6](images/test_sample_006_orig.png) | ![recon 6](images/test_sample_006_recon.png) |
 
-**Accuracy**: Character: 0.248, Color: 0.851
+**Accuracy**: Character: 0.256, Color: 0.851
 
 ### Ego Class Reconstruction
 
@@ -563,7 +568,7 @@ Performance Summary:
 |---|---|
 | ![orig class 6](images/test_sample_006_ego_class_orig.png) | ![recon class 6](images/test_sample_006_ego_class_recon.png) |
 
-**Class Accuracy**: 0.769
+**Class Accuracy**: 0.802
 
 ### Bag Reconstruction
 
@@ -585,7 +590,6 @@ Original Bag (8 items):
 Reconstructed Bag (12 items):
 ------------------------------
   '#' (color  7)
-  '+' (color  1)
   '-' (color  3)
   '-' (color  7)
   '.' (color  7)
@@ -593,8 +597,9 @@ Reconstructed Bag (12 items):
   '<' (color  7)
   '>' (color  7)
   '@' (color 15)
-  '^' (color  8)
   '`' (color  7)
+  'd' (color 15)
+  '|' (color  3)
   '|' (color  7)
 
 Accuracy Metrics:
@@ -610,11 +615,11 @@ Accuracy Metrics:
   Missed items: 1 items
     ')' (color  6)
   False positives: 5 items
-    '+' (color  1)
     '-' (color  3)
     '>' (color  7)
-    '^' (color  8)
     '`' (color  7)
+    'd' (color 15)
+    '|' (color  3)
 
 Performance Summary:
 ------------------------------
@@ -640,7 +645,7 @@ Performance Summary:
 |---|---|
 | ![orig 7](images/test_sample_007_orig.png) | ![recon 7](images/test_sample_007_recon.png) |
 
-**Accuracy**: Character: 0.190, Color: 0.587
+**Accuracy**: Character: 0.289, Color: 0.612
 
 ### Ego Class Reconstruction
 
@@ -648,7 +653,7 @@ Performance Summary:
 |---|---|
 | ![orig class 7](images/test_sample_007_ego_class_orig.png) | ![recon class 7](images/test_sample_007_ego_class_recon.png) |
 
-**Class Accuracy**: 0.612
+**Class Accuracy**: 0.570
 
 ### Bag Reconstruction
 
@@ -677,7 +682,8 @@ Original Bag (15 items):
 Reconstructed Bag (13 items):
 ------------------------------
   '#' (color  7)
-  '(' (color  3)
+  '%' (color  3)
+  ')' (color  6)
   '-' (color  3)
   '-' (color  7)
   '.' (color  7)
@@ -686,14 +692,14 @@ Reconstructed Bag (13 items):
   '>' (color  7)
   '@' (color 15)
   '`' (color  7)
-  '{' (color 12)
   '|' (color  3)
   '|' (color  7)
 
 Accuracy Metrics:
 ------------------------------
-  Correctly predicted: 10 items
+  Correctly predicted: 11 items
     '#' (color  7)
+    ')' (color  6)
     '-' (color  3)
     '-' (color  7)
     '.' (color  7)
@@ -703,23 +709,21 @@ Accuracy Metrics:
     '`' (color  7)
     '|' (color  3)
     '|' (color  7)
-  Missed items: 5 items
+  Missed items: 4 items
     ')' (color  3)
-    ')' (color  6)
     '+' (color  3)
     '+' (color  5)
     'f' (color 15)
-  False positives: 3 items
-    '(' (color  3)
+  False positives: 2 items
+    '%' (color  3)
     '>' (color  7)
-    '{' (color 12)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.769 (10/13)
-  Recall: 0.667 (10/15)
-  F1-Score: 0.714
-  Total unique items: 18
+  Precision: 0.846 (11/13)
+  Recall: 0.733 (11/15)
+  F1-Score: 0.786
+  Total unique items: 17
 ```
 
 ### Passability & Safety
@@ -738,7 +742,7 @@ Performance Summary:
 |---|---|
 | ![orig 8](images/test_sample_008_orig.png) | ![recon 8](images/test_sample_008_recon.png) |
 
-**Accuracy**: Character: 0.256, Color: 0.678
+**Accuracy**: Character: 0.314, Color: 0.678
 
 ### Ego Class Reconstruction
 
@@ -746,7 +750,7 @@ Performance Summary:
 |---|---|
 | ![orig class 8](images/test_sample_008_ego_class_orig.png) | ![recon class 8](images/test_sample_008_ego_class_recon.png) |
 
-**Class Accuracy**: 0.678
+**Class Accuracy**: 0.661
 
 ### Bag Reconstruction
 
@@ -780,47 +784,46 @@ Reconstructed Bag (15 items):
   '.' (color  7)
   '.' (color  8)
   '<' (color  7)
+  '>' (color  7)
   '@' (color 15)
-  '[' (color  8)
+  'F' (color 15)
+  '[' (color  6)
   '`' (color  7)
-  'd' (color 15)
   '{' (color 12)
   '|' (color  3)
   '|' (color  7)
-  '|' (color 15)
 
 Accuracy Metrics:
 ------------------------------
-  Correctly predicted: 9 items
+  Correctly predicted: 10 items
     '#' (color  7)
     '-' (color  3)
     '-' (color  7)
     '.' (color  7)
     '.' (color  8)
     '<' (color  7)
+    '>' (color  7)
     '@' (color 15)
     '|' (color  3)
     '|' (color  7)
-  Missed items: 5 items
+  Missed items: 4 items
     '$' (color 11)
     '%' (color  3)
     '*' (color 15)
     '+' (color  3)
-    '>' (color  7)
-  False positives: 6 items
+  False positives: 5 items
     ')' (color  6)
-    '[' (color  8)
+    'F' (color 15)
+    '[' (color  6)
     '`' (color  7)
-    'd' (color 15)
     '{' (color 12)
-    '|' (color 15)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.600 (9/15)
-  Recall: 0.643 (9/14)
-  F1-Score: 0.621
-  Total unique items: 20
+  Precision: 0.667 (10/15)
+  Recall: 0.714 (10/14)
+  F1-Score: 0.690
+  Total unique items: 19
 ```
 
 ### Passability & Safety
@@ -839,7 +842,7 @@ Performance Summary:
 |---|---|
 | ![orig 9](images/test_sample_009_orig.png) | ![recon 9](images/test_sample_009_recon.png) |
 
-**Accuracy**: Character: 0.421, Color: 0.760
+**Accuracy**: Character: 0.339, Color: 0.752
 
 ### Ego Class Reconstruction
 
@@ -847,7 +850,7 @@ Performance Summary:
 |---|---|
 | ![orig class 9](images/test_sample_009_ego_class_orig.png) | ![recon class 9](images/test_sample_009_ego_class_recon.png) |
 
-**Class Accuracy**: 0.727
+**Class Accuracy**: 0.744
 
 ### Bag Reconstruction
 
@@ -869,27 +872,23 @@ Original Bag (11 items):
   '|' (color  3)
   '|' (color  7)
 
-Reconstructed Bag (13 items):
+Reconstructed Bag (10 items):
 ------------------------------
   '#' (color  7)
-  ')' (color  6)
-  '-' (color  3)
   '-' (color  7)
   '.' (color  7)
   '.' (color  8)
   '<' (color  7)
   '>' (color  7)
   '@' (color 15)
-  '`' (color  7)
-  '{' (color 12)
+  'd' (color 15)
   '|' (color  3)
   '|' (color  7)
 
 Accuracy Metrics:
 ------------------------------
-  Correctly predicted: 9 items
+  Correctly predicted: 8 items
     '#' (color  7)
-    '-' (color  3)
     '-' (color  7)
     '.' (color  7)
     '.' (color  8)
@@ -897,21 +896,20 @@ Accuracy Metrics:
     '@' (color 15)
     '|' (color  3)
     '|' (color  7)
-  Missed items: 2 items
+  Missed items: 3 items
+    '-' (color  3)
     'F' (color 10)
     'f' (color 15)
-  False positives: 4 items
-    ')' (color  6)
+  False positives: 2 items
     '>' (color  7)
-    '`' (color  7)
-    '{' (color 12)
+    'd' (color 15)
 
 Performance Summary:
 ------------------------------
-  Precision: 0.692 (9/13)
-  Recall: 0.818 (9/11)
-  F1-Score: 0.750
-  Total unique items: 15
+  Precision: 0.800 (8/10)
+  Recall: 0.727 (8/11)
+  F1-Score: 0.762
+  Total unique items: 13
 ```
 
 ### Passability & Safety
@@ -922,6 +920,6 @@ Performance Summary:
 
 ## Overall Statistics
 
-- **Average Character Accuracy**: 0.260
-- **Average Color Accuracy**: 0.664
+- **Average Character Accuracy**: 0.266
+- **Average Color Accuracy**: 0.660
 - **Total Samples**: 10

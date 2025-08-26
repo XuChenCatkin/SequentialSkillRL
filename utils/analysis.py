@@ -1034,7 +1034,7 @@ def analyze_latent_space(
     latent_means = np.mean(latent_vectors, axis=0)
     
     # Create comprehensive visualization
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 18))
     
     # 1. PCA of latent space colored by dataset (moved to first position)
     for dataset in unique_datasets:
@@ -1128,6 +1128,68 @@ def analyze_latent_space(
     # Add correlation colorbar
     cbar = plt.colorbar(im, ax=axes[1, 2])
     cbar.set_label('Correlation')
+    
+    # 7. Per-dimension KL divergence histogram
+    # Compute per-dimension KL divergence: KL(q(z_i) || p(z_i)) for each dimension
+    # Assuming standard normal prior: KL = 0.5 * (var + mean^2 - 1 - log(var))
+    per_dim_kl = 0.5 * (latent_vars + latent_means**2 - 1 - np.log(np.maximum(latent_vars, 1e-8)))
+    
+    axes[2, 0].bar(range(len(per_dim_kl)), per_dim_kl)
+    axes[2, 0].axhline(0.05, color='red', linestyle='--', alpha=0.7, label='Threshold (0.05 nats)')
+    axes[2, 0].set_xlabel('Latent Dimension')
+    axes[2, 0].set_ylabel('KL Divergence (nats)')
+    axes[2, 0].set_title('Per-Dimension KL Divergence')
+    axes[2, 0].legend()
+    axes[2, 0].grid(True, alpha=0.3)
+    
+    # 8. Eigenvalues of posterior covariance matrix
+    posterior_cov = np.cov(latent_vectors.T)
+    eigenvalues = np.linalg.eigvals(posterior_cov)
+    eigenvalues = np.sort(eigenvalues)[::-1]  # Sort in descending order
+    
+    axes[2, 1].bar(range(len(eigenvalues)), eigenvalues)
+    axes[2, 1].axhline(1.0, color='red', linestyle='--', alpha=0.7, label='Unit variance threshold')
+    axes[2, 1].set_xlabel('Eigenvalue Index (sorted)')
+    axes[2, 1].set_ylabel('Eigenvalue')
+    axes[2, 1].set_title('Posterior Covariance Eigenvalues')
+    axes[2, 1].legend()
+    axes[2, 1].grid(True, alpha=0.3)
+    axes[2, 1].set_yscale('log')  # Log scale for better visualization
+    
+    # 9. Mutual Information and Total Correlation
+    # Use proper β-VAE decomposition: KL = MI + TC + DW-KL
+    
+    # First compute overall KL divergence KL(q(z) || p(z))
+    kl_total = 0.5 * (np.trace(posterior_cov) + np.sum(latent_means**2) - 
+                      latent_vectors.shape[1] - np.linalg.slogdet(posterior_cov)[1])
+    
+    # Dimension-wise KL: sum of KL(q(z_i) || p(z_i)) for each dimension
+    dimension_wise_kl = np.sum(per_dim_kl)
+    
+    # Total Correlation: -0.5 * log(det(R)) where R is normalized covariance
+    diag_vars = np.maximum(np.diag(posterior_cov), 1e-8)
+    D_sqrt_inv = np.diag(1.0 / np.sqrt(diag_vars))
+    R = D_sqrt_inv @ posterior_cov @ D_sqrt_inv  # Normalized covariance
+    R = 0.5 * (R + R.T) + 1e-8 * np.eye(R.shape[0])  # Ensure symmetry and stability
+    total_correlation = -0.5 * np.linalg.slogdet(R)[1]
+    
+    # Mutual Information: residual from the decomposition
+    mutual_info = kl_total - total_correlation - dimension_wise_kl
+    
+    metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL\n(sum)']
+    values = [mutual_info, total_correlation, dimension_wise_kl, kl_total]
+    colors = ['skyblue', 'lightcoral', 'lightgreen', 'gold']
+    
+    bars = axes[2, 2].bar(metrics, values, color=colors, alpha=0.7)
+    axes[2, 2].set_ylabel('Nats')
+    axes[2, 2].set_title('β-VAE KL Decomposition: KL = MI + TC + DW-KL')
+    axes[2, 2].grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, values):
+        height = bar.get_height()
+        axes[2, 2].text(bar.get_x() + bar.get_width()/2., height + 0.01*max(values),
+                       f'{value:.3f}', ha='center', va='bottom', fontsize=9)
     
     pca_explained_variance = pca.explained_variance_ratio_
     
