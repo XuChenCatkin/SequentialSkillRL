@@ -1087,6 +1087,7 @@ def train_multimodalhack_vae(
             if hf_upload_directly:
                 repo_url = save_model_to_huggingface(
                     model=model,
+                    config=config,
                     repo_name=hf_repo_name,
                     token=hf_token,
                     private=hf_private,
@@ -1104,16 +1105,13 @@ def train_multimodalhack_vae(
                     'test_losses': test_losses,
                     'final_train_loss': final_train_loss,
                     'final_test_loss': final_test_loss,
-                    'model_config': {
-                        'latent_dim': config.latent_dim,
-                        'lowrank_dim': config.low_rank,
-                    },
                     'training_timestamp': datetime.now().isoformat(),
                 }, save_path)
                 logger.info(f"💾 Model saved locally: {save_path}")
                 
                 repo_url = save_model_to_huggingface(
                     model=model,
+                    config=config,
                     model_save_path=save_path,
                     repo_name=hf_repo_name,
                     token=hf_token,
@@ -1187,10 +1185,6 @@ def train_multimodalhack_vae(
             'test_losses': test_losses,
             'final_train_loss': final_train_loss,
             'final_test_loss': final_test_loss,
-            'model_config': {
-                'latent_dim': config.latent_dim,
-                'lowrank_dim': config.low_rank,
-            },
             'training_timestamp': datetime.now().isoformat(),
         }, save_path)
         logger.info(f"💾 Model saved locally: {save_path}")

@@ -5,7 +5,7 @@ import torch
 from datetime import datetime
 from huggingface_hub import HfApi, login, hf_hub_download, HfFileSystem
 from matplotlib import pyplot as plt
-from src.model import MultiModalHackVAE
+from src.model import MultiModalHackVAE, VAEConfig
 
 # Weights & Biases integration
 try:
@@ -177,6 +177,7 @@ def cleanup_old_checkpoints(checkpoint_dir: str, keep_last_n: int) -> None:
 
 def save_model_to_huggingface(
     model: MultiModalHackVAE,
+    config: VAEConfig,
     model_save_path: str = None,
     repo_name: str = None,
     token: Optional[str] = None,
@@ -237,10 +238,7 @@ def save_model_to_huggingface(
             print(f"💾 Creating temporary model file for direct upload...")
             torch.save({
                 'model_state_dict': model.state_dict(),
-                'model_config': {
-                    'latent_dim': getattr(model, 'latent_dim', 96),
-                    'lowrank_dim': getattr(model, 'lowrank_dim', 0),
-                },
+                'config': config,
                 'upload_timestamp': datetime.now().isoformat(),
             }, model_save_path)
             temp_model_file.close()
@@ -450,22 +448,9 @@ def load_model_from_local(
             config = checkpoint['config']
             print(f"🏗️  Using saved VAEConfig from checkpoint")
         else:
-            # Legacy checkpoint - create VAEConfig from old parameters
-            print(f"🔄 Converting legacy checkpoint to VAEConfig")
-            from src.model import VAEConfig
-            
-            # Extract legacy parameters with defaults
-            model_config_dict = checkpoint.get('model_config', {})
-            
-            # Create VAEConfig with legacy parameter mapping
-            config = VAEConfig(
-                latent_dim=model_config_dict.get('latent_dim', 96),
-                encoder_dropout=model_config_dict.get('dropout_rate', 0.1),
-                decoder_dropout=model_config_dict.get('dropout_rate', 0.1),
-                low_rank=model_config_dict.get('lowrank_dim', 0),
-                # Use defaults for other parameters
-            )
-            print(f"🏗️  Created VAEConfig from legacy parameters")
+            # Create default VAEConfig
+            config = VAEConfig()
+            print(f"🏗️  No config in checkpoint. Created default VAEConfig")
         
         # Apply any overrides from model_kwargs
         if model_kwargs:
@@ -568,30 +553,10 @@ def load_model_from_huggingface(
             # Modern checkpoint with VAEConfig
             vae_config = checkpoint['config']
             print(f"🏗️  Using saved VAEConfig from checkpoint")
-        elif 'latent_dim' in config:
-            # Modern config format
-            from src.model import VAEConfig
-            vae_config = VAEConfig(
-                latent_dim=config.get('latent_dim', 96),
-                encoder_dropout=config.get('encoder_dropout', 0.1),
-                decoder_dropout=config.get('decoder_dropout', 0.1),
-                low_rank=config.get('low_rank', 0),
-            )
-            print(f"🏗️  Created VAEConfig from modern config format")
         else:
-            # Legacy config format - create VAEConfig from old parameters
-            print(f"🔄 Converting legacy HuggingFace config to VAEConfig")
-            from src.model import VAEConfig
-            
-            # Create VAEConfig with legacy parameter mapping
-            vae_config = VAEConfig(
-                latent_dim=config.get('latent_dim', 96),
-                encoder_dropout=config.get('dropout_rate', 0.1),
-                decoder_dropout=config.get('dropout_rate', 0.1),
-                low_rank=config.get('lowrank_dim', 0),
-                # Use defaults for other parameters
-            )
-            print(f"🏗️  Created VAEConfig from legacy parameters")
+            # Create default VAEConfig
+            vae_config = VAEConfig()
+            print(f"🏗️  No config in checkpoint. Created default VAEConfig")
         
         # Apply any overrides from model_kwargs
         if model_kwargs:
