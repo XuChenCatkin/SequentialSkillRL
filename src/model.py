@@ -439,7 +439,7 @@ class VAEConfig:
     passability_dirs: int = 8  # number of passability directions (N,NE,E,SE,S,SW,W,NW)
     value_horizons: List[int] = field(default_factory=lambda: [1, 5, 10])
     # Skill belief (future sticky HMM integration)
-    skill_num: int = 0                         # number of skills; 0 disables skill head
+    skill_num: int = 40                         # number of skills; 0 disables skill head
 
     # Goal and value hyperparameters (moved from data collection)
     gamma: float = 0.95                        # discount factor for k-step returns
@@ -455,8 +455,8 @@ class VAEConfig:
     # Loss weights
     raw_modality_weights: Dict[str, float] = field(default_factory=lambda: {
         'ego_class': 5.0,
-        'passability': 20.0,
-        'safety': 20.0,
+        'passability': 5.0,
+        'safety': 5.0,
         'reward': 0.5,
         'done': 1.0,
         'value_k': 1.0,
@@ -466,7 +466,7 @@ class VAEConfig:
         'goal': 3.0,
         'occupy': 0.5,
         'forward': 5.0,
-        'inverse': 10,
+        'inverse': 10.0,
         'ego_char': 0.5,
         'ego_color': 0.5,
         'hero_loc': 20.0,
