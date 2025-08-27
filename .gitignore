@@ -206,3 +206,4 @@ data/
 data_cache/
 checkpoints/
 models/
+wandb/

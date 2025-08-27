@@ -15,8 +15,6 @@ Inputs (per time-step)
 * blstats     : FloatTensor[B,27] - game statistics (hp, gold, position, etc.) - processed to 43 dims
 * msg_tokens  : LongTensor[B,256] - tokenized message text (0-127 + SOS/EOS)
 * hero_info   : LongTensor[B,4] - hero attributes [role, race, gender, alignment]
-* inv_oclasses: LongTensor[B,55] - inventory object classes (0-18)
-* inv_strs    : LongTensor[B,55,80] - inventory string descriptions (0-127 per char)
 
 Outputs  
 -------
@@ -42,7 +40,6 @@ Architecture
     3. StatsMLP: [B,27] → [B,16] - preprocessed game statistics (43 processed dims)
     4. MessageGRU: [B,256] → [B,12] - bidirectional message encoding
     5. HeroEmb: [B,4] → [B,16] - hero attribute embeddings
-    6. InventoryEncoder: [B,55] & [B,55,80] → [B,24] - inventory features
 
 **Decoder**: Shared latent → specialized heads for each modality
     - Supports both discrete (logits) and continuous (embeddings) reconstruction
@@ -57,23 +54,39 @@ Architecture
 """
 
 from __future__ import annotations
+from unittest import result
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 import logging
+import math
+from typing import Optional, List, Dict
+from enum import IntEnum
+from dataclasses import dataclass, field
+from nle import nethack
+from utils.math_utils import kl_gaussian_lowrank_q_p
+
+# Import NetHackCategory from data_collection
+try:
+    from .data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step_multi_with_mask, DIRS_8
+except ImportError:
+    # Fallback for when running as script
+    from src.data_collection import NetHackCategory, crop_ego, categorize_glyph_tensor, nearest_stairs_vector, discounted_k_step_multi_with_mask, DIRS_8
 
 # ------------------------- hyper‑params ------------------------------ #
 CHAR_DIM = 96      # ASCII code space for characters shown on the map (32-127)
-CHAR_EMB = 16      # char‑id embedding dim (0-15)
 COLOR_DIM = 16      # colour id space for colours
-COLOR_EMB = 4       # colour‑id embedding dim
-GLYPH_EMB = CHAR_EMB + COLOR_EMB  # glyph embedding dim
-LATENT_DIM = 64     # z‑dim for VAE
 BLSTATS_DIM = 27   # raw scalar stats (hp, gold, …)
+MSG_PAD = 0  
 MSG_VOCAB = 128     # Nethack takes 32-127 byte for char of messages
+MSG_SOS = MSG_VOCAB  # start-of-sequence token id
+MSG_EOS = MSG_VOCAB + 1  # end-of-sequence token id
+MSG_VSIZE = MSG_VOCAB + 2  # vocab size including SOS/EOS
+MSG_MAXLEN = 256  # max length of message text (padded/truncated)
 GLYPH_DIM = CHAR_DIM * COLOR_DIM  # glyph dim for char + color
-PADDING_IDX = [CHAR_DIM, COLOR_DIM]  # padding index for glyphs
-LOW_RANK = 4      # low-rank factorisation rank for covariance
+BLANK_CHAR = 32        # blank space
+BLACK_COLOR = 0        # black color (background)
 # NetHack map dimensions (from NetHack source: include/config.h)
 MAP_HEIGHT = 21     # ROWNO - number of rows in the map
 MAP_WIDTH = 79      # COLNO-1 - playable columns (COLNO=80, but rightmost is UI)
@@ -83,14 +96,6 @@ ROLE_CAD = 13     # role cardinality for MiniHack (e.g. 4 for 'knight')
 RACE_CAD = 5      # race cardinality for MiniHack (e.g. 0 for 'human')
 GEND_CAD = 3      # gender cardinality for MiniHack (e.g. 'male', 'female', 'neuter')
 ALIGN_CAD = 3     # alignment cardinality for MiniHack (e.g. 1 for 'lawful')
-ROLE_EMB = 8      # role embedding dim
-RACE_EMB = 4      # race embedding dim
-GEND_EMB = 2      # gender embedding dim
-ALIGN_EMB = 2     # alignment embedding dim
-# Inventory constants 
-INV_MAX_SIZE = 55      # Maximum inventory size in NetHack
-INV_STR_LEN = 80       # Maximum string length for inventory descriptions
-INV_OCLASS_DIM = 19    # Object class cardinality (0-18)
 
 # Condition mask constants (blstats[25] bit field)
 CONDITION_BITS = [
@@ -141,294 +146,802 @@ BLSTATS_CAT = [
     "alignment",         # 26: Alignment (-1 to 1, -1=chaotic, 0=neutral, 1=lawful)
 ]
 
-# Inventory object class mappings
-INV_OCLASS_MAP = {
-    # 0 random object, not appear in inventory
-    1:ord(']'), # Illegal object
-    2:ord(')'), # Weapon
-    3:ord('['), # Armor
-    4:ord('='), # Ring
-    5:ord('"'), # Amulet
-    6:ord('('), # Tool
-    7:ord('%'), # Food
-    8:ord('!'), # Potion
-    9:ord('?'), # Scroll
-    10:ord('+'), # Spellbook
-    11:ord('/'), # Wand
-    12:ord('$'), # Coin
-    13:ord('*'), # Gem
-    14:ord('`'), # Rock
-    15:ord('0'), # Iron Ball
-    16:ord('_'), # Chains
-    17:ord('.'), # Venom
-    18: 128      # MAXOCLASSES, used for padding, use same as PADDING_IDX
-}
+COMMON_CHARS = [ord('#'), ord('.'), ord('-'), ord('|'), ord('>'), ord('<'), ord('@')]
+COMMON_GLYPHS = [(a, c) for a in COMMON_CHARS for c in range(COLOR_DIM)] # (char, color) pairs for common glyphs
+HERO_CHAR = ord('@')  # hero character code (ASCII 64)
 
-class GlyphCNN(nn.Module):
-    """3-layer conv on [B, C= (char_emb+color_emb), H, W]."""
-    def __init__(self):
+def _gn_groups(c: int) -> int:
+    """Pick a sensible GroupNorm group count that divides c."""
+    for g in (32, 16, 8, 4, 2, 1):
+        if c % g == 0:
+            return g
+    return 1
+
+def _pair_index(char_ascii: torch.Tensor, color_id: torch.Tensor) -> torch.Tensor:
+    """
+    Map ASCII char (32..127) + color (0..15) -> flat pair index [0..GLYPH_DIM-1].
+    Both tensors are same shape; returns long tensor of that shape.
+    """
+    ch = (char_ascii - 32).clamp(0, CHAR_DIM - 1)
+    co = color_id.clamp(0, COLOR_DIM - 1)
+    return ch * COLOR_DIM + co
+
+def _to_pair_idx(pair_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Inverse of _pair_index: flat pair index [0..GLYPH_DIM-1] -> (char_ascii [32..127], color_id [0..15])
+    """
+    ch = (pair_idx // COLOR_DIM) + 32
+    co = pair_idx % COLOR_DIM
+    return ch, co
+
+def make_pair_bag(glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> torch.Tensor:
+    """
+    Returns a binary presence vector for (char,color) pairs, excluding (32,0).
+    glyph_chars/colors: [B,H,W]  ->  bag: [B, GLYPH_DIM] in {0,1}.
+    """
+    B, H, W = glyph_chars.shape
+    flat_idx = _pair_index(glyph_chars, glyph_colors)   # [B,H,W]
+    bag = torch.zeros(B, GLYPH_DIM, device=glyph_chars.device, dtype=torch.float32)
+    bag.scatter_add_(1, flat_idx.view(B, -1), torch.ones(B, H*W, device=glyph_chars.device))
+    # remove the padding pair (space, black)
+    pad_idx = _pair_index(torch.full_like(glyph_chars, BLANK_CHAR), torch.zeros_like(glyph_colors))
+    pad_counts = torch.zeros(B, GLYPH_DIM, device=glyph_chars.device).scatter_add_(
+        1, pad_idx.view(B, -1), torch.ones(B, H*W, device=glyph_chars.device)
+    )
+    bag = (bag - pad_counts).clamp_min_(0.0)
+    bag = (bag > 0).float()
+    return bag
+
+def bag_marginals(bag_pairs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    bag_pairs: [B, GLYPH_DIM] -> (char_presence [B,CHAR_DIM], color_presence [B,COLOR_DIM])
+    """
+    B = bag_pairs.size(0)
+    pairs = bag_pairs.view(B, CHAR_DIM, COLOR_DIM)
+    char_pres  = 1.0 - torch.prod(1.0 - pairs, dim=2)
+    color_pres = 1.0 - torch.prod(1.0 - pairs, dim=1)
+    return char_pres, color_pres
+
+def bag_presence_to_glyph_sets(bag_presence: torch.Tensor) -> list[set[tuple[int, int]]]:
+    """
+    Convert bag_presence tensor to list of sets containing (char, color) pairs.
+    
+    Args:
+        bag_presence: [B, GLYPH_DIM] tensor with 1s indicating presence of glyph pairs
+        
+    Returns:
+        List of length B, where each element is a set containing (char_ascii, color_id) tuples
+        for glyphs that are present in the bag (bag_presence == 1)
+    """
+    B = bag_presence.shape[0]
+    result = []
+    
+    for b in range(B):
+        # Get indices where bag_presence is 1 for this batch element
+        # exclude padding (32,0) which is at index 0
+        present_indices = torch.where(bag_presence[b] == 1)[0]  # [num_present]
+        present_indices = present_indices[present_indices != 0]  # Exclude padding index
+
+        # Convert flat indices to (char, color) pairs using _to_pair_idx
+        bag_set = set()
+        for idx in present_indices:
+            char_ascii, color_id = _to_pair_idx(idx)
+            bag_set.add((char_ascii.item(), color_id.item()))
+        
+        result.append(bag_set)
+    
+    return result
+
+def hero_presence_and_centroid(glyph_chars: torch.Tensor, blstats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Presence p in {0,1} and centroid (y,x) in [-1,1]^2 for '@'.
+    If absent, centroid is (0,0) and p=0 (loss masked by p).
+    """
+    B= glyph_chars.shape[0]
+
+    x_coord, y_coord = blstats[:, 0], blstats[:, 1]
+    # Convert coordinates to long for indexing and clamp to valid range
+    y_coord_idx = torch.clamp(y_coord.long(), 0, MAX_Y_COORD)
+    x_coord_idx = torch.clamp(x_coord.long(), 0, MAX_X_COORD)
+    present = (glyph_chars[torch.arange(B, device=glyph_chars.device), y_coord_idx, x_coord_idx] == HERO_CHAR).float()  # [B]
+    cy = y_coord / MAX_Y_COORD * 2 - 1  # y coordinate in [-1,1]
+    cx = x_coord / MAX_X_COORD * 2 - 1  # x coordinate in [-1,1]
+    centroid = torch.stack([cy, cx], dim=1)                      # [B,2]
+    return present, centroid
+
+def _broadcast_nk(x: torch.Tensor | None, N: int, K: int, device) -> torch.Tensor | None:
+    if x is None:
+        return None
+    x = x.to(device)
+    if x.dim() == 1 and x.shape[0] == N:
+        x = x.unsqueeze(1).expand(N, K)
+    elif x.dim() == 2 and x.shape == (N, K):
+        pass
+    else:
+        raise ValueError(f"mask/weight must be [N] or [N,{K}], got {tuple(x.shape)}")
+    return x
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, num_layers: int = 2, dropout: float = 0.0):
         super().__init__()
-        self.char_emb = nn.Embedding(CHAR_DIM + 1, CHAR_EMB)
-        self.col_emb  = nn.Embedding(COLOR_DIM + 1, COLOR_EMB)
+        layers: List[nn.Module] = []
+        d = in_dim
+        for i in range(num_layers - 1):
+            layers += [nn.Linear(d, hidden), nn.ReLU(inplace=True)]
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            d = hidden
+        layers.append(nn.Linear(d, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class ConvBlock(nn.Module):
+    """
+    Conv -> GroupNorm -> ReLU -> Dropout.
+    Supports anisotropic kernel/dilation and correct padding.
+    """
+    def __init__(self, c_in, c_out, k=3, dilation=1, drop=0.0):
+        super().__init__()
+        # normalize args to tuples
+        if isinstance(k, int): kh, kw = k, k
+        else: kh, kw = k
+        if isinstance(dilation, int): dh, dw = dilation, dilation
+        else: dh, dw = dilation
+
+        pad_h = dh * (kh // 2)
+        pad_w = dw * (kw // 2)
+
         self.net = nn.Sequential(
-            nn.Conv2d(GLYPH_EMB, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)  # -> [B,64,1,1]
+            nn.Conv2d(c_in, c_out, kernel_size=(kh, kw), padding=(pad_h, pad_w), dilation=(dh, dw)),
+            nn.GroupNorm(num_groups=_gn_groups(c_out), num_channels=c_out),
+            nn.ReLU(),
+            nn.Dropout2d(drop) if drop and drop > 0 else nn.Identity()
         )
 
-    def forward(self, glyph_chars: torch.IntTensor, glyph_colors: torch.IntTensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # glyph_chars are in the range of [32, 127] (ASCII codes)
-        # shift to [0, 95] for model indices before embedding
-        glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Normalize to [0, 95]
-        char_embedding = self.char_emb(glyph_chars)  # [B, H, W] -> [B, H, W, 16]
-        char_embedding = char_embedding.permute(0, 3, 1, 2)  # [B, H, W, 16] -> [B, 16, H, W]
-        color_embedding = self.col_emb(glyph_colors)  # [B, H, W] -> [B, H, W, 4]
-        color_embedding = color_embedding.permute(0, 3, 1, 2)  # [B, H, W, 4] -> [B, 4, H, W]
-        glyph_emb = torch.cat([char_embedding, color_embedding], dim=1)  # [B, 20, H, W]
-        x = self.net(glyph_emb)
-        feature = x.view(x.size(0), -1)  # [B,64]
-        return feature, char_embedding, color_embedding
+    def forward(self, x):
+        res = self.net(x)
+        return res
     
-    def get_output_channels(self) -> int:
-        """Returns the number of output channels after self.net."""
-        return 64
-    
-class GlyphBag(nn.Module):
-    """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
-    def __init__(self, max_len=64, logger: logging.Logger=None):
+class AttnPool(nn.Module):
+    """
+    Masked attention pooling with K learnable queries.
+    Returns either concatenated [B, K*C]
+    """
+    def __init__(self, C: int, K: int = 1):
         super().__init__()
-        self.logger = logger or logging.getLogger(__name__)
-        if max_len <= 0:
-            raise ValueError("max_len must be a positive integer.")
-        if max_len > GLYPH_DIM:
-            self.logger.warning(f"max_len ({max_len}) is larger than GLYPH_DIM ({GLYPH_DIM}), truncating to {GLYPH_DIM}.")
-            max_len = GLYPH_DIM
-        self.max_len = max_len  # max number of unique glyphs in the bag
-        self.net = nn.RNN(GLYPH_EMB, 32, batch_first=True)  # simple RNN for bag encoding
-            
-        
-    def encode_glyphs_to_bag(self, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> torch.Tensor:
-        """Encodes glyphs into a bag-of-glyphs representation (sorted)."""
-        # Create a bag of glyphs tensor
-        B, H, W = glyph_chars.size()
-        bag = torch.zeros(B, self.max_len, 2, dtype=torch.long, device=glyph_chars.device)
-        
-        # Encode each glyph as a unique id
-        g_ids = torch.concat([glyph_chars.unsqueeze(1), glyph_colors.unsqueeze(1)], dim=1)  # [B, 2, H, W]
-        g_ids = g_ids.view(B, 2, -1)  # flatten to [B, 2, H*W]
-        # for each batch, create a sorted bag of glyphs
-        for b in range(B):
-            # g_ids[b] has shape [2, H*W], find unique glyph pairs along dim=1
-            unique_glyphs, counts = torch.unique(g_ids[b], return_counts=True, dim=1)
-            # Sort by the glyph pairs - need to sort by both char and color
-            # First sort by character (row 0), then by color (row 1) for ties
-            sorted_indices = torch.arange(unique_glyphs.size(1), device=unique_glyphs.device)
-            perm_sec = torch.argsort(unique_glyphs[1], stable=True)  # sort by color
-            sorted_indices = sorted_indices[perm_sec]  # apply color sort
-            perm_pri = torch.argsort(unique_glyphs[0][sorted_indices], stable=True)  # sort by char
-            sorted_indices = sorted_indices[perm_pri]  # apply char sort
-            sorted_glyphs = unique_glyphs[:, sorted_indices]
-            sorted_counts = counts[sorted_indices]
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Batch {b}: unique glyphs {unique_glyphs.size(0)}, counts {counts.size(0)}")
-                self.logger.debug(f"Batch {b}: sorted glyphs {sorted_glyphs}, counts {sorted_counts}")
-            if len(sorted_glyphs) > self.max_len:
-                self.logger.warning(f"Batch {b}: Too many unique glyphs ({len(sorted_glyphs)}), truncating to {self.max_len}.")
-            # Fill the bag with glyph ids (up to max_len)
-            bag[b, :min(sorted_glyphs.size(1), self.max_len)] = sorted_glyphs[:self.max_len].t()
-            bag[b, min(sorted_glyphs.size(1), self.max_len):] = torch.IntTensor(PADDING_IDX)  # pad the rest
-        return bag  # [B, max_len, 2] of glyph ids
+        self.Q = nn.Parameter(torch.randn(K, C))
+        self.proj = nn.Linear(C, C, bias=False)
+        # Fallback for fully blank frames (per head)
+        self.empty_vec = nn.Parameter(torch.zeros(C))
 
-    def forward(self, glyph_encoder: GlyphCNN, glyph_chars: torch.Tensor, glyph_colors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Encode glyphs to bag
-        bag = self.encode_glyphs_to_bag(glyph_chars, glyph_colors)
-        char_bag = bag[:, :, 0]  # [B, max_len] of char ids
-        color_bag = bag[:, :, 1]  # [B, max_len] of color ids
-        char_bag = torch.clamp(char_bag - 32, 0, CHAR_DIM - 1)  # Ensure char ids are in range [0, CHAR_DIM-1]
-        char_emb = glyph_encoder.char_emb(char_bag)  # [B, max_len] -> [B, max_len, CHAR_EMB]
-        color_emb = glyph_encoder.col_emb(color_bag)  # [B, max_len] -> [B, max_len, COLOR_EMB]
-        emb = torch.cat([char_emb, color_emb], dim=2)  # [B, max_len, GLYPH_EMB]
-        # Use RNN to encode the bag into a fixed-size vector
-        padding_indices = torch.IntTensor(PADDING_IDX).to(bag.device)  # [2]
-        packed_emb = nn.utils.rnn.pack_padded_sequence(emb, lengths=(bag != padding_indices).all(dim=-1).sum(dim=1).cpu(), batch_first=True, enforce_sorted=False)
-        _, h = self.net(packed_emb)  # h: [1,B,32]
-        features = h.squeeze(0)  # [B,32]
-        return features, emb, bag # [B, max_len, GLYPH_EMB], [B, max_len, 2]
+    def forward(self, feats: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        feats: [B, C, H, W]
+        mask : [B, 1, H, W] in {0,1}; 1 = keep, 0 = blank
+        """
+        B, C, H, W = feats.shape
+        X = feats.view(B, C, H * W).transpose(1, 2)     # [B, HW, C]
+        X = self.proj(X)                                # [B, HW, C]
+        Q = self.Q                                      # [K, C]
+
+        # scores: [B, K, HW]
+        scores = torch.einsum('bhc,kc->bkh', X, Q)
+        mflat = mask.view(B, 1, H * W)                  # [B, 1, HW]
+        scores = scores.masked_fill(mflat == 0, float('-inf'))
+
+        # identify heads with all -inf (no valid locations)
+        bad = torch.isinf(scores).all(dim=-1)           # [B, K]
+        # safe softmax
+        attn = torch.softmax(scores, dim=-1)            # [B, K, HW]
+        attn = torch.nan_to_num(attn, nan=0.0)
+
+        # pooled per head: [B, K, C]
+        Z = torch.einsum('bkh,bhc->bkc', attn, X)
+
+        if bad.any():
+            # replace bad heads with learnable empty vector
+            # Ensure dtype compatibility for mixed precision training
+            Z[bad] = self.empty_vec.to(Z.dtype)
+
+        return Z.reshape(B, -1)                     # [B, K*C]
+    
+class FiLM(nn.Module):
+    """Per-sample channel-wise affine: y = x * (1 + gamma) + beta"""
+    def __init__(self, z_dim: int, c: int):
+        super().__init__()
+        self.fc = nn.Linear(z_dim, 2 * c)
+    def forward(self, x: torch.Tensor, z: torch.Tensor):
+        B, C, H, W = x.shape
+        gamma, beta = self.fc(z).chunk(2, dim=-1)  # [B,C], [B,C]
+        gamma = gamma.view(B, C, 1, 1)
+        beta  = beta.view(B, C, 1, 1)
+        return x * (1.0 + gamma) + beta
+
+class ResBlockFiLM(nn.Module):
+    """Conv-GN-FiLM-ReLU x2 with residual; supports anisotropic dilation."""
+    def __init__(self, c_in: int, c_out: int, dilation=(1,1), drop=0.0, z_dim: int = 0):
+        super().__init__()
+        dh, dw = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+        pad = (dh, dw)
+        self.conv1 = nn.Conv2d(c_in,  c_out, 3, padding=pad, dilation=(dh, dw))
+        self.gn1   = nn.GroupNorm(_gn_groups(c_out), c_out)
+        self.film1 = FiLM(z_dim, c_out)
+
+        self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=pad, dilation=(dh, dw))
+        self.gn2   = nn.GroupNorm(_gn_groups(c_out), c_out)
+        self.film2 = FiLM(z_dim, c_out)
+
+        self.act   = nn.ReLU(inplace=True)
+        self.drop  = nn.Dropout2d(drop) if drop > 0 else nn.Identity()
+        self.skip  = (nn.Conv2d(c_in, c_out, 1) if c_in != c_out else nn.Identity())
+
+    def forward(self, x, z):
+        h = self.conv1(x); h = self.gn1(h); h = self.film1(h, z); h = self.act(h); h = self.drop(h)
+        h = self.conv2(h); h = self.gn2(h); h = self.film2(h, z); h = self.act(h); h = self.drop(h)
+        return h + self.skip(x)
+
+
+@dataclass
+class VAEConfig:
+    
+    # Embedding dimensions
+    # --- Character and color embeddings
+    char_emb: int = 16      # char‑id embedding dim (0-15)
+    color_emb: int = 4       # colour‑id embedding dim
+    glyph_emb: int = field(init=False)  # glyph embedding dim
+    
+    # --- Entity embeddings
+    role_emb: int = 8        # role embedding dim
+    race_emb: int = 4      # race embedding dim
+    gend_emb: int = 2      # gender embedding dim
+    align_emb: int = 2     # alignment embedding dim
+
+    encoder_dropout: float = 0.0    # dropout rate for all encoder blocks
+    decoder_dropout: float = 0.0    # dropout rate for all decoder blocks
+
+    # --- Latent space
+    latent_dim: int = 96     # z‑dim for VAE
+    bag_dim: int = 16        # bag embedding dim (for glyph-bag)
+    core_dim: int = field(init=False)  # core embedding dim (for map encoder)
+    low_rank: int = 0        # low-rank factorisation rank for covariance
+    
+    # Encoder settings
+    # --- Map encoder ---
+    attn_queries: int = 2          # number of attention queries for pooling
+    map_feat_channels: int = 96         # feature channels in map encoder
+    # --- Stats encoder ---
+    stat_feat_channels: int = 16         # feature channels in stats encoder
+    # --- Message encoder ---
+    msg_emb: int = 32                     # message embedding dim
+    msg_hidden: int = 12                # message hidden dim
+
+    # Decoder settings
+    # --- Map decoder ---
+    ego_window: int = 11                       # must be odd
+    ego_classes: int = NetHackCategory.get_category_count()  # number of ego classes
+    map_dec_base_ch: int = 64          # base channels in map decoder
+    
+    # --- Stats decoder ---
+    stats_cond_dim: int = 19  # number of continuous stats
+    
+    # --- Message decoder ---
+    msg_ch: int = 128
+    
+    # Dynamics heads
+    action_dim: int = len(nethack.ACTIONS)     # one‑hot; 0 disables forward/inverse
+    forward_hidden: int = 256
+    use_world_model: bool = True
+    gru_hidden: int = 256
+    use_inverse_dynamics: bool = True
+    goal_dir_dim: int = 2                      # 0 disables (set 2 for (dx,dy) regression)
+    passability_dirs: int = 8  # number of passability directions
+    value_horizons: List[int] = field(default_factory=lambda: [1, 5, 10])
+    # Skill belief (future sticky HMM integration)
+    skill_num: int = 40                         # number of skills; 0 disables skill head
+
+    # Goal and value hyperparameters (moved from data collection)
+    gamma: float = 0.95                        # discount factor for k-step returns
+    goal_prefer: str = '>'                     # preferred stairs type ('>' for down, '<' for up)
+
+    # KL prior mode
+    prior_mode: str = "standard"               # "standard" | "hmm" | "blend"
+    prior_blend_alpha: float = 0.5
+    
+    focal_loss_alpha = 0.5
+    focal_loss_gamma = 2.0
+
+    # Loss weights
+    raw_modality_weights: Dict[str, float] = field(default_factory=lambda: {
+        'ego_class': 5.0,
+        'passability': 5.0,
+        'safety': 5.0,
+        'reward': 0.5,
+        'done': 1.0,
+        'value_k': 1.0,
+        'bag': 3.0,
+        'stats': 0.5,
+        'msg': 1.0,
+        'goal': 3.0,
+        'occupy': 0.5,
+        'forward': 5.0,
+        'inverse': 10.0,
+        'ego_char': 0.5,
+        'ego_color': 0.5,
+        'hero_loc': 20.0,
+    })
+    
+    # KL Beta parameters for adaptive loss weighting
+    initial_mi_beta: float = 0.0001
+    final_mi_beta: float = 1.0
+    mi_beta_shape: str = 'cosine'
+    initial_tc_beta: float = 0.0001
+    final_tc_beta: float = 1.0
+    tc_beta_shape: str = 'cosine'
+    initial_dw_beta: float = 0.0001
+    final_dw_beta: float = 1.0
+    dw_beta_shape: str = 'cosine'
+    warmup_epoch_ratio: float = 0.3
+    free_bits: float = 0.0
+    # Contrastive addition for world model (mild by default)
+    nce_weight: float = 0.1
+    nce_temperature: float = 0.2
+
+    def __post_init__(self):
+        self.glyph_emb = self.char_emb + self.color_emb
+        self.core_dim = self.latent_dim - self.bag_dim
+        if self.core_dim <= 0:
+            raise ValueError("Core dimension must be positive; check latent_dim and bag_dim settings.")
+        if self.ego_window % 2 == 0:
+            raise ValueError("Ego window must be odd; got {}".format(self.ego_window))
+        if self.action_dim < 0:
+            raise ValueError("Action dimension must be non-negative; got {}".format(self.action_dim))
+
+class MapEncoder(nn.Module):
+    """
+    NetHack map encoder:
+      - char & color embeddings (space can be true padding)
+      - +1 foreground mask channel
+      - +2 CoordConv channels (x,y in [-1,1])
+      - Conv backbone mixing standard & anisotropic dilated convs
+      - Masked attention pooling (K queries) or masked mean
+
+    Forward returns a vector suitable for a VAE encoder MLP or heads.
+    """
+    def __init__(self, config: VAEConfig):
+        super().__init__()
+        self.char_emb = nn.Embedding(CHAR_DIM , config.char_emb)
+        self.col_emb  = nn.Embedding(COLOR_DIM, config.color_emb)
+        in_ch = config.char_emb + config.color_emb + 1  # + foreground mask
+        in_ch += 2 # +2 for CoordConv (x,y in [-1,1])
+
+        # Stem
+        self.stem = ConvBlock(in_ch, 64, k=3, dilation=1, drop=config.encoder_dropout)
+
+        # Body: mix normal and width-focused dilations (map is 21x79)
+        self.body = nn.Sequential(
+            ConvBlock(64, 64, k=3, dilation=1,        drop=config.encoder_dropout),      # local
+            ConvBlock(64, 64, k=3, dilation=(1, 3),   drop=config.encoder_dropout),      # widen RF (width)
+            ConvBlock(64, 64, k=3, dilation=1,        drop=config.decoder_dropout),
+            ConvBlock(64, 96, k=3, dilation=(1, 9),   drop=config.decoder_dropout),
+            ConvBlock(96, config.map_feat_channels, k=3, dilation=1, drop=config.decoder_dropout),
+        )
+
+        # Pooling
+        self.pool = AttnPool(C=config.map_feat_channels, K=config.attn_queries)
+        pooled_dim = config.map_feat_channels * config.attn_queries
+
+        # Tiny head you can keep or replace downstream
+        self.out_dim = pooled_dim
+        self.norm_out = nn.LayerNorm(self.out_dim)
+
         
+    @staticmethod
+    def _coords(B, H, W, device, dtype):
+        yy = torch.linspace(-1, 1, H, device=device, dtype=dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+        xx = torch.linspace(-1, 1, W, device=device, dtype=dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        return yy, xx
+
+    def forward(self, glyph_chars: torch.IntTensor, glyph_colors: torch.IntTensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # glyph_chars in ASCII [32..127]; shift to [0..95];
+        gc = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)
+        B, H, W = gc.shape
+        device = gc.device
+        fg = ((gc != 0) & (glyph_colors != 0)).unsqueeze(1).float()  # [B,1,H,W]
+        ce = self.char_emb(gc).permute(0,3,1,2)         # [B,16,H,W]
+        co = self.col_emb(glyph_colors).permute(0,3,1,2)# [B, 4,H,W]
+        yy, xx = self._coords(B, H, W, device, ce.dtype)
+        x = torch.cat([ce * fg, co * fg, fg, yy, xx], dim=1)
+        x = self.stem(x)
+        x = self.body(x)
+        pooled = self.pool(x, fg)
+        return self.norm_out(pooled)
+    
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
-        return 32
+        return self.out_dim
+    
+class MapDecoder(nn.Module):
+    """Latent vector -> occupancy/glyph/color logits at 21x79, with FiLM and CoordConv."""
+    def __init__(self, config: VAEConfig):
+        super().__init__()
+        self.z_bag_dim = config.bag_dim
+        self.z_core_dim = config.core_dim
+        self.latent_dim = config.latent_dim
+        self.ego_window = config.ego_window
+        self.ego_classes = config.ego_classes
+        self.base_ch = config.map_dec_base_ch
+        self.register_buffer("full_yy", torch.linspace(-1, 1, MAP_HEIGHT).view(1,1,MAP_HEIGHT,1))
+        self.register_buffer("full_xx", torch.linspace(-1, 1, MAP_WIDTH ).view(1,1,1,MAP_WIDTH))
+        self.register_buffer("ego_yy",  torch.linspace(-1, 1, self.ego_window).view(1,1,self.ego_window,1))
+        self.register_buffer("ego_xx",  torch.linspace(-1, 1, self.ego_window).view(1,1,1,self.ego_window))
+        
+        self.bag_head = MLP(self.z_bag_dim, 128, GLYPH_DIM, num_layers=2, dropout=config.decoder_dropout)
+        
+        self.hero_presence_head = nn.Linear(self.z_bag_dim, 1)   # logits
+        self.hero_centroid_head = nn.Linear(self.z_bag_dim, 2)   # tanh -> [-1,1]
+        self.ego_head = MLP(config.latent_dim, 128, self.ego_window * self.ego_window * self.ego_classes, num_layers=2, dropout=config.decoder_dropout)
+
+        # project z to a broadcast feature map
+        self.z_core_to_map = nn.Sequential(nn.Linear(self.z_core_dim, config.map_dec_base_ch), nn.ReLU(inplace=True), nn.Linear(config.map_dec_base_ch, config.map_dec_base_ch))
+        self.head_occ = nn.Sequential(
+            nn.Conv2d(config.map_dec_base_ch + 2, config.map_dec_base_ch//2, 1),  # +2 for coordinate channels
+            nn.ReLU(inplace=True), 
+            nn.Conv2d(config.map_dec_base_ch//2, 1, 1)
+        )
+
+        self.z_to_ego_map = nn.Sequential(nn.Linear(self.latent_dim, config.map_dec_base_ch), nn.ReLU(inplace=True), nn.Linear(config.map_dec_base_ch, config.map_dec_base_ch))
+        # FiLM-conditioned residual body (anisotropic to cover width)
+        self.core_block = ResBlockFiLM(config.map_dec_base_ch + 2, config.map_dec_base_ch, (1,9),  config.decoder_dropout, z_dim=self.latent_dim)  # +2 for coordinate channels
+
+        # heads
+        self.head_chr = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, CHAR_DIM, 1))
+        self.head_col = nn.Sequential(nn.Conv2d(config.map_dec_base_ch, config.map_dec_base_ch//2, 1), nn.ReLU(inplace=True), nn.Conv2d(config.map_dec_base_ch//2, COLOR_DIM, 1))
+
+    def _prior_to_bias(self, prior: torch.Tensor, strength: float) -> torch.Tensor:
+        """
+        prior: probabilities in [0,1], shape [B,C].
+        Returns additive bias (logits) [B,C] scaled by bag_bias_strength.
+        """
+        p = prior.clamp(1e-6, 1 - 1e-6)
+        return strength * torch.log(p / (1 - p))
+
+
+    def forward(self, z: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        B = z.size(0)
+        z_bag  = z[:, :self.z_bag_dim]
+        z_core = z[:, self.z_bag_dim:]
+
+        bag_head_logits = self.bag_head(z_bag)  # [B, GLYPH_DIM]
+        hero_logits = self.hero_presence_head(z_bag).squeeze(1)  # [B,]
+        hero_centroid = torch.tanh(self.hero_centroid_head(z_bag))  # [B,2] in [-1,1]
+        ego_logits = self.ego_head(z).view(-1, self.ego_classes, self.ego_window, self.ego_window)  # [B, C, k, k]
+        
+        z_core_map = self.z_core_to_map(z_core).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, MAP_HEIGHT, MAP_WIDTH)  # [B, C, H, W]
+        
+        # Properly expand coordinate tensors to full map size
+        full_yy_expanded = self.full_yy.expand(B, 1, MAP_HEIGHT, MAP_WIDTH)  # [B, 1, 21, 79]
+        full_xx_expanded = self.full_xx.expand(B, 1, MAP_HEIGHT, MAP_WIDTH)  # [B, 1, 21, 79]
+        
+        coords_full = torch.cat([full_yy_expanded, full_xx_expanded], dim=1)
+        x_full = torch.cat([z_core_map, coords_full], dim=1)
+        occ = self.head_occ(x_full) # [B, 1, H, W]
+        z_ego_map = self.z_to_ego_map(z).view(B, self.base_ch, 1, 1).expand(B, self.base_ch, self.ego_window, self.ego_window)  # [B, C, k, k]
+        
+        # Properly expand ego coordinate tensors to full ego window size
+        ego_yy_expanded = self.ego_yy.expand(B, 1, self.ego_window, self.ego_window)  # [B, 1, k, k]
+        ego_xx_expanded = self.ego_xx.expand(B, 1, self.ego_window, self.ego_window)  # [B, 1, k, k]
+        coords_ego = torch.cat([ego_yy_expanded, ego_xx_expanded], dim=1)
+        
+        x_ego_in = torch.cat([z_ego_map, coords_ego], dim=1)
+        x_ego = self.core_block(x_ego_in, z) # [B, C, k, k]
+        g_logits = self.head_chr(x_ego)  # [B, CHAR_DIM, k, k]
+        c_logits = self.head_col(x_ego)  # [B, COLOR_DIM, k, k]
+        
+        out['bag_logits'] = bag_head_logits
+        out['hero_presence_logits'] = hero_logits
+        out['hero_centroid'] = hero_centroid
+        out['ego_class_logits'] = ego_logits
+        out['occupy_logits'] = occ
+        out['ego_char_logits'] = g_logits
+        out['ego_color_logits'] = c_logits
+        return out
+
+    @staticmethod
+    def _sample_per_pixel(
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        deterministic: bool = True
+    ) -> torch.Tensor:
+        """
+        logits: [B, C, H, W] -> returns indices [B, H, W]
+        """
+        if deterministic:
+            return logits.argmax(dim=1)
+
+        B, C, H, W = logits.shape
+        x = (logits / max(temperature, 1e-6)).permute(0, 2, 3, 1).reshape(B*H*W, C)  # [BHW,C]
+
+        if top_k > 0:
+            vals, inds = torch.topk(x, k=min(top_k, C), dim=1)
+            mask = torch.full_like(x, float("-inf"))
+            mask.scatter_(1, inds, vals)
+            x = mask
+
+        if 0.0 < top_p < 1.0:
+            probs = x.softmax(dim=1)
+            sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=1)
+            cum = sorted_probs.cumsum(dim=1)
+            keep = cum <= top_p
+            # always keep at least 1
+            keep[:, 0] = True
+            filtered = torch.full_like(x, float("-inf"))
+            filtered.scatter_(1, sorted_idx, torch.where(keep, x.gather(1, sorted_idx), torch.full_like(sorted_probs, float("-inf"))))
+            x = filtered
+
+        idx = torch.distributions.Categorical(logits=x).sample()  # [BHW]
+        return idx.view(B, H, W)
+
+    @staticmethod
+    def sample_ego_from_logits(
+        ego_char_logits: torch.Tensor,
+        ego_color_logits: torch.Tensor,
+        ego_class_logits: torch.Tensor,
+        temperature: float = 1.0,
+        glyph_top_k: int = 0,
+        glyph_top_p: float = 1.0,
+        color_top_k: int = 0,
+        color_top_p: float = 1.0,
+        class_top_k: int = 0,
+        class_top_p: float = 1.0,
+        deterministic: bool = True
+    ) -> dict[str, torch.Tensor]:
+        """
+        Inputs are logits:
+          - ego_char_logits:  [B, CHAR_DIM, k, k]
+          - ego_color_logits: [B, COLOR_DIM, k, k]
+          - ego_class_logits: [B, NUM_CLASSES, k, k]
+        Returns integer maps:
+          - ego_chars:  [B, k, k]    ASCII in [32..127] (space==32)
+          - ego_colors: [B, k, k]    in [0..15]
+          - ego_class:  [B, k, k]    class indices
+        """
+        # sample per-pixel indices
+        char_idx = MapDecoder._sample_per_pixel(
+            ego_char_logits, temperature, glyph_top_k, glyph_top_p, deterministic
+        )                                # [B,k,k] in [0..CHAR_DIM-1]
+        color_idx = MapDecoder._sample_per_pixel(
+            ego_color_logits, temperature, color_top_k, color_top_p, deterministic
+        )                                # [B,k,k] in [0..COLOR_DIM-1]
+        class_idx = MapDecoder._sample_per_pixel(
+            ego_class_logits, temperature, class_top_k, class_top_p, deterministic
+        )                                # [B,k,k]
+
+        # shift chars back to ASCII range
+        ego_chars = (char_idx + 32).clamp(32, 127)     # [B,k,k] ASCII
+        ego_colors = color_idx                         # [B,k,k] 0..15
+        ego_class  = class_idx                         # [B,k,k]
+
+        return {"ego_chars": ego_chars, "ego_colors": ego_colors, "ego_class": ego_class}
+
+    @staticmethod
+    def format_passability_safety(
+        passability_presence: torch.Tensor,           # [B, 8]
+        safety_presence: torch.Tensor,                # [B, 8]
+        pass_mask: torch.Tensor | None = None,        # [B] or [B,8], 0 = ignore (OOB, etc.)
+        safe_mask: torch.Tensor | None = None,        # [B] or [B,8]
+        pass_weight: torch.Tensor | None = None,      # [B] or [B,8], e.g. 0.2 for unknown tiles
+        safe_weight: torch.Tensor | None = None,      # [B] or [B,8]
+        masked_value: float | None = None             # e.g., float('nan') to visualize masked spots
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Format passability/safety + (optional) masks & weights into 3x3 hero-centric grids.
+
+        Direction order expected: (N, E, S, W, NE, SE, SW, NW)
+        Returns a dict with keys:
+        - 'pass_grid', 'safe_grid'              -> [B,3,3] values
+        - 'pass_mask_grid', 'safe_mask_grid'    -> [B,3,3] {0,1}
+        - 'pass_weight_grid', 'safe_weight_grid'-> [B,3,3] >=0
+        The hero center cell [1,1] is set to -1 in value grids, 1 in mask grids, 0 in weight grids.
+        """
+        device = passability_presence.device
+        B, K = passability_presence.shape
+        assert safety_presence.shape == (B, K)
+        assert K == 8, "Expected 8 directions (N,E,S,W,NE,SE,SW,NW)."
+
+        # Broadcast mask/weight to [B,8] if provided
+        pass_mask   = _broadcast_nk(pass_mask,   B, K, device)
+        safe_mask   = _broadcast_nk(safe_mask,   B, K, device)
+        pass_weight = _broadcast_nk(pass_weight, B, K, device)
+        safe_weight = _broadcast_nk(safe_weight, B, K, device)
+
+        # Allocate grids
+        pass_grid       = torch.zeros(B, 3, 3, device=device, dtype=passability_presence.dtype)
+        safe_grid       = torch.zeros(B, 3, 3, device=device, dtype=safety_presence.dtype)
+        pass_mask_grid  = torch.ones(B, 3, 3, device=device)   # center marked valid by default
+        safe_mask_grid  = torch.ones(B, 3, 3, device=device)
+        pass_w_grid     = torch.zeros(B, 3, 3, device=device)
+        safe_w_grid     = torch.zeros(B, 3, 3, device=device)
+
+        # Direction -> grid mapping
+        # Grid:
+        #  (0,0)=NW  (0,1)=N  (0,2)=NE
+        #  (1,0)=W   (1,1)=@  (1,2)=E
+        #  (2,0)=SW  (2,1)=S  (2,2)=SE
+        dir_pos = [(0,1), (1,2), (2,1), (1,0), (0,2), (2,2), (2,0), (0,0)]  # N,E,S,W,NE,SE,SW,NW
+
+        for i, (r, c) in enumerate(dir_pos):
+            pass_grid[:, r, c] = passability_presence[:, i]
+            safe_grid[:, r, c] = safety_presence[:, i]
+
+            if pass_mask is not None:
+                pass_mask_grid[:, r, c] = pass_mask[:, i].to(pass_mask_grid.dtype)
+            if safe_mask is not None:
+                safe_mask_grid[:, r, c] = safe_mask[:, i].to(safe_mask_grid.dtype)
+
+            if pass_weight is not None:
+                pass_w_grid[:, r, c] = pass_weight[:, i].to(pass_w_grid.dtype)
+            if safe_weight is not None:
+                safe_w_grid[:, r, c] = safe_weight[:, i].to(safe_w_grid.dtype)
+
+        # Center (hero)
+        pass_grid[:, 1, 1] = -1.0
+        safe_grid[:, 1, 1] = -1.0
+        pass_mask_grid[:, 1, 1] = 1.0
+        safe_mask_grid[:, 1, 1] = 1.0
+        pass_w_grid[:, 1, 1] = 0.0
+        safe_w_grid[:, 1, 1] = 0.0
+
+        # Optionally visualize masked cells as NaN (or any sentinel)
+        if masked_value is not None:
+            mv = torch.tensor(masked_value, device=device, dtype=pass_grid.dtype)
+            if pass_mask is not None:
+                pm = (pass_mask_grid[:, :, :] < 0.5)
+                pass_grid[pm] = mv
+            if safe_mask is not None:
+                sm = (safe_mask_grid[:, :, :] < 0.5)
+                safe_grid[sm] = mv
+                
+        return {
+            'passability_grid': pass_grid,
+            'safety_grid': safe_grid,
+            'pass_mask_grid': pass_mask_grid,
+            'safe_mask_grid': safe_mask_grid,
+            'pass_weight_grid': pass_w_grid,
+            'safe_weight_grid': safe_w_grid,
+        }
 
 class BlstatsPreprocessor(nn.Module):
-    """
-    Preprocesses blstats (27-dimensional) for the VAE model.
-    Uses a mixed approach: continuous normalization + discrete embeddings.
-    
-    Based on analysis from trial.ipynb:
-    - blstats[0]: x_coordinate (0-78)
-    - blstats[1]: y_coordinate (0-20)  
-    - blstats[2-8]: attributes (strength, dex, con, int, wis, cha)
-    - blstats[9]: score, blstats[13]: gold, blstats[19]: exp_points, blstats[20]: time
-    - blstats[10-11]: hp/max_hp, blstats[14-15]: energy/max_energy
-    - blstats[21]: hunger_state (0-6), blstats[23]: dungeon_num, blstats[24]: level_num
-    - blstats[25]: condition_mask (bitfield) - special handling for multiple conditions
-    - ignore game time (blstats[20]) and alignment (blstats[26] - already in hero_info)
-    """
-    def __init__(self, stats_dim=27):
+    def __init__(self, stats_dim=BLSTATS_DIM):
         super().__init__()
         self.stats_dim = stats_dim
-        self.useful_dims = [i for i in range(stats_dim) if i not in [20, 26]]  # Ignore time and alignment
-        # Define discrete stats that need embeddings
-        self.discrete_indices = [21, 23, 24]  # hunger_state, dungeon_number, level_number
-        self.condition_index = 25  # Special handling for condition mask
-        self.continuous_indices = [i for i in self.useful_dims if i not in self.discrete_indices + [self.condition_index]]
-        
-        # Embedding layers for discrete stats
-        self.hunger_emb = nn.Embedding(7, 3)    # Hunger states (0-6)
-        self.dungeon_emb = nn.Embedding(11, 4)  # Dungeon numbers (0-10)
-        self.level_emb = nn.Embedding(51, 4)    # Level numbers (0-50)
-        
-        # Condition mask processing - decode each bit as separate binary features
-        self.num_conditions = NUM_CONDITIONS
-        self.condition_bits = CONDITION_BITS
-        
-        # BatchNorm for continuous stats
-        self.batch_norm = nn.BatchNorm1d(len(self.continuous_indices) - 2)  # -2 for removed max_hp/max_energy
-        
-    def forward(self, blstats):
-        """
-        Args:
-            blstats: [B, 27] tensor of raw blstats
-        Returns:
-            processed_stats: [B, processed_dim] tensor
-        """
-
-        # Process continuous stats
-        continuous_stats = blstats[:, self.continuous_indices].float()  # [B, 21]
-        
-        # Process continuous stats - let BatchNorm handle most normalization
-        continuous_processed = continuous_stats.clone()
-        
-        # Only apply essential transformations before BatchNorm
-        # 1. Coordinate normalization (these have known, bounded ranges)
-        continuous_processed[:, 0] = continuous_stats[:, 0] / MAX_X_COORD  # x coordinate (0-78) -> [0, 1]
-        continuous_processed[:, 1] = continuous_stats[:, 1] / MAX_Y_COORD  # y coordinate (0-20) -> [0, 1]
-        
-        # 2. Log transform for heavily skewed distributions (but don't bound with tanh)
-        log_indices = [9, 13, 19]  # score, gold, exp_points
-        for idx in log_indices:
-            if idx in self.continuous_indices:
-                local_idx = self.continuous_indices.index(idx)
-                # Apply log1p to handle skewness, let BatchNorm handle scaling
-                continuous_processed[:, local_idx] = torch.log1p(torch.clamp(continuous_processed[:, local_idx], min=0))
-        
-        # 3. Keep other stats as-is - BatchNorm will normalize them appropriately
-        # No need for manual normalization of attributes, depth, armor_class, etc.
-        
-        # Create health and energy ratios
-        hp_ratio = continuous_stats[:, 10] / torch.clamp(continuous_stats[:, 11], min=1)  # hp/max_hp
-        energy_ratio = continuous_stats[:, 14] / torch.clamp(continuous_stats[:, 15], min=1)  # energy/max_energy
-        
-        # Replace health and energy stats with ratios and remove max health/energy
-        hp_idx = self.continuous_indices.index(10)  # hp
-        max_hp_idx = self.continuous_indices.index(11)  # max_hp
-        energy_idx = self.continuous_indices.index(14)  # energy
-        max_energy_idx = self.continuous_indices.index(15)  # max_energy
-        
-        continuous_processed[:, hp_idx] = hp_ratio
-        continuous_processed[:, energy_idx] = energy_ratio
-        
-        # Remove max health and max energy from continuous stats
-        # Create mask to keep all indices except max_hp and max_energy
-        keep_indices = [i for i in range(continuous_processed.size(1)) if i not in [max_hp_idx, max_energy_idx]]
-        continuous_processed = continuous_processed[:, keep_indices]  # [B, 19]
-        
-        # Apply BatchNorm
-        continuous_normalized = self.batch_norm(continuous_processed)  # [B, 19]
-        
-        # Process discrete stats
-        # if the stats are out of bounds, log the issue
-        if blstats[:, 21].max() > 6 or blstats[:, 21].min() < 0:
-            logging.warning(f"Hunger state out of bounds: {blstats[:, 21].min()} to {blstats[:, 21].max()}")
-        if blstats[:, 23].max() > 10 or blstats[:, 23].min() < 0:
-            logging.warning(f"Dungeon number out of bounds: {blstats[:, 23].min()} to {blstats[:, 23].max()}")
-        if blstats[:, 24].max() > 50 or blstats[:, 24].min() < 0:
-            logging.warning(f"Level number out of bounds: {blstats[:, 24].min()} to {blstats[:, 24].max()}")
-        hunger_state = torch.clamp(blstats[:, 21].long(), 0, 6)
-        dungeon_num = torch.clamp(blstats[:, 23].long(), 0, 10)
-        level_num = torch.clamp(blstats[:, 24].long(), 0, 50)
-        
-        hunger_emb = self.hunger_emb(hunger_state)
-        dungeon_emb = self.dungeon_emb(dungeon_num)
-        level_emb = self.level_emb(level_num)
-        
-        # Process condition mask (bitfield)
-        condition_mask = blstats[:, self.condition_index].long()  # [B]
-        condition_features = []
-        for bit_value in self.condition_bits:
-            # Extract each bit as a binary feature
-            is_condition_active = ((condition_mask & bit_value) > 0).float()  # [B]
-            condition_features.append(is_condition_active.unsqueeze(-1))  # [B, 1]
-        condition_vector = torch.cat(condition_features, dim=-1)  # [B, 13]
-        
-        # Combine all features
-        processed_stats = torch.cat([
-            continuous_normalized,  # [B, 19]
-            hunger_emb,            # [B, 3]
-            dungeon_emb,           # [B, 4]
-            level_emb,             # [B, 4]
-            condition_vector       # [B, 13]
-        ], dim=1) # [B, 19 + 3 + 4 + 4 + 13] = [B, 43]
-        
-        return processed_stats
-    
+        self.useful = [i for i in range(stats_dim) if i not in [20, 26]]
+        self.disc = [21, 23, 24]
+        self.cond_idx = 25
+        self.cont = [i for i in self.useful if i not in self.disc + [self.cond_idx]]
+        self.bn = nn.BatchNorm1d(len(self.cont) - 2)
+        # embeddings for encoder side (not used in decoder loss)
+        self.hunger_emb  = nn.Embedding(7, 3)
+        self.dungeon_emb = nn.Embedding(11, 4)
+        self.level_emb   = nn.Embedding(51, 4)
+    def forward(self, bl):
+        # encoded features for encoder MLP
+        cont = bl[:, self.cont].float()
+        proc = cont.clone()
+        # coords
+        proc[:, 0] = cont[:, 0] / MAX_X_COORD
+        proc[:, 1] = cont[:, 1] / MAX_Y_COORD
+        # log1p for score,gold,exp
+        for idx in [9, 13, 19]:
+            if idx in self.cont:
+                j = self.cont.index(idx)
+                proc[:, j] = torch.log1p(proc[:, j].clamp(min=0))
+        # ratios
+        hp_idx = self.cont.index(10); maxhp_idx = self.cont.index(11)
+        en_idx = self.cont.index(14); maxen_idx = self.cont.index(15)
+        proc[:, hp_idx] = cont[:, 10] / torch.clamp(cont[:, 11], min=1)
+        proc[:, en_idx] = cont[:, 14] / torch.clamp(cont[:, 15], min=1)
+        keep = [i for i in range(proc.size(1)) if i not in [maxhp_idx, maxen_idx]]
+        proc = proc[:, keep]
+        proc = self.bn(proc)
+        hunger = torch.clamp(bl[:, 21].long(), 0, 6)
+        dung   = torch.clamp(bl[:, 23].long(), 0, 10)
+        level  = torch.clamp(bl[:, 24].long(), 0, 50)
+        h_emb  = self.hunger_emb(hunger)
+        d_emb  = self.dungeon_emb(dung)
+        l_emb  = self.level_emb(level)
+        cond_mask = bl[:, self.cond_idx].long()
+        cond_vec = torch.stack([((cond_mask & v) > 0).float() for v in CONDITION_BITS], dim=1)
+        enc = torch.cat([proc, h_emb, d_emb, l_emb, cond_vec], dim=1)  # [B,43]
+        return enc
     def get_output_dim(self):
-        """Returns the output dimension of processed stats"""
-        continuous_dim = len(self.continuous_indices) - 2  # -2 for removed max_hp/max_energy
-        discrete_dim = 3 + 4 + 4  # hunger + dungeon + level embeddings (no alignment)
-        condition_dim = self.num_conditions  # Binary features for each condition bit
-        return continuous_dim + discrete_dim + condition_dim  # 19 + 11 + 13 = 43
+        return 43
+    # targets for decoder loss
+    def targets(self, bl) -> dict[str, torch.Tensor]:
+        with torch.no_grad():
+            cont = bl[:, self.cont].float()
+            proc = cont.clone()
+            proc[:, 0] = cont[:, 0] / MAX_X_COORD
+            proc[:, 1] = cont[:, 1] / MAX_Y_COORD
+            for idx in [9, 13, 19]:
+                if idx in self.cont:
+                    j = self.cont.index(idx)
+                    proc[:, j] = torch.log1p(proc[:, j].clamp(min=0))
+            hp_idx = self.cont.index(10); maxhp_idx = self.cont.index(11)
+            en_idx = self.cont.index(14); maxen_idx = self.cont.index(15)
+            proc[:, hp_idx] = cont[:, hp_idx] / torch.clamp(cont[:, maxhp_idx], min=1)
+            proc[:, en_idx] = cont[:, en_idx] / torch.clamp(cont[:, maxen_idx], min=1)
+            keep = [i for i in range(proc.size(1)) if i not in [maxhp_idx, maxen_idx]]
+            # Apply keep filtering BEFORE batch norm, same as in forward()
+            proc = proc[:, keep]
+            cont_norm = self.bn(proc)  # uses running stats; fine for targets
+            hunger = torch.clamp(bl[:, 21].long(), 0, 6)
+            dung   = torch.clamp(bl[:, 23].long(), 0, 10)
+            level  = torch.clamp(bl[:, 24].long(), 0, 50)
+            cond_mask = bl[:, 25].long()
+            cond_vec = torch.stack([((cond_mask & v) > 0).float() for v in CONDITION_BITS], dim=1)
+        return {"cont": cont_norm, "hunger": hunger, "dungeon": dung, "level": level, "cond": cond_vec}
 
-class StatsMLP(nn.Module):
-    def __init__(self, stats: int=BLSTATS_DIM, emb_dim: int=64):
+class StatsEncoder(nn.Module):
+    def __init__(self, config: VAEConfig, stats: int = BLSTATS_DIM):
         super().__init__()
         self.preprocessor = BlstatsPreprocessor(stats_dim=stats)
         input_dim = self.preprocessor.get_output_dim()  # 43 dimensions after preprocessing
-        
+        self.out_dim = config.stat_feat_channels  # 16 output channels
         self.net = nn.Sequential(
             nn.Linear(input_dim, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
+            nn.Linear(32, config.stat_feat_channels), nn.ReLU(),
         )
         
     def forward(self, stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         processed = self.preprocessor(stats)  # [B, 27] -> [B, 43]
         features = self.net(processed)  # [B, 43] -> [B, 16]
-        return features, processed
+        return features
     
     def get_output_channels(self) -> int:
         """Returns the number of output channels after self.net."""
-        return 16
+        return self.out_dim
 
-class MessageGRU(nn.Module):
-    def __init__(self, vocab: int=MSG_VOCAB+2, emb: int=32, hid: int=12):
+class StatsDecoder(nn.Module):
+    """Predict stats with proper likelihoods: continuous (Gaussian), discrete (CE), conditions (BCE)."""
+    def __init__(self, config: VAEConfig):
         super().__init__()
-        self.emb_dim = emb
-        self.hid_dim = hid
+        hid = 256
+        self.net = nn.Sequential(nn.Linear(config.core_dim, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU())
+        self.mu      = nn.Linear(hid, config.stats_cond_dim)
+        self.logvar  = nn.Linear(hid, config.stats_cond_dim)
+        self.hunger  = nn.Linear(hid, 7)
+        self.dungeon = nn.Linear(hid, 11)
+        self.level   = nn.Linear(hid, 51)
+        self.cond    = nn.Linear(hid, len(CONDITION_BITS))
+    def forward(self, z):
+        h = self.net(z)
+        return {"mu": self.mu(h), "logvar": self.logvar(h), "hunger": self.hunger(h), "dungeon": self.dungeon(h), "level": self.level(h), "cond": self.cond(h)}
+
+class MessageEncoder(nn.Module):
+    def __init__(self, config: VAEConfig,vocab: int=MSG_VSIZE):
+        super().__init__()
+        self.emb_dim = config.msg_emb
+        self.hid_dim = config.msg_hidden
         self.vocab = vocab
-        self.emb = nn.Embedding(vocab, emb, padding_idx=0)
-        self.gru = nn.GRU(emb, hid, batch_first=True, bidirectional=True)  # bidirectional GRU
-        self.out = nn.Linear(hid * 2, hid)  # output layer to reduce to hid_dim
-        self.sos = MSG_VOCAB  # start-of-sequence token
-        self.eos = MSG_VOCAB + 1  # end-of-sequence token
-        
+        self.emb = nn.Embedding(vocab, self.emb_dim, padding_idx=MSG_PAD)
+        self.gru = nn.GRU(self.emb_dim, self.hid_dim, batch_first=True, bidirectional=True)  # bidirectional GRU
+        self.out = nn.Linear(self.hid_dim * 2, self.hid_dim)  # output layer to reduce to hid_dim
+        self.sos = MSG_SOS  # start-of-sequence token
+        self.eos = MSG_EOS  # end-of-sequence token
+
     def forward(self, msg_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         msg_tokens: [B, 256] padded with 0s
         returns: [B, hid_dim] encoding, [B, 256, emb_dim] embeddings
         """
         # calculate lengths for packing
-        lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
+        lengths = (msg_tokens != MSG_PAD).sum(dim=1)  # [B,] - count non-padding tokens
         # for entries who length is 0, pad a ' ' token
         bempty = (lengths == 0)
         padded_msg_tokens = msg_tokens.clone()  # clone to avoid modifying original
@@ -446,39 +959,140 @@ class MessageGRU(nn.Module):
         h_fw, h_bw = h_n[0], h_n[1] # forward and backward hidden states
         h = torch.cat([h_fw, h_bw], dim=1) # [B, hid_dim * 2]
         out = self.out(h)  # [B, hid_dim * 2] -> [B, hid_dim]
-        return out, x  # return the final hidden state and the embeddings
-    
-    def teacher_forcing_decorator(self, msg_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        msg_tokens: [B, 256] padded with 0s
-        returns: [B, 256] shifted and decorated msg_tokens, [B, 256, emb_dim] shifted embeddings
-        """
-        # calculate lengths for packing
-        lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
-        bempty = (lengths == 0)
-        padded_msg_tokens = msg_tokens.clone()  # clone to avoid modifying original
-        padded_msg_tokens[bempty, 0] = ord(' ')  # set space token for empty messages
-        lengths[bempty] = 1  # set length to 1 for empty messages
-        shifted_tokens = torch.zeros_like(padded_msg_tokens)
-        shifted_tokens[:, 0] = self.sos  # set start-of-sequence token
-        shifted_tokens[:, 1:] = padded_msg_tokens[:, :-1]  # shift right by 1
-        # Get embeddings for shifted tokens
-        shifted_embeddings = self.emb(shifted_tokens)  # [B, 256, emb_dim]
-        return shifted_tokens, shifted_embeddings  # return shifted tokens and embeddings
-        
+        return out
+
     def get_output_channels(self) -> int:
         """Returns the number of output channels."""
         return self.hid_dim
     
+class MessageDecoder(nn.Module):
+    def __init__(self, config: VAEConfig, L: int = MSG_MAXLEN, vocab: int = MSG_VSIZE):
+        super().__init__()
+        self.L = L; self.vocab = vocab
+        x = torch.linspace(-1, 1, L).view(1,1,L)
+        self.register_buffer("pos", x)
+        self.z_to_line = nn.Sequential(nn.Linear(config.core_dim, config.msg_ch), nn.ReLU(), nn.Linear(config.msg_ch, config.msg_ch))
+        self.stem = nn.Sequential(nn.Conv1d(config.msg_ch+1, config.msg_ch, 3, padding=1), nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU())
+        self.block = nn.Sequential(
+            nn.Conv1d(config.msg_ch, config.msg_ch, 3, padding=1, dilation=1),  nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU(),
+            nn.Conv1d(config.msg_ch, config.msg_ch, 3, padding=2, dilation=2),  nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU(),
+            nn.Conv1d(config.msg_ch, config.msg_ch, 3, padding=4, dilation=4),  nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU(),
+            nn.Conv1d(config.msg_ch, config.msg_ch, 3, padding=8, dilation=8),  nn.GroupNorm(_gn_groups(config.msg_ch), config.msg_ch), nn.ReLU(),
+        )
+        self.head = nn.Conv1d(config.msg_ch, vocab, 1)
+    def forward(self, z):
+        B = z.size(0)
+        line = self.z_to_line(z).unsqueeze(-1).expand(B, -1, self.L)
+        x = torch.cat([line, self.pos.expand(B, -1, -1)], dim=1)
+        x = self.stem(x)
+        x = self.block(x)
+        logits = self.head(x).transpose(1, 2)  # [B,L,V]
+        return logits
+    
+    @staticmethod
+    def _filter_topk_topp(logits: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
+        """Apply top-k/top-p over the last dim (vocab). logits: [B,L,V]."""
+        B, L, V = logits.shape
+        out = logits
+        if top_k is not None and top_k > 0 and top_k < V:
+            kth = torch.topk(out, top_k, dim=-1).values[..., -1, None]
+            out = out.masked_fill(out < kth, float('-inf'))
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(out, dim=-1, descending=True)
+            probs = F.softmax(sorted_logits, dim=-1)
+            cum = probs.cumsum(dim=-1)
+            remove = cum > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            remove = remove | torch.isneginf(sorted_logits)
+            to_remove = torch.zeros_like(out, dtype=torch.bool)
+            to_remove.scatter_(-1, sorted_idx, remove)
+            out = out.masked_fill(to_remove, float('-inf'))
+        return out
+
+    @staticmethod
+    def sample_from_logits(
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        deterministic: bool = False,
+        allow_eos: bool = True,
+        forbid_eos_at_start: bool = True,
+        allow_pad: bool = False,
+        sos_id: int | None = MSG_SOS,
+        eos_id: int | None = MSG_EOS,
+        pad_id: int | None = MSG_PAD,
+    ) -> torch.Tensor:
+        """
+        Sample token sequences from non-AR message logits.
+        Args:
+            logits: [B, L, V]
+            temperature: softmax temperature (>0). 1.0 = no change
+            top_k/top_p: nucleus filtering along vocab dim
+            deterministic: if True, returns argmax per position (greedy)
+            allow_eos: if True, EOS can be sampled; tokens after first EOS are set to PAD
+            forbid_eos_at_start: if True, EOS is disallowed at position 0
+            allow_pad: if False, PAD is disallowed before EOS (it will still be inserted after EOS)
+            sos_id/eos_id/pad_id: special token ids; set to None to disable masking
+        Returns:
+            tokens: [B, L] long
+        """
+        assert temperature > 0, "temperature must be > 0"
+        B, L, V = logits.shape
+        logit = logits / temperature
+        # mask unwanted specials
+        if sos_id is not None:
+            logit[..., sos_id] = float('-inf')
+        if not allow_pad and pad_id is not None:
+            logit[..., pad_id] = float('-inf')
+        if forbid_eos_at_start and eos_id is not None:
+            logit[:, 0, eos_id] = float('-inf')
+        # filter
+        logit = MessageDecoder._filter_topk_topp(logit, top_k=top_k, top_p=top_p)
+        if deterministic:
+            tokens = logit.argmax(dim=-1)
+        else:
+            probs = F.softmax(logit, dim=-1)
+            probs = torch.nan_to_num(probs, nan=0.0)
+            flat = probs.reshape(B * L, V)
+            # fallback for degenerate rows (all zeros)
+            zero_row = (flat.sum(dim=-1, keepdim=True) == 0)
+            if zero_row.any():
+                arg = logit.reshape(B*L, V).argmax(dim=-1, keepdim=True)
+                one_hot = torch.zeros_like(flat).scatter_(1, arg, 1.0)
+                flat = torch.where(zero_row, one_hot, flat)
+            idx = torch.multinomial(flat, 1).squeeze(-1)  # [B*L]
+            tokens = idx.view(B, L)
+        # post-process: after first EOS -> PAD
+        if eos_id is not None and pad_id is not None and allow_eos:
+            with torch.no_grad():
+                is_eos = (tokens == eos_id)
+                # first eos position per batch; if none, set to L
+                first = torch.where(is_eos.any(dim=1), is_eos.float().argmax(dim=1), torch.full((B,), L, device=tokens.device))
+                arange = torch.arange(L, device=tokens.device).view(1, L).expand(B, L)
+                after = arange > first.view(B, 1)
+                tokens = torch.where(after, torch.full_like(tokens, pad_id), tokens)
+        # never emit SOS
+        if sos_id is not None:
+            tokens = torch.where(tokens == sos_id, torch.full_like(tokens, (eos_id if allow_eos and eos_id is not None else pad_id if pad_id is not None else 0)), tokens)
+        return tokens
+
+    def generate(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Convenience: z -> logits -> tokens."""
+        logits = self.forward(z)
+        return self.sample_from_logits(logits, **kwargs)
+    
 class HeroEmbedding(nn.Module):
     """Hero embedding for MiniHack."""
-    def __init__(self):
+    def __init__(self, config: VAEConfig):
         super().__init__()
-        self.role_emb = nn.Embedding(ROLE_CAD, ROLE_EMB)
-        self.race_emb = nn.Embedding(RACE_CAD, RACE_EMB)
-        self.gend_emb = nn.Embedding(GEND_CAD, GEND_EMB)
-        self.align_emb = nn.Embedding(ALIGN_CAD, ALIGN_EMB)
-    
+        self.role_emb = nn.Embedding(ROLE_CAD, config.role_emb)
+        self.race_emb = nn.Embedding(RACE_CAD, config.race_emb)
+        self.gend_emb = nn.Embedding(GEND_CAD, config.gend_emb)
+        self.align_emb = nn.Embedding(ALIGN_CAD, config.align_emb)
+        self.out_dim = config.role_emb + config.race_emb + config.gend_emb + config.align_emb
+
     def forward(self, role: torch.Tensor, race: torch.Tensor,
                 gend: torch.Tensor, align: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Forward pass for hero embedding."""
@@ -490,318 +1104,329 @@ class HeroEmbedding(nn.Module):
         align_emb = self.align_emb(align)
         
         hero_vec = torch.cat([role_emb, race_emb, gend_emb, align_emb], dim=-1)
-        embeddings = {
-            'role': role_emb,
-            'race': race_emb,
-            'gend': gend_emb,
-            'align': align_emb
-        }
-        return hero_vec, embeddings  # [B, 16]
+        return hero_vec  # [B, 16]
     
     def get_output_channels(self) -> int:
         """Returns the number of output channels for hero embedding."""
-        return ROLE_EMB + RACE_EMB + GEND_EMB + ALIGN_EMB  # 16
-    
+        return self.out_dim  # 16
 
-class InventoryEncoder(nn.Module):
-    """
-    Encodes inventory using object classes (inv_oclasses) and string descriptions (inv_strs).
-    We use char embeddings from GlyphCNN for object classes.
-    
-    Architecture:
-    - Object classes: [B, 55] -> [B, hid] using a simple RNN
-    - String descriptions: [B, 55, 80] -> [B, hid * 2] using a bidirectional GRU
-    - Fusion: Concatenate object class and string embeddings, then pass through a linear layer to output [B, output_dim].
-    
-    This approach avoids using inv_glyphs which can be inconsistent and instead uses
-    semantic object class information and natural language descriptions.
-    """
-    def __init__(self, vocab: int=MSG_VOCAB + 2, str_emb: int=16, hid: int=16, output_dim: int=24):
+class ActionAuxHead(nn.Module):
+    """Action auxiliary head for VAE."""
+    def __init__(self, cfg: VAEConfig):
         super().__init__()
-        self.output_dim = output_dim
-        self.vocab = vocab
-        self.str_emb_dim = str_emb
-        self.hid_dim = hid
-        self.sos = MSG_VOCAB  # start-of-sequence token for strings
-        self.eos = MSG_VOCAB + 1  # end-of-sequence token
+        self.k = cfg.ego_window
+        self.dirs = cfg.passability_dirs
+        self.num_classes = cfg.ego_classes
         
-        self.oclass_net = nn.RNN(CHAR_EMB, hid, batch_first=True)  # simple RNN for object class encoding
-        
-        # Simple character-level processing
-        self.char_emb = nn.Embedding(vocab, str_emb, padding_idx=0)
-        self.str_gru = nn.GRU(str_emb, hid, batch_first=True, bidirectional=True)
-        
-        # Fusion layer
-        self.fusion = nn.Sequential(
-            nn.Linear(hid * 3, hid),
-            nn.ReLU(),
-            nn.Linear(hid, output_dim)
+        # Directional offsets around the center (N,E,S,W,NE,SE,SW,NW)
+        self.dir_offsets = DIRS_8  # (dy, dx) in (y,x)
+        # map into tensor indices (col, row)
+        self.dir_cr = [(self.k//2 + dy, self.k//2 + dx) for (dy, dx) in self.dir_offsets]
+
+        # Class → passable/safe mapping (can refine if you change NetHackCategory)
+        # Safe ⊂ Passable. Monsters/water/traps are not safe.
+        PASSABLE = {
+            NetHackCategory.FLOORS, NetHackCategory.UP_STAIRS, 
+            NetHackCategory.DOWN_STAIRS, NetHackCategory.TRAPS, 
+            NetHackCategory.ITEMS, NetHackCategory.FURNITURE,
+            NetHackCategory.PLAYER_OR_HUMAN, NetHackCategory.HARMLESS_MONSTERS,
+            NetHackCategory.LOW_THREAT_MONSTERS, NetHackCategory.MEDIUM_THREAT_MONSTERS,
+            NetHackCategory.HIGH_THREAT_MONSTERS, NetHackCategory.EXTREME_THREAT_MONSTERS,
+            NetHackCategory.UNKNOWN_MONSTERS
+        }
+        SAFE = {
+            NetHackCategory.FLOORS, NetHackCategory.UP_STAIRS, 
+            NetHackCategory.DOWN_STAIRS, NetHackCategory.ITEMS, 
+            NetHackCategory.FURNITURE
+        }
+
+        self.register_buffer("class_to_pass",
+                             torch.zeros(self.num_classes, dtype=torch.float32))
+        self.register_buffer("class_to_safe",
+                             torch.zeros(self.num_classes, dtype=torch.float32))
+        for c in PASSABLE:
+            self.class_to_pass[c.value] = 1.0
+        for c in SAFE:
+            self.class_to_safe[c.value] = 1.0
+
+        # Latent-gated correction
+        self.gate = nn.Sequential(
+            nn.LayerNorm(cfg.latent_dim),
+            nn.Linear(cfg.latent_dim, cfg.forward_hidden), nn.ReLU(),
+            nn.Dropout(cfg.decoder_dropout),
+            nn.Linear(cfg.forward_hidden, 2 * cfg.passability_dirs)  # pass & safe deltas
         )
         
-    def forward(self, glyph_encoder: GlyphCNN, inv_oclasses: torch.Tensor, inv_strs: torch.Tensor) -> torch.Tensor:
+        self.goal = MLP(cfg.latent_dim, cfg.forward_hidden, cfg.goal_dir_dim, 2, cfg.decoder_dropout) if cfg.goal_dir_dim > 0 else None
+        
+    @staticmethod
+    def _logit(p, eps=1e-5):
+        p = p.clamp(eps, 1.0 - eps)
+        return torch.log(p) - torch.log(1.0 - p)
+
+    def forward(self, z: torch.Tensor, ego_class_logits: torch.Tensor) -> dict[str, torch.Tensor]:
         """
+        Forward pass for action value head.
+        
         Args:
-            inv_oclasses: [B, 55] - object class indices
-            inv_strs: [B, 55, 80] - string descriptions (character codes)
+            z: [B, latent_dim] latent vector
+            ego_class_logits: [B, num_classes, k, k] per-pixel class logits
+        
         Returns:
-            inv_features: [B, output_dim] - encoded inventory features
+            Dictionary with outputs:
+            - passability: [B, passability_dirs]
+            - safety: [B, passability_dirs]
+            - goal: [B, goal_dir_dim] (if applicable)
         """
-        B = inv_oclasses.size(0)
-        # map inv_oclasses to char
-        inv_class = map(lambda x: INV_OCLASS_MAP.get(x, 128), inv_oclasses.view(-1).tolist())  # flatten and map
-        inv_class = torch.tensor(list(inv_class), dtype=torch.long, device=inv_oclasses.device).view(B, INV_MAX_SIZE)  # [B, 55]
+        B, C, k, _ = ego_class_logits.shape
+        assert C == self.num_classes and k == self.k, f"expect [B,{self.num_classes},{self.k},{self.k}]"
+
+        probs = F.softmax(ego_class_logits, dim=1)   # [B,C,k,k]
+
+        # Collect class distributions at 8 neighbor locations
+        neigh = []
+        for (c, r) in self.dir_cr:
+            neigh.append(probs[:, :, c, r])         # [B,C]
+        neigh = torch.stack(neigh, dim=1)            # [B,8,C]
+
+        # Priors from class maps
+        pass_prior = torch.matmul(neigh, self.class_to_pass)  # [B,8]
+        safe_prior = torch.matmul(neigh, self.class_to_safe)  # [B,8]
+
+        # Latent-gated corrections (per direction)
+        delta = self.gate(z).view(B, 2, self.dirs)            # [B,2,8]
+        pass_logits = self._logit(pass_prior) + delta[:, 0, :]
+        safe_logits = self._logit(safe_prior) + delta[:, 1, :]
+
+        out = {
+            "passability_logits": pass_logits,
+            "safety_logits": safe_logits,
+            "pass_prior": pass_prior.detach(),
+            "safe_prior": safe_prior.detach()
+        }
+        if self.goal is not None:
+            out["goal_pred"] = torch.tanh(self.goal(z))  # in [-1,1]
+        return out
+
+class WorldModel(nn.Module):
+    """
+    Deterministic GRU state s_t with Gaussian prior over z_{t+1}.
+    roll_out(...) expects sequences [B,T,...] and returns flattened heads for loss.
+    """
+    def __init__(self, cfg: VAEConfig):
+        super().__init__()
+        self.enabled = (cfg.action_dim > 0) and cfg.use_world_model
+        self.skill_num = cfg.skill_num
+        self.z_dim = cfg.latent_dim
+        self.a_dim = cfg.action_dim + cfg.skill_num  # action + skill
+        self.s_dim = cfg.gru_hidden
+        if not self.enabled:
+            return
+        self.in_norm  = nn.LayerNorm(self.z_dim + self.a_dim)
+        self.gru      = nn.GRUCell(self.z_dim + self.a_dim, self.s_dim)
+        self.out_norm = nn.LayerNorm(self.s_dim)
+
+        hid = cfg.forward_hidden
+        # Prior over z_{t+1}
+        self.prior_mu     = nn.Linear(self.s_dim, self.z_dim)
+        self.prior_logvar = nn.Linear(self.s_dim, self.z_dim)
+        self.prior_lowrank = nn.Linear(self.s_dim, self.z_dim * cfg.low_rank) if cfg.low_rank > 0 else None
         
-        # Process object classes
-        inv_class_emb = glyph_encoder.char_emb(inv_class)  # [B, 55] -> [B, 55, CHAR_EMB]
-        packed_inv_class_emb = nn.utils.rnn.pack_padded_sequence(
-            inv_class_emb, (inv_oclasses != 18).sum(dim=1).cpu(),
-            batch_first=True, enforce_sorted=False
-        )  # Pack the sequences for RNN
-        _, h_class_n = self.oclass_net(packed_inv_class_emb)  # h_class_n: [1, B, hid]
-        h_class = h_class_n.squeeze(0)  # [B, hid]
+        # Predictors from s_t (reward/done/value)
+        self.reward   = MLP(self.s_dim, hid, 1, num_layers=2, dropout=cfg.decoder_dropout)
+        self.done     = MLP(self.s_dim, hid, 1, num_layers=2, dropout=cfg.decoder_dropout)
+        self.value_k  = MLP(self.s_dim, hid, len(cfg.value_horizons), num_layers=2, dropout=cfg.decoder_dropout)
         
-        # Process string descriptions
-        inv_strs_with_eos = inv_strs.clone().view(B * INV_MAX_SIZE, INV_STR_LEN)  # Flatten to [B*55, 80]
-        lengths = (inv_strs_with_eos != 0).sum(dim=-1)  # [B*55,] - count non-padding characters
-        bHasSpace = (lengths < INV_STR_LEN)  # check if there is space for EOS
-        inv_strs_with_eos[bHasSpace, lengths[bHasSpace]] = self.eos  # set end-of-sequence token at the end of each string
-        str_emb = self.char_emb(inv_strs_with_eos)  # [B*55, 80, str_emb]
-        packed_str_emb = nn.utils.rnn.pack_padded_sequence(
-            str_emb, lengths.cpu(), batch_first=True, enforce_sorted=False
-        )  # Pack the sequences for GRU
-        
-        # GRU over characters
-        packed_out, h_n = self.gru(packed_str_emb)  # hidden: [2, B*55, hid]
-        # Use final hidden state (concat forward and backward)
-        str_final = torch.cat([h_n[0], h_n[1]], dim=1)  # [B*55, hid * 2]
-        str_final = str_final.view(B, INV_MAX_SIZE, self.hid_dim * 2)  # [B, 55, hid * 2]
-        
-        # Average pool over inventory slots (mask out empty slots)
-        str_mask = (inv_strs.sum(dim=-1) > 0).float().unsqueeze(-1)  # [B, 55, 1]
-        str_masked = str_final * str_mask  # [B, 55, hid * 2]
-        str_pooled = str_masked.sum(dim=1) / (str_mask.sum(dim=1) + 1e-8)  # [B, hid * 2]
-        
-        # Fusion
-        combined = torch.cat([h_class, str_pooled], dim=-1)  # [B, hid] + [B, hid * 2] -> [B, hid * 3]
-        inv_features = self.fusion(combined)  # [B, output_dim]
-        
-        return inv_features, inv_class_emb, str_emb  # return features, class embeddings, string embeddings
-        # inv_class_emb: [B, 55, CHAR_EMB], str_emb: [B, 55, 80, str_emb]
-        
-    def teacher_forcing_decorator(self, glyph_encoder: GlyphCNN, inv_oclasses: torch.Tensor, inv_strs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            inv_oclasses: [B, 55] - object class indices
-            inv_strs: [B, 55, 80] - string descriptions (character codes)
-        Returns:
-            shifted_oclasses: [B, 55] - shifted object class indices with sos/eos
-            shifted_strs: [B, 55, 80] - shifted string descriptions with sos/eos
-            shifted_oclass_emb: [B, 55, CHAR_EMB] - shifted object class embeddings
-            shifted_str_emb: [B, 55, 80, str_emb] - shifted string embeddings
-        """
-        B = inv_oclasses.size(0)
-        # Shift object classes
-        shifted_oclasses = torch.zeros_like(inv_oclasses)
-        shifted_oclasses[:, 0] = self.sos  # set start-of-sequence token
-        shifted_oclasses[:, 1:] = inv_oclasses[:, :-1]  # shift right by 1
-        lengths_oclasses = (inv_oclasses != 18).sum(dim=1)  # count non-padding object classes
-        bHasSpace = lengths_oclasses < INV_MAX_SIZE - 1  # check if there is space for EOS
-        shifted_oclasses[bHasSpace, lengths_oclasses[bHasSpace] + 1] = self.eos  # set end-of-sequence token at the end of each object class sequence
-        # Shift string descriptions
-        flat_inv_strs = inv_strs.view(B * INV_MAX_SIZE, INV_STR_LEN)  # Flatten to [B*55, 80]
-        shifted_strs = flat_inv_strs.clone()
-        shifted_strs[:, 0] = self.sos  # set start-of-sequence token
-        shifted_strs[:, 1:] = flat_inv_strs[:, :-1]  # shift right by 1
-        # Get embeddings for shifted object classes and strings
-        shifted_oclass_emb = glyph_encoder.char_emb(shifted_oclasses)  # [B, 55] -> [B, 55, CHAR_EMB]
-        shifted_str_emb = self.char_emb(shifted_strs)  # [B*55, 80] -> [B*55, 80, str_emb]
-        shifted_str_emb = shifted_str_emb.view(B, INV_MAX_SIZE, INV_STR_LEN, self.str_emb_dim)
-        return shifted_oclasses, shifted_strs, shifted_oclass_emb, shifted_str_emb  # return shifted object classes and strings, and their embeddings
+    def initial_state(self, B: int, device=None):
+        return torch.zeros(B, self.s_dim, device=device)
     
-    def get_output_channels(self) -> int:
-        """Returns the number of output channels."""
-        return self.output_dim
+    @torch.no_grad()
+    def _pack_a(self, a_onehot: torch.Tensor, h_onehot: torch.Tensor | None):
+        if h_onehot is None:
+            h_onehot = torch.zeros(a_onehot.size(0), self.skill_num, device=a_onehot.device) if self.skill_num > 0 else None
+        return torch.cat([a_onehot, h_onehot], dim=-1) if self.skill_num > 0 else a_onehot
+
+    def forward(self,
+                z_seq: torch.Tensor,            # [B,T-1,Z] (posterior samples or means)
+                a_seq: torch.Tensor,            # [B,T-1,A]
+                has_next: torch.Tensor,         # [B,T-1] bool
+                h_seq: torch.Tensor | None = None # [B,T-1,K] or None
+                ) -> dict[str, torch.Tensor]:
+        """
+        Computes s_t = GRU(s_{t-1}, [stopgrad(z_t), a_t(, h_t)]) and heads at times t=0..T-2.
+        Returns flattened outputs aligned to pairs (t, t+1).
+        """
+        if not self.enabled:
+            raise RuntimeError("Forward model disabled (action_dim=0).")
+        B, T_minus_1, _ = z_seq.shape
+        device = z_seq.device
+        s = self.initial_state(B, device)
+        prior_mu, prior_logvar, prior_lowrank = [], [], []
+        rew, done, valk = [], [], []
+
+        for t in range(T_minus_1):
+            x_in = torch.cat([z_seq[:, t].detach(), self._pack_a(a_seq[:, t], h_seq[:, t] if h_seq is not None else None)], dim=-1)
+            x_in = self.in_norm(x_in)
+            s = self.gru(x_in, s)
+            s = self.out_norm(s)
+
+            prior_mu.append(self.prior_mu(s))
+            prior_logvar.append(self.prior_logvar(s))
+            if self.prior_lowrank is not None:
+                prior_lowrank.append(self.prior_lowrank(s)) 
+            rew.append(self.reward(s))
+            done.append(self.done(s))
+            valk.append(self.value_k(s))
+
+            # reset state where there is no next frame (episode boundary)
+            if has_next is not None:
+                mask = has_next[:, t].view(B, 1).float()
+                s = s * mask  # simple reset
+
+        # stack and flatten to [B*(T-1), ...]
+        def _flat(xs): return torch.stack(xs, dim=1).reshape(-1, xs[0].shape[-1])
+        out = {
+            "prior_mu": _flat(prior_mu),            # [B*(T-1), Z]
+            "prior_logvar": _flat(prior_logvar),    # [B*(T-1), Z]
+            "prior_lowrank": _flat(prior_lowrank) if self.prior_lowrank is not None else None,  # [B*(T-1), Z*R] or None
+            "reward": _flat(rew),                   # [B*(T-1), 1]
+            "done_logits": _flat(done),             # [B*(T-1), 1]
+            "value_k": _flat(valk)                  # [B*(T-1), len(K)]
+        }
+        return out
+
+
+class InverseDynamics(nn.Module):
+    def __init__(self, cfg: VAEConfig):
+        super().__init__()
+        self.enabled = (cfg.action_dim > 0) and cfg.use_inverse_dynamics
+        self.skill_num = cfg.skill_num
+        if not self.enabled:
+            return
+        self.net = MLP(2 * cfg.latent_dim, 256, cfg.action_dim + cfg.skill_num, num_layers=3)
+
+    def forward(self, z_t: torch.Tensor, z_tp1: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            raise RuntimeError("Inverse dynamics disabled.")
+        x = torch.cat([z_t, z_tp1], dim=1)
+        return self.net(x)  # logits [B, A + skill_num]
 
 class MultiModalHackVAE(nn.Module):
-    def __init__(self, 
-                 bInclude_glyph_bag=True, 
-                 bInclude_hero=True,
-                 bInclude_inventory=True,
-                 dropout_rate=0.0,
-                 enable_dropout_on_latent=True,
-                 enable_dropout_on_decoder=True,
-                 logger: logging.Logger=None):
+    def __init__(self, config: VAEConfig,
+                 logger: logging.Logger | None=None):
         super().__init__()
         self.logger = logger or logging.getLogger(__name__)
-        self.dropout_rate = dropout_rate
-        self.enable_dropout_on_latent = enable_dropout_on_latent
-        self.enable_dropout_on_decoder = enable_dropout_on_decoder
         
-        self.glyph_cnn = GlyphCNN()
-        self.glyph_bag = GlyphBag(logger=self.logger)  # for bag of glyphs
-        self.stats_mlp = StatsMLP()
-        self.msg_gru   = MessageGRU()
-        self.hero_emb = HeroEmbedding()  # for hero embedding
-        self.inv_encoder = InventoryEncoder()  # for inventory encoding
-        
-        self.include_glyph_bag = bInclude_glyph_bag
-        self.include_hero = bInclude_hero
-        self.include_inventory = bInclude_inventory
+        self.map_encoder = MapEncoder(config)
+        self.stats_encoder = StatsEncoder(config)
+        self.msg_encoder = MessageEncoder(config)
+        self.hero_emb = HeroEmbedding(config)
 
-        fusion_in = self.glyph_cnn.get_output_channels() + \
-                    self.stats_mlp.get_output_channels() + \
-                    self.msg_gru.get_output_channels() + \
-                    (self.glyph_bag.get_output_channels() if bInclude_glyph_bag else 0) + \
-                    (self.hero_emb.get_output_channels() if bInclude_hero else 0) + \
-                    (self.inv_encoder.get_output_channels() if bInclude_inventory else 0)  # cnn + stats + msg + bag of glyphs + hero embedding + inventory
+        fusion_in = 2 * self.map_encoder.get_output_channels() + \
+                    self.stats_encoder.get_output_channels() + \
+                    self.msg_encoder.get_output_channels() + \
+                    self.hero_emb.get_output_channels() # cnn + stats + msg + hero embedding
         
         # Add dropout to the encoder fusion layer if enabled
-        if self.dropout_rate > 0.0 and self.enable_dropout_on_latent:
+        if config.encoder_dropout > 0.0:
             self.to_latent = nn.Sequential(
                 nn.LayerNorm(fusion_in),
-                nn.Dropout(self.dropout_rate),
+                nn.Dropout(config.encoder_dropout),
                 nn.Linear(fusion_in, 256), nn.ReLU(),
-                nn.Dropout(self.dropout_rate),
+                nn.Dropout(config.encoder_dropout),
             )
         else:
             self.to_latent = nn.Sequential(
                 nn.LayerNorm(fusion_in),
                 nn.Linear(fusion_in, 256), nn.ReLU(),
             )
-        self.latent_dim = LATENT_DIM
-        self.mu_head     = nn.Linear(256, LATENT_DIM)
-        self.logvar_diag_head = nn.Linear(256, LATENT_DIM)  # diagonal part
-        self.lowrank_factor_head = nn.Linear(256, LATENT_DIM * LOW_RANK)  # low-rank factors
+        self.latent_dim = config.latent_dim
+        self.lowrank_dim = config.low_rank
+        self.z_bag_dim = config.bag_dim  # Add missing attribute
+        self.z_core_dim = config.core_dim  # Add missing attribute
+        self.mu_head     = nn.Linear(256, self.latent_dim)
+        self.logvar_diag_head = nn.Linear(256, self.latent_dim)  # diagonal part
+        self.lowrank_factor_head = nn.Linear(256, self.latent_dim * self.lowrank_dim) if self.lowrank_dim else None # low-rank factors
 
-        # We will have 3 categories of decoder heads:
-        # 1. For reconstruction of observations:
-        #    - glyphs (pixel-wise categorical for both char and color)
-        #    - glyphs_bag (pixel-wise categorical) (optional)
-        #    - stats (pixel-wise categorical)
-        #    - messages (token-wise categorical)
-        #    - heros (token-wise categorical) (optional)
-        # 2. For reconstruction of frozen embeddings (optional):
-        #    - glyph_char_embeddings (pixel-wise continuous)
-        #    - glyph_color_embeddings (pixel-wise continuous)
-        #    - glyph_bag_embeddings (pixel-wise continuous) (optional)
-        #    - stats_embeddings (pixel-wise continuous)
-        #    - messages_embeddings (pixel-wise continuous)
-        #    - heros_embeddings (pixel-wise continuous) (optional)
-        # 3. For dynamic predictions p(x_{t+1} | z_t, a_t, h_t, c)
-        
-        # This will be shared across all decoders
-        if self.dropout_rate > 0.0 and self.enable_dropout_on_decoder:
-            self.decode_shared = nn.Sequential(
-                nn.Linear(LATENT_DIM, 256), nn.ReLU(),
-                nn.Dropout(self.dropout_rate),
-            )
-        else:
-            self.decode_shared = nn.Sequential(
-                nn.Linear(LATENT_DIM, 256), nn.ReLU(),
-            )
-        
-        # ------------- Decode embeddings ----------------
-        
-        # from 256 to 20 * 21 * 79 using conv transpose
-        # First reshape 256 -> (64, 1, 1), then upsample to (20, 21, 79)
-        self.decode_glyph_emb = nn.Sequential(
-            # Start: [B, 256] -> [B, 64, 1, 1]
-            nn.Linear(256, 64 * 1 * 1),
-            nn.Unflatten(1, (64, 1, 1)),  # [B, 64, 1, 1]
-            
-            # Upsample to target size: 21 x 79
-            # Step 1: [B, 64, 1, 1] -> [B, 32, 3, 10] 
-            nn.ConvTranspose2d(64, 32, kernel_size=(3, 10), stride=1, padding=0),  # -> [B, 32, 3, 10]
-            nn.ReLU(),
-            
-            # Step 2: [B, 32, 3, 10] -> [B, 20, 21, 79]
-            # kernel_size needed: (21-3+1, 79-10+1) = (19, 70)
-            nn.ConvTranspose2d(32, GLYPH_EMB, kernel_size=(19, 70), stride=1, padding=0)  # -> [B, 20, 21, 79]
-        )
-        
-        # glyph bag embeddings
-        # Note: glyph bag reconstruction (if required) is derived from char/color logits
-        # No separate head needed since glyph bag is just unique combinations of char+color
-        
-        # stats embeddings
-        self.decode_stats_emb = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, self.stats_mlp.preprocessor.get_output_dim())  # [B, 256] -> [B, 43]
-        )
-        
-        # Message decoder - use unidirectional GRU with proper hidden state size
-        self.decode_msg_latent2hidden = nn.Linear(256, self.msg_gru.hid_dim)  # [B, 256] -> [B, hid_dim]
-        self.decode_msg_gru = nn.GRU(self.msg_gru.emb_dim, self.msg_gru.hid_dim, batch_first=True)  # [B, T, emb_dim] -> [B, T, hid_dim]
-        self.decode_msg_hidden2emb = nn.Linear(self.msg_gru.hid_dim, self.msg_gru.emb_dim)  # [B, T, hid_dim] -> [B, T, emb_dim]
-        
-        # Inventory embedding decoder
-        self.decode_inv_latent2hidden = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, self.inv_encoder.hid_dim * 3)  # [B, 256] -> [B, hid_dim * 3] (for oclass + str)
-        )
-        self.decode_inv_class_rnn_emb = nn.RNN(CHAR_EMB, self.inv_encoder.hid_dim, batch_first=True)  # RNN for object class decoding, [B, 55, CHAR_EMB] -> [B, 55, hid_dim]
-        self.decode_inv_class_hidden2emb = nn.Linear(self.inv_encoder.hid_dim, self.glyph_cnn.char_emb.embedding_dim)  # [B, 55, hid_dim] -> [B, 55, CHAR_EMB]
-        self.decode_inv_str_gru_emb = nn.GRU(self.inv_encoder.str_emb_dim, self.inv_encoder.hid_dim, batch_first=True, bidirectional=True)  # GRU for string decoding, [B*55, 80, emb_dim] -> [B*55, 80, hid_dim * 2]
-        self.decode_inv_str_hidden2emb = nn.Linear(self.inv_encoder.hid_dim * 2, self.inv_encoder.str_emb_dim)  # [B*55, 80, hid_dim * 2] -> [B*55, 80, str_emb]
-        
-        # ------------- Decode logits ----------------
-        # These will take the embedding as starting point
-        
-        # Separate heads for char and color reconstruction
-        # these will return logits for each pixel
-        self.decode_chars = nn.Conv2d(CHAR_EMB, CHAR_DIM, kernel_size=1)  # [B, 16, 21, 79] -> [B, 256, 21, 79]
-        self.decode_colors = nn.Conv2d(COLOR_EMB, COLOR_DIM, kernel_size=1)  # [B, 4, 21, 79] -> [B, 16, 21, 79]
-        
-        # Note: glyph bag reconstruction is derived from char/color logits
-        # No separate head needed since glyph bag is just unique combinations of char+color
-        
-        # stats - decode to 24 relevant dimensions (excluding time and unknowns)
-        # Split into discrete and continuous components
-        self.decode_stats_continuous = nn.Sequential(
-            nn.ReLU(), 
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 64), nn.ReLU(),  # [B, 43] -> [B, 64]
-            nn.Linear(64, 19),  # [B, 64] -> [B, 19] for normalized continuous stats (matches BatchNorm input)
-        )
-        
-        # Discrete stats: hunger_state (0-6), dungeon_number (0-10), level_number (0-50)
-        self.decode_hunger_state = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 7),  # [B, 32] -> [B, 7] for hunger states
-        )
-        
-        self.decode_dungeon_number = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 11),  # [B, 32] -> [B, 11] for dungeon numbers
-        )
-        
-        self.decode_level_number = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 51),  # [B, 32] -> [B, 51] for level numbers
-        )
-        
-        # Condition mask decoder - outputs 13 binary logits (one per condition bit)
-        self.decode_condition_mask = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(self.stats_mlp.preprocessor.get_output_dim(), 32), nn.ReLU(),
-            nn.Linear(32, 13),  # [B, 32] -> [B, 13] for condition bits (binary classification per bit)
-        )
-        
-        # messages - use extended vocabulary to include SOS/EOS tokens
-        self.decode_msg = nn.Linear(self.msg_gru.emb_dim, self.msg_gru.vocab)  # [B, T, emb_dim] -> [B, T, vocab_size]
-        
-        self.decode_inv_class = nn.Linear(self.glyph_cnn.char_emb.embedding_dim, INV_OCLASS_DIM)  # [B, 55, CHAR_EMB] -> [B, 55, INV_OCLASS_DIM]
-        self.decode_inv_str = nn.Linear(self.inv_encoder.str_emb_dim, self.inv_encoder.vocab)  # [B, 55, 80, str_emb] -> [B, 55, 80, MSG_VOCAB + 2]
-        
-        # Dynamic prediction heads
-        # It takes latent z, action a, HDP HMM state h and hero info c
-        # TODO: Implement dynamic prediction heads
+        self.z_norm = torch.nn.LayerNorm(self.latent_dim, elementwise_affine=False)
+        self.map_decoder  = MapDecoder(config)
+        self.stats_decoder = StatsDecoder(config)
+        self.msg_decoder   = MessageDecoder(config)
+        self.action_aux_head = ActionAuxHead(config)
+        self.world_model = WorldModel(config)
+        self.inverse_dynamics = InverseDynamics(config)
         
 
+    def encode(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info):
+        """
+        Encodes the input features into a latent space.
         
+        Args:
+            glyph_chars: [B, 21, 79] - character glyphs
+            glyph_colors: [B, 21, 79] - color glyphs
+            blstats: [B, BLSTATS_DIM] - baseline stats
+            msg_tokens: [B, 256] - message tokens (padded)
+            hero_info: [B, 4] - hero information
+                    
+        Returns:
+            mu: [B, LATENT_DIM] - mean of the latent distribution
+            logvar_diag: [B, LATENT_DIM] - diagonal log variance of the latent distribution  
+            lowrank_factors: [B, LATENT_DIM, LOW_RANK] - low-rank factors if applicable
+        """
+        
+        # glyphs
+        if glyph_chars.size(0) != glyph_colors.size(0):
+            raise ValueError("glyph_chars and glyph_colors must have the same batch size.")
+        B = glyph_chars.size(0)
+        if glyph_chars.size(1) != glyph_colors.size(1):
+            raise ValueError("glyph_chars and glyph_colors must have the same height and width.")
+        
+        # Encode all features and get embeddings
+        glyph_feat = self.map_encoder(glyph_chars, glyph_colors)  # [B,64]
+        
+        # rare glyph features
+        rare_glyph_chars = torch.full_like(glyph_chars, ord(' '))  # fill with space character
+        rare_glyph_colors = torch.zeros_like(glyph_colors)  # fill with black color
+        is_fg = (glyph_chars != ord(' ')) & (glyph_colors != 0)  # foreground mask
+        is_common = torch.zeros_like(is_fg, dtype=torch.bool)  # common glyphs mask
+        for c in COMMON_GLYPHS:
+            is_common |= (glyph_chars == c[0]) & (glyph_colors == c[1])
+        is_rare = is_fg & ~is_common  # rare glyphs mask
+        rare_glyph_chars[is_rare] = glyph_chars[is_rare]
+        rare_glyph_colors[is_rare] = glyph_colors[is_rare]
+        rare_glyph_feat = self.map_encoder(rare_glyph_chars, rare_glyph_colors)  # [B,64]
 
+        stats_feat = self.stats_encoder(blstats)
+        
+        # Message encoding
+        msg_feat = self.msg_encoder(msg_tokens)  # [B,hid_dim], [B,256,emb_dim]
+        
+        # Hero embedding
+        # check shape of hero_info should be [B, 4] with role, race, gend, align
+        if hero_info.size(0) != B:
+            raise ValueError("hero_info must have the same batch size as glyph_chars and glyph_colors.")
+        if hero_info.size(1) != 4:
+            raise ValueError("hero_info must have shape [B, 4]")
+        hero_info = hero_info.long()
+        role, race, gend, align = hero_info[:, 0], hero_info[:, 1], hero_info[:, 2], hero_info[:, 3]
+        hero_feat = self.hero_emb(role, race, gend, align)  # [B,16], dict
+        features = [glyph_feat, rare_glyph_feat, stats_feat, msg_feat, hero_feat]
+        
+        fused = torch.cat(features, dim=-1)
+        
+        # Encode to latent space
+        h = self.to_latent(fused)
+        mu = self.mu_head(h)
+        logvar_diag = self.logvar_diag_head(h)
+        lowrank_factors = self.lowrank_factor_head(h).view(B, self.latent_dim, self.lowrank_dim) if self.lowrank_factor_head is not None else None
+
+        return {
+            'mu': mu,  # [B, LATENT_DIM]
+            'logvar': logvar_diag,  # [B, LATENT_DIM]
+            'lowrank_factors': lowrank_factors,  # [B, LATENT_DIM, LOW_RANK] or None
+            "stats_encoder": self.stats_encoder
+        }
+          
     def _reparameterise(self, mu, logvar, lowrank_factors=None):
         diag_std = torch.exp(0.5*logvar)
         eps1 = torch.randn_like(diag_std)
@@ -814,486 +1439,1065 @@ class MultiModalHackVAE(nn.Module):
             z += lowrank_std
         return z    # [B, LATENT_DIM]
 
-    def forward(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info=None, inv_oclasses=None, inv_strs=None):
-        # glyphs
-        if glyph_chars.size(0) != glyph_colors.size(0):
-            raise ValueError("glyph_chars and glyph_colors must have the same batch size.")
-        B = glyph_chars.size(0)
-        if glyph_chars.size(1) != glyph_colors.size(1):
-            raise ValueError("glyph_chars and glyph_colors must have the same height and width.")
+    def decode(
+        self, 
+        z,  # [B*T, latent_dim]
+        action_onehot=None, # [B, T-1, A]
+        has_next=None,    # [B, T-1] bool
+        skill_onehot=None, # [B, T-1, K]
+        z_next_detach=None, # [B, T-1, latent_dim]
+        z_current_for_dynamics=None # [B, T-1, latent_dim]
+        ) -> Dict[str, torch.Tensor]: 
         
-        # Encode all features and get embeddings
-        glyph_feat, char_emb, color_emb = self.glyph_cnn(glyph_chars, glyph_colors)  # [B,64], [B,16,H,W], [B,4,H,W]
-        stats_feat, stats_emb = self.stats_mlp(blstats)
-        
-        # Message encoding
-        msg_feat, msg_emb_no_shift = self.msg_gru(msg_tokens)  # [B,hid_dim], [B,256,emb_dim]
-        msg_token_shift, msg_emb_shift = self.msg_gru.teacher_forcing_decorator(msg_tokens)  # [B,256] -> [B,256,emb_dim]
-        
-        features = [glyph_feat, stats_feat, msg_feat]
-        
-        if self.include_glyph_bag:
-            glyph_bag_feat, glyph_bag_emb, glyph_bag = self.glyph_bag(self.glyph_cnn, glyph_chars, glyph_colors) # [B,32], [B,max_len,20], [B,max_len, 2]
-            features.append(glyph_bag_feat)
-        else:
-            glyph_bag_emb = None
-            glyph_bag = None
-        
-        if self.include_hero != (hero_info is not None):
-            raise ValueError("hero_info must be provided if and only if include_hero is True.")
-        
-        # Hero embedding
-        # check shape of hero_info should be [B, 4] with role, race, gend, align
-        if hero_info is not None:
-            if hero_info.size(0) != B:
-                raise ValueError("hero_info must have the same batch size as glyph_chars and glyph_colors.")
-            if hero_info.size(1) != 4:
-                raise ValueError("hero_info must have shape [B, 4]")
-            role, race, gend, align = hero_info[:, 0], hero_info[:, 1], hero_info[:, 2], hero_info[:, 3]
-            hero_feat, hero_emb_dict = self.hero_emb(role, race, gend, align)  # [B,16], dict
-            features.append(hero_feat)
-        else:
-            hero_emb_dict = None
-        
-        # Inventory encoding (optional)
-        if self.include_inventory and inv_oclasses is not None and inv_strs is not None:
-            inv_features, inv_oclasses_emb_no_shift, inv_str_emb_no_shift = self.inv_encoder(self.glyph_cnn, inv_oclasses, inv_strs)  # [B, output_dim]
-            features.append(inv_features)
-            inv_oclasses_shift, inv_strs_shift, inv_oclasses_emb_shift, inv_strs_emb_shift = self.inv_encoder.teacher_forcing_decorator(self.glyph_cnn, inv_oclasses, inv_strs)  # [B, 55], [B, 55, 80], [B, 55, CHAR_EMB], [B, 55, 80, str_emb]
-        else:
-            inv_features = None
-            inv_oclasses_emb_no_shift = None
-            inv_str_emb_no_shift = None
-            inv_oclasses_shift = None
-            inv_strs_shift = None
-            inv_oclasses_emb_shift = None
-            inv_strs_emb_shift = None
-        
-        fused = torch.cat(features, dim=-1)
-        
-        # Encode to latent space
-        h = self.to_latent(fused)
-        mu = self.mu_head(h)
-        logvar_diag = self.logvar_diag_head(h)
-        lowrank_factors = self.lowrank_factor_head(h).view(B, LATENT_DIM, LOW_RANK)
-        z = self._reparameterise(mu, logvar_diag, lowrank_factors)
+        B, T_minus_1 = None, None
+        if action_onehot is not None:
+            B = action_onehot.size(0)
+            T_minus_1 = action_onehot.size(1)
+        elif has_next is not None:
+            B = has_next.size(0)
+            T_minus_1 = has_next.size(1)
+        elif skill_onehot is not None:
+            B = skill_onehot.size(0)
+            T_minus_1 = skill_onehot.size(1)
+        elif z_next_detach is not None:
+            B = z_next_detach.size(0)
+            T_minus_1 = z_next_detach.size(1)
+        elif z_current_for_dynamics is not None:
+            B = z_current_for_dynamics.size(0)
+            T_minus_1 = z_current_for_dynamics.size(1)
+        if B is not None and T_minus_1 is not None:
+            if z.size(0) != B * (T_minus_1 + 1):
+                raise ValueError("z must have shape [B*T, latent_dim] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if action_onehot is not None and (action_onehot.size(0) != B or action_onehot.size(1) != T_minus_1):
+                raise ValueError("action_onehot must have shape [B, T-1, A] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if has_next is not None and (has_next.size(0) != B or has_next.size(1) != T_minus_1):
+                raise ValueError("has_next must have shape [B, T-1] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if skill_onehot is not None and (skill_onehot.size(0) != B or skill_onehot.size(1) != T_minus_1):
+                raise ValueError("skill_onehot must have shape [B, T-1, K] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if z_next_detach is not None and (z_next_detach.size(0) != B or z_next_detach.size(1) != T_minus_1):
+                raise ValueError("z_next_detach must have shape [B, T-1, latent_dim] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+            if z_current_for_dynamics is not None and (z_current_for_dynamics.size(0) != B or z_current_for_dynamics.size(1) != T_minus_1):
+                raise ValueError("z_current_for_dynamics must have shape [B, T-1, latent_dim] when action_onehot, skill_onehot, z_next_detach, or z_current_for_dynamics is provided.")
+        # split z -> [z_bag | z_core]
+        z_n    = self.z_norm(z)
+        z_core = z_n[:, self.z_bag_dim:]
 
-        # Decode
-        shared_features = self.decode_shared(z)  # [B, 256]
+        out_map = self.map_decoder(z_n)  # decode map features
+        stats_pred = self.stats_decoder(z_core)
+        msg_logits = self.msg_decoder(z_core)
+        out_aux = self.action_aux_head(z_n, out_map['ego_class_logits'])
+        # Keep dynamics in the same normalized coordinate system
+        z_cur_n  = self.z_norm(z_current_for_dynamics.view(B*T_minus_1, -1)) if z_current_for_dynamics is not None else None
+        z_next_n = self.z_norm(z_next_detach.view(B*T_minus_1, -1))          if z_next_detach is not None else None
+        out_world = self.world_model(z_cur_n.view(B, T_minus_1, -1), action_onehot, has_next, skill_onehot) if action_onehot is not None and z_cur_n is not None and self.world_model.enabled else None
+        inverse_dynamics_logits = self.inverse_dynamics(z_cur_n, z_next_n) if z_next_n is not None and z_cur_n is not None and self.inverse_dynamics.enabled else None
         
-        # Decode embeddings
-        glyph_emb_decoded = self.decode_glyph_emb(shared_features)  # [B, 20, 21, 79]
-        stats_emb_decoded = self.decode_stats_emb(shared_features)  # [B, 43]
+        out = {
+            **out_map,
+            "stats_pred": stats_pred, 
+            "msg_logits": msg_logits, 
+            **out_aux,
+            "inverse_dynamics_logits": inverse_dynamics_logits,  # [B * (T-1), A + skill_num] or None
+        }
         
-        # Message decoding - autoregressive GRU decoding with proper hidden state
-        msg_hidden_init = self.decode_msg_latent2hidden(shared_features)  # [B, 256] -> [B, hid_dim]
-        # Use teacher forcing - pass the shifted embeddings through GRU
-        msg_lengths = (msg_token_shift != 0).sum(dim=1)  # [B,] - count non-padding tokens
-        packed_msg_emb_shift = nn.utils.rnn.pack_padded_sequence(
-            msg_emb_shift, lengths=msg_lengths.cpu(),
-            batch_first=True, enforce_sorted=False
+        if out_world is not None:
+            out.update(out_world)
+
+        return out
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        glyph_chars = batch['game_chars'] # [B, 21, 79]
+        glyph_colors = batch['game_colors'] # [B, 21, 79]
+        blstats = batch['blstats'] # [B, BLSTATS_DIM]
+        msg_tokens = batch['message_chars'] # [B, 256]
+        hero_info = batch['hero_info'] # [B, 4]
+        enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
+        z = self._reparameterise(enc["mu"], enc["logvar"], enc["lowrank_factors"])  # [B,D]
+        
+        # Calculate z_next_detach if we have sequential data and save to batch
+        if 'has_next' in batch and 'original_batch_shape' in batch:
+            B, T = batch['original_batch_shape']
+            if T > 1:
+                # Reshape z to [B, T, latent_dim] to work with sequences
+                z_reshaped = z.view(B, T, -1)  # [B, T, latent_dim]
+                
+                # Create z_next by shifting: z_next[t] = z[t+1]
+                # Only valid for t < T-1, so we exclude the last timestep
+                z_next = z_reshaped[:, 1:, :].contiguous()  # [B, T-1, latent_dim]
+                z_current_for_dynamics = z_reshaped[:, :-1, :].contiguous()  # [B, T-1, latent_dim]
+                
+                # Save whole tensors to batch - let vae_loss handle masking with has_next
+                z_next_detach = z_next.detach()  # [B, T-1, latent_dim]
+                
+                mu_reshaped = enc['mu'].view(B, T, -1)
+                mu_next_detach = mu_reshaped[:, 1:, :].contiguous().detach()  # [B, T-1, latent_dim]
+                mu_next_flat_detach = mu_next_detach.view(-1, mu_next_detach.shape[-1])  # [B*(T-1), latent_dim]
+                logvar_reshaped = enc['logvar'].view(B, T, -1)
+                logvar_next_detach = logvar_reshaped[:, 1:, :].contiguous().detach()  # [B, T-1, latent_dim]
+                logvar_next_flat_detach = logvar_next_detach.view(-1, logvar_next_detach.shape[-1])  # [B*(T-1), latent_dim]
+                lowrank_reshaped = enc['lowrank_factors'].view(B, T, self.latent_dim, self.lowrank_dim) if enc['lowrank_factors'] is not None else None
+                lowrank_next_detach = lowrank_reshaped[:, 1:, :, :].contiguous().detach() if lowrank_reshaped is not None else None  # [B, T-1, latent_dim, low_rank] or None
+                lowrank_next_flat_detach = lowrank_next_detach.view(-1, lowrank_next_detach.shape[-2], lowrank_next_detach.shape[-1]) if lowrank_next_detach is not None else None
+                
+                action_onehot = batch.get('action_onehot')
+                action_onehot_reshaped = action_onehot.view(B, T, -1) if action_onehot is not None else None
+                action_onehot_for_dynamics = action_onehot_reshaped[:, :-1, :].contiguous() if action_onehot_reshaped is not None else None  # [B, T-1, A]
+                action_onehot_for_dynamics_flat = action_onehot_for_dynamics.view(-1, action_onehot_for_dynamics.shape[-1]) if action_onehot_for_dynamics is not None else None  # [B*(T-1), A]
+                
+                skill_onehot = batch.get('skill_onehot')
+                skill_onehot_reshaped = skill_onehot.view(B, T, -1) if skill_onehot is not None else None
+                skill_onehot_for_dynamics = skill_onehot_reshaped[:, :-1, :].contiguous() if skill_onehot_reshaped is not None else None  # [B, T-1, K]
+                skill_onehot_for_dynamics_flat = skill_onehot_for_dynamics.view(-1, skill_onehot_for_dynamics.shape[-1]) if skill_onehot_for_dynamics is not None else None  # [B*(T-1), K]
+                
+                has_next = batch.get('has_next')
+                has_next_reshaped = has_next.view(B, T)
+                has_next_for_dynamics = has_next_reshaped[:, :-1].contiguous()
+                has_next_for_dynamics_flat = has_next_for_dynamics.view(-1)  # [B*(T-1)]
+                
+                rewards = batch.get('reward_target')
+                rewards_reshaped = rewards.view(B, T)
+                rewards_for_dynamics = rewards_reshaped[:, 1:].contiguous()
+                rewards_for_dynamics_flat = rewards_for_dynamics.view(-1)  # [B*(T-1)]
+                
+                dones = batch.get('done')
+                dones_reshaped = dones.view(B, T)
+                dones_for_dynamics = dones_reshaped[:, 1:].contiguous()
+                dones_for_dynamics_flat = dones_for_dynamics.view(-1)  # [B*(T-1)]
+            else:
+                z_next_detach = None  # No next state if T <= 1
+                z_current_for_dynamics = None  # No current state if T <= 1
+                mu_next_flat_detach = None  # No next mu if T <= 1
+                logvar_next_flat_detach = None  # No next logvar if T <=
+                lowrank_next_flat_detach = None  # No next lowrank if T <= 1
+                action_onehot_for_dynamics = None
+                action_onehot_for_dynamics_flat = None  # No action if T <= 1
+                skill_onehot_for_dynamics = None
+                skill_onehot_for_dynamics_flat = None  # No skill if T <= 1
+                has_next_for_dynamics = None
+                has_next_for_dynamics_flat = None  # No has_next if T <= 1
+                rewards_for_dynamics_flat = None  # No rewards if T <= 1
+                dones_for_dynamics_flat = None  # No dones if T <= 1
+        else:
+            z_next_detach = None
+            z_current_for_dynamics = None
+            mu_next_flat_detach = None  # No next mu if T <= 1
+            logvar_next_flat_detach = None  # No next logvar if T <= 1
+            lowrank_next_flat_detach = None  # No next lowrank if T <= 1
+            action_onehot_for_dynamics = None  # No action if T <= 1
+            action_onehot_for_dynamics_flat = None  # No action if T <= 1
+            skill_onehot_for_dynamics = None
+            skill_onehot_for_dynamics_flat = None  # No skill if T <= 1
+            has_next_for_dynamics = None  # No has_next if T <= 1
+            has_next_for_dynamics_flat = None  # No has_next if T <= 1
+            rewards_for_dynamics_flat = None  # No rewards if T <= 1
+            dones_for_dynamics_flat = None  # No dones if T <= 1
+                
+        batch['mu_next_detach'] = mu_next_flat_detach  # [B*(T-1), latent_dim] or None
+        batch['logvar_next_detach'] = logvar_next_flat_detach  # [B*(T-1), latent_dim] or None
+        batch['lowrank_next_detach'] = lowrank_next_flat_detach  # [B*(T-1), latent_dim, low_rank] or None
+        batch['action_onehot_for_dynamics'] = action_onehot_for_dynamics_flat  # [B*(T-1), A]
+        batch['skill_onehot_for_dynamics'] = skill_onehot_for_dynamics_flat  # [B*(T-1), K]
+        batch['has_next_for_dynamics'] = has_next_for_dynamics_flat  # [B*(T-1)]
+        batch['rewards_for_dynamics'] = rewards_for_dynamics_flat  # [B*(T-1)]
+        batch['dones_for_dynamics'] = dones_for_dynamics_flat  # [B*(T-1)]
+
+        dec = self.decode(z, action_onehot=action_onehot_for_dynamics, has_next=has_next_for_dynamics, skill_onehot=skill_onehot_for_dynamics, z_next_detach=z_next_detach, z_current_for_dynamics=z_current_for_dynamics)
+        return {**enc, **dec, 'z': z}  # include z in the output
+    
+    @torch.no_grad()
+    def sample(
+        self,
+        glyph_chars: torch.Tensor | None = None,
+        glyph_colors: torch.Tensor | None = None,
+        blstats: torch.Tensor | None = None,
+        msg_tokens: torch.Tensor | None = None,
+        hero_info: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+        use_mean: bool = True,
+        include_logits: bool = False,
+        # map sampling
+        map_temperature: float = 1.0,
+        map_occ_thresh: float = 0.5,
+        bag_presence_thresh: float = 0.5,
+        hero_presence_thresh: float = 0.5,
+        passability_thresh: float = 0.5,
+        safety_thresh: float = 0.5,
+        map_deterministic: bool = True,
+        glyph_top_k: int = 0,
+        glyph_top_p: float = 1.0,
+        color_top_k: int = 0,
+        color_top_p: float = 1.0,
+        class_top_k: int = 0,
+        class_top_p: float = 1.0,
+        # message sampling
+        msg_temperature: float = 1.0,
+        msg_top_k: int = 0,
+        msg_top_p: float = 1.0,
+        msg_deterministic: bool = True,
+        allow_eos: bool = True,
+        forbid_eos_at_start: bool = True,
+        allow_pad: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Convenience sampler.
+        If `z` is None, encodes provided inputs and samples z (or takes mean if `use_mean`).
+        Returns a dict with hard map (`fg_mask, chars, colors`), tokenized message, and optional logits.
+        """
+        assert (z is not None) or (glyph_chars is not None and glyph_colors is not None and blstats is not None and msg_tokens is not None), \
+            "Provide either z or the full set of inputs to encode."
+
+        if z is None:
+            enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
+            mu, logvar = enc["mu"], enc["logvar"]
+            z = mu if use_mean else self._reparameterise(mu, logvar)
+        else:
+            enc = None
+
+        B = z.size(0)
+        
+        dec = self.decode(z)
+
+        # --- Map sampling ---
+        ego_samples = MapDecoder.sample_ego_from_logits(
+            dec["ego_char_logits"], dec["ego_color_logits"], dec["ego_class_logits"],
+            temperature=map_temperature,
+            deterministic=map_deterministic,
+            glyph_top_k=glyph_top_k, glyph_top_p=glyph_top_p,
+            color_top_k=color_top_k, color_top_p=color_top_p,
+            class_top_k=class_top_k, class_top_p=class_top_p
         )
-        # Decode messages using GRU
-        packed_msg_hidden_decoded, _ = self.decode_msg_gru(packed_msg_emb_shift, msg_hidden_init.unsqueeze(0))  # hidden: [1, B, hid_dim]
-        # Unpack the output - pad back to original length (256)
-        msg_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(packed_msg_hidden_decoded, batch_first=True, total_length=msg_emb_shift.size(1))
-        # Convert hidden states back to embeddings
-        msg_emb_decoded = self.decode_msg_hidden2emb(msg_hidden_decoded)  # [B, 256, hid_dim] -> [B, 256, emb_dim]
         
-        if self.include_inventory and inv_oclasses is not None and inv_strs is not None:
-            # Decode inventory embeddings
-            inv_hidden = self.decode_inv_latent2hidden(shared_features)  # [B, 256] -> [B, hid_dim * 3]
-            # Decode object classes using RNN
-            inv_oclass_lengths = (inv_oclasses_shift != 18).sum(dim=1)  # [B,] - count non-padding object classes
-            packed_inv_oclass_emb_shift = nn.utils.rnn.pack_padded_sequence(
-                inv_oclasses_emb_shift, lengths=inv_oclass_lengths.cpu(),
-                batch_first=True, enforce_sorted=False
-            )
-            packed_inv_oclass_decoded, _ = self.decode_inv_class_rnn_emb(packed_inv_oclass_emb_shift, inv_hidden[:, :self.inv_encoder.hid_dim].unsqueeze(0))  # hidden: [1, B, hid_dim]
-            inv_oclasses_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(packed_inv_oclass_decoded, batch_first=True)  # [B, 55, hid_dim]
-            inv_oclasses_emb_decoded = self.decode_inv_class_hidden2emb(inv_oclasses_hidden_decoded)  # [B, 55, hid_dim] -> [B, 55, CHAR_EMB]
-            
-            inv_str_lengths = (inv_strs_shift.view(B * INV_MAX_SIZE, -1) != 0).sum(dim=-1)  # [B*55, ] - count non-padding characters
-            packed_inv_str_emb_shift = nn.utils.rnn.pack_padded_sequence(
-                inv_strs_emb_shift.view(B * INV_MAX_SIZE, INV_STR_LEN, self.inv_encoder.str_emb_dim), 
-                lengths=inv_str_lengths.cpu(),
-                batch_first=True, enforce_sorted=False
-            )
-            packed_inv_str_decoded, _ = self.decode_inv_str_gru_emb(packed_inv_str_emb_shift, inv_hidden[:, self.inv_encoder.hid_dim:].unsqueeze(0))  # hidden: [1, B*55, hid_dim * 2]
-            inv_str_hidden_decoded, _ = nn.utils.rnn.pad_packed_sequence(packed_inv_str_decoded, batch_first=True)  # [B*55, 80, hid_dim * 2]
-            inv_str_emb_decoded = self.decode_inv_str_hidden2emb(inv_str_hidden_decoded)  # [B*55, 80, hid_dim * 2] -> [B, 55, 80, str_emb]
-            inv_str_emb_decoded = inv_str_emb_decoded.view(B, INV_MAX_SIZE, INV_STR_LEN, self.inv_encoder.str_emb_dim)
+        occupy_logit = dec["occupy_logits"]
+        hero_presence_logit = dec["hero_presence_logits"]
+        bag_presence_logit = dec["bag_logits"]
+        passability_logit = dec["passability_logits"]
+        safety_logit = dec["safety_logits"]
+        hero_centroid = dec["hero_centroid"]
+        if map_deterministic:
+            occupy = (torch.sigmoid(occupy_logit) > map_occ_thresh).float()  # [B,1,21,79]
+            has_hero = (torch.sigmoid(hero_presence_logit) > hero_presence_thresh)  # [B]
+            bag_presence = (torch.sigmoid(bag_presence_logit) > bag_presence_thresh)  # [B, GLYPH_DIM]
+            passability_presence = (torch.sigmoid(passability_logit) > passability_thresh).float()  # [B, 8]
+            safety_presence = (torch.sigmoid(safety_logit) > safety_thresh).float()  # [B, 8]
         else:
-            inv_oclasses_emb_decoded = None
-            inv_str_emb_decoded = None
-            
+            occupy = torch.bernoulli(torch.sigmoid(occupy_logit))  # [B,1,21,79]
+            has_hero = torch.bernoulli(torch.sigmoid(hero_presence_logit))  # [B]
+            bag_presence = torch.bernoulli(torch.sigmoid(bag_presence_logit))  # [B, GLYPH_DIM]
+            passability_presence = torch.bernoulli(torch.sigmoid(passability_logit))  # [B, 8]
+            safety_presence = torch.bernoulli(torch.sigmoid(safety_logit))  # [B, 8]
         
-        # logits
-        # char logits takes first 16 channels of glyph_emb_decoded
-        # color logits takes last 4 channels of glyph_emb_decoded
-        char_logits = self.decode_chars(glyph_emb_decoded[:, :CHAR_EMB, :, :])  # [B, 16, 21, 79] -> [B, 96, 21, 79]
-        color_logits = self.decode_colors(glyph_emb_decoded[:, CHAR_EMB:, :, :])  # [B, 4, 21, 79] -> [B, 16, 21, 79]
-        
-        # Decode stats - separate into continuous and discrete components
-        stats_continuous_normalized = self.decode_stats_continuous(stats_emb_decoded)  # [B, 19]
-        
-        # Invert BatchNorm transformation: output = normalized * std + mean
-        # Need to access the BatchNorm from the preprocessor to get running statistics
-        running_var = self.stats_mlp.preprocessor.batch_norm.running_var
-        running_mean = self.stats_mlp.preprocessor.batch_norm.running_mean
-        stats_continuous = stats_continuous_normalized * running_var.sqrt() + running_mean
-        
-        hunger_state_logits = self.decode_hunger_state(stats_emb_decoded)      # [B, 7]
-        dungeon_number_logits = self.decode_dungeon_number(stats_emb_decoded)  # [B, 11]
-        level_number_logits = self.decode_level_number(stats_emb_decoded)      # [B, 51]
-        condition_mask_logits = self.decode_condition_mask(stats_emb_decoded)  # [B, 13]
-        
-        # Message decoding - GRU approach with proper teacher forcing
-        msg_logits = self.decode_msg(msg_emb_decoded)  # [B, 256, emb_dim] -> [B, 256, MSG_VOCAB]
-        
-        if self.include_inventory and inv_oclasses is not None and inv_strs is not None:
-            # Decode inventory logits
-            inv_oclasses_logits = self.decode_inv_class(inv_oclasses_emb_decoded)  # [B, 55, CHAR_EMB] -> [B, 55, INV_OCLASS_DIM]
-            inv_strs_logits = self.decode_inv_str(inv_str_emb_decoded)  # [B, 55, 80, str_emb] -> [B, 55, 80, MSG_VOCAB + 2]
-        else:
-            inv_oclasses_logits = None
-            inv_strs_logits = None
+        bag_sets = bag_presence_to_glyph_sets(bag_presence)  # [B, bag_dim]
+        pass_safety_dict = MapDecoder.format_passability_safety(passability_presence, safety_presence)  # [B, 21, 79], [B, 21, 79]
 
-        return {
-            'glyph_emb_decoded': glyph_emb_decoded,  # [B, 20, 21, 79]
-            'stats_emb_decoded': stats_emb_decoded,  # [B, 43]
-            'msg_emb_decoded': msg_emb_decoded,  # [B, 256, emb_dim]
-            'inv_oclasses_emb_decoded': inv_oclasses_emb_decoded,  # [B, 55, CHAR_EMB]
-            'inv_str_emb_decoded': inv_str_emb_decoded,  # [B, 55, 80, str_emb]
-            'char_logits': char_logits, # [B, 256, 21, 79]
-            'color_logits': color_logits,  # [B, 16, 21, 79]
-            'stats_continuous': stats_continuous,  # [B, 19]
-            'hunger_state_logits': hunger_state_logits,  # [B, 7]
-            'dungeon_number_logits': dungeon_number_logits,  # [B, 11]
-            'level_number_logits': level_number_logits,  # [B, 51]
-            'condition_mask_logits': condition_mask_logits,  # [B, 13]
-            'msg_logits': msg_logits, # [B, 256, MSG_VOCAB]
-            'inv_oclasses_logits': inv_oclasses_logits,  # [B, 55, INV_OCLASS_DIM]
-            'inv_strs_logits': inv_strs_logits,  # [B, 55, 80, MSG_VOCAB + 2]
-            'target_char_emb': char_emb,  # [B, 16, H, W]
-            'target_color_emb': color_emb,  # [B, 4, H, W]  
-            'target_stats_emb': stats_emb,  # [B, emb_dim]
-            'target_msg_emb': msg_emb_no_shift,  # [B, T, emb_dim]
-            'target_glyph_bag_emb': glyph_bag_emb,  # [B, max_len, 20]
-            'target_glyph_bag': glyph_bag,  # [B, max_len, 2] - for glyph bag reconstruction loss
-            'target_hero_emb': hero_emb_dict,  # dict of embeddings
-            'target_inv_oclassess_emb': inv_oclasses_emb_no_shift,  # [B, 55, CHAR_EMB]
-            'target_inv_strs_emb': inv_str_emb_no_shift,  # [B, 55, 80, str_emb]
-            'mu': mu, # [B, LATENT_DIM]
-            'logvar': logvar_diag, # [B, LATENT_DIM]
-            'lowrank_factors': lowrank_factors # [B, LATENT_DIM, LOW_RANK]
+        # --- Message sampling ---
+        msg_tokens_out = MessageDecoder.sample_from_logits(
+            dec["msg_logits"],
+            temperature=msg_temperature,
+            top_k=msg_top_k, top_p=msg_top_p,
+            deterministic=msg_deterministic,
+            allow_eos=allow_eos,
+            forbid_eos_at_start=forbid_eos_at_start,
+            allow_pad=allow_pad,
+            sos_id=MSG_SOS, eos_id=MSG_EOS, pad_id=MSG_PAD,
+        )
+
+        # --- Stats point predictions (no sampling) ---
+        sp = dec["stats_pred"]
+        stats_point = {
+            "cont_mu": sp["mu"],
+            "hunger": sp["hunger"].argmax(dim=-1),
+            "dungeon": sp["dungeon"].argmax(dim=-1),
+            "level": sp["level"].argmax(dim=-1),
+            "cond": (torch.sigmoid(sp["cond"]) > 0.5),
         }
 
-    def get_dropout_config(self):
-        """
-        Get dropout configuration for logging and debugging
-        
-        Returns:
-            Dict containing dropout configuration
-        """
-        return {
-            'dropout_rate': self.dropout_rate,
-            'enable_dropout_on_latent': self.enable_dropout_on_latent,
-            'enable_dropout_on_decoder': self.enable_dropout_on_decoder,
-            'training_mode': self.training,
-            'dropout_active': self.training and self.dropout_rate > 0.0
+        out = {
+            "occupancy_mask": occupy,
+            "hero_presence": has_hero,
+            "hero_centroid": hero_centroid,
+            **ego_samples,
+            "msg_tokens": msg_tokens_out,
+            "stats_point": stats_point,
+            "bag_sets": bag_sets,
+            "z": z,
+            **pass_safety_dict
         }
+        if include_logits:
+            out.update({
+                "occupy_logits": occupy_logit,
+                "ego_char_logits": dec["ego_char_logits"],
+                "ego_color_logits": dec["ego_color_logits"],
+                "ego_class_logits": dec["ego_class_logits"],
+                "hero_presence_logits": hero_presence_logit,
+                "hero_centroid": hero_centroid,
+                "msg_logits": dec["msg_logits"],
+                "bag_logits": bag_presence_logit,
+                "passability_logits": passability_logit,
+                "safety_logits": safety_logit,
+            })
+        return out
+        
 
 # ------------------------- loss helpers ------------------------------ #
 
+def _bce_focal_with_logits(logits, target, alpha_pos=0.25, gamma=2.0, reduction='mean'):
+    # logits, target: [B,H,W]
+    p = torch.sigmoid(logits)
+    p_t = torch.where(target > 0.5, p, 1.0 - p)
+    alpha_t = torch.where(target > 0.5, torch.full_like(target, alpha_pos), torch.full_like(target, 1.0 - alpha_pos))
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+    loss = alpha_t * (1.0 - p_t).pow(gamma) * bce
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss
+
+def _message_ce_loss(logits: torch.Tensor, tgt: torch.Tensor, pad_id: int = MSG_PAD, eos_id: int = MSG_EOS) -> torch.Tensor:
+    # logits: [B,L,V], tgt: [B,L]
+    B, L, V = logits.shape
+    with torch.no_grad():
+        pad_mask = (tgt == pad_id)
+        if eos_id is not None:
+            eos_pos = (tgt == eos_id).float()
+            after = torch.cumsum(eos_pos, dim=1) > 0
+            after[:, 0] = False
+            mask = pad_mask | after
+        else:
+            mask = pad_mask
+    ce = F.cross_entropy(logits.reshape(B*L, V), tgt.reshape(B*L), reduction='none').view(B, L)
+    keep = (~mask).float()
+    return (ce * keep).sum() / B
+
+@torch.no_grad()
+def jaccard_index_from_logits(
+    logits: torch.Tensor,          # [N, 1, H, W]
+    targets: torch.Tensor,         # [N, 1, H, W] float/bool {0,1}
+    mask: torch.Tensor | None = None,  # [N, 1, H, W] bool (optional)
+    threshold: float = 0.5
+) -> float:
+    """
+    Returns: Jaccard index (float)
+    """
+    probs = torch.sigmoid(logits)
+    preds = (probs >= threshold).float()
+    if mask is not None:
+        m = mask.float()
+        intersection = ((preds * targets).float() * m).sum()
+        union = (((preds + targets) >= 1.0).float() * m).sum()
+    else:
+        intersection = (preds * targets).float().sum()
+        union = ((preds + targets) >= 1.0).float().sum()
+    return intersection / union.clamp_min(1.0e-8)
+
+@torch.no_grad()
+def ego_metrics_from_logits(
+    logits: torch.Tensor,          # [N, C, k, k]
+    targets: torch.Tensor,         # [N, k, k] (long)
+    mask: torch.Tensor | None = None,  # [N] or [N,k,k] or [N,1,k,k] (bool)
+    ignore_index: int | None = None,
+    topk: tuple[int, ...] = (1, 3),
+    ece_bins: int = 15,
+) -> dict:
+    """
+    Computes robust multi-class metrics for imbalanced pixel labels.
+
+    Returns scalars:
+      - acc_top1, acc_topK (for K in topk)
+      - ece
+    """
+    assert logits.dim() == 4 and targets.dim() == 3, "Shapes: logits [N,C,k,k], targets [N,k,k]"
+    N, C, k, k2 = logits.shape
+    assert k == k2 and targets.shape == (N, k, k)
+
+    # --- build a pixel mask ---
+    if mask is None:
+        pix_mask = torch.ones((N, 1, k, k), dtype=torch.bool, device=logits.device)
+    else:
+        if mask.dim() == 1:      # [N]
+            pix_mask = mask.view(N, 1, 1, 1).expand(N, 1, k, k)
+        elif mask.dim() == 3:    # [N,k,k]
+            pix_mask = mask.unsqueeze(1).to(dtype=torch.bool)
+        elif mask.dim() == 4:    # [N,1,k,k] or [N,?,k,k]
+            pix_mask = mask[:, :1].to(dtype=torch.bool)
+        else:
+            raise ValueError(f"Bad mask shape: {tuple(mask.shape)}")
+
+    # Ignore index mask
+    if ignore_index is not None:
+        ig = (targets == ignore_index).unsqueeze(1)  # [N,1,k,k]
+        pix_mask = pix_mask & (~ig)
+
+    valid = pix_mask.squeeze(1)                      # [N,k,k] bool
+    num_valid = valid.sum()
+    if num_valid == 0:
+        returned_metrics = {}
+        for K in topk:
+            if K <= 1:
+                returned_metrics['acc_top1'] = 0.0
+            else:
+                returned_metrics[f'acc_top{K}'] = 0.0
+        returned_metrics['ece'] = 0.0
+        return returned_metrics
+
+    # --- flatten valid pixels ---
+    t = targets[valid]                               # [M]
+    l = logits.permute(0, 2, 3, 1)[valid]            # [M,C]
+    probs = F.softmax(l, dim=1)                      # [M,C]
+    pred_top1 = probs.argmax(dim=1)                  # [M]               
+
+    # --- top-k accuracy ---
+    metrics = {}
+    for K in topk:
+        if K <= 1:
+            acc = (pred_top1 == t).float().mean().item()
+            metrics[f'acc_top1'] = acc
+        else:
+            topk_idx = probs.topk(K, dim=1).indices   # [M,K]
+            correct = (topk_idx == t.view(-1,1)).any(dim=1).float().mean().item()
+            metrics[f'acc_top{K}'] = correct
+    
+    # --- ECE (Expected Calibration Error) on top-1 probs ---
+    conf, pred = probs.max(dim=1)            # [M]
+    correct = (pred == t).float()
+    # bin by confidence
+    bin_ids = torch.clamp((conf * ece_bins).long(), min=0, max=ece_bins-1)
+    ece = torch.tensor(0.0, device=logits.device)
+    for b in range(ece_bins):
+        m = (bin_ids == b)
+        n_b = m.sum()
+        if n_b > 0:
+            acc_b = correct[m].mean()
+            conf_b = conf[m].mean()
+            ece += (n_b.float() / conf.numel()) * (acc_b - conf_b).abs()
+    metrics['ego/ece'] = ece.item()
+
+    return metrics
+
+@torch.no_grad()
+def binary_accuracy_from_logits(
+    logits: torch.Tensor,              # [N, K]
+    targets: torch.Tensor,             # [N, K] in {0,1}
+    mask: torch.Tensor | None = None,  # [N] or [N,K] (0=ignore)
+    weight: torch.Tensor | None = None,# [N] or [N,K] (importance)
+    threshold: float = 0.5,
+) -> dict:
+    """
+    Weighted + masked binary accuracy.
+    - mask: elements with mask==0 are ignored (hard mask).
+    - weight: per-element importance (e.g., down-weight 'unknown' tiles).
+    Returns:
+        {
+          'acc': float,               # micro accuracy over all elements
+          'acc_per_dim': Tensor[K],   # weighted accuracy per direction
+          'support_per_dim': Tensor[K]# effective weight per direction
+        }
+    """
+    # predictions
+    probs = torch.sigmoid(logits)
+    preds = (probs >= threshold).to(torch.float32)
+    tgt   = targets.to(torch.float32)
+
+    # build combined weights W: same shape as logits [N,K]
+    W = torch.ones_like(preds, dtype=torch.float32)
+    if mask is not None:
+        m = mask.to(torch.float32)
+        if m.dim() == 1: m = m.unsqueeze(1)           # [N,1] -> [N,K] by broadcast
+        W = W * m
+    if weight is not None:
+        w = weight.to(torch.float32)
+        if w.dim() == 1: w = w.unsqueeze(1)
+        W = W * w
+
+    # correctness matrix
+    # drop "unknown" labels (tgt==0.5) from the metric
+    unknown = (tgt == 0.5)
+    if unknown.any():
+        W = W * (~unknown).to(torch.float32)
+    corr = (preds == tgt).to(torch.float32)
+
+    # micro accuracy
+    num = (corr * W).sum()
+    den = W.sum().clamp_min(1e-6)
+    acc_micro = (num / den).item()
+
+    # per-dimension accuracy
+    num_d = (corr * W).sum(dim=0)                 # [K]
+    den_d = W.sum(dim=0).clamp_min(1e-6)          # [K]
+    acc_per_dim = (num_d / den_d).detach().cpu()
+
+    return {
+        'acc': acc_micro,
+        'acc_per_dim': acc_per_dim,
+        'support_per_dim': den_d.detach().cpu(),
+    }
+    
+@torch.no_grad()
+def goal_metrics(
+    pred_vec: torch.Tensor,     # [N, 2] (x,y) in [-1,1], typically tanh output
+    tgt_vec: torch.Tensor,      # [N, 2] (x,y) in [-1,1]
+    mask: torch.Tensor | None = None,  # [N] bool
+    map_W: int = 79, map_H: int = 21
+) -> dict:
+    """
+    Computes:
+      - mae_tiles_x/y: per-axis MAE in *tiles*
+      - mae_tiles_L2: Euclidean MAE in tiles
+      - angle_mae_deg / angle_med_deg: angular error in degrees
+    """
+    p = pred_vec
+    t = tgt_vec
+    if mask is not None:
+        m = mask.view(-1,1).float()
+        denom = m.sum().clamp_min(1.0)
+        p = p * m; t = t * m
+    else:
+        denom = torch.tensor(float(p.shape[0]), device=p.device)
+
+    # scale normalized [-1,1] vectors to tile units (half-extent = W/2, H/2)
+    dx_tiles = (p[:,0] - t[:,0]) * (map_W - 1)
+    dy_tiles = (p[:,1] - t[:,1]) * (map_H - 1)
+
+    mae_x = dx_tiles.abs().sum() / denom
+    mae_y = dy_tiles.abs().sum() / denom
+    mae_L2 = torch.sqrt(dx_tiles**2 + dy_tiles**2).sum() / denom
+
+    # angle error (wrap to [-180, 180])
+    ang_p = torch.atan2(p[:,1].clamp(-1,1), p[:,0].clamp(-1,1))  # radians
+    ang_t = torch.atan2(t[:,1].clamp(-1,1), t[:,0].clamp(-1,1))
+    d = (ang_p - ang_t) * (180.0 / math.pi)
+    d = ( (d + 180.0) % 360.0 ) - 180.0
+    if mask is not None:
+        m1 = mask.float()
+        angle_mae = d.abs().sum() / m1.sum().clamp_min(1.0)
+        angle_med = d.abs()[m1.bool()].median() if m1.sum() > 0 else torch.tensor(0.0)
+    else:
+        angle_mae = d.abs().mean()
+        angle_med = d.abs().median()
+
+    return {
+        'goal_mae_tiles_x': mae_x.item(),
+        'goal_mae_tiles_y': mae_y.item(),
+        'goal_mae_tiles_L2': mae_L2.item(),
+        'goal_angle_mae_deg': angle_mae.item(),
+        'goal_angle_med_deg': angle_med.item(),
+    }
+    
+@torch.no_grad()
+def dynamics_metrics(
+    z_next_pred: torch.Tensor,   # [P, Z]
+    z_next_true: torch.Tensor,   # [P, Z] (detached target)
+) -> dict:
+    """
+    Returns mean/median cosine similarity and R^2 (overall and per-dim mean).
+    """
+    # cosine per pair
+    cos = F.cosine_similarity(z_next_pred, z_next_true, dim=1)  # [P]
+    cos_mean = cos.mean().item()
+    cos_median = cos.median().item()
+
+    # R^2 overall (flatten across dims)
+    y = z_next_true
+    y_hat = z_next_pred
+    y_bar = y.mean()
+    ss_res = ((y - y_hat)**2).sum()
+    ss_tot = ((y - y_bar)**2).sum().clamp_min(1e-8)
+    r2_overall = (1.0 - ss_res / ss_tot).item()
+
+    # R^2 per-dimension then averaged (more robust to dim scaling)
+    y_mean_dim = y.mean(dim=0, keepdim=True)
+    ss_res_d = ((y - y_hat)**2).sum(dim=0)
+    ss_tot_d = ((y - y_mean_dim)**2).sum(dim=0).clamp_min(1e-8)
+    r2_per_dim = (1.0 - ss_res_d / ss_tot_d)
+    r2_mean_dim = r2_per_dim.mean().item()
+    r2_median_dim = r2_per_dim.median().item()
+
+    return {
+        'dyn_cosine_mean': cos_mean,
+        'dyn_cosine_median': cos_median,
+        'dyn_r2_overall': r2_overall,
+        'dyn_r2_mean_dim': r2_mean_dim,
+        'dyn_r2_median_dim': r2_median_dim
+    }
+
+def _info_nce(q: torch.Tensor, k: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
+    """Batch InfoNCE with in-batch negatives; q and k are [N,D]."""
+    q = F.normalize(q, dim=1)
+    k = F.normalize(k.detach(), dim=1)   # stop-grad on targets
+    logits = (q @ k.t()) / max(temperature, 1e-6)  # [N,N]
+    labels = torch.arange(q.size(0), device=q.device)
+    return F.cross_entropy(logits, labels)
+
 def vae_loss(
-    model_output, 
-    glyph_chars, 
-    glyph_colors, 
-    blstats, 
-    msg_tokens,
-    valid_screen,
-    inv_oclasses=None, 
-    inv_strs=None, 
-    raw_modality_weights={'char': 1.0, 'color': 1.0, 'stats': 1.0, 'msg': 1.0, 'inv_oclass': 1.0, 'inv_str': 1.0},
-    emb_modality_weights={'char_emb': 0.1, 'color_emb': 0.1, 'stats_emb': 5.0, 'msg_emb': 0.1, 'inv_oclasses_emb': 1.0, 'inv_strs_emb': 1.0},
-    weight_emb=1.0, 
-    weight_raw=0.1, 
-    kl_beta=1.0):
+    model_output: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    config: VAEConfig,
+    mi_beta: float = 1.0,
+    tc_beta: float = 1.0,
+    dw_beta: float = 1.0
+    ):
     """
-    VAE loss with separate embedding and raw reconstruction losses.
-    
-    IMPORTANT: For proper VAE training, losses are computed as:
-    
-    Raw losses: Sum over spatial/sequence dimensions for each sample, average over valid samples
-    Embedding losses: Calculate L2 norm ||emb - target||^2 for each spatial/sequence location,
-                     sum over spatial/sequence dimensions, average over valid samples
-    
-    valid_screen: [B] boolean tensor indicating which samples are valid for loss calculation
-    
-    This ensures reconstruction and KL losses are on the same scale, preventing
-    training collapse from KL domination.
+    VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
     """
+    # Extract inputs from batch
+    glyph_chars = batch['game_chars']  # [B, 21, 79]
+    glyph_colors = batch['game_colors']  # [B, 21, 79]
+    blstats = batch['blstats'] # [B, BLSTATS_DIM]
+    msg_tokens = batch['message_chars']  # [B, 256]
+    valid_screen = batch['valid_screen']  # [B] boolean mask for valid samples
+    # Determine batch dimensions
+    total_samples = len(valid_screen)
     
+    if 'original_batch_shape' in batch:
+        B, T = batch['original_batch_shape']
+    else:
+        # Fallback: try to infer from data
+        B = batch.get('batch_size', 1)
+        T = total_samples // B if B > 0 else total_samples
+    
+    # ============= On-the-fly Goal and Value Target Computation =============
+    # Compute goal_target, goal_mask, and value_k_target on-the-fly using config parameters
+    if 'game_chars' in batch and 'game_colors' in batch and 'reward_target' in batch and 'done_target' in batch:
+        if T > 1:
+            # Reshape data back to [B, T, ...] for goal and value computation
+            game_chars_reshaped = batch['game_chars'].view(B, T, 21, 79)  # [B, T, H, W]
+            game_colors_reshaped = batch['game_colors'].view(B, T, 21, 79)  # [B, T, H, W]
+            reward_reshaped = batch['reward_target'].view(B, T)  # [B, T]
+            done_reshaped = batch['done_target'].view(B, T)  # [B, T]
+            
+            # Initialize goal and value targets
+            goal_target_flat = torch.zeros(total_samples, 2, dtype=torch.float32, device=batch['game_chars'].device)
+            goal_mask_flat = torch.zeros(total_samples, dtype=torch.float32, device=batch['game_chars'].device)
+            value_k_target_flat = torch.zeros(B*(T-1), len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
+            value_k_mask_flat = torch.zeros(B*(T-1), len(config.value_horizons), dtype=torch.float32, device=batch['game_chars'].device)
+            
+            # Process each game sequence
+            for g in range(B):
+                # Compute k-step value returns for this game sequence
+                rewards_np = reward_reshaped[g].cpu().numpy()
+                done_np = done_reshaped[g].cpu().numpy().astype(bool)
+                
+                value_targets, value_masks = discounted_k_step_multi_with_mask(rewards_np, done_np, config.value_horizons, config.gamma)
+
+                # Stack and convert to tensor [T, num_horizons]
+                value_targets = torch.tensor(value_targets, dtype=torch.float32, device=batch['game_chars'].device)
+                value_masks = torch.tensor(value_masks, dtype=torch.float32, device=batch['game_chars'].device)
+
+                # Fill value targets for this game
+                start_idx = g * (T-1)
+                end_idx = start_idx + (T-1)
+                value_k_target_flat[start_idx:end_idx] = value_targets[:-1,:]  # Exclude last timestep which has no next
+                value_k_mask_flat[start_idx:end_idx] = value_masks[:-1,:]
+                
+                # Compute goal targets for each timestep in this game
+                for t in range(T):
+                    flat_idx = g * T + t
+                    
+                    # Skip if not a valid screen
+                    if not valid_screen[flat_idx]:
+                        continue
+                        
+                    chars_map = game_chars_reshaped[g, t]  # [H, W]
+                    
+                    # Find hero position
+                    hero_pos = (chars_map == ord('@')).nonzero(as_tuple=True)
+                    if len(hero_pos[0]) > 0:
+                        hero_y, hero_x = int(hero_pos[0][0]), int(hero_pos[1][0])
+                        
+                        # Compute goal vector using config parameters
+                        goal_vec = nearest_stairs_vector(chars_map, hero_y, hero_x, prefer=config.goal_prefer)
+                        if goal_vec is not None:
+                            goal_target_flat[flat_idx, 0] = goal_vec[0]  # dy
+                            goal_target_flat[flat_idx, 1] = goal_vec[1]  # dx
+                            goal_mask_flat[flat_idx] = 1.0
+                        # else: goal_target remains zero, goal_mask remains 0.0
+            
+            # Add computed targets to batch
+            batch['goal_target'] = goal_target_flat
+            batch['goal_mask'] = goal_mask_flat  
+            batch['value_k_target'] = value_k_target_flat
+            batch['value_k_mask'] = value_k_mask_flat
+
+    # stats
+    pre = model_output['stats_encoder'].preprocessor
+    pre = pre.to(blstats.device)
+    pre.eval()
+    with torch.no_grad():
+        t = pre.targets(blstats[valid_screen])
     # Extract outputs from model
-    mu = model_output['mu']
-    logvar = model_output['logvar']
+    mu = model_output['mu'][valid_screen]  # [valid_B, LATENT_DIM]
+    logvar = model_output['logvar'][valid_screen]
     lowrank_factors = model_output['lowrank_factors']
+    if lowrank_factors is not None:
+        lowrank_factors = lowrank_factors[valid_screen]  # [valid_B, LATENT_DIM, LOW_RANK]
     
     # Raw reconstruction logits
-    char_logits = model_output['char_logits']  # [B, 256, 21, 79]
-    color_logits = model_output['color_logits']  # [B, 16, 21, 79]
-    msg_logits = model_output['msg_logits']  # [B, 256, MSG_VOCAB+2]
+    occupy_logits = model_output['occupy_logits'][valid_screen]  # [B, 1, 21, 79]
+    ego_char_logits = model_output['ego_char_logits'][valid_screen]  # [B, CHAR_DIM, k, k]
+    ego_color_logits = model_output['ego_color_logits'][valid_screen]  # [B, COLOR_DIM, k, k]
+    ego_class_logits = model_output['ego_class_logits'][valid_screen]  # [B, CLASS_DIM, k, k]
+    hero_presence_logits = model_output['hero_presence_logits'][valid_screen]  # [B]
+    hero_centroid = model_output['hero_centroid'][valid_screen]  # [B, 2]
+    bag_logits = model_output['bag_logits'][valid_screen]  # [B, GLYPH_DIM]
     
-    # Embedding reconstructions (continuous targets)
-    glyph_emb_decoded = model_output['glyph_emb_decoded']  # [B, 20, 21, 79]
-    stats_emb_decoded = model_output['stats_emb_decoded']  # [B, 43]
-    msg_emb_decoded = model_output['msg_emb_decoded']  # [B, 256, emb_dim]
+    # message logits
+    msg_logits = model_output['msg_logits'][valid_screen]  # [B, 256, MSG_VSIZE]
+    
+    # action related outputs
+    passability_logits = model_output['passability_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
+    safety_logits = model_output['safety_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
+    skill_logits = model_output.get('skill_logits', None)  # [B, SKILL_NUM] if applicable
+    if skill_logits is not None:
+        skill_logits = skill_logits[valid_screen]  # [B, SKILL_NUM]
+    
+    # latent forward model
+    latent_pred_mu = model_output.get('prior_mu', None)
+    latent_pred_logvar = model_output.get('prior_logvar', None)
+    latent_pred_lowrank = model_output.get('prior_lowrank', None)
+    valid_screen_reshape = valid_screen.view(B, T)  # [B, T]
+    valid_screen_for_dynamics = valid_screen_reshape[:, :-1].contiguous()  # [B, T-1]
+    valid_screen_for_dynamics = valid_screen_for_dynamics.view(-1)
+    reward = model_output['reward'][valid_screen_for_dynamics].squeeze(1)  # [B]
+    done_logits = model_output['done_logits'][valid_screen_for_dynamics].squeeze(1)  # [B]
+    value_k = model_output['value_k'][valid_screen_for_dynamics]  # [B, NUM_HORIZONS]
+    if latent_pred_mu is not None and latent_pred_logvar is not None:
+        latent_pred_mu = latent_pred_mu[valid_screen_for_dynamics] # [B*(T-1), LATENT_DIM]
+        latent_pred_logvar = latent_pred_logvar[valid_screen_for_dynamics] # [B*(T-1), LATENT_DIM]
+    if latent_pred_lowrank is not None:
+        latent_pred_lowrank = latent_pred_lowrank[valid_screen_for_dynamics] # [B*(T-1), LATENT_DIM, LOW_RANK]
+    
+    # inverse dynamics logits
+    inverse_dynamics_logits = model_output.get('inverse_dynamics_logits', None)
+    if inverse_dynamics_logits is not None:
+        inverse_dynamics_logits = inverse_dynamics_logits[valid_screen_for_dynamics]  # [B*(T-1), A + skill_num]
     
     valid_B = valid_screen.sum().item()  # Number of valid samples
-    
     assert valid_B > 0, "No valid samples for loss calculation. Check valid_screen mask."
     
     # ============= Raw Reconstruction Losses =============
     raw_losses = {}
+    metrics = {}
     
     # Glyph reconstruction (chars + colors)
-    glyph_chars = torch.clamp(glyph_chars - 32, 0, CHAR_DIM - 1)  # Ensure valid range for chars
+    gc = glyph_chars[valid_screen]
+    fg = (gc != ord(' '))                 # [valid_B,H,W]
+    occ_t = fg.float().unsqueeze(1)           # [valid_B,1,H,W]
+    bag_t = make_pair_bag(glyph_chars[valid_screen], glyph_colors[valid_screen])  # [valid_B,GLYPH_DIM]
+    hero_p_t, hero_c_t = hero_presence_and_centroid(glyph_chars[valid_screen], blstats[valid_screen]) # [valid_B], [valid_B,2]
     
-    # Sum over spatial dimensions for each sample, then average over valid samples
-    # char_logits: [B, CHAR_DIM, H, W], glyph_chars: [B, H, W]
-    char_loss_per_sample = F.cross_entropy(char_logits, glyph_chars, reduction='none')  # [B, H, W]
-    color_loss_per_sample = F.cross_entropy(color_logits, glyph_colors, reduction='none')  # [B, H, W]
-    
-    # Sum over spatial dimensions for each sample
-    char_loss_per_sample = char_loss_per_sample.sum(dim=[1, 2])  # [B] - sum over H, W
-    color_loss_per_sample = color_loss_per_sample.sum(dim=[1, 2])  # [B] - sum over H, W
-    
-    # Average over valid samples only
-    raw_losses['char'] = char_loss_per_sample[valid_screen].mean()
-    raw_losses['color'] = color_loss_per_sample[valid_screen].mean()
+    # ---- hero presence + centroid ----
+    hero_bce = F.binary_cross_entropy_with_logits(hero_presence_logits, hero_p_t, pos_weight=torch.full_like(hero_presence_logits, 10), reduction='none')  # [valid_B]
+    hero_mse = ((hero_centroid - hero_c_t) ** 2).sum(dim=1) * hero_p_t # [valid_B,2] -> [valid_B]
+    hero_loss = hero_bce + 5.0 * hero_mse
+    raw_losses['hero_loc'] = hero_loss.mean()  # Average over valid samples
 
-    # Stats reconstruction - separate losses for continuous and discrete components
-    # Extract model outputs
-    stats_continuous = model_output['stats_continuous']  # [B, 19] - already inverted to original scale
-    hunger_state_logits = model_output['hunger_state_logits']
-    dungeon_number_logits = model_output['dungeon_number_logits']
-    level_number_logits = model_output['level_number_logits']
-    condition_mask_logits = model_output['condition_mask_logits']  # [B, 13]
+    # occupancy focal BCE (mean over pixels)
+    #occ_loss_per_sample = _bce_focal_with_logits(occupy_logits.squeeze(1), occ_t.squeeze(1), alpha_pos=focal_loss_alpha, gamma=focal_loss_gamma, reduction='none').sum(dim=[1, 2])  # [valid_B]
+    with torch.no_grad():
+        pos = occ_t.sum()
+        neg = occ_t.numel() - pos
+        pos_weight = (neg / pos).clamp(max=10.0)
+    occ_loss_per_sample = F.binary_cross_entropy_with_logits(occupy_logits, occ_t, reduction='none', pos_weight=pos_weight).sum(dim=[1,2,3])  # [valid_B]
+    assert occ_loss_per_sample.shape == (valid_B,), f"occupy loss shape mismatch: {occ_loss_per_sample.shape} != ({valid_B},)"
+    raw_losses['occupy'] = occ_loss_per_sample.mean()  # Average over valid samples
+    metrics['metrics/occupy_jaccard'] = jaccard_index_from_logits(occupy_logits, occ_t, threshold=0.5)
     
-    # Extract relevant targets (24 dimensions, excluding time and unknowns)
-    relevant_indices = [i for i in range(27) if i not in [20, 26]]  # Exclude time and unknowns
-    target_stats = blstats[:, relevant_indices]  # [B, 24]
-    
-    # Separate continuous and discrete targets
-    discrete_indices = [21, 23, 24]  # hunger_state, dungeon_number, level_number (in original indexing)
-    continuous_indices = [i for i in relevant_indices if i not in discrete_indices + [25]]  # 21 indices
-    
-    # Map discrete indices to the relevant_indices space
-    discrete_targets = []
-    discrete_targets.append(blstats[:, 21].long())  # hunger_state
-    discrete_targets.append(blstats[:, 23].long())  # dungeon_number  
-    discrete_targets.append(blstats[:, 24].long())  # level_number
-    
-    # Prepare condition mask target - convert bitfield to binary vector (same as encoder)
-    condition_mask_target = blstats[:, 25].long()  # [B] - condition mask bitfield
-    condition_target_vector = []
-    for bit_value in CONDITION_BITS:
-        is_condition_active = ((condition_mask_target & bit_value) > 0).float()  # [B]
-        condition_target_vector.append(is_condition_active)
-    condition_target_vector = torch.stack(condition_target_vector, dim=1)  # [B, 13]
-    
-    # For continuous targets, we need to prepare them the same way as preprocessor does
-    # The decoder outputs stats_continuous on the original scale, so we need to prepare the targets
-    continuous_targets_raw = blstats[:, continuous_indices]  # [B, 21]
-    
-    # Process continuous targets the same way as preprocessor (coordinate normalization, log1p, ratios)
-    # but we need to prepare the targets to match what the decoder should output
-    continuous_targets_processed = continuous_targets_raw.clone()
-    continuous_targets_processed[:, 0] = continuous_targets_processed[:, 0] / MAX_X_COORD  # x coordinate
-    continuous_targets_processed[:, 1] = continuous_targets_processed[:, 1] / MAX_Y_COORD  # y coordinate
-    
-    # Apply log1p to skewed features
-    skewed_indices = [9, 13, 19]  # Based on preprocessor
-    continuous_targets_processed[:, skewed_indices] = torch.log1p(continuous_targets_processed[:, skewed_indices])
-    
-    # Create health and energy ratios
-    hp_ratio = continuous_targets_processed[:, 10] / torch.clamp(continuous_targets_processed[:, 11], min=1)
-    energy_ratio = continuous_targets_processed[:, 14] / torch.clamp(continuous_targets_processed[:, 15], min=1)
-    
-    # Replace health and energy stats with ratios and remove max health/energy
-    continuous_targets_processed[:, 10] = hp_ratio
-    continuous_targets_processed[:, 14] = energy_ratio
-    
-    # Remove max health and max energy columns (indices 11 and 15)
-    keep_indices = [i for i in range(continuous_targets_processed.size(1)) if i not in [11, 15]]
-    continuous_targets_final = continuous_targets_processed[:, keep_indices]  # [B, 19]
-    
-    # Calculate losses - sum over feature dimensions for each sample, average over valid samples
-    stat_raw_losses = {}
-    
-    # Continuous stats: sum over features for each sample
-    stats_continuous_loss = F.mse_loss(stats_continuous, continuous_targets_final, reduction='none')  # [B, 19]
-    stats_continuous_loss = stats_continuous_loss.sum(dim=1)  # [B] - sum over features
-    stat_raw_losses['stats_continuous'] = stats_continuous_loss[valid_screen].mean()
-    
-    # Discrete stats: already scalar per sample, just average over valid samples
-    stat_raw_losses['stats_hunger'] = F.cross_entropy(hunger_state_logits[valid_screen], discrete_targets[0][valid_screen], reduction='mean')
-    stat_raw_losses['stats_dungeon'] = F.cross_entropy(dungeon_number_logits[valid_screen], discrete_targets[1][valid_screen], reduction='mean')
-    stat_raw_losses['stats_level'] = F.cross_entropy(level_number_logits[valid_screen], discrete_targets[2][valid_screen], reduction='mean')
-    
-    # Condition mask: sum over condition bits for each sample
-    condition_loss = F.binary_cross_entropy_with_logits(condition_mask_logits, condition_target_vector, reduction='none')  # [B, 13]
-    condition_loss = condition_loss.sum(dim=1)  # [B] - sum over condition bits
-    stat_raw_losses['stats_condition'] = condition_loss[valid_screen].mean()
+    # ---- bag presence BCE (weighted) ----
+    # weights: de-emphasize very common chars
+    with torch.no_grad():
+        w = torch.ones(valid_B, GLYPH_DIM, device=bag_t.device)
+        # downweight common chars (all colors)
+        common_idx = []
+        for ch in COMMON_GLYPHS:
+            ci = (ch[0] - 32)
+            if 0 <= ci < CHAR_DIM:
+                base = ci * COLOR_DIM + ch[1]
+                common_idx.append(base)
+        if common_idx:
+            w[:, common_idx] = 0.1
 
-    # Total stats loss
-    raw_losses['stats'] = (stat_raw_losses['stats_continuous'] + 
-                          stat_raw_losses['stats_hunger'] + 
-                          stat_raw_losses['stats_dungeon'] + 
-                          stat_raw_losses['stats_level'] + 
-                          stat_raw_losses['stats_condition'])
+        w[:, 0] = 0.0  # ignore space glyph
 
-    # Message reconstruction - sum over sequence length for each sample, average over valid samples
-    msg_lengths = (msg_tokens != 0).sum(dim=1)  # [B,] - count non-padding tokens
-    msg_tokens_with_eos = msg_tokens.clone()
-    # Add EOS tokens where there's space
-    mask = msg_lengths < msg_tokens.size(1)
-    msg_tokens_with_eos[mask, msg_lengths[mask]] = MSG_VOCAB + 1  # EOS token
+    bag_bce = F.binary_cross_entropy_with_logits(bag_logits, bag_t, weight=w, reduction='none').sum(dim=1).mean()
     
-    # Calculate loss for each sample, sum over sequence length
-    msg_loss_per_token = F.cross_entropy(
-        msg_logits.view(-1, msg_logits.size(-1)), 
-        msg_tokens_with_eos.view(-1), 
-        reduction='none', 
-        ignore_index=0
-    )  # [B*seq_len]
+    raw_losses['bag'] = bag_bce
+    metrics['metrics/bag_jaccard'] = jaccard_index_from_logits(bag_logits.unsqueeze(1), bag_t.unsqueeze(1), threshold=0.5)
     
-    # Reshape and sum over sequence length for each sample
-    msg_loss_per_sample = msg_loss_per_token.view(msg_logits.size(0), -1).sum(dim=1)  # [B] - sum over seq_len
-    raw_losses['msg'] = msg_loss_per_sample[valid_screen].mean()  # Average over valid samples
+    sp = model_output['stats_pred']
+    # Filter stats_pred by valid_screen to match target dimensions
+    sp_filtered = {}
+    for key, value in sp.items():
+        if isinstance(value, torch.Tensor):
+            sp_filtered[key] = value[valid_screen]
+        else:
+            sp_filtered[key] = value
     
-    # Inventory reconstruction (optional) - sum over inventory dimensions for each sample, average over valid samples
-    inv_oclasses_logits = model_output['inv_oclasses_logits']
-    inv_strs_logits = model_output['inv_strs_logits']
-    if inv_oclasses_logits is not None and inv_strs_logits is not None and inv_oclasses is not None and inv_strs is not None:
-        # Object class reconstruction - sum over inventory slots for each sample
-        inv_oclass_loss_per_token = F.cross_entropy(
-            inv_oclasses_logits.view(-1, INV_OCLASS_DIM), 
-            inv_oclasses.view(-1), 
-            reduction='none', 
-            ignore_index=18  # Padding index
-        )  # [B*inv_slots]
-        inv_oclass_loss_per_sample = inv_oclass_loss_per_token.view(inv_oclasses_logits.size(0), -1).sum(dim=1)  # [B] - sum over inv_slots
-        raw_losses['inv_oclasses'] = inv_oclass_loss_per_sample[valid_screen].mean()
+    var = sp_filtered['logvar'].exp().clamp_min(1e-6)
+    nll_cont = 0.5 * (((t['cont'] - sp_filtered['mu'])**2 / var) + sp_filtered['logvar'] + math.log(2*math.pi))
+    nll_cont = nll_cont.sum(dim=1).mean()
+    hung_loss = F.cross_entropy(sp_filtered['hunger'], t['hunger'], reduction='mean')
+    dung_loss = F.cross_entropy(sp_filtered['dungeon'], t['dungeon'], reduction='mean')
+    level_loss = F.cross_entropy(sp_filtered['level'], t['level'], reduction='mean')
+    cond_loss = F.binary_cross_entropy_with_logits(sp_filtered['cond'], t['cond'], reduction='none').sum(dim=1).mean()
+    stats_loss = nll_cont + hung_loss + dung_loss + level_loss + cond_loss
+    raw_losses['stats'] = stats_loss
+
+    # message CE (mask PAD + after EOS)
+    msg_t = msg_tokens[valid_screen]
+    msg_loss = _message_ce_loss(msg_logits, msg_t, pad_id=MSG_PAD, eos_id=MSG_EOS)
+    raw_losses['msg'] = msg_loss
+    
+    # --- Core heads ---
+    # Compute ego targets on-the-fly from game map data
+    valid_glyph_chars = glyph_chars[valid_screen]   # [valid_B, H, W]
+    valid_glyph_colors = glyph_colors[valid_screen] # [valid_B, H, W]
+    valid_blstats = blstats[valid_screen]           # [valid_B, BLSTATS_DIM]
+    
+    # Compute ego view data on-the-fly for each valid sample
+    valid_B = valid_screen.sum().item()
+    ego_window = config.ego_window  # Get ego window size from config
+    ego_char_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)  # Start with 0s
+    ego_color_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)
+    ego_class_targets = torch.zeros((valid_B, ego_window, ego_window), dtype=torch.long, device=glyph_chars.device)
+    
+    for i in range(valid_B):
+        # Get hero position (centroids are in [x, y] format)
+        hero_x, hero_y = int(valid_blstats[i, 0].item()), int(valid_blstats[i, 1].item())
         
-        # String reconstruction - sum over inventory slots and string length for each sample
-        inv_str_loss_per_token = F.cross_entropy(
-            inv_strs_logits.view(-1, MSG_VOCAB + 2), 
-            inv_strs.view(-1), 
-            reduction='none', 
-            ignore_index=0  # Padding index
-        )  # [B*inv_slots*str_len]
-        inv_str_loss_per_sample = inv_str_loss_per_token.view(inv_strs_logits.size(0), -1).sum(dim=1)  # [B] - sum over inv_slots*str_len
-        raw_losses['inv_strs'] = inv_str_loss_per_sample[valid_screen].mean()
+        # Crop ego view
+        ego_chars, ego_colors = crop_ego(valid_glyph_chars[i], valid_glyph_colors[i], hero_y, hero_x, ego_window)
+        ego_class = categorize_glyph_tensor(ego_chars, ego_colors)
+        
+        # Convert ASCII characters to model space (32-127 -> 0-95)
+        ego_char_targets[i] = torch.clamp(ego_chars - 32, 0, CHAR_DIM - 1)
+        ego_color_targets[i] = ego_colors  
+        ego_class_targets[i] = ego_class
     
-    # ============= Embedding Reconstruction Losses =============
-    emb_losses = {}
-    
-    # Target embeddings (from encoder)
-    target_char_emb = model_output['target_char_emb']  # [B, 16, H, W]
-    target_color_emb = model_output['target_color_emb']  # [B, 4, H, W]
-    target_stats_emb = model_output['target_stats_emb']  # [B, emb_dim] 
-    target_msg_emb = model_output['target_msg_emb']  # [B, 256, emb_dim]
-    
-    # Embedding reconstruction losses - calculate L2 norm for each location, sum over spatial dims, average over valid samples
-    # Split glyph embeddings back to char/color
-    char_emb_recon, color_emb_recon = torch.split(glyph_emb_decoded, [CHAR_EMB, COLOR_EMB], dim=1)  # Split into char and color embeddings
-    
-    emb_losses['char_emb'] = F.mse_loss(char_emb_recon[valid_screen], target_char_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-    emb_losses['color_emb'] = F.mse_loss(color_emb_recon[valid_screen], target_color_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
+    # Compute ego losses using on-the-fly targets
+    ego_char_weight = torch.ones(CHAR_DIM, device=ego_char_targets.device)
+    for ch in COMMON_CHARS:
+        ci = ch - 32
+        if 0 <= ci < CHAR_DIM:
+            ego_char_weight[ci] = 0.1
+    ego_char_weight[0] = 0.01  # downweight space char even more
+    raw_losses['ego_char'] = F.cross_entropy(ego_char_logits, ego_char_targets, weight=ego_char_weight, reduction='none').sum(dim=[1,2]).mean()
+    ego_color_weight = torch.ones(COLOR_DIM, device=ego_color_targets.device)
+    ego_color_weight[7] = 0.5  # downweight common color (gray)
+    raw_losses['ego_color'] = F.cross_entropy(ego_color_logits, ego_color_targets, weight=ego_color_weight, reduction='none').sum(dim=[1,2]).mean()
+    ego_class_weight = torch.ones(NetHackCategory.get_category_count(), device=ego_class_targets.device)
+    ego_class_weight[:4] = 0.1  # downweight very common classes (space, wall, door, floor)
+    raw_losses['ego_class'] = F.cross_entropy(ego_class_logits, ego_class_targets, weight=ego_class_weight, reduction='none').sum(dim=[1,2]).mean()
 
-    # Stats embedding loss
-    # stats_emb_decoded is [B, 45], target_stats_emb is [B, 45]
-    emb_losses['stats_emb'] = F.mse_loss(stats_emb_decoded[valid_screen], target_stats_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
+    ego_char_metrics = ego_metrics_from_logits(ego_char_logits, ego_char_targets, topk=(1,3))
+    ego_color_metrics = ego_metrics_from_logits(ego_color_logits, ego_color_targets, topk=(1,3))
+    ego_class_metrics = ego_metrics_from_logits(ego_class_logits, ego_class_targets, topk=(1,3))
     
-    # Message embedding loss
-    emb_losses['msg_emb'] = F.mse_loss(msg_emb_decoded[valid_screen], target_msg_emb[valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-    
-    # Inventory embedding loss (optional)
-    inv_oclasses_emb_decoded = model_output['inv_oclasses_emb_decoded'] # [B, 55, CHAR_EMB]
-    inv_str_emb_decoded = model_output['inv_str_emb_decoded'] # [B, 55, 80, str_emb]
-    if inv_oclasses_emb_decoded is not None and inv_str_emb_decoded is not None:
-        emb_losses['inv_oclasses_emb'] = F.mse_loss(inv_oclasses_emb_decoded[valid_screen], model_output['target_inv_oclassess_emb'][valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-        emb_losses['inv_strs_emb'] = F.mse_loss(inv_str_emb_decoded[valid_screen], model_output['target_inv_strs_emb'][valid_screen].detach(), reduction='sum') / valid_B  # Average over valid samples
-    
-    # ============= Combine Losses =============
-    
+    metrics.update({f'metrics/ego_char/{k}': v for k, v in ego_char_metrics.items()})
+    metrics.update({f'metrics/ego_color/{k}': v for k, v in ego_color_metrics.items()})
+    metrics.update({f'metrics/ego_class/{k}': v for k, v in ego_class_metrics.items()})
+
+    if 'passability_target' in batch:
+        loss = F.binary_cross_entropy_with_logits(passability_logits, batch['passability_target'][valid_screen], reduction='none')  # [B, PASSABILITY_DIRS]
+        if 'hard_mask' in batch:
+            m = batch['hard_mask'][valid_screen].float()  # [B, PASSABILITY_DIRS]
+            loss = loss * m
+        else:
+            m = None
+        if 'weight' in batch:
+            w = batch['weight'][valid_screen].float()  # [B, PASSABILITY_DIRS]
+            loss = loss * w
+        else:
+            w = None
+        denom = (m if m is not None else torch.ones_like(loss))
+        denom = denom * (w if w is not None else 1.0)
+        denom = denom.sum(dim=1).clamp_min(1.0)  # [B]
+        raw_losses['passability'] = (loss.sum(dim=1) / denom).mean()  # Mean over valid samples
+        pass_metrics = binary_accuracy_from_logits(passability_logits, batch['passability_target'][valid_screen], m, w)
+        metrics.update({f'metrics/passability/{k}': v for k, v in pass_metrics.items()})
+
+    if 'rewards_for_dynamics' in batch:
+        rewards_for_dynamics = batch['rewards_for_dynamics'][valid_screen_for_dynamics]  # [B*(T-1)]
+        # Higher weight for non-zero rewards (20x weight)
+        weights = torch.where(rewards_for_dynamics != 0, 20.0, 1.0)
+        weighted_loss = ((reward - rewards_for_dynamics)**2 * weights).sum()
+        total_weight = weights.sum()
+        raw_losses['reward'] = weighted_loss / total_weight.clamp_min(1.0)
+
+    if 'dones_for_dynamics' in batch:
+        done_target = batch['dones_for_dynamics'][valid_screen_for_dynamics].float()  # Convert bool to float
+        raw_losses['done'] = F.binary_cross_entropy_with_logits(done_logits, done_target, reduction='mean')
+
+    if 'value_k_target' in batch:
+        tgt = batch['value_k_target'][valid_screen_for_dynamics]
+        mask = batch['value_k_mask'][valid_screen_for_dynamics]
+        raw_losses['value_k'] = ((value_k - tgt)**2 * mask).sum() / mask.sum().clamp_min(1.0)  # Mean over valid samples
+
+    # --- Safety risk (8 dirs) ---
+    if 'safety_target' in batch:
+        loss = F.binary_cross_entropy_with_logits(safety_logits, batch['safety_target'][valid_screen], reduction='none')  # [B, PASSABILITY_DIRS]
+        if 'hard_mask' in batch:
+            m = batch['hard_mask'][valid_screen].float()  # [B, PASSABILITY_DIRS]
+            loss = loss * m
+        else:
+            m = None
+        if 'weight' in batch:
+            w = batch['weight'][valid_screen].float()  # [B, PASSABILITY_DIRS]
+            loss = loss * w
+        else:
+            w = None
+        denom = (m if m is not None else torch.ones_like(loss))
+        denom = denom * (w if w is not None else 1.0)
+        denom = denom.sum(dim=1).clamp_min(1.0)  # [B]
+        raw_losses['safety'] = (loss.sum(dim=1) / denom).mean()  # Mean over valid samples
+        safety_metrics = binary_accuracy_from_logits(safety_logits, batch['safety_target'][valid_screen], m, w)
+        metrics.update({f'metrics/safety/{k}': v for k, v in safety_metrics.items()})
+
+    # --- Goal direction ---
+    if ('goal_target' in batch) and ('goal_pred' in model_output):
+        goal_pred_filtered = model_output['goal_pred'][valid_screen]
+        g_tgt  = batch['goal_target'][valid_screen]
+        g_m    = batch['goal_mask'][valid_screen].unsqueeze(1)  # [B,1]
+        num    = g_m.sum().clamp_min(1.0)
+        if goal_pred_filtered is not None:
+            raw_losses['goal'] = ((goal_pred_filtered - g_tgt)**2 * g_m).sum() / num
+            goal_metrics_dict = goal_metrics(goal_pred_filtered, batch['goal_target'][valid_screen], mask=batch.get('goal_mask')[valid_screen], map_W=79, map_H=21)
+            metrics.update({f'metrics/goal/{k}': v for k, v in goal_metrics_dict.items()})
+
+    # --- Dynamics ---
+    has_next_mask = batch['has_next_for_dynamics'][valid_screen_for_dynamics]  # [B*(T-1)]
+    # Forward dynamics: predict z_next from z_current and action
+    if (latent_pred_mu is not None) and (latent_pred_logvar is not None) and ('mu_next_detach' in batch) and ('logvar_next_detach' in batch):
+        mu_next_detach = batch['mu_next_detach'][valid_screen_for_dynamics][has_next_mask]
+        logvar_next_detach = batch['logvar_next_detach'][valid_screen_for_dynamics][has_next_mask]
+        latent_pred_mu_filtered = latent_pred_mu[has_next_mask]
+        latent_pred_logvar_filtered = latent_pred_logvar[has_next_mask]
+        if latent_pred_lowrank is not None and ('lowrank_next_detach' in batch) and (batch['lowrank_next_detach'] is not None):
+            lowrank_next_detach = batch['lowrank_next_detach'][valid_screen_for_dynamics][has_next_mask]
+            latent_pred_lowrank_filtered = latent_pred_lowrank[has_next_mask]
+        else:
+            lowrank_next_detach = None
+            latent_pred_lowrank_filtered = None
+        
+        kl_wm = kl_gaussian_lowrank_q_p(
+            mu_q=mu_next_detach,
+            logvar_q=logvar_next_detach,
+            F_q=lowrank_next_detach,
+            mu_p=latent_pred_mu_filtered,
+            logvar_p=latent_pred_logvar_filtered,
+            F_p=latent_pred_lowrank_filtered
+        )
+
+        raw_losses['forward'] = kl_wm.mean()  # Mean over valid samples
+
+    # Inverse dynamics: predict action from z_current and z_next
+    if inverse_dynamics_logits is not None:
+        # Apply has_next mask if available for proper filtering
+        inverse_logits_filtered = inverse_dynamics_logits[has_next_mask]
+        action_tgt = batch['action_onehot_for_dynamics'][valid_screen_for_dynamics][has_next_mask]
+        ce = F.cross_entropy(inverse_logits_filtered, action_tgt.argmax(dim=1).long(), reduction='mean')
+        raw_losses['inverse'] = ce
+        inv_metrics = ego_metrics_from_logits(inverse_logits_filtered.view(*inverse_logits_filtered.shape, 1, 1), action_tgt.argmax(dim=1).long().view(*action_tgt.argmax(dim=1).shape, 1, 1), topk=(1,3))
+        metrics.update({f'metrics/inverse/{k}': v for k, v in inv_metrics.items()})
+
     # Sum raw reconstruction losses
-    total_raw_loss = sum(raw_losses[k] * raw_modality_weights.get(k, 1.0) for k in raw_losses)
-    
-    # Sum embedding losses (when implemented)
-    total_emb_loss = sum(emb_losses[k] * emb_modality_weights.get(k, 1.0) for k in emb_losses)
+    total_raw_loss = sum(raw_losses[k] * config.raw_modality_weights.get(k, 1.0) for k in raw_losses)
 
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
     # KL divergence for low-rank approximation
+    eps = 1e-6
+    logvar = logvar.clamp(min=-10.0, max=10.0)  # Prevent extreme values
+    var = torch.exp(logvar).clamp_min(eps)  # [valid_B, LATENT_DIM]
+    mu2 = mu.square().sum(dim=1)  # mu^T * mu # [valid_B,]
+    d = mu.size(1)
     if lowrank_factors is not None:
-        Sigma_q = torch.bmm(lowrank_factors, lowrank_factors.transpose(1, 2)) + torch.diag_embed(torch.exp(logvar))
+        r = lowrank_factors.size(2)
+        U = lowrank_factors.to(torch.float64)  # [valid_B, LATENT_DIM, LOW_RANK]
+        UUT_bar = torch.zeros(d, d, device=mu.device, dtype=torch.float64)  # [LATENT_DIM, LATENT_DIM]
+        UUT_bar += torch.einsum('bik,bjk->ij', U, U) / valid_B # [LATENT_DIM, LATENT_DIM]
+        diag_E_Sigma = var.mean(dim=0, dtype=torch.float64) + (U * U).mean(dim=(0,2))  # E[diag(Sigma_q)], [LATENT_DIM]
+        Sigma_q_bar = UUT_bar + torch.diag(diag_E_Sigma) - torch.diag((U * U).mean(dim=(0,2)))  # [LATENT_DIM, LATENT_DIM]
+        Sigma_q_bar.fill_diagonal_(0.0)
+        Sigma_q_bar = Sigma_q_bar + torch.diag(diag_E_Sigma)  # [LATENT_DIM, LATENT_DIM]
+        tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))  # Trace of Sigma_q
+        Dinvu = U / var.unsqueeze(-1)  # [valid_B, LATENT_DIM, LOW_RANK]
+        I_plus = torch.bmm(U.transpose(1, 2), Dinvu)  # [valid_B, LOW_RANK, LOW_RANK]
+        eye_r = torch.eye(r, device=mu.device, dtype=torch.float64).unsqueeze(0)  # [1, LOW_RANK, LOW_RANK]
+        I_plus = I_plus + eye_r  # [valid_B, LOW_RANK, LOW_RANK]
+        sign2, logdet_small = torch.linalg.slogdet(I_plus)  # log(det(I + U^T * diag(1/var) * U))
+        if not torch.all(sign2 > 0):
+            raise ValueError("Matrix I + U^T * diag(1/var) * U is not positive definite.")
+        log_det_Sigma_q = logdet_small + logvar.sum(dim=1).to(torch.float64)  # log(det(Sigma_q)) [valid_B,]
+        log_det_Sigma_q = log_det_Sigma_q.to(mu.dtype)
     else:
         # If no low-rank factors, just use diagonal covariance
-        Sigma_q = torch.diag_embed(torch.exp(logvar))
+        Sigma_q_bar = torch.diag(var.mean(dim=0, dtype=torch.float64))  # [LATENT_DIM, LATENT_DIM]
+        tr_Sigma_q = var.sum(dim=1)  # Trace of Sigma_q
+        log_det_Sigma_q = logvar.sum(dim=1)  # log(det(Sigma_q)) [valid_B,]
     # KL divergence: D_KL(q(z|x) || p(z)) =
     # 0.5 * (tr(Sigma_q) + mu^T * mu - d - log(det(Sigma_q)))
     # where d is the dimensionality of the latent space (LATENT_DIM)
-    d = mu.size(1)
-    tr_Sigma_q = torch.einsum('bii->b', Sigma_q)  # Trace of Sigma_q
-    mu2 = mu.square().sum(dim=1)  # mu^T * mu
-    sign, logabsdet = torch.linalg.slogdet(Sigma_q)  # log(det(Sigma_q))
-    if not torch.all(sign > 0):
-        raise ValueError("Covariance matrix Sigma_q is not positive definite.")
-    log_det_Sigma_q = logabsdet  # log(det(Sigma_q)) [B,]
-    kl_loss = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
-    kl_loss = kl_loss.mean()  # Average over batch
+    
+    kl_per_sample = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)  # [valid_B,]
+    kl_loss = kl_per_sample.mean()  # Average over batch
+
+    # Cov(mu) = E[mu * mu^T] - E[mu] * E[mu]^T
+    mu64 = mu.to(torch.float64)
+    mu_bar = mu64.mean(dim=0)  # Average mean vector over batch
+    mu_c = mu64 - mu_bar
+    S_mu = (mu_c.t() @ mu_c) / valid_B  # Covariance matrix of the posterior distribution
+    assert S_mu.shape == (d, d), f"Covariance matrix of mu shape mismatch: {S_mu.shape} != {(d, d)}"
+    total_S = Sigma_q_bar + S_mu  # Total covariance matrix of the posterior distribution
+    # Ensure the covariance matrix is symmetric
+    total_S = (total_S + total_S.T) / 2 # [LATENT_DIM, LATENT_DIM]
+    total_S = total_S + eps * torch.eye(d, device=mu.device, dtype=torch.float64)  # Numerical stability
+    
+    # Dimension-wise KL divergence with free bits regularization
+    diag_S_bar = torch.diag(total_S).clamp_min(eps)  # Diagonal of the covariance matrix, [LATENT_DIM]
+    dwkl_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())  # [LATENT_DIM]
+    dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - config.free_bits, min=0)  # Free bits regularization
+    dwkl = dwkl_per_dim.sum().to(mu.dtype)  # Sum over dimensions
+    dwkl_fb = dwkl_fb_per_dim.sum().to(mu.dtype)  # Free bits regularization sum
+    
+    # total correlation term - use FP32 for linear algebra operations
+    with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for numerical stability
+        # Convert to FP32 for linear algebra operations
+        D_sqrt_inv = torch.diag(1.0 / torch.sqrt(diag_S_bar)).to(torch.float64) 
+        R = D_sqrt_inv @ total_S @ D_sqrt_inv  # R = inv_sqrt * total_S * inv_sqrt
+        R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=torch.float64)  # Ensure symmetry and positive definiteness
+        sign, logabsdet_R = torch.linalg.slogdet(R)  # log(det(R))
+        if not torch.all(sign > 0):
+            raise ValueError("Covariance matrix R is not positive definite.")
+        total_correlation = -0.5 * logabsdet_R  # Total correlation term
+        
+        # Convert back to original dtype if needed
+        total_correlation = total_correlation.to(mu.dtype)
+    
+    mutual_information = kl_loss - total_correlation - dwkl  # Mutual information term
+    
+    with torch.no_grad():
+        # Compute the eigenvalues and eigenvectors - use FP32 for numerical stability
+        with torch.amp.autocast('cuda', enabled=False):
+            eigenvalues = torch.linalg.eigvalsh(total_S.float())
+        kl_diagnosis = {
+            'mutual_info': float(mutual_information.item()),
+            'total_correlation': float(total_correlation.item()),
+            'dimension_wise_kl': dwkl_per_dim,
+            'dimension_wise_kl_sum': float(dwkl.item()),
+            'eigenvalues': eigenvalues
+        }
+    
     # Total weighted loss
-    total_loss = (weight_raw * total_raw_loss + 
-                  weight_emb * total_emb_loss + 
-                  kl_beta * kl_loss)
+    total_loss = (total_raw_loss + 
+                  mi_beta * mutual_information + 
+                  tc_beta * total_correlation +
+                  dw_beta * dwkl_fb)  # Free bits regularization
     
     return {
         'total_loss': total_loss,
         'total_raw_loss': total_raw_loss,
-        'total_emb_loss': total_emb_loss,
         'kl_loss': kl_loss,
         'raw_losses': raw_losses,
-        'emb_losses': emb_losses,
-        'raw_stats_losses': stat_raw_losses,
+        'kl_diagnosis': kl_diagnosis,
+        'metrics': metrics
     }
-
-def calc_eigen_values(mu: torch.Tensor, logvar: torch.Tensor, lowrank_factors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Calculate the eigenvalues and eigenvectors of the approximate posterior distribution.
-
-    Args:
-        mu: The mean of the latent distribution (B, latent_dim)
-        logvar: The log variance of the latent distribution (B, latent_dim)
-        lowrank_factors: The low-rank factors for the latent distribution (B, latent_dim, rank)
-
-    Returns:
-        A tuple containing the eigenvalues and eigenvectors.
-    """
-    B, D = mu.shape
-    r = lowrank_factors.shape[-1]
-    # Compute the covariance matrix
-    cov = torch.bmm(lowrank_factors, lowrank_factors.transpose(1, 2)) + torch.diag_embed(torch.exp(logvar))
-    cov = cov.mean(0)  # Average over batch dimension
-    assert cov.shape == (D, D), f"Covariance matrix shape mismatch: {cov.shape} != {(D, D)}"
-    mu_bar = mu.mean(0)
-    mu_c = mu - mu_bar
-    S_mu = (mu_c.T @ mu_c) / B
-    S = cov + S_mu  # Covariance matrix of the posterior distribution
-    # Ensure the covariance matrix is symmetric
-    S = (S + S.T) / 2
-    # Compute the eigenvalues and eigenvectors
-    eigenvalues, eigenvectors = torch.linalg.eigh(S)
-    return eigenvalues, eigenvectors
