@@ -808,6 +808,37 @@ def visualize_reconstructions(
         }
     }
 
+def _mean_ekl_diag_or_lowrank(mu_np, logvar_np, lowrank_np=None):
+    """
+    Average per-sample KL(q(z|x) || N(0,I)).
+    Supports diag posterior (logvar) and optional low-rank factors F (B,D,R).
+    Uses matrix determinant lemma: det(Λ + FF^T) = det(Λ) * det(I + F^T Λ^{-1} F).
+    """
+    B, D = mu_np.shape
+    mu2_sum = (mu_np**2).sum(axis=1)                      # [B]
+    if lowrank_np is None:
+        # diag Σ = diag(exp(logvar))
+        s2 = np.exp(logvar_np)                            # [B,D]
+        tr_sum = s2.sum(axis=1)                           # [B]
+        logdet = logvar_np.sum(axis=1)                    # [B] (since det(Λ)=exp(sum logvar))
+        kl = 0.5 * (tr_sum + mu2_sum - D - logdet)
+        return float(kl.mean())
+    else:
+        # Σ = Λ + F F^T, Λ=diag(s2)
+        F = lowrank_np                                    # [B,D,R]
+        s2 = np.exp(logvar_np)                            # [B,D]
+        tr_sum = s2.sum(axis=1) + np.sum(F**2, axis=(1,2))
+        # logdet(Σ) = logdet(Λ) + logdet(I + F^T Λ^{-1} F)
+        logdet_L = logvar_np.sum(axis=1)                  # [B]
+        # build R x R matrix per-sample: I + F^T Λ^{-1} F
+        invL_F = F / np.maximum(s2[..., None], 1e-8)      # [B,D,R]
+        Bt = np.matmul(F.transpose(0,2,1), invL_F)        # [B,R,R]
+        # stable logdet via slogdet
+        sign, logdet_B = np.linalg.slogdet(np.eye(Bt.shape[1])[None,...] + Bt)
+        logdet_B = np.where(sign > 0, logdet_B, -1e9)     # guard
+        logdet = logdet_L + logdet_B
+        kl = 0.5 * (tr_sum + mu2_sum - D - logdet)
+        return float(kl.mean())
 
 def analyze_latent_space(
     model,
@@ -979,16 +1010,7 @@ def analyze_latent_space(
 
     # --- KL decomposition (Gaussian assumption): KL(q(z)||N(0,I)) = MI + TC + DW
     # Total KL with full Σ_agg and mean_total
-    sign, logdet = np.linalg.slogdet(Sigma_agg)
-    if sign <= 0:
-        # very rare after shrinkage; force PSD
-        w, V = np.linalg.eigh(Sigma_agg)
-        w_clipped = np.clip(w, jitter_eps, None)
-        logdet = np.log(w_clipped).sum()
-        Sigma_trace = w_clipped.sum()
-    else:
-        Sigma_trace = np.trace(Sigma_agg)
-    kl_total = 0.5 * (Sigma_trace + (mean_total @ mean_total) - D - logdet)
+    ekl = _mean_ekl_diag_or_lowrank(mu_all, logvar_all, lowrank_all)  # E_x KL(q(z|x)||N(0,I))
 
     # Dimension-wise KL: sum_i KL(q(z_i)||N(0,1)) with Var(z_i)=var_total_i, mean=mean_total_i
     dw_kl = 0.5 * np.sum(var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
@@ -1000,7 +1022,7 @@ def analyze_latent_space(
     _, logdetR = np.linalg.slogdet(R)
     tc = -0.5 * logdetR
 
-    mi = float(kl_total - tc - dw_kl)
+    mi = float(ekl - tc - dw_kl)
 
     # --- Visualization
     import matplotlib.pyplot as plt
@@ -1069,7 +1091,7 @@ def analyze_latent_space(
 
     # (2,2) KL decomposition
     metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL']
-    vals = [mi, tc, dw_kl, kl_total]
+    vals = [mi, tc, dw_kl, ekl]
     bars = axes[2,2].bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
     axes[2,2].set_ylabel('nats'); axes[2,2].set_title('KL = MI + TC + DW')
     for b, v in zip(bars, vals):
@@ -1116,7 +1138,7 @@ def analyze_latent_space(
     # --- reporting
     print(f"\n📊 Enhanced Latent Space Analysis")
     print(f"  - Samples: {total} ({got_train} train, {got_test} test), D={D}")
-    print(f"  - KL total={kl_total:.3f}, MI={mi:.3f}, TC={tc:.3f}, DW={dw_kl:.3f}")
+    print(f"  - KL total={ekl:.3f}, MI={mi:.3f}, TC={tc:.3f}, DW={dw_kl:.3f}")
     print(f"  - PCA first 5 explained: {pca_expl[:5]} (cum {np.cumsum(pca_expl[:5])})")
 
     return {
@@ -1127,7 +1149,7 @@ def analyze_latent_space(
         'pca_components': latent_pca,
         'pca_model': pca,
         'tsne_components': latent_tsne,
-        'metrics': {'kl_total': float(kl_total), 'mi': float(mi), 'tc': float(tc), 'dw_kl': float(dw_kl)},
+        'metrics': {'kl_total': float(ekl), 'mi': float(mi), 'tc': float(tc), 'dw_kl': float(dw_kl)},
         'dataset_labels': ds_list,
         'plot_path': save_path,
         'tty_grid_path': tty_save_path,
