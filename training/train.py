@@ -12,6 +12,9 @@ import warnings
 import logging
 from datetime import datetime
 from torch.optim.lr_scheduler import OneCycleLR
+from src.skill_space import StickyHDPHMMVI, StickyHDPHMMParams, NIWPrior
+import copy
+
 warnings.filterwarnings('ignore')
 
 # Add project root to Python path
@@ -102,6 +105,43 @@ def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress
         raise ValueError(f"Unknown shape: {shape}. Supported shapes: linear, cubic, sigmoid, cosine, exponential, constant, custom.")
 
 
+@torch.no_grad()
+def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int | None = None, logger=None):
+    """
+    Run one E-step pass: update sticky-HDP-HMM variational posteriors using encoder outputs.
+    """
+    model.eval()
+    n_batches = len(dataset) if max_batches is None else min(len(dataset), max_batches)
+    for bi, batch in enumerate(dataset):
+        if bi >= n_batches: break
+        batch_dev = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                x = v.to(device, non_blocking=True)
+                if x.dim() >= 3 and k not in ('original_batch_shape',):
+                    B,T = x.shape[:2]; batch_dev[k] = x.view(B*T, *x.shape[2:])
+                else:
+                    batch_dev[k] = x
+            else:
+                batch_dev[k] = v
+        # forward encode only
+        out = model(batch_dev)  # returns 'mu', 'logvar', optionally 'lowrank_factors'
+        mu    = out['mu']
+        logvar= out['logvar']
+        F     = out.get('lowrank_factors', None)
+        B, T = batch['original_batch_shape']
+        valid = batch_dev['valid_screen'].view(B,T)
+        # reshape to [B,T,...]
+        mu_bt = mu.view(B,T,-1)
+        var_bt = logvar.exp().clamp_min(1e-6).view(B,T,-1)
+        F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
+        hmm.update_from_encoder(mu_bt, var_bt, F_bt, mask=valid)
+        if logger and (bi+1) % 50 == 0:
+            logger.info(f"[E-step] processed {bi+1}/{n_batches} batches")
+    return hmm
+
+
+
 def train_multimodalhack_vae(
     train_file: str, 
     test_file: str,                     
@@ -164,7 +204,12 @@ def train_multimodalhack_vae(
     # Early stopping parameters
     early_stopping: bool = True,
     early_stopping_patience: int = 3,
-    early_stopping_min_delta: float = 0.01) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
+    early_stopping_min_delta: float = 0.01,
+    
+    # sticky-HDP-HMM parameters
+    hmm: Optional[StickyHDPHMMVI] = None,
+    use_hmm_prior: bool = False
+    ) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
     """
     Train MultiModalHackVAE on NetHack Learning Dataset with adaptive loss weighting
 
@@ -610,7 +655,35 @@ def train_multimodalhack_vae(
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
                     model_output = model(batch_device)
-                    
+
+                    # ==== (M‑step) HMM prior cache for this batch (no gradients) ====
+                    if use_hmm_prior and (hmm is not None):
+                        with torch.no_grad():
+                            B,T = batch_device['original_batch_shape']
+                            valid_bt = batch_device['valid_screen'].view(B,T)
+                            mu_bt    = model_output['mu'].view(B,T,-1)
+                            var_bt   = model_output['logvar'].exp().clamp_min(1e-6).view(B,T,-1)
+                            F_btr    = model_output.get('lowrank_factors', None)
+                            F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
+                            # emission expected log-likelihood per (b,t,k)
+                            logB = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt)     # [B,T,K]
+                            pi_star, ElogA = hmm._Epi(), hmm._ElogA()                     # variational expectations
+                            r_hat, xi_hat, ll = hmm.forward_backward(logB, pi_star, ElogA, mask=valid_bt)  # r_hat: [B,T,K]
+                            # prior Gaussians
+                            mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
+                            # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
+                            logdet_Sigma_k = -torch.logdet(E_Lambda + 1e-6*torch.eye(E_Lambda.size(-1), device=E_Lambda.device)).to(mu_bt.dtype)
+                            # flatten responsibilities to align with valid_screen
+                            r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
+                        # stash cache into batch so vae_loss can pick it up
+                        batch_device['sticky_hmm'] = hmm
+                        batch_device['hmm_cache'] = {
+                            'mu_k': mu_k.to(model_output['mu'].dtype),
+                            'E_Lambda': E_Lambda.to(model_output['mu'].dtype),
+                            'logdet_Sigma_k': logdet_Sigma_k.to(model_output['mu'].dtype),
+                            'r_hat_flat': r_hat_flat.to(model_output['mu'].dtype),
+                        }
+
                     # Calculate adaptive weights for this step
                     mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
                     
@@ -1236,3 +1309,87 @@ def train_multimodalhack_vae(
         wandb.finish()
     
     return model, train_losses, test_losses
+
+def train_vae_with_sticky_hmm_em(
+    pretrained_ckpt_path: str,
+    train_dataset, 
+    test_dataset,
+    config : VAEConfig,
+    # Sticky-HDP-HMM params
+    alpha: float = 5.0, 
+    kappa: float = 20.0, 
+    gamma: float = 5.0,
+    # NIW prior params
+    niw_mu0: float = 0.0, 
+    niw_kappa0: float = 0.1, 
+    niw_Psi0: float = 1.0,
+    niw_nu0: int = 96 + 2,
+    em_rounds: int = 3, 
+    m_epochs_per_round: int = 1,
+    save_dir: str = "checkpoints_hmm",
+    device: torch.device = torch.device('cuda'),
+    use_bf16: bool = False,
+    logger=None,
+    push_to_hub: bool = False,  # optional – if you already have HF setup
+    hub_repo_id_hmm: str | None = None,
+    hub_repo_id_vae_hmm: str | None = None,
+):
+    """
+    Loads a pretrained VAE (plain prior), fits sticky-HDP-HMM in E-steps, and fine-tunes the VAE
+    with the HMM prior in M-steps. Saves HMM and the VAE+HMM under separate profiles.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    # 1) Load the pretrained VAE (kept intact)
+    model = MultiModalHackVAE(config).to(device)
+    ckpt = torch.load(pretrained_ckpt_path, map_location='cpu')
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
+    if logger: logger.info("Loaded pretrained VAE checkpoint (plain prior).")
+
+    # 2) Instantiate HMM
+    D = config.latent_dim
+    K = config.skill_num
+    niw = NIWPrior(
+        mu0=torch.full(D, niw_mu0, device=device), 
+        kappa0=niw_kappa0,
+        Psi0=torch.eye(D, device=device) * niw_Psi0,
+        nu0=niw_nu0
+    )
+    hmm_params = StickyHDPHMMParams(
+        alpha=alpha, 
+        kappa=kappa, 
+        gamma=gamma,
+        K=K,
+        D=D,
+        device=device
+    )
+    hmm = StickyHDPHMMVI(
+        p=hmm_params,
+        niw_prior=niw
+    )
+
+    for r in range(em_rounds):
+        if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: E-step ==========")
+        fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, logger=logger)
+        # save HMM posterior
+        hmm_path = os.path.join(save_dir, f"hmm_round{r+1}.pt")
+        torch.save(hmm.state_dict(), hmm_path)
+        if logger: logger.info(f"Saved HMM posterior → {hmm_path}")
+        # (optional) push to hub here if you like
+
+        if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: M-step ==========")
+        # fine‑tune VAE with HMM prior for a few epochs
+        train_multimodalhack_vae(
+            model=model,
+            train_dataset=train_dataset,
+            test_dataset=test_dataset,
+            config=config,
+            epochs=m_epochs_per_round,
+            resume_checkpoint_path=None,
+            use_bf16=use_bf16,
+            hmm=hmm,
+            use_hmm_prior=True
+        )
+        # save the VAE+HMM (separate profile)
+        vae_hmm_path = os.path.join(save_dir, f"vae_with_hmm_round{r+1}.pt")
+        torch.save({'model_state_dict': model.state_dict()}, vae_hmm_path)
+        if logger: logger.info(f"Saved VAE+HMM → {vae_hmm_path}")

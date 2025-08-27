@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 
 def _chol_logdet(A):
     # A: [B, R, R] SPD
@@ -108,3 +109,47 @@ def kl_gaussian_lowrank_q_p(mu_q, logvar_q, F_q,
     D = mu_q.size(1)
     kl = 0.5 * (logdet_p - logdet_q - D + trace_term + quad)
     return kl
+
+def _trace_A_Sigma(A: torch.Tensor, diag_var: torch.Tensor, F: Optional[torch.Tensor]) -> torch.Tensor:
+    """
+    tr(A * (diag(diag_var) + F F^T)) for each sample
+    A: [K,D,D], diag_var: [B,D], F: [B,D,R] or None  -> returns [B,K]
+    """
+    D = diag_var.size(-1)
+    Adiag = torch.diagonal(A, dim1=-2, dim2=-1)              # [K,D]
+    term_diag = torch.einsum('bd,kd->bk', diag_var, Adiag)   # [B,K]
+    if F is None:
+        return term_diag
+    # F term: sum_r f_r^T A f_r
+    # reshape for batched einsum
+    # F: [B,D,R], A: [K,D,D] -> [B,K] by sum over r
+    fr_A = torch.einsum('bdr,kde->bkre', F, A)               # [B,K,R,D]
+    fr_A_fr = torch.einsum('bkre,bdr->bkr', fr_A, F)         # [B,K,R]
+    return term_diag + fr_A_fr.sum(dim=-1)                   # [B,K]
+
+def kl_gaussian_lowrank_to_fixed_gaussians(
+    mu_q: torch.Tensor,           # [B,D]
+    diagvar_q: torch.Tensor,      # [B,D]
+    F_q: Optional[torch.Tensor],  # [B,D,R] or None
+    mu_p: torch.Tensor,           # [K,D]
+    Lambda_p: torch.Tensor,       # [K,D,D]  (precision = Σ^{-1})
+    logdet_Sigma_p: torch.Tensor  # [K]  (for Σ = Lambda^{-1})
+) -> torch.Tensor:
+    """
+    KL for each (sample b, prior component k):
+       0.5 * [ tr(Σ_p^{-1} Σ_q) + (μ_p-μ_q)^T Σ_p^{-1} (μ_p-μ_q) - D + log|Σ_p| - log|Σ_q| ]
+    Returns: [B,K]
+    """
+    B, D = mu_q.shape
+    # trace term
+    tr_term = _trace_A_Sigma(Lambda_p, diagvar_q, F_q)       # [B,K]
+    # quadratic term
+    diff = (mu_p.unsqueeze(0) - mu_q.unsqueeze(1))           # [B,K,D]
+    quad = torch.einsum('bkd,kde,bke->bk', diff, Lambda_p, diff)  # [B,K]
+    # logdet terms
+    logdet_Sigma_q = _logdet_sigma(diagvar_q.log(), F_q)         # [B]
+    # Broadcast to [B,K]
+    logdet_Sigma_q = logdet_Sigma_q.unsqueeze(1).expand(-1, mu_p.size(0))
+    # assemble
+    kl_bk = 0.5 * (tr_term + quad - D + logdet_Sigma_p.unsqueeze(0) - logdet_Sigma_q)
+    return kl_bk  # [B,K]

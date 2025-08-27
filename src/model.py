@@ -65,7 +65,7 @@ from typing import Optional, List, Dict
 from enum import IntEnum
 from dataclasses import dataclass, field
 from nle import nethack
-from utils.math_utils import kl_gaussian_lowrank_q_p
+from utils.math_utils import kl_gaussian_lowrank_q_p, kl_gaussian_lowrank_to_fixed_gaussians
 
 # Import NetHackCategory from data_collection
 try:
@@ -2407,44 +2407,61 @@ def vae_loss(
         weights.update(weight_override)
     total_raw_loss = sum(raw_losses[k] * weights.get(k, 1.0) for k in raw_losses)
 
-    # KL divergence
-    # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
-    # KL divergence for low-rank approximation
+    # === KL term: either standard Normal prior or sticky‑HDP‑HMM prior ===
     eps = 1e-6
-    logvar = logvar.clamp(min=-10.0, max=10.0)  # Prevent extreme values
-    var = torch.exp(logvar).clamp_min(eps)  # [valid_B, LATENT_DIM]
-    mu2 = mu.square().sum(dim=1)  # mu^T * mu # [valid_B,]
+    logvar = logvar.clamp(min=-10.0, max=10.0)
+    var = torch.exp(logvar).clamp_min(eps)  # [valid_B, D]
     d = mu.size(1)
+    
     if lowrank_factors is not None:
-        r = lowrank_factors.size(2)
-        U = lowrank_factors.to(torch.float64)  # [valid_B, LATENT_DIM, LOW_RANK]
+        U = lowrank_factors.to(torch.float64)
         UUT_bar = torch.zeros(d, d, device=mu.device, dtype=torch.float64)  # [LATENT_DIM, LATENT_DIM]
         UUT_bar += torch.einsum('bik,bjk->ij', U, U) / valid_B # [LATENT_DIM, LATENT_DIM]
         diag_E_Sigma = var.mean(dim=0, dtype=torch.float64) + (U * U).mean(dim=(0,2))  # E[diag(Sigma_q)], [LATENT_DIM]
         Sigma_q_bar = UUT_bar + torch.diag(diag_E_Sigma) - torch.diag((U * U).mean(dim=(0,2)))  # [LATENT_DIM, LATENT_DIM]
         Sigma_q_bar.fill_diagonal_(0.0)
         Sigma_q_bar = Sigma_q_bar + torch.diag(diag_E_Sigma)  # [LATENT_DIM, LATENT_DIM]
-        tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))  # Trace of Sigma_q
-        Dinvu = U / var.unsqueeze(-1)  # [valid_B, LATENT_DIM, LOW_RANK]
-        I_plus = torch.bmm(U.transpose(1, 2), Dinvu)  # [valid_B, LOW_RANK, LOW_RANK]
-        eye_r = torch.eye(r, device=mu.device, dtype=torch.float64).unsqueeze(0)  # [1, LOW_RANK, LOW_RANK]
-        I_plus = I_plus + eye_r  # [valid_B, LOW_RANK, LOW_RANK]
-        sign2, logdet_small = torch.linalg.slogdet(I_plus)  # log(det(I + U^T * diag(1/var) * U))
-        if not torch.all(sign2 > 0):
-            raise ValueError("Matrix I + U^T * diag(1/var) * U is not positive definite.")
-        log_det_Sigma_q = logdet_small + logvar.sum(dim=1).to(torch.float64)  # log(det(Sigma_q)) [valid_B,]
-        log_det_Sigma_q = log_det_Sigma_q.to(mu.dtype)
     else:
-        # If no low-rank factors, just use diagonal covariance
+        U = None
         Sigma_q_bar = torch.diag(var.mean(dim=0, dtype=torch.float64))  # [LATENT_DIM, LATENT_DIM]
-        tr_Sigma_q = var.sum(dim=1)  # Trace of Sigma_q
-        log_det_Sigma_q = logvar.sum(dim=1)  # log(det(Sigma_q)) [valid_B,]
-    # KL divergence: D_KL(q(z|x) || p(z)) =
-    # 0.5 * (tr(Sigma_q) + mu^T * mu - d - log(det(Sigma_q)))
-    # where d is the dimensionality of the latent space (LATENT_DIM)
-    
-    kl_per_sample = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)  # [valid_B,]
-    kl_loss = kl_per_sample.mean()  # Average over batch
+
+    hmm = batch.get('sticky_hmm', None)   # injected by train loop during M‑step
+    if hmm is None:
+        # ------ Standard Normal prior (your original code) ------
+        mu2 = mu.square().sum(dim=1)
+        if lowrank_factors is not None:
+            r = lowrank_factors.size(2)
+            tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))
+            Dinvu = U / var.unsqueeze(-1)
+            I_plus = torch.bmm(U.transpose(1, 2), Dinvu)
+            I_plus = I_plus + torch.eye(r, device=mu.device, dtype=torch.float64).unsqueeze(0)
+            _, logdet_small = torch.linalg.slogdet(I_plus)
+            log_det_Sigma_q = (logdet_small + logvar.sum(dim=1).to(torch.float64)).to(mu.dtype)
+        else:
+            tr_Sigma_q = var.sum(dim=1)
+            log_det_Sigma_q = logvar.sum(dim=1)
+        kl_per_sample = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
+        kl_loss = kl_per_sample.mean()
+        kl_mode = 'standard'
+    else:
+        # ------ Sticky‑HDP‑HMM prior ------
+        # We need responsibilities r_hat[t,k] for this batch and the prior Gaussians (mu_k, Sigma_k).
+        # The train loop passes 'hmm_cache' with: mu_k [K,D], E_Lambda [K,D,D], logdet_Sigma_k [K],
+        # and r_hat for the sequences in this batch (already aligned to valid_screen).
+        hmm_cache = batch['hmm_cache']   # dict created in train loop
+        mu_k = hmm_cache['mu_k']                     # [K,D]
+        E_Lambda = hmm_cache['E_Lambda']             # [K,D,D]
+        logdet_Sigma_k = hmm_cache['logdet_Sigma_k'] # [K]
+        r_hat = hmm_cache['r_hat_flat']              # [valid_B,K] responsibilities for valid positions
+
+        # KL(q(z_t)|p(z_t|h_t=k)) for all k, then expectation over r_hat
+        kl_bk = kl_gaussian_lowrank_to_fixed_gaussians(
+            mu_q=mu, diagvar_q=var, F_q=lowrank_factors,
+            mu_p=mu_k, Lambda_p=E_Lambda, logdet_Sigma_p=logdet_Sigma_k
+        )  # [valid_B,K]
+        kl_per_sample = (kl_bk * r_hat).sum(dim=1)   # [valid_B]
+        kl_loss = kl_per_sample.mean()
+        kl_mode = 'sticky_hdp_hmm'
 
     # Cov(mu) = E[mu * mu^T] - E[mu] * E[mu]^T
     mu64 = mu.to(torch.float64)
