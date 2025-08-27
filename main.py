@@ -3,7 +3,8 @@ import sys
 import torch
 from datetime import datetime
 from src.data_collection import NetHackDataCollector, BLStatsAdapter
-from training.train import train_multimodalhack_vae, VAEConfig, create_visualization_demo, analyze_glyph_char_color_pairs, plot_glyph_char_color_pairs_from_saved
+from training.train import train_multimodalhack_vae, VAEConfig
+from utils.analysis import create_visualization_demo, analyze_glyph_char_color_pairs, plot_glyph_char_color_pairs_from_saved
 
 if __name__ == "__main__":
     
