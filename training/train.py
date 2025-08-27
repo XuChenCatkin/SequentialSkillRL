@@ -140,14 +140,10 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
             logger.info(f"[E-step] processed {bi+1}/{n_batches} batches")
     return hmm
 
-
-
-def train_multimodalhack_vae(
+def load_datasets(
     train_file: str, 
     test_file: str,                     
     dbfilename: str = 'ttyrecs.db',
-    config: VAEConfig = None,
-    epochs: int = 10, 
     batch_size: int = 32, 
     sequence_size: int = 32, 
     training_batches: int = 100,
@@ -156,11 +152,86 @@ def train_multimodalhack_vae(
     max_testing_batches: int = 20,
     training_game_ids: List[int] | None = None,
     testing_game_ids: List[int] | None = None,
+    data_cache_dir: str = "data_cache",
+    force_recollect: bool = False,
+    logger: logging.Logger = None
+) -> Tuple[List, List]:
+    """
+    Load training and testing datasets with caching
+    
+    Args:
+        train_file: Path to the training samples
+        test_file: Path to the testing samples
+        dbfilename: Path to the NetHack Learning Dataset database file
+        batch_size: Training batch size
+        sequence_size: Sequence length for temporal data
+        training_batches: Number of training batches to use
+        testing_batches: Number of testing batches to use
+        max_training_batches: Maximum training batches to collect
+        max_testing_batches: Maximum testing batches to collect
+        training_game_ids: Specific game IDs for training (optional)
+        testing_game_ids: Specific game IDs for testing (optional)
+        data_cache_dir: Directory to cache processed data
+        force_recollect: Force data recollection even if cache exists
+        logger: Logger instance
+        
+    Returns:
+        Tuple of (train_dataset, test_dataset)
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    # Create adapter and datasets with caching
+    adapter = BLStatsAdapter()
+    collector = NetHackDataCollector(dbfilename)
+    
+    # Create cache directory
+    os.makedirs(data_cache_dir, exist_ok=True)
+    
+    # Cache file names based on dataset parameters
+    train_cache_file = os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}.pt")
+    test_cache_file = os.path.join(data_cache_dir, f"{test_file}_b{batch_size}_s{sequence_size}_m{max_testing_batches}.pt")
+
+    # Collect or load training data
+    logger.info(f"📊 Preparing training data...")
+    train_dataset = collector.collect_or_load_data(
+        dataset_name=train_file,
+        adapter=adapter,
+        save_path=train_cache_file,
+        max_batches=max_training_batches,
+        batch_size=batch_size,
+        seq_length=sequence_size,
+        force_recollect=force_recollect,
+        game_ids=training_game_ids
+    )
+    train_dataset = train_dataset[:training_batches] if len(train_dataset) > training_batches else train_dataset
+    
+    # Collect or load testing data
+    logger.info(f"📊 Preparing testing data...")
+    test_dataset = collector.collect_or_load_data(
+        dataset_name=test_file,
+        adapter=adapter,
+        save_path=test_cache_file,
+        max_batches=max_testing_batches,
+        batch_size=batch_size,
+        seq_length=sequence_size,
+        force_recollect=force_recollect,
+        game_ids=testing_game_ids
+    )
+    test_dataset = test_dataset[:testing_batches] if len(test_dataset) > testing_batches else test_dataset
+    
+    logger.info(f"✅ Datasets loaded: {len(train_dataset)} train batches, {len(test_dataset)} test batches")
+    return train_dataset, test_dataset
+
+
+def train_multimodalhack_vae(
+    train_dataset: List,
+    test_dataset: List,
+    config: VAEConfig = None,
+    epochs: int = 10, 
     max_learning_rate: float = 1e-3,
     device: str = None, 
     logger: logging.Logger = None,
-    data_cache_dir: str = "data_cache",
-    force_recollect: bool = False,
     shuffle_batches: bool = True,
     shuffle_within_batch: bool = False,
     
@@ -211,31 +282,21 @@ def train_multimodalhack_vae(
     use_hmm_prior: bool = False
     ) -> Tuple[MultiModalHackVAE, List[float], List[float]]:
     """
-    Train MultiModalHackVAE on NetHack Learning Dataset with adaptive loss weighting
+    Train MultiModalHackVAE on pre-loaded NetHack datasets with adaptive loss weighting
 
     Args:
-        train_file: Path to the training samples
-        test_file: Path to the testing samples
-        dbfilename: Path to the NetHack Learning Dataset database file
+        train_dataset: Pre-loaded training dataset (list of batches)
+        test_dataset: Pre-loaded testing dataset (list of batches)
         config: VAEConfig object containing model configuration and training hyperparameters.
                 If None, will create default config. For resuming from checkpoint, config from checkpoint takes precedence.
         epochs: Number of training epochs
-        batch_size: Training batch size
         max_learning_rate: max learning rate for optimizer
         device: Device to use ('cuda' or 'cpu')
-        data_cache_dir: Directory to cache processed data
-        force_recollect: Force data recollection even if cache exists
+        logger: Logger instance
         shuffle_batches: Whether to shuffle training batches at the start of each epoch
         shuffle_within_batch: Whether to shuffle games within each batch (preserves temporal order within each game)
         use_bf16: Whether to use BF16 mixed precision training for memory efficiency
         custom_kl_beta_function: Optional custom function for KL beta ramping (overrides config beta curves)
-        free_bits: Target free bits for KL loss (0.0 disables)
-        warmup_epoch_ratio: Ratio of epochs for warm-up phase
-        focal_loss_alpha: Alpha parameter for focal loss (0.0 disables)
-        focal_loss_gamma: Gamma parameter for focal loss (0.0 disables)
-        dropout_rate: Dropout rate (0.0-1.0) for regularization. 0.0 disables dropout
-        enable_dropout_on_latent: Whether to apply dropout to encoder fusion layers
-        enable_dropout_on_decoder: Whether to apply dropout to decoder layers
         save_path: Path to save the trained model
         save_checkpoints: Whether to save checkpoints during training
         checkpoint_dir: Directory to save checkpoints
@@ -262,7 +323,8 @@ def train_multimodalhack_vae(
         early_stopping: Whether to enable early stopping based on test loss
         early_stopping_patience: Number of epochs with no improvement after which training will be stopped
         early_stopping_min_delta: Minimum relative change in test loss to qualify as an improvement
-        
+        hmm: Optional HMM model for skill-based priors
+        use_hmm_prior: Whether to use HMM prior instead of standard normal prior
 
     Returns:
         Tuple of (trained_model, train_losses, test_losses)
@@ -288,17 +350,19 @@ def train_multimodalhack_vae(
             ]
         )
         logger = logging.getLogger(__name__)
+        
+    batch_size, sequence_size = (train_dataset[0]['game_chars'].shape[0], train_dataset[0]['game_chars'].shape[1]) if len(train_dataset) > 0 else (None, None)
 
     # Initialize Weights & Biases if requested
     if use_wandb and WANDB_AVAILABLE:
         # Prepare configuration for wandb
         wandb_config = {
             "epochs": epochs,
+            "max_learning_rate": max_learning_rate,
+            "train_batches": len(train_dataset),
+            "test_batches": len(test_dataset),
             "batch_size": batch_size,
             "sequence_size": sequence_size,
-            "max_learning_rate": max_learning_rate,
-            "training_batches": training_batches,
-            "testing_batches": testing_batches,
             "device": str(device),
             "use_bf16": use_bf16,
             "shuffle_batches": shuffle_batches,
@@ -368,13 +432,12 @@ def train_multimodalhack_vae(
     elif use_wandb and not WANDB_AVAILABLE:
         logger.warning("⚠️  wandb requested but not available. Install with: pip install wandb")
 
-    logger.info(f"🔥Training MultiModalHackVAE with {training_batches} train batches, {testing_batches} test batches")
+    logger.info(f"🔥Training MultiModalHackVAE with {len(train_dataset)} train batches, {len(test_dataset)} test batches")
     logger.info(f"   Epochs: {epochs}")
     logger.info(f"   Batch size: {batch_size}")
     logger.info(f"   Sequence size: {sequence_size}")
     logger.info(f"   Device: {device}")
     logger.info(f"   Mixed Precision: BF16 = {use_bf16}")
-    logger.info(f"   Data cache: {data_cache_dir}")
     logger.info(f"   Shuffle batches: {shuffle_batches}")
     logger.info(f"   Shuffle within batch: {shuffle_within_batch}")
     logger.info(f"   VAE Configuration:")
@@ -393,6 +456,8 @@ def train_multimodalhack_vae(
     if early_stopping:
         logger.info(f"     - Patience: {early_stopping_patience} epochs")
         logger.info(f"     - Min delta: {early_stopping_min_delta:.6f}")
+    if hmm is not None:
+        logger.info(f"   HMM Prior: {'Enabled' if use_hmm_prior else 'Available but disabled'}")
 
     def get_adaptive_weights(global_step: int, total_steps: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float]:
         """Calculate adaptive weights based on current global training step"""
@@ -428,45 +493,6 @@ def train_multimodalhack_vae(
             logger.debug(f"Step {global_step}/{total_steps} - Adaptive weights: mi_beta={mi_beta:.3f}, tc_beta={tc_beta:.3f}, dw_beta={dw_beta:.3f}")
 
         return mi_beta, tc_beta, dw_beta
-    
-    # Create adapter and datasets with caching
-    adapter = BLStatsAdapter()
-    collector = NetHackDataCollector(dbfilename)
-    
-    # Create cache directory
-    os.makedirs(data_cache_dir, exist_ok=True)
-    
-    # Cache file names based on dataset parameters
-    train_cache_file = os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}.pt")
-    test_cache_file = os.path.join(data_cache_dir, f"{test_file}_b{batch_size}_s{sequence_size}_m{max_testing_batches}.pt")
-
-    # Collect or load training data
-    logger.info(f"📊 Preparing training data...")
-    train_dataset = collector.collect_or_load_data(
-        dataset_name=train_file,
-        adapter=adapter,
-        save_path=train_cache_file,
-        max_batches=max_training_batches,
-        batch_size=batch_size,
-        seq_length=sequence_size,
-        force_recollect=force_recollect,
-        game_ids=training_game_ids
-    )
-    train_dataset = train_dataset[:training_batches] if len(train_dataset) > training_batches else train_dataset
-    
-    # Collect or load testing data
-    logger.info(f"📊 Preparing testing data...")
-    test_dataset = collector.collect_or_load_data(
-        dataset_name=test_file,
-        adapter=adapter,
-        save_path=test_cache_file,
-        max_batches=max_testing_batches,
-        batch_size=batch_size,
-        seq_length=sequence_size,
-        force_recollect=force_recollect,
-        game_ids=testing_game_ids
-    )
-    test_dataset = test_dataset[:testing_batches] if len(test_dataset) > testing_batches else test_dataset
 
     # Resume from checkpoint if specified
     if resume_checkpoint_path and os.path.exists(resume_checkpoint_path):
@@ -666,9 +692,11 @@ def train_multimodalhack_vae(
                             F_btr    = model_output.get('lowrank_factors', None)
                             F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
                             # emission expected log-likelihood per (b,t,k)
-                            logB = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt)     # [B,T,K]
-                            pi_star, ElogA = hmm._Epi(), hmm._ElogA()                     # variational expectations
-                            r_hat, xi_hat, ll = hmm.forward_backward(logB, pi_star, ElogA, mask=valid_bt)  # r_hat: [B,T,K]
+                            logB = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
+                            pi_star  = hmm._Epi()                              # [K]
+                            ElogA    = hmm._ElogA()                            # [K,K]
+                            log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
+                            r_hat, xi_hat, ll = hmm.forward_backward(log_pi, ElogA, logB)
                             # prior Gaussians
                             mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
                             # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
@@ -1311,10 +1339,11 @@ def train_multimodalhack_vae(
     return model, train_losses, test_losses
 
 def train_vae_with_sticky_hmm_em(
-    pretrained_ckpt_path: str,
-    train_dataset, 
-    test_dataset,
-    config : VAEConfig,
+    pretrained_ckpt_path: str = None,
+    pretrained_hf_repo: str = None,
+    train_dataset=None, 
+    test_dataset=None,
+    config: VAEConfig = None,
     # Sticky-HDP-HMM params
     alpha: float = 5.0, 
     kappa: float = 20.0, 
@@ -1324,32 +1353,112 @@ def train_vae_with_sticky_hmm_em(
     niw_kappa0: float = 0.1, 
     niw_Psi0: float = 1.0,
     niw_nu0: int = 96 + 2,
+    hmm_only: bool = False,
     em_rounds: int = 3, 
     m_epochs_per_round: int = 1,
     save_dir: str = "checkpoints_hmm",
     device: torch.device = torch.device('cuda'),
     use_bf16: bool = False,
     logger=None,
-    push_to_hub: bool = False,  # optional – if you already have HF setup
+    # HuggingFace integration
+    push_to_hub: bool = False,
     hub_repo_id_hmm: str | None = None,
     hub_repo_id_vae_hmm: str | None = None,
+    hf_token: str | None = None,
+    hf_private: bool = True,
+    hf_upload_artifacts: bool = True,
+    # Additional training arguments that might be needed for M-step
+    **train_kwargs
 ):
     """
     Loads a pretrained VAE (plain prior), fits sticky-HDP-HMM in E-steps, and fine-tunes the VAE
-    with the HMM prior in M-steps. Saves HMM and the VAE+HMM under separate profiles.
+    with the HMM prior in M-steps using train_multimodalhack_vae. Saves HMM and the VAE+HMM under separate profiles.
+    
+    This function implements an EM algorithm where:
+    - E-step: Fits HMM posterior using current VAE representations 
+    - M-step: Fine-tunes VAE with HMM prior using the full train_multimodalhack_vae training pipeline
+    
+    Args:
+        pretrained_ckpt_path: Path to local checkpoint file (alternative to pretrained_hf_repo)
+        pretrained_hf_repo: HuggingFace repo ID to load pretrained VAE from (e.g., "username/nethack-vae")
+        train_dataset: Training dataset for HMM fitting and VAE fine-tuning
+        test_dataset: Testing dataset for VAE fine-tuning
+        config: VAEConfig object. If None, will be loaded from checkpoint/HF repo
+        alpha: DP concentration parameter for sticky-HDP-HMM
+        kappa: Sticky parameter (self-transition bias)
+        gamma: Top-level DP concentration parameter  
+        niw_mu0: NIW prior mean parameter
+        niw_kappa0: NIW prior concentration parameter
+        niw_Psi0: NIW prior scale matrix parameter
+        niw_nu0: NIW prior degrees of freedom
+        hmm_only: If True, only fits HMM without VAE fine-tuning
+        em_rounds: Number of EM iterations
+        m_epochs_per_round: Number of VAE training epochs per M-step
+        save_dir: Local directory to save checkpoints
+        device: Device for training
+        use_bf16: Whether to use BF16 mixed precision
+        logger: Logger instance
+        push_to_hub: Whether to push models to HuggingFace Hub
+        hub_repo_id_hmm: HuggingFace repo ID for HMM models (e.g., "username/nethack-hmm")
+        hub_repo_id_vae_hmm: HuggingFace repo ID for VAE+HMM models (e.g., "username/nethack-vae-hmm")
+        hf_token: HuggingFace API token
+        hf_private: Whether to create private repos on HuggingFace
+        hf_upload_artifacts: Whether to upload training artifacts
+        **train_kwargs: Additional arguments passed to train_multimodalhack_vae
+        
+    Returns:
+        Tuple of (model, hmm, training_info)
     """
+    from .training_utils import load_model_from_huggingface, load_model_from_local, save_model_to_huggingface
+    
     os.makedirs(save_dir, exist_ok=True)
-    # 1) Load the pretrained VAE (kept intact)
-    model = MultiModalHackVAE(config).to(device)
-    ckpt = torch.load(pretrained_ckpt_path, map_location='cpu')
-    model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    if logger: logger.info("Loaded pretrained VAE checkpoint (plain prior).")
+    
+    # 1) Load the pretrained VAE from HuggingFace or local checkpoint
+    if pretrained_hf_repo:
+        if logger: logger.info(f"🤗 Loading pretrained VAE from HuggingFace: {pretrained_hf_repo}")
+        model = load_model_from_huggingface(
+            repo_name=pretrained_hf_repo,
+            token=hf_token,
+            device=device
+        )
+        # Extract config from loaded model
+        if config is None and hasattr(model, 'config'):
+            config = model.config
+        elif config is None:
+            if logger: logger.warning("⚠️  No config provided and none found in model. Using default VAEConfig.")
+            config = VAEConfig()
+    elif pretrained_ckpt_path:
+        if logger: logger.info(f"📁 Loading pretrained VAE from local checkpoint: {pretrained_ckpt_path}")
+        model = load_model_from_local(
+            checkpoint_path=pretrained_ckpt_path,
+            device=device
+        )
+        # Load config from checkpoint if not provided
+        if config is None:
+            try:
+                ckpt = torch.load(pretrained_ckpt_path, map_location='cpu', weights_only=False)
+                if 'config' in ckpt:
+                    config = ckpt['config']
+                    if logger: logger.info("✅ Loaded VAEConfig from checkpoint")
+                else:
+                    if logger: logger.warning("⚠️  No config in checkpoint. Using default VAEConfig.")
+                    config = VAEConfig()
+            except Exception as e:
+                if logger: logger.warning(f"⚠️  Error loading config from checkpoint: {e}. Using default VAEConfig.")
+                config = VAEConfig()
+    else:
+        raise ValueError("Either pretrained_ckpt_path or pretrained_hf_repo must be provided")
+
+    model = model.to(device)
+    if logger: logger.info("✅ Loaded pretrained VAE checkpoint (plain prior).")
 
     # 2) Instantiate HMM
     D = config.latent_dim
     K = config.skill_num
+    if logger: logger.info(f"🧠 Initializing Sticky-HDP-HMM: latent_dim={D}, skills={K}")
+    
     niw = NIWPrior(
-        mu0=torch.full(D, niw_mu0, device=device), 
+        mu0=torch.full((D,), niw_mu0, device=device), 
         kappa0=niw_kappa0,
         Psi0=torch.eye(D, device=device) * niw_Psi0,
         nu0=niw_nu0
@@ -1367,29 +1476,256 @@ def train_vae_with_sticky_hmm_em(
         niw_prior=niw
     )
 
+    # Track training info for final summary
+    training_info = {
+        'hmm_only': hmm_only,
+        'em_rounds': em_rounds,
+        'm_epochs_per_round': m_epochs_per_round,
+        'hmm_params': {
+            'alpha': alpha,
+            'kappa': kappa, 
+            'gamma': gamma,
+            'K': K,
+            'D': D
+        },
+        'niw_params': {
+            'mu0': niw_mu0,
+            'kappa0': niw_kappa0,
+            'Psi0': niw_Psi0,
+            'nu0': niw_nu0
+        },
+        'hmm_paths': [],
+        'vae_hmm_paths': [],
+        'hf_repos': {
+            'hmm': hub_repo_id_hmm,
+            'vae_hmm': hub_repo_id_vae_hmm
+        }
+    }
+
+    # 3) EM Algorithm: Alternating E-steps (HMM fitting) and M-steps (VAE fine-tuning)
     for r in range(em_rounds):
         if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: E-step ==========")
+        
+        # E-step: Fit HMM posterior using current VAE representations
         fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, logger=logger)
-        # save HMM posterior
+        
+        # Save HMM posterior locally
         hmm_path = os.path.join(save_dir, f"hmm_round{r+1}.pt")
-        torch.save(hmm.state_dict(), hmm_path)
-        if logger: logger.info(f"Saved HMM posterior → {hmm_path}")
-        # (optional) push to hub here if you like
+        hmm_save_data = {
+            'hmm_state_dict': hmm.state_dict(),
+            'hmm_params': hmm_params,
+            'niw_prior': niw,
+            'round': r + 1,
+            'config': config,
+            'training_timestamp': datetime.now().isoformat(),
+        }
+        torch.save(hmm_save_data, hmm_path)
+        training_info['hmm_paths'].append(hmm_path)
+        if logger: logger.info(f"💾 Saved HMM posterior → {hmm_path}")
+        
+        # Push HMM to HuggingFace if requested
+        if push_to_hub and hub_repo_id_hmm:
+            try:
+                if logger: logger.info(f"🤗 Uploading HMM round {r+1} to HuggingFace: {hub_repo_id_hmm}")
+                
+                from .training_utils import save_hmm_to_huggingface
+                repo_url = save_hmm_to_huggingface(
+                    hmm=hmm,
+                    hmm_params=hmm_params,
+                    niw_prior=niw,
+                    config=config,
+                    repo_name=hub_repo_id_hmm,
+                    round_num=r + 1,
+                    total_rounds=em_rounds,
+                    token=hf_token,
+                    private=hf_private,
+                    commit_message=f"Upload Sticky-HDP-HMM round {r+1}/{em_rounds}",
+                    base_vae_repo=pretrained_hf_repo if pretrained_hf_repo else "local_checkpoint"
+                )
+                if logger: logger.info(f"✅ HMM uploaded to: {repo_url}")
+                
+            except Exception as e:
+                if logger: logger.error(f"❌ Failed to upload HMM to HuggingFace: {e}")
+
+        # Skip M-step if hmm_only is True
+        if hmm_only:
+            if logger: logger.info(f"🔒 Skipping M-step (VAE fine-tuning) because hmm_only=True")
+            continue
 
         if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: M-step ==========")
-        # fine‑tune VAE with HMM prior for a few epochs
-        train_multimodalhack_vae(
-            model=model,
-            train_dataset=train_dataset,
-            test_dataset=test_dataset,
-            config=config,
-            epochs=m_epochs_per_round,
-            resume_checkpoint_path=None,
-            use_bf16=use_bf16,
-            hmm=hmm,
-            use_hmm_prior=True
-        )
-        # save the VAE+HMM (separate profile)
+        
+        # M-step: Fine-tune VAE with current HMM prior using train_multimodalhack_vae
+        if logger: logger.info(f"🔧 Fine-tuning VAE with HMM prior for {m_epochs_per_round} epochs...")
+        
+        # Prepare training arguments for M-step
+        m_step_kwargs = {
+            'train_dataset': train_dataset,
+            'test_dataset': test_dataset,
+            'config': config,
+            'epochs': m_epochs_per_round,
+            'device': device,
+            'logger': logger,
+            'use_bf16': use_bf16,
+            'hmm': hmm,
+            'use_hmm_prior': True,  # Always use HMM prior in M-step
+            'save_path': os.path.join(save_dir, f"vae_hmm_round{r+1}_temp.pth"),
+            'use_wandb': False,  # Disable wandb for M-step to avoid conflicts
+            'upload_to_hf': False,  # Don't upload intermediate M-step results
+            'early_stopping': False,  # Disable early stopping for short M-step training
+            **train_kwargs  # Include any additional training arguments
+        }
+        
+        # Run M-step training
+        model, train_losses, test_losses = train_multimodalhack_vae(**m_step_kwargs)
+        
+        # Clean up temporary file created by train_multimodalhack_vae
+        temp_file = m_step_kwargs['save_path']
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            if logger: logger.debug(f"🗑️  Removed temporary file: {temp_file}")
+        
+        if logger: logger.info(f"✅ M-step completed: final_train_loss={train_losses[-1]:.4f}, final_test_loss={test_losses[-1]:.4f}")
+        
+        # Save the VAE+HMM locally
         vae_hmm_path = os.path.join(save_dir, f"vae_with_hmm_round{r+1}.pt")
-        torch.save({'model_state_dict': model.state_dict()}, vae_hmm_path)
-        if logger: logger.info(f"Saved VAE+HMM → {vae_hmm_path}")
+        vae_hmm_save_data = {
+            'model_state_dict': model.state_dict(),
+            'config': config,
+            'hmm_state_dict': hmm.state_dict(),
+            'hmm_params': hmm_params,
+            'niw_prior': niw,
+            'round': r + 1,
+            'train_losses': train_losses,
+            'test_losses': test_losses,
+            'final_train_loss': train_losses[-1] if train_losses else None,
+            'final_test_loss': test_losses[-1] if test_losses else None,
+            'training_timestamp': datetime.now().isoformat(),
+        }
+        torch.save(vae_hmm_save_data, vae_hmm_path)
+        training_info['vae_hmm_paths'].append(vae_hmm_path)
+        if logger: logger.info(f"💾 Saved VAE+HMM → {vae_hmm_path}")
+        
+        # Push VAE+HMM to HuggingFace if requested
+        if push_to_hub and hub_repo_id_vae_hmm:
+            try:
+                if logger: logger.info(f"🤗 Uploading VAE+HMM round {r+1} to HuggingFace: {hub_repo_id_vae_hmm}")
+                
+                # Create model card content specific to VAE+HMM
+                vae_hmm_model_card_data = {
+                    "model_type": "MultiModalHackVAE_with_StickyHDPHMM",
+                    "round": r + 1,
+                    "total_rounds": em_rounds,
+                    "hmm_parameters": training_info['hmm_params'],
+                    "niw_parameters": training_info['niw_params'],
+                    "latent_dim": D,
+                    "num_skills": K,
+                    "base_vae_repo": pretrained_hf_repo if pretrained_hf_repo else "local_checkpoint",
+                    "final_train_loss": train_losses[-1] if train_losses else None,
+                    "final_test_loss": test_losses[-1] if test_losses else None,
+                    "m_step_epochs": m_epochs_per_round
+                }
+                
+                # Upload VAE+HMM with additional files
+                additional_files = {
+                    vae_hmm_path: f"vae_with_hmm_round{r+1}.pt"
+                }
+                
+                repo_url = save_model_to_huggingface(
+                    model=model,
+                    config=config,
+                    repo_name=hub_repo_id_vae_hmm,
+                    token=hf_token,
+                    private=hf_private,
+                    commit_message=f"Upload VAE+HMM round {r+1}/{em_rounds} (train_loss={train_losses[-1]:.4f})" if train_losses else f"Upload VAE+HMM round {r+1}/{em_rounds}",
+                    model_card_data=vae_hmm_model_card_data,
+                    upload_directly=True,
+                    additional_files=additional_files
+                )
+                if logger: logger.info(f"✅ VAE+HMM uploaded to: {repo_url}")
+                
+                # Upload training artifacts if requested
+                if hf_upload_artifacts:
+                    from .training_utils import upload_training_artifacts_to_huggingface
+                    upload_training_artifacts_to_huggingface(
+                        repo_name=hub_repo_id_vae_hmm,
+                        train_losses=train_losses,
+                        test_losses=test_losses,
+                        training_config=training_info,
+                        token=hf_token
+                    )
+                
+            except Exception as e:
+                if logger: logger.error(f"❌ Failed to upload VAE+HMM to HuggingFace: {e}")
+
+    # Final summary
+    if logger: logger.info(f"\n🎉 {'HMM-only' if hmm_only else 'EM'} training completed! Summary:")
+    if logger: logger.info(f"  - EM rounds: {em_rounds}")
+    if not hmm_only:
+        if logger: logger.info(f"  - M-step epochs per round: {m_epochs_per_round}")
+    else:
+        if logger: logger.info(f"  - M-step: Skipped (HMM-only mode)")
+    if logger: logger.info(f"  - HMM checkpoints: {len(training_info['hmm_paths'])}")
+    if not hmm_only:
+        if logger: logger.info(f"  - VAE+HMM checkpoints: {len(training_info['vae_hmm_paths'])}")
+    else:
+        if logger: logger.info(f"  - VAE+HMM checkpoints: 0 (HMM-only mode)")
+    if push_to_hub:
+        if logger: logger.info(f"  - HuggingFace repos:")
+        if hub_repo_id_hmm:
+            if logger: logger.info(f"    * HMM: https://huggingface.co/{hub_repo_id_hmm}")
+        if hub_repo_id_vae_hmm and not hmm_only:
+            if logger: logger.info(f"    * VAE+HMM: https://huggingface.co/{hub_repo_id_vae_hmm}")
+
+    return model, hmm, training_info
+
+def example_train_vae_with_hmm():
+    """
+    Example usage of train_vae_with_sticky_hmm_em function
+    """
+    import logging
+    
+    # Set up logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Example: Load pre-trained VAE from HuggingFace and train with HMM
+    model, hmm, training_info = train_vae_with_sticky_hmm_em(
+        # Load from HuggingFace
+        pretrained_hf_repo="username/nethack-vae-pretrained",
+        
+        # Or load from local checkpoint
+        # pretrained_ckpt_path="checkpoints/checkpoint_epoch_0015.pth",
+        
+        # Datasets (you need to prepare these beforehand)
+        train_dataset=None,  # Your training dataset
+        test_dataset=None,   # Your testing dataset
+        
+        # HMM parameters
+        alpha=5.0,
+        kappa=20.0,
+        gamma=5.0,
+        hmm_only=False,  # Set to True to only fit HMM without VAE fine-tuning
+        em_rounds=3,
+        m_epochs_per_round=2,
+        
+        # HuggingFace integration
+        push_to_hub=True,
+        hub_repo_id_hmm="username/nethack-hmm",
+        hub_repo_id_vae_hmm="username/nethack-vae-hmm",
+        hf_token="your_hf_token",  # Or set HF_TOKEN environment variable
+        hf_private=True,
+        
+        # Training parameters
+        use_bf16=True,
+        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+        logger=logger,
+        
+        # Additional training arguments passed to M-step
+        max_learning_rate=1e-4,  # Lower learning rate for fine-tuning
+    )
+    
+    print(f"✅ Training completed!")
+    print(f"📊 HMM checkpoints: {len(training_info['hmm_paths'])}")
+    print(f"📊 VAE+HMM checkpoints: {len(training_info['vae_hmm_paths'])}")
+    
+    return model, hmm, training_info

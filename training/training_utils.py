@@ -816,3 +816,306 @@ def create_model_demo_notebook(repo_name: str, save_path: str = "demo_notebook.i
     
     print(f"📓 Demo notebook created: {save_path}")
 
+def save_hmm_to_huggingface(
+    hmm,  # StickyHDPHMMVI
+    hmm_params,  # StickyHDPHMMParams
+    niw_prior,  # NIWPrior
+    config: VAEConfig,
+    repo_name: str,
+    round_num: int,
+    total_rounds: int,
+    token: Optional[str] = None,
+    private: bool = True,
+    commit_message: str = None,
+    base_vae_repo: str = None
+) -> str:
+    """
+    Save Sticky-HDP-HMM model to HuggingFace Hub
+    
+    Args:
+        hmm: Trained StickyHDPHMMVI model
+        hmm_params: HMM parameters
+        niw_prior: NIW prior
+        config: VAEConfig from associated VAE
+        repo_name: HuggingFace repository name
+        round_num: Current EM round number
+        total_rounds: Total number of EM rounds
+        token: HuggingFace token
+        private: Whether to create private repository
+        commit_message: Commit message
+        base_vae_repo: Base VAE repository name
+        
+    Returns:
+        Repository URL on HuggingFace Hub
+    """
+    if not HF_AVAILABLE:
+        raise ImportError("HuggingFace Hub is required. Install with: pip install huggingface_hub")
+    
+    # Login if token is provided
+    if token:
+        login(token=token)
+    
+    api = HfApi()
+    
+    try:
+        # Check if repository exists, create if not
+        try:
+            repo_info = api.repo_info(repo_id=repo_name, repo_type="model")
+            print(f"📁 Repository {repo_name} already exists")
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower() or isinstance(e, RepositoryNotFoundError):
+                print(f"🆕 Creating new repository: {repo_name}")
+                api.create_repo(repo_id=repo_name, private=private, repo_type="model")
+            else:
+                raise e
+    
+        # Prepare HMM data
+        import tempfile
+        temp_hmm_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pt')
+        hmm_data = {
+            'hmm_state_dict': hmm.state_dict(),
+            'hmm_params': hmm_params,
+            'niw_prior': niw_prior,
+            'round': round_num,
+            'total_rounds': total_rounds,
+            'config': config,
+            'training_timestamp': datetime.now().isoformat(),
+        }
+        torch.save(hmm_data, temp_hmm_file.name)
+        temp_hmm_file.close()
+        
+        # Prepare model metadata
+        model_info = {
+            "model_type": "StickyHDPHMM",
+            "framework": "PyTorch",
+            "task": "latent-dynamics-modeling",
+            "round": round_num,
+            "total_rounds": total_rounds,
+            "latent_dim": config.latent_dim,
+            "num_skills": config.skill_num,
+            "hmm_parameters": {
+                "alpha": hmm_params.alpha,
+                "kappa": hmm_params.kappa,
+                "gamma": hmm_params.gamma,
+                "K": hmm_params.K,
+                "D": hmm_params.D
+            },
+            "base_vae_repo": base_vae_repo or "unknown"
+        }
+        
+        # Create model card
+        model_card_content = f"""---
+license: mit
+language: en
+tags:
+- nethack
+- reinforcement-learning
+- hmm
+- sticky-hdp-hmm
+- latent-dynamics
+- variational-inference
+pipeline_tag: other
+---
+
+# Sticky-HDP-HMM for NetHack (Round {round_num}/{total_rounds})
+
+A Sticky Hierarchical Dirichlet Process Hidden Markov Model trained on NetHack latent representations for learning skills and temporal dynamics.
+
+## Model Description
+
+This is a Sticky-HDP-HMM model that learns discrete skills and temporal transitions in the latent space of a NetHack VAE. The model uses:
+- Sticky self-transitions to encourage temporal persistence of skills
+- Hierarchical Dirichlet Process for automatic skill discovery
+- Normal-Inverse-Wishart priors for skill emission distributions
+
+## Model Details
+
+- **Model Type**: Sticky Hierarchical Dirichlet Process Hidden Markov Model
+- **Framework**: PyTorch with Variational Inference
+- **EM Round**: {round_num} of {total_rounds}
+- **Latent Dimensions**: {model_info.get('latent_dim', 'unknown')}
+- **Maximum Skills**: {model_info.get('num_skills', 'unknown')}
+- **Base VAE**: {base_vae_repo or 'local checkpoint'}
+
+## HMM Parameters
+
+- **Alpha (DP concentration)**: {hmm_params.alpha}
+- **Kappa (sticky parameter)**: {hmm_params.kappa}
+- **Gamma (top-level DP)**: {hmm_params.gamma}
+
+## Usage
+
+```python
+from train import load_hmm_from_huggingface
+import torch
+
+# Load the HMM
+hmm, config = load_hmm_from_huggingface("{repo_name}")
+
+# The HMM can be used with a VAE for skill-based generation
+```
+
+## Training
+
+This HMM was trained using Expectation-Maximization on VAE latent representations:
+- E-step: Variational inference for posterior skill assignments
+- M-step: VAE fine-tuning with HMM skill prior
+
+## Citation
+
+If you use this model, please consider citing:
+
+```bibtex
+@misc{{nethack-hmm,
+  title={{Sticky-HDP-HMM for NetHack Skill Learning}},
+  author={{Xu Chen}},
+  year={{2025}},
+  url={{https://huggingface.co/{repo_name}}}
+}}
+```
+"""
+        
+        # Save model card
+        model_card_path = "HMM_README.md"
+        with open(model_card_path, "w") as f:
+            f.write(model_card_content)
+        
+        # Save model config
+        config_path = "HMM_config.json"
+        with open(config_path, "w") as f:
+            json.dump(model_info, f, indent=2)
+        
+        # Upload files
+        print(f"📤 Uploading HMM to {repo_name}...")
+        
+        # Upload HMM file
+        api.upload_file(
+            path_or_fileobj=temp_hmm_file.name,
+            path_in_repo=f"hmm_round{round_num}.pt",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message=commit_message or f"Upload Sticky-HDP-HMM round {round_num}/{total_rounds}"
+        )
+        
+        # Upload model card
+        api.upload_file(
+            path_or_fileobj=model_card_path,
+            path_in_repo="README.md",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message="Add HMM model card"
+        )
+        
+        # Upload config
+        api.upload_file(
+            path_or_fileobj=config_path,
+            path_in_repo="config.json",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message="Add HMM config"
+        )
+        
+        # Clean up temporary files
+        os.unlink(temp_hmm_file.name)
+        os.remove(model_card_path)
+        os.remove(config_path)
+        
+        repo_url = f"https://huggingface.co/{repo_name}"
+        print(f"✅ HMM successfully uploaded to: {repo_url}")
+        return repo_url
+        
+    except Exception as e:
+        print(f"❌ Error uploading HMM to HuggingFace: {e}")
+        # Clean up temporary file on error
+        if 'temp_hmm_file' in locals() and os.path.exists(temp_hmm_file.name):
+            os.unlink(temp_hmm_file.name)
+        raise
+
+
+def load_hmm_from_huggingface(
+    repo_name: str,
+    round_num: int = None,
+    revision_name: Optional[str] = None,
+    token: Optional[str] = None,
+    device: str = "cpu"
+) -> tuple:
+    """
+    Load Sticky-HDP-HMM model from HuggingFace Hub
+    
+    Args:
+        repo_name: HuggingFace repository name
+        round_num: Specific round number to load (if None, loads latest)
+        revision_name: Specific revision to load
+        token: HuggingFace token
+        device: Device to load the model on
+        
+    Returns:
+        Tuple of (hmm, config, hmm_params, niw_prior, metadata)
+    """
+    if not HF_AVAILABLE:
+        raise ImportError("HuggingFace Hub is required. Install with: pip install huggingface_hub")
+    
+    # Login if token is provided
+    if token:
+        login(token=token)
+    
+    try:
+        # Download config first
+        print(f"📥 Downloading HMM config from {repo_name}...")
+        config_path = hf_hub_download(
+            repo_id=repo_name,
+            filename="config.json",
+            repo_type="model",
+            revision=revision_name
+        )
+        
+        with open(config_path, "r") as f:
+            config_data = json.load(f)
+        
+        # Determine which round to load
+        if round_num is None:
+            round_num = config_data.get('round', 1)
+        
+        # Download HMM file
+        hmm_filename = f"hmm_round{round_num}.pt"
+        print(f"📥 Downloading HMM weights from {repo_name}: {hmm_filename}...")
+        
+        hmm_path = hf_hub_download(
+            repo_id=repo_name,
+            filename=hmm_filename,
+            repo_type="model",
+            revision=revision_name
+        )
+        
+        # Load HMM data
+        hmm_checkpoint = torch.load(hmm_path, map_location=device, weights_only=False)
+        
+        # Extract components
+        config = hmm_checkpoint['config']
+        hmm_params = hmm_checkpoint['hmm_params'] 
+        niw_prior = hmm_checkpoint['niw_prior']
+        
+        # Recreate HMM
+        from src.skill_space import StickyHDPHMMVI
+        hmm = StickyHDPHMMVI(
+            p=hmm_params,
+            niw_prior=niw_prior
+        )
+        hmm.load_state_dict(hmm_checkpoint['hmm_state_dict'])
+        hmm = hmm.to(device)
+        
+        print(f"✅ HMM loaded successfully from HuggingFace: {repo_name}")
+        print(f"🎯 Round: {round_num}, Device: {device}")
+        
+        metadata = {
+            'round': hmm_checkpoint.get('round', round_num),
+            'total_rounds': hmm_checkpoint.get('total_rounds', 'unknown'),
+            'training_timestamp': hmm_checkpoint.get('training_timestamp', 'unknown')
+        }
+        
+        return hmm, config, hmm_params, niw_prior, metadata
+        
+    except Exception as e:
+        print(f"❌ Error loading HMM from HuggingFace: {e}")
+        raise
+

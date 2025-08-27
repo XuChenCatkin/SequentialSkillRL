@@ -171,7 +171,7 @@ class StickyHDPHMMVI(nn.Module):
 
         # Quadratic mean term: (m-μ)^T E[Λ] (m-μ)
         # shape juggling: EΛ [K,D,D], diff [B,T,K,D]
-        quad_mean = torch.einsum('btkd,kde,btk e->btk', diff, E_Lam, diff)  # [B,T,K]
+        quad_mean = torch.einsum('btkd,kde,btke->btk', diff, E_Lam, diff)  # [B,T,K]
 
         # Trace term for diagonal covariance: Tr(EΛ diag(v))
         # = sum_i EΛ_{ii} * v_i
@@ -343,6 +343,16 @@ class StickyHDPHMMVI(nn.Module):
         """E[log Φ] row-wise from Dirichlet φ."""
         phi = self.dir.phi
         return torch.special.digamma(phi) - torch.special.digamma(phi.sum(dim=1, keepdim=True))
+    
+    def _Epi(self) -> torch.Tensor:
+        """
+        Return π* (point estimate) implied by the current stick β via stick-breaking.
+        Shape: [K]
+        """
+        with torch.no_grad():
+            beta = torch.sigmoid(self.u_beta)               # [K]
+            pi, _ = stick_breaking(beta)                    # [K]
+        return pi
 
     def _update_transitions(self, xihat: torch.Tensor, pi_star: torch.Tensor):
         """Dirichlet rows update with stickiness."""
@@ -473,3 +483,25 @@ class StickyHDPHMMVI(nn.Module):
             "phi": self.dir.phi.detach(),           # [K,K]
             "beta_u": self.u_beta.detach(),         # [K]
         }
+        
+    def get_emission_expectations(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns (μ_k, E[Λ_k], E[log|Λ_k|]) under the current NIW posteriors.
+        Shapes: μ_k:[K,D], E[Λ_k]:[K,D,D], E[log|Λ_k|]:[K]
+        """
+        return self.niw.mu, self._get_E_Lambda(), self._get_E_logdet_Lambda()
+    
+    
+    def load_posterior_params(self, params: Dict[str, torch.Tensor]) -> None:
+        """
+        Inverse of get_posterior_params(): load NIW/Dir/β parameters from disk.
+        Tensors are moved to module device/dtype; refresh emission cache.
+        """
+        dev, dt = self.mu0.device, self.mu0.dtype
+        self.niw.mu    = params["mu"].to(dev=dev, dtype=dt)
+        self.niw.kappa = params["kappa"].to(dev=dev, dtype=dt)
+        self.niw.Psi   = params["Psi"].to(dev=dev, dtype=dt)
+        self.niw.nu    = params["nu"].to(dev=dev, dtype=dt)
+        if "phi" in params:     self.dir.phi.copy_(params["phi"].to(dev=dev, dtype=dt))
+        if "beta_u" in params:  self.u_beta.data.copy_(params["beta_u"].to(dev=dev, dtype=dt))
+        self._cache_fresh = False

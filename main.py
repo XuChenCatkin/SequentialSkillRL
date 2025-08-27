@@ -3,7 +3,7 @@ import sys
 import torch
 from datetime import datetime
 from src.data_collection import NetHackDataCollector, BLStatsAdapter
-from training.train import train_multimodalhack_vae, VAEConfig
+from training.train import train_multimodalhack_vae, VAEConfig, load_datasets
 from utils.analysis import create_visualization_demo, analyze_glyph_char_color_pairs, plot_glyph_char_color_pairs_from_saved
 
 if __name__ == "__main__":
@@ -293,58 +293,69 @@ if __name__ == "__main__":
         )
 
         print(f"\n🧪 Starting train_multimodalhack_vae...")
-        model, train_losses, test_losses = train_multimodalhack_vae(
+        
+        # Load datasets first
+        print("📊 Loading datasets...")
+        train_dataset, test_dataset = load_datasets(
             train_file=train_file,
             test_file=test_file,
-            config=vae_config,
-            epochs=15,          
+            dbfilename='ttyrecs.db',
             batch_size=batch_size,
-            sequence_size=sequence_size,    
-            max_learning_rate=1e-3,
+            sequence_size=sequence_size,
             training_batches=max_training_batches,
             testing_batches=max_testing_batches,
             max_training_batches=max_training_batches,
             max_testing_batches=max_testing_batches,
-            save_path="models/nethack-vae.pth",
-            device='cuda' if torch.cuda.is_available() else 'cpu',
-            use_bf16=False,  # Enable BF16 mixed precision training
-            data_cache_dir="data_cache",
-            force_recollect=False,  # Use the data we just collected
-            shuffle_batches=True,  # Shuffle training batches each epoch for better training
-            shuffle_within_batch=True,  # Shuffle within each batch for more variety
-            
-            custom_kl_beta_function = lambda init, end, progress: init + (end - init) * min(progress, 0.2) * 5.0, 
-            
-            # Early stopping settings
-            early_stopping = False,
-            early_stopping_patience = 3,
-            early_stopping_min_delta = 0.01,
-
-            # Enable checkpointing
-            save_checkpoints=True,
-            checkpoint_dir="checkpoints",
-            save_every_n_epochs=1,
-            keep_last_n_checkpoints=2,
-            
-            # Wandb integration example
-            use_wandb=True,
-            wandb_project="nethack-vae",
-            wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
-            wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-            wandb_tags=["nethack", "vae"],
-            wandb_notes="Full VAE training run",
-            log_every_n_steps=5,  # Log every 5 steps
-            log_model_architecture=True,
-            log_gradients=True,
-            
-            # HuggingFace integration example
-            upload_to_hf=True, 
-            hf_repo_name="CatkinChen/nethack-vae",
-            hf_upload_directly=True,  # Upload directly without extra local save
-            hf_upload_checkpoints=True,  # Also upload checkpoints
-            hf_model_card_data=hf_model_card_data
+            data_cache_dir=data_cache_dir,
+            force_recollect=False
         )
+        
+        if sys.argv[2] == "vae_only":
+            # Train with pre-loaded datasets
+            model, train_losses, test_losses = train_multimodalhack_vae(
+                train_dataset=train_dataset,
+                test_dataset=test_dataset,
+                config=vae_config,
+                epochs=15,          
+                max_learning_rate=1e-3,
+                save_path="models/nethack-vae.pth",
+                device='cuda' if torch.cuda.is_available() else 'cpu',
+                use_bf16=False,  # Enable BF16 mixed precision training
+                shuffle_batches=True,  # Shuffle training batches each epoch for better training
+                shuffle_within_batch=True,  # Shuffle within each batch for more variety
+                
+                custom_kl_beta_function = lambda init, end, progress: init + (end - init) * min(progress, 0.2) * 5.0, 
+                
+                # Early stopping settings
+                early_stopping = False,
+                early_stopping_patience = 3,
+                early_stopping_min_delta = 0.01,
 
-        print(f"\n🎉 Full VAE training run completed successfully!")
-        print(f"   📈 Train losses: {train_losses}")
-        print(f"   📈 Test losses: {test_losses}")
+                # Enable checkpointing
+                save_checkpoints=True,
+                checkpoint_dir="checkpoints",
+                save_every_n_epochs=1,
+                keep_last_n_checkpoints=2,
+                
+                # Wandb integration example
+                use_wandb=True,
+                wandb_project="nethack-vae",
+                wandb_entity="xchen-catkin-ucl",  # Replace with your wandb username
+                wandb_run_name=f"vae-test-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                wandb_tags=["nethack", "vae"],
+                wandb_notes="Full VAE training run",
+                log_every_n_steps=5,  # Log every 5 steps
+                log_model_architecture=True,
+                log_gradients=True,
+                
+                # HuggingFace integration example
+                upload_to_hf=True, 
+                hf_repo_name="CatkinChen/nethack-vae",
+                hf_upload_directly=True,  # Upload directly without extra local save
+                hf_upload_checkpoints=True,  # Also upload checkpoints
+                hf_model_card_data=hf_model_card_data
+            )
+
+            print(f"\n🎉 Full VAE training run completed successfully!")
+            print(f"   📈 Train losses: {train_losses}")
+            print(f"   📈 Test losses: {test_losses}")
