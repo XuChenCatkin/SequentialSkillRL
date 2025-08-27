@@ -96,7 +96,7 @@ if __name__ == "__main__":
             if 'test_reconstruction_results' in results:
                 print(f"🎨 Test reconstructions: {results['test_reconstruction_results']['num_samples']} samples")
             if 'latent_analysis' in results:
-                print(f"🧠 Latent analysis: {len(results['latent_analysis']['latent_vectors'])} total samples analyzed")
+                print(f"🧠 Latent analysis: {len(results['latent_analysis']['mu'])} total samples analyzed")
                 
         except Exception as e:
             print(f"❌ Demo failed: {e}")

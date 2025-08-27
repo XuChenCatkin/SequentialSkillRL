@@ -1,332 +1,475 @@
-# sticky_hdp_hmm.py
-import math
+# ===== skill_space.py ======================================================
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-digamma = torch.special.digamma
-lgamma  = torch.special.gammaln
-EPS     = 1e-9
+# --------- helpers ------------------------------------------------------------
 
+def stick_breaking(beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    beta: [K] with elements in (0,1)
+    returns pi: [K], rest: scalar (pi_{K+1})
+    """
+    K = beta.numel()
+    one = torch.ones(1, device=beta.device, dtype=beta.dtype)
+    cprod = torch.cumprod(torch.cat([one, 1 - beta[:-1]], dim=0), dim=0)  # [K]
+    pi = beta * cprod  # [K]
+    rest = torch.prod(1 - beta)
+    return pi, rest
+
+def chol_inv_logdet(S: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    S: [..., D, D] SPD
+    returns (S^{-1}, log|S|)
+    """
+    L = torch.linalg.cholesky(S)                             # [..., D, D]
+    logdet = 2.0 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)
+    inv = torch.cholesky_inverse(L)                          # [..., D, D]
+    return inv, logdet
+
+# --------- priors/posteriors containers --------------------------------------
 
 @dataclass
-class StickyHDPHMMConfig:
-    K: int                      # truncation (explicit states); we also allocate K+1 remainder
-    D: int                      # latent dimensionality
-    alpha: float = 6.0          # DP concentration
-    kappa: float = 4.0          # stickiness
-    gamma: float = 1.0          # top-level GEM mass
-    # NIW hyperparams
-    mu0: float = 0.0
-    kappa0: float = 1e-2
-    nu0: int = 32               # must be > D-1; set larger than D for stability
-    psi0_scale: float = 1.0     # Ψ0 = psi0_scale * I
-    # Optim
-    beta_lr: float = 5e-2       # lr for β (stick weights) optimiser
+class NIWPrior:
+    mu0: torch.Tensor        # [D]
+    kappa0: float
+    Psi0: torch.Tensor       # [D,D] (scale matrix of IW)
+    nu0: float               # > D-1
+
+@dataclass
+class NIWPosterior:
+    mu: torch.Tensor         # [K,D]
+    kappa: torch.Tensor      # [K]
+    Psi: torch.Tensor        # [K,D,D]
+    nu: torch.Tensor         # [K]
+
+@dataclass
+class DirPosterior:
+    # Row-wise parameters for q(Φ_k) = Dir(φ_k), φ_k in R^K
+    phi: torch.Tensor        # [K,K]
+
+@dataclass
+class StickyHDPHMMParams:
+    alpha: float = 4.0
+    kappa: float = 4.0
+    gamma: float = 1.0           # Beta(1, gamma) on stick v_k
+    K: int = 16
+    D: int = 64
     device: str = "cpu"
+    dtype: torch.dtype = torch.float32
 
+# --------- main class ---------------------------------------------------------
 
-class StickyHDPHMM(nn.Module):
+class StickyHDPHMMVI(nn.Module):
     """
-    Truncated sticky-HDP-HMM with NIW emissions; mean-field VI with online updates.
-    Matches the derivations in your screenshots (B.1–B.4).
+    Sticky HDP-HMM with Gaussian emissions, NIW prior, truncated to K.
+    Supports encoder covariance of the form diag(sigma^2) + F F^T (optional).
     """
-    def __init__(self, cfg: StickyHDPHMMConfig):
+
+    def __init__(self, p: StickyHDPHMMParams, niw_prior: NIWPrior):
         super().__init__()
-        self.cfg = cfg
-        self.K = cfg.K
-        self.Kp1 = cfg.K + 1
-        self.D = cfg.D
-        self.alpha = cfg.alpha
-        self.kappa = cfg.kappa
-        self.gamma = cfg.gamma
-        self.device = torch.device(cfg.device)
+        self.p = p
 
-        # ----- Global sticks β_k (k=1..K) as unconstrained u_k parameters -----
-        # β_k = sigmoid(u_k); π* constructed via stick-breaking
-        u0 = torch.full((self.K,), -math.log(self.K), dtype=torch.float32)  # small sticks initially
-        self.u = nn.Parameter(u0)
+        D, K = p.D, p.K
+        dev, dt = p.device, p.dtype
 
-        # ----- Variational rows q(Φ_k) ~ Dir(φ̂_k) for k=1..K (each length K+1) -----
-        # start from prior α π* + κ δ (we’ll fill π* after init)
-        self.phi_hat = nn.Parameter(torch.ones(self.K, self.Kp1), requires_grad=False)
+        # --- variational params ---
+        # Emission NIW posteriors
+        self.niw = NIWPosterior(
+            mu=torch.zeros(K, D, device=dev, dtype=dt),
+            kappa=torch.full((K,), niw_prior.kappa0, device=dev, dtype=dt),
+            Psi=torch.stack([niw_prior.Psi0.clone().to(dev=dev, dtype=dt) for _ in range(K)], dim=0),
+            nu=torch.full((K,), niw_prior.nu0, device=dev, dtype=dt),
+        )
 
-        # ----- Variational NIW parameters for emissions (k = 1..K+1) -----
-        I = torch.eye(self.D, dtype=torch.float32, device=self.device)
-        Psi0 = cfg.psi0_scale * I
-        # store as buffers so we can "online add" sufficient stats by direct assignment
-        self.register_buffer("mu0", torch.full((self.D,), cfg.mu0))
-        self.register_buffer("kappa0", torch.tensor(cfg.kappa0))
-        self.register_buffer("nu0", torch.tensor(max(cfg.nu0, self.D + 2)))  # safety
-        self.register_buffer("Psi0", Psi0)
+        # Transition posteriors q(Φ_k)=Dir(φ_k)
+        self.dir = DirPosterior(
+            phi=torch.full((K, K), fill_value=p.alpha / K, device=dev, dtype=dt)
+        )
 
-        # initialise posteriors with prior
-        self.register_buffer("kappa_hat", torch.full((self.Kp1,), float(cfg.kappa0)))
-        self.register_buffer("nu_hat",    torch.full((self.Kp1,), float(max(cfg.nu0, self.D + 2))))
-        self.register_buffer("mu_hat",    self.mu0.expand(self.Kp1, self.D).clone())
-        self.register_buffer("Psi_hat",   Psi0.expand(self.Kp1, self.D, self.D).clone())
+        # Global sticks (point estimate): β unconstrained params u -> σ(u)
+        self.u_beta = nn.Parameter(torch.zeros(K, device=dev, dtype=dt))
 
-        # cached π* from current β
-        self._update_pi_from_u()
+        # Cache: precision expectations and Elog|Λ|
+        self._cache_fresh = False
+        self._E_Lambda = None      # [K,D,D]
+        self._E_logdet_Lambda = None  # [K]
 
-        # set initial Dirichlet params from the prior
-        with torch.no_grad():
-            for k in range(self.K):
-                ph = self.alpha * self.pi_star.clone()
-                ph[k] = ph[k] + self.kappa
-                self.phi_hat[k] = torch.clamp(ph, min=1e-3)
+        # Save NIW prior
+        self.register_buffer("mu0", niw_prior.mu0.to(dev=dev, dtype=dt))
+        self.kappa0 = float(niw_prior.kappa0)
+        self.register_buffer("Psi0", niw_prior.Psi0.to(dev=dev, dtype=dt))
+        self.nu0 = float(niw_prior.nu0)
 
-        # optimiser only for u (β sticks)
-        self.beta_optim = torch.optim.Adam([self.u], lr=cfg.beta_lr)
+    # ---- expectations for emissions -----------------------------------------
+    def _refresh_emission_cache(self):
+        """Compute E[Λ_k] and E[log|Λ_k|] under NIW posteriors."""
+        K, D = self.p.K, self.p.D
+        Psi = self.niw.Psi                        # [K,D,D]
+        nu = self.niw.nu.view(K, 1, 1)            # [K,1,1]
 
-    # ---------- helpers ----------
-    def _beta_from_u(self) -> torch.Tensor:
-        return torch.sigmoid(self.u)  # (K,)
-    def _pi_from_beta(self, beta: torch.Tensor) -> torch.Tensor:
-        # stick-breaking to π* of length K+1 (remainder)
-        K = beta.shape[0]
-        remain = torch.cumprod(1 - beta, dim=0)
-        pi = torch.empty(K + 1, device=beta.device, dtype=beta.dtype)
-        pi[:-1] = beta * torch.cat([torch.ones(1, device=beta.device, dtype=beta.dtype), remain[:-1]], dim=0)
-        pi[-1]  = remain[-1]
-        return torch.clamp(pi, min=EPS)
-    def _update_pi_from_u(self):
-        with torch.no_grad():
-            self.beta = self._beta_from_u().detach()
-            self.pi_star = self._pi_from_beta(self.beta)  # (K+1,)
+        # E[Λ] = nu * Psi^{-1}
+        Psi_inv, logdet_Psi = chol_inv_logdet(Psi)
+        E_Lambda = nu * Psi_inv                   # [K,D,D]
 
-    # expected log A row from Dirichlet params
-    @staticmethod
-    def dirichlet_expected_log_row(phi_row: torch.Tensor) -> torch.Tensor:
-        # phi_row: (K+1,)
-        return digamma(phi_row) - digamma(phi_row.sum(-1, keepdim=True))
+        # E[log |Λ|] = sum_i ψ((ν+1-i)/2) + D log 2 - log|Ψ|
+        i = torch.arange(1, D + 1, device=Psi.device, dtype=Psi.dtype).view(1, D)
+        E_logdet = torch.sum(torch.special.digamma((self.niw.nu.view(K, 1) + 1 - i) / 2.0), dim=1)
+        E_logdet = E_logdet + D * torch.log(torch.tensor(2.0, device=Psi.device, dtype=Psi.dtype)) - logdet_Psi
 
-    # NIW expectations used in B_tk
-    def _E_log_det_Sigma(self) -> torch.Tensor:
-        # E[log |Σ_k|] under NIW posterior
-        #  sum_d ψ((ν+1-d)/2) - D log 2 - log |Ψ|
-        D = self.D
-        v = self.nu_hat  # (K+1,)
-        # log |Ψ_hat|
-        logdetPsi = torch.linalg.slogdet(self.Psi_hat)[1]  # (K+1,)
-        terms = torch.stack([digamma((v + 1.0 - d) * 0.5) for d in range(1, D + 1)], dim=-1).sum(-1)
-        return terms - D * math.log(2.0) - logdetPsi  # (K+1,)
+        self._E_Lambda = E_Lambda
+        self._E_logdet_Lambda = E_logdet
+        self._cache_fresh = True
 
-    def _E_Lambda(self) -> torch.Tensor:
-        # E[Σ^{-1}] = ν Ψ^{-1}
-        # compute inverse of Ψ_hat for all k
-        invPsi = torch.linalg.inv(self.Psi_hat)  # (K+1,D,D)
-        v = self.nu_hat.view(-1, 1, 1)
-        return v * invPsi  # (K+1,D,D)
+    def _get_E_Lambda(self):
+        if not self._cache_fresh:
+            self._refresh_emission_cache()
+        return self._E_Lambda
 
-    # ---------- E-step: emissions, forward-backward ----------
-    def _emission_loglik(self, z_mu: torch.Tensor, z_var: torch.Tensor) -> torch.Tensor:
+    def _get_E_logdet_Lambda(self):
+        if not self._cache_fresh:
+            self._refresh_emission_cache()
+        return self._E_logdet_Lambda
+
+    # ---- expected emission log-likelihood B_tk -------------------------------
+    def expected_emission_loglik(
+        self,
+        mu_t: torch.Tensor,                 # [T,D] or [B,T,D]
+        diag_var_t: Optional[torch.Tensor] = None,  # [T,D] or [B,T,D]
+        F_t: Optional[torch.Tensor] = None,         # [T,D,R] or [B,T,D,R]
+        mask: Optional[torch.Tensor] = None         # [T] or [B,T] (0=ignore)
+    ) -> torch.Tensor:
         """
-        z_mu: (T,D)   encoder means
-        z_var:(T,D)   encoder diag variances
-        returns log_B: (T, K+1)  E_q[log N(z_t | μ_k, Σ_k)]
+        Returns log B: [T,K] (or [B,T,K]) with E[log p(z_t|h_t=k)].
+        Uses: Tr(E[Λ] Σ_q) + (m_t-μ_k)^T E[Λ] (m_t-μ_k) and E[log|Λ|].
         """
-        T, D = z_mu.shape
-        E_logdet = self._E_log_det_Sigma()                     # (K+1,)
-        Lambda   = self._E_Lambda()                            # (K+1,D,D)
-        mu_hat   = self.mu_hat                                  # (K+1,D)
-        kappa    = self.kappa_hat                               # (K+1,)
-        nu       = self.nu_hat                                  # (K+1,)
+        K, D = self.p.K, self.p.D
+        E_Lam = self._get_E_Lambda()               # [K,D,D]
+        E_logdet = self._get_E_logdet_Lambda()     # [K]
+        dev = mu_t.device
 
-        # Precompute Λ diagonal for the diag term
-        Lambda_diag = torch.diagonal(Lambda, dim1=-2, dim2=-1)  # (K+1,D)
+        # Bring to [B,T,...]
+        if mu_t.dim() == 2:
+            mu_t = mu_t.unsqueeze(0)
+            if diag_var_t is not None: diag_var_t = diag_var_t.unsqueeze(0)
+            if F_t is not None: F_t = F_t.unsqueeze(0)
+            if mask is not None: mask = mask.unsqueeze(0)
 
-        # trace(Λ * diag(z_var)) term: (T,K+1)
-        t1 = torch.einsum('kd,td->tk', Lambda_diag, z_var)
+        B, T, D_ = mu_t.shape
+        assert D_ == D
 
-        # (z - μ_hat)^T Λ (z - μ_hat) term: (T,K+1)
-        diff = z_mu.unsqueeze(1) - mu_hat.unsqueeze(0)          # (T,K+1,D)
-        t2 = torch.einsum('tki,kij,tkj->tk', diff, Lambda, diff)
+        # Moments of q(z_t): E[z] and Σ_q
+        m = mu_t                                     # [B,T,D]
+        diagv = (torch.zeros_like(m) if diag_var_t is None else diag_var_t).clamp_min(0.0)  # [B,T,D]
 
-        # NIW mean-uncertainty correction: Tr(Λ * Ψ_hat/(κ̂(ν-D-1))) = D * ν / (κ̂ (ν-D-1))
-        denom = torch.clamp(nu - D - 1.0, min=1.0)
-        t3 = (D * nu / (kappa * denom)).unsqueeze(0).expand(T, -1)  # (T,K+1)
+        # diff_{b,t,k} = m_{b,t} - mu_k
+        diff = m.unsqueeze(2) - self.niw.mu.unsqueeze(0).unsqueeze(0)     # [B,T,K,D]
 
-        quad = t1 + t2 + t3
+        # Quadratic mean term: (m-μ)^T E[Λ] (m-μ)
+        # shape juggling: EΛ [K,D,D], diff [B,T,K,D]
+        quad_mean = torch.einsum('btkd,kde,btk e->btk', diff, E_Lam, diff)  # [B,T,K]
 
-        log_B = -0.5 * (E_logdet.unsqueeze(0) + quad + D * math.log(2 * math.pi))
-        return log_B  # (T,K+1)
+        # Trace term for diagonal covariance: Tr(EΛ diag(v))
+        # = sum_i EΛ_{ii} * v_i
+        ELam_diag = torch.diagonal(E_Lam, dim1=-2, dim2=-1)               # [K,D]
+        trace_diag = torch.einsum('btd,kd->btk', diagv, ELam_diag)        # [B,T,K]
 
-    def _expected_log_A(self) -> torch.Tensor:
-        # (K,K+1) rows for A; last column exists, last row doesn't exist (no row for remainder)
-        rows = []
-        for k in range(self.K):
-            rows.append(self.dirichlet_expected_log_row(self.phi_hat[k]))
-        return torch.stack(rows, dim=0)  # (K,K+1)
+        # Low-rank part: Tr(EΛ F F^T) = sum_r f_r^T EΛ f_r
+        if F_t is not None:
+            # F: [B,T,D,R]; compute (EΛ @ F) -> [K,D,R] then f·(...) per (b,t)
+            # We have per (b,t) a matrix F_{bt} [D,R]
+            R = F_t.size(-1)
+            trace_lr = []
+            ELam = E_Lam  # [K,D,D]
+            for r in range(R):
+                f_r = F_t[..., r]                           # [B,T,D]
+                # f_r^T EΛ f_r -> [B,T,K]
+                term = torch.einsum('btd,kde,bte->btk', f_r, ELam, f_r)
+                trace_lr.append(term)
+            trace_lr = torch.stack(trace_lr, dim=0).sum(0)  # [B,T,K]
+        else:
+            trace_lr = 0.0
 
-    def _forward_backward(self, log_B: torch.Tensor, log_pi: torch.Tensor,
-                          log_A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        quad = quad_mean + trace_diag + trace_lr            # [B,T,K]
+
+        const = (-0.5 * self.p.D) * torch.log(torch.tensor(2.0 * torch.pi, device=dev, dtype=mu_t.dtype))
+        logB = 0.5 * self._get_E_logdet_Lambda().view(1, 1, K) + const - 0.5 * quad  # [B,T,K]
+
+        if mask is not None:
+            msk = mask.to(dtype=mu_t.dtype).view(B, T, 1)   # 1=keep, 0=ignore
+            # Put -inf where masked out, so FB ignores them
+            logB = torch.where(msk > 0, logB, torch.full_like(logB, float('-inf')))
+
+        return logB.squeeze(0) if logB.size(0) == 1 else logB  # [T,K] or [B,T,K]
+
+    # ---- forward-backward ----------------------------------------------------
+    def forward_backward(
+        self,
+        log_pi: torch.Tensor,         # [K]
+        ElogA: torch.Tensor,          # [K,K] (row-wise E[log Φ_kj])
+        logB: torch.Tensor,           # [T,K]
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """
-        log_B: (T,K+1), log_pi: (K+1,), log_A: (K,K+1)
         Returns:
-            gamma: (T,K+1)   posteriors q(h_t=k)
-            xi:    (T-1,K,K+1) expected transitions q(h_t=j, h_{t+1}=k)
-            logZ:  scalar normaliser
+          rhat: [T,K]     (state marginals)
+          xihat: [T-1,K,K] (pairwise transitions)
+          ll: scalar log-likelihood
         """
-        T, Kp1 = log_B.shape
-        K = Kp1 - 1
+        T, K = logB.shape
+        # forward
+        alpha = torch.empty(T, K, device=logB.device, dtype=logB.dtype)
+        logZ = torch.zeros(T, device=logB.device, dtype=logB.dtype)
 
-        # forward (log-space)
-        log_alpha = torch.empty(T, Kp1, device=log_B.device)
-        log_alpha[0] = log_pi + log_B[0]
+        a0 = log_pi + logB[0]                         # [K]
+        logZ[0] = torch.logsumexp(a0, dim=-1)
+        alpha[0] = a0 - logZ[0]
+
         for t in range(1, T):
-            # for each dest k, sum over previous i: logsumexp(log_alpha[t-1,i] + log_A[i,k])
-            trans = log_alpha[t - 1, :K].unsqueeze(-1) + log_A  # (K, K+1)
-            msg = torch.logsumexp(trans, dim=0)                 # (K+1,)
-            # allow transitions from remainder too by treating its row as π* (common trick)
-            # i.e., α_{t-1,K+1} + log π* + ...
-            msg = torch.logaddexp(msg, log_alpha[t - 1, -1] + log_pi)  # (K+1,)
-            log_alpha[t] = log_B[t] + msg
+            # log p(h_t=j | y_1..t-1) = logsum_i alpha_{t-1,i} + ElogA_{i,j}
+            m = alpha[t-1].unsqueeze(1) + ElogA       # [K,K]
+            pred = torch.logsumexp(m, dim=0)          # [K]
+            a = pred + logB[t]                        # [K]
+            logZ[t] = torch.logsumexp(a, dim=-1)
+            alpha[t] = a - logZ[t]
 
-        logZ = torch.logsumexp(log_alpha[-1], dim=-1)
+        ll = logZ.sum().item()
 
-        # backward (log-space)
-        log_beta = torch.zeros_like(log_alpha)
-        for t in range(T - 2, -1, -1):
-            # next step messages
-            tmp = log_B[t + 1].unsqueeze(0).expand(K, -1) + log_beta[t + 1].unsqueeze(0).expand(K, -1)  # (K,K+1)
-            # transitions from i→k through next observation
-            log_beta[t, :K] = torch.logsumexp(log_A + tmp, dim=1)  # sum over k
-            # remainder row ~ π*
-            log_beta[t, -1] = torch.logsumexp(log_pi + log_B[t + 1] + log_beta[t + 1], dim=-1)
+        # backward
+        beta = torch.zeros_like(alpha)
+        for t in reversed(range(T-1)):
+            # beta_t(i) = logsum_j ElogA_{i,j} + logB_{t+1,j} + beta_{t+1}(j)
+            b = ElogA + logB[t+1].unsqueeze(0) + beta[t+1].unsqueeze(0)  # [K,K]
+            beta[t] = torch.logsumexp(b, dim=1) - logZ[t+1]
 
-        # marginals γ
-        log_gamma = log_alpha + log_beta - logZ
-        gamma = torch.softmax(log_gamma, dim=-1)  # (T,K+1)
+        # posteriors
+        rhat_log = alpha + beta
+        rhat_log = rhat_log - torch.logsumexp(rhat_log, dim=1, keepdim=True)
+        rhat = torch.exp(rhat_log)
 
-        # pairwise ξ (t=0..T-2, i in 1..K, k in 1..K+1)
-        xi = torch.empty(T - 1, K, Kp1, device=log_B.device)
-        for t in range(T - 1):
-            temp = (log_alpha[t, :K].unsqueeze(-1) +
-                    log_A +
-                    log_B[t + 1].unsqueeze(0) +
-                    log_beta[t + 1].unsqueeze(0))
-            # add remainder source: i=K+1 row ≈ π*
-            temp = torch.logaddexp(temp, log_pi + log_B[t + 1] + log_beta[t + 1])
-            temp = temp - torch.logsumexp(temp.reshape(-1), dim=0)
-            xi[t] = torch.exp(temp)
+        # pairwise posteriors
+        xihat = torch.empty(T-1, K, K, device=logB.device, dtype=logB.dtype)
+        for t in range(T-1):
+            x = (alpha[t].unsqueeze(1) + ElogA + logB[t+1].unsqueeze(0) + beta[t+1].unsqueeze(0))  # [K,K]
+            x = x - torch.logsumexp(x.view(-1), dim=0)
+            xihat[t] = torch.exp(x)
 
-        return gamma, xi, logZ
+        return rhat, xihat, ll
 
-    # ---------- M-step / variational updates ----------
-    @torch.no_grad()
-    def _update_rows_dirichlet(self, xi: torch.Tensor):
-        # xi: (T-1,K,K+1); Dirichlet params φ̂_kj = α π*_j + κ δ_{jk} + sum_t ξ̂_{t,kj}
-        add = xi.sum(dim=0)  # (K,K+1)
-        for k in range(self.K):
-            base = self.alpha * self.pi_star.clone()
-            base[k] = base[k] + self.kappa
-            self.phi_hat[k] = torch.clamp(base + add[k], min=1e-3)
-
-    @torch.no_grad()
-    def _update_emissions_NIW(self, z_mu: torch.Tensor, z_var: torch.Tensor, gamma: torch.Tensor):
+    # ---- M-step: NIW & transition -------------------------------------------
+    def _moments_from_encoder(
+        self, mu_t: torch.Tensor, rhat: torch.Tensor,
+        diag_var_t: Optional[torch.Tensor] = None,
+        F_t: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Conjugate NIW updates using sufficient stats weighted by gamma.
+        Returns:
+          Nk: [K], M1: [K,D], M2: [K,D,D]
         """
-        T = z_mu.size(0)
-        # responsibilities per state
-        Nk = gamma.sum(dim=0)                           # (K+1,)
-        # first moment
-        S1 = torch.einsum('tk,td->kd', gamma, z_mu)     # (K+1,D)
-        # second moment: E[zz^T] = diag(var) + mu mu^T
-        S2 = torch.einsum('tk,td,te->kde', gamma, z_mu, z_mu)  # (K+1,D,D)
-        S2 = S2 + torch.einsum('tk,td->kd', gamma, z_var).unsqueeze(-1) * torch.eye(self.D, device=z_mu.device)
+        if mu_t.dim() == 3:
+            # [B,T,D]
+            mu_t = mu_t.reshape(-1, mu_t.size(-1))
+            if diag_var_t is not None:
+                diag_var_t = diag_var_t.reshape(-1, diag_var_t.size(-1))
+            if F_t is not None:
+                F_t = F_t.reshape(-1, F_t.size(-2), F_t.size(-1))  # [BT,D,R]
 
-        # updates (B.3 bottom)
-        self.kappa_hat = self.kappa0 + Nk
-        self.nu_hat    = self.nu0 + Nk
+        T, D = mu_t.shape
+        K = self.p.K
+        rhat = rhat.reshape(-1, K)             # [T,K]
 
-        mu_num = self.kappa0 * self.mu0.unsqueeze(0) + S1
-        self.mu_hat = mu_num / self.kappa_hat.unsqueeze(-1)
+        Nk = rhat.sum(dim=0)                   # [K]
+        M1 = torch.einsum('tk,td->kd', rhat, mu_t)  # [K,D]
 
-        # Ψ̂ = Ψ0 + S2 + κ0 μ0 μ0^T − κ̂ μ̂ μ̂^T
-        mu0_outer = torch.einsum('d,e->de', self.mu0, self.mu0) * self.kappa0
-        mu_hat_outer = torch.einsum('kd,ke->kde', self.mu_hat, self.mu_hat) * self.kappa_hat.unsqueeze(-1).unsqueeze(-1)
-        self.Psi_hat = self.Psi0.unsqueeze(0) + S2 + mu0_outer.unsqueeze(0) - mu_hat_outer
+        # E[z z^T] for each t: diag(var) + μμ^T + F F^T
+        if diag_var_t is None:
+            diag_var_t = torch.zeros_like(mu_t)
 
-        # numerical safety
-        for k in range(self.Kp1):
-            # make Ψ̂ PD
-            self.Psi_hat[k] = 0.5 * (self.Psi_hat[k] + self.Psi_hat[k].T)
-            # add tiny jitter if needed
-            self.Psi_hat[k] = self.Psi_hat[k] + 1e-6 * torch.eye(self.D, device=self.Psi_hat.device)
+        # accumulate M2 = sum_t r_tk E[zz^T]
+        M2 = torch.zeros(K, D, D, device=mu_t.device, dtype=mu_t.dtype)
 
-    # ----- ELBO restricted to β (B.4), and one gradient step on u -----
-    def _beta_elbo(self, gamma1: torch.Tensor) -> torch.Tensor:
+        # diagonal contribution
+        for k in range(K):
+            # sum_t r_tk * diag(var_t)
+            w_diag = (rhat[:, k].unsqueeze(1) * diag_var_t).sum(dim=0)  # [D]
+            M2[k] += torch.diag(w_diag)
+
+        # mean outer products
+        # sum_t r_tk * μ_t μ_t^T
+        M2 += torch.einsum('tk,td,te->kde', rhat, mu_t, mu_t)
+
+        # low-rank contribution
+        if F_t is not None:
+            # For each t, E[FF^T] = F F^T
+            # sum_t r_tk * F_t F_t^T
+            R = F_t.size(-1)
+            for r in range(R):
+                f = F_t[..., r]  # [T,D]
+                M2 += torch.einsum('tk,td,te->kde', rhat, f, f)
+
+        return Nk, M1, M2
+
+    def _update_NIW(self, Nk, M1, M2):
+        """Closed-form NIW updates from soft moments."""
+        K, D = self.p.K, self.p.D
+        mu0 = self.mu0
+        k0 = self.kappa0
+        Psi0 = self.Psi0
+        nu0 = self.nu0
+
+        k_hat = k0 + Nk                            # [K]
+        mu_hat = (k0 * mu0.unsqueeze(0) + M1) / k_hat.unsqueeze(1)  # [K,D]
+        nu_hat = nu0 + Nk                           # [K]
+        # Ψ̂ = Ψ0 + M2 + κ0 μ0 μ0^T − κ̂ μ̂ μ̂^T
+        Psi_hat = Psi0.unsqueeze(0).expand(K, D, D).clone()
+        Psi_hat = Psi_hat + M2 + k0 * torch.einsum('d,e->de', mu0, mu0).unsqueeze(0) - \
+                  torch.einsum('k,kd,ke->kde', k_hat, mu_hat, mu_hat)
+
+        # Ensure SPD numerically (tiny jitter)
+        eps = 1e-6
+        I = torch.eye(D, device=Psi_hat.device, dtype=Psi_hat.dtype)
+        Psi_hat = Psi_hat + eps * I.unsqueeze(0)
+
+        self.niw.mu = mu_hat
+        self.niw.kappa = k_hat
+        self.niw.Psi = Psi_hat
+        self.niw.nu = nu_hat
+        self._cache_fresh = False
+
+    def _ElogA(self) -> torch.Tensor:
+        """E[log Φ] row-wise from Dirichlet φ."""
+        phi = self.dir.phi
+        return torch.special.digamma(phi) - torch.special.digamma(phi.sum(dim=1, keepdim=True))
+
+    def _update_transitions(self, xihat: torch.Tensor, pi_star: torch.Tensor):
+        """Dirichlet rows update with stickiness."""
+        K = self.p.K
+        alpha, kappa = self.p.alpha, self.p.kappa
+        # counts
+        counts = xihat.sum(dim=0)                      # [K,K]
+        prior_rows = alpha * pi_star.view(1, K) + kappa * torch.eye(K, device=counts.device, dtype=counts.dtype)
+        self.dir.phi = prior_rows + counts
+
+    # ---- π-step: optimize beta (point estimate) ------------------------------
+    def _optimize_pi(self, rhat: torch.Tensor) -> torch.Tensor:
         """
-        ELBO restricted to β (Eq. B.4). gamma1 = q(h1=k) = gamma[0].
+        Maximize the β-restricted ELBO:
+            L(β) = E_q[log p(Φ | π)] + E_q[log p(h1 | π)] + log p(β)
+        with π = SB(β). Uses autograd on u_beta.
+        Returns π* (detached).
         """
-        beta = torch.sigmoid(self.u)                  # (K,)
-        pi   = self._pi_from_beta(beta)               # (K+1,)
-        # refresh cache for outside users
-        self.pi_star = pi.detach()
+        K = self.p.K
+        alpha, kappa, gamma = self.p.alpha, self.p.kappa, self.p.gamma
+        phi = self.dir.phi.detach()
+        ElogA = torch.special.digamma(phi) - torch.special.digamma(phi.sum(1, keepdim=True))  # [K,K]
+        r1 = rhat[0]  # [K]
 
-        # First term: (γ-1) ∑ log(1-β_k)
-        term1 = (self.gamma - 1.0) * torch.log1p(-beta + EPS).sum()
+        opt = torch.optim.Adam([self.u_beta], lr=0.05)
+        for _ in range(200):
+            opt.zero_grad()
+            beta = torch.sigmoid(self.u_beta)              # [K]
+            pi, _ = stick_breaking(beta)                   # [K]
+            # prior rows a_k = α π + κ δ_k
+            a = alpha * pi.unsqueeze(0) + kappa * torch.eye(K, device=pi.device, dtype=pi.dtype)  # [K,K]
 
-        # Second term: ∑_k ∑_j [ (α π*_j + κ δ_{jk} − 1)(ψ(φ̂_kj) − ψ(∑ φ̂_km)) − log Γ(α π*_j + κ δ_{jk}) ]
-        phi = self.phi_hat.detach()                   # (K,K+1)
-        ElogA = digamma(phi) - digamma(phi.sum(-1, keepdim=True))  # (K,K+1)
-        pi_row = self.alpha * pi.unsqueeze(0).expand(self.K, -1)   # (K,K+1)
-        sticky = torch.zeros_like(pi_row)
-        sticky[torch.arange(self.K), torch.arange(self.K)] = self.kappa
-        conc = pi_row + sticky  # (K,K+1)
+            # E[log p(Φ | π)] under q(Φ): Dirichlet expectation
+            # = sum_k [ sum_j (a_kj - 1) ElogA_kj - (logB(a_k)) ]  ; logB(a)=sum_j lgamma(a_j)-lgamma(sum_j a_j)
+            term1 = (a - 1.0) * ElogA
+            lnorm = torch.lgamma(a).sum(dim=1) - torch.lgamma(a.sum(dim=1))
+            L1 = term1.sum() - lnorm.sum()
 
-        term2 = ((conc - 1.0) * ElogA - lgamma(conc)).sum()
+            # E[log p(h1 | π)] = sum_k r1_k log π_k
+            L2 = torch.sum(r1 * torch.log(torch.clamp(pi, min=1e-30)))
 
-        # Third term: ∑_k r̂_{1k} log π_k*
-        term3 = (gamma1 * (pi + EPS).log()).sum()
+            # log p(β) = sum_k (γ-1) log(1-β_k)  (since Beta(1,γ))
+            L3 = (gamma - 1.0) * torch.sum(torch.log(torch.clamp(1.0 - beta, min=1e-30)))
 
-        return term1 + term2 + term3
-
-    def step_optimize_beta(self, gamma_first: torch.Tensor, steps: int = 5):
-        for _ in range(steps):
-            self.beta_optim.zero_grad()
-            L = -self._beta_elbo(gamma_first)  # minimise negative ELBO
+            L = -(L1 + L2 + L3)  # minimize negative
             L.backward()
-            self.beta_optim.step()
-        self._update_pi_from_u()
+            opt.step()
 
-    # ---------- PUBLIC: one online VI pass on a sequence ----------
-    def online_update(self, z_mu: torch.Tensor, z_var: torch.Tensor, n_beta_steps: int = 5):
+        with torch.no_grad():
+            beta = torch.sigmoid(self.u_beta)
+            pi, _ = stick_breaking(beta)
+        return pi.detach()
+
+    # ---- public update API ---------------------------------------------------
+    def update_from_encoder(
+        self,
+        mu_t: torch.Tensor,                     # [T,D] or [B,T,D]
+        diag_var_t: Optional[torch.Tensor] = None,  # same shape as mu_t
+        F_t: Optional[torch.Tensor] = None,         # [T,D,R] or [B,T,D,R]
+        mask: Optional[torch.Tensor] = None,        # [T] or [B,T] (1=valid)
+        n_e_steps: int = 1,
+        optimize_pi: bool = True,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Perform one VI pass given a new sequence of encoder posteriors (means & diag vars).
-        Args:
-            z_mu : (T,D)
-            z_var: (T,D)
+        One outer VI step: (E-step -> M-step -> (optional) π-step).
+        Returns a dict with rhat, xihat and current ELBO-ish pieces.
         """
-        z_mu  = z_mu.to(self.device)
-        z_var = z_var.to(self.device)
+        # (a) build emission log-likelihoods
+        logB = self.expected_emission_loglik(mu_t, diag_var_t, F_t, mask)  # [T,K] or [B,T,K]
 
-        # E-step
-        log_B  = self._emission_loglik(z_mu, z_var)         # (T,K+1)
-        log_pi = (self.pi_star + EPS).log()                 # (K+1,)
-        log_A  = self._expected_log_A()                     # (K,K+1)
+        if logB.dim() == 3:
+            # process sequences independently then pool moments
+            outs = []
+            for b in range(logB.size(0)):
+                outs.append(self._update_single_seq(mu_t[b], diag_var_t[b] if diag_var_t is not None else None,
+                                                   F_t[b] if F_t is not None else None,
+                                                   mask[b] if mask is not None else None,
+                                                   logB[b], n_e_steps, optimize_pi))
+            # merge rhat for reference; NIW/Dir are global already
+            return outs[-1]  # return last (parameters already updated globally)
+        else:
+            return self._update_single_seq(mu_t, diag_var_t, F_t, mask, logB, n_e_steps, optimize_pi)
 
-        gamma, xi, _ = self._forward_backward(log_B, log_pi, log_A)
+    def _update_single_seq(
+        self, mu_t, diag_var_t, F_t, mask, logB, n_e_steps, optimize_pi
+    ):
+        K = self.p.K
+        # init π from current β
+        with torch.no_grad():
+            pi, _ = stick_breaking(torch.sigmoid(self.u_beta))
+        log_pi = torch.log(torch.clamp(pi, min=1e-30))
 
-        # M-step (variational updates)
-        self._update_rows_dirichlet(xi)
-        self._update_emissions_NIW(z_mu, z_var, gamma)
+        for _ in range(n_e_steps):
+            # E-step
+            ElogA = self._ElogA()                              # [K,K]
+            rhat, xihat, ll = self.forward_backward(log_pi, ElogA, logB)
 
-        # optimise β (π*)
-        self.step_optimize_beta(gamma_first=gamma[0], steps=n_beta_steps)
+            # M-step: emissions
+            Nk, M1, M2 = self._moments_from_encoder(mu_t, rhat, diag_var_t, F_t)
+            self._update_NIW(Nk, M1, M2)
 
-        # return posteriors for potential external logging
+            # π-step (optional)
+            if optimize_pi:
+                pi = self._optimize_pi(rhat)
+                log_pi = torch.log(torch.clamp(pi, min=1e-30))
+
+            # M-step: transitions (uses π* through its prior rows)
+            self._update_transitions(xihat, pi)
+
+            # recompute logB because NIW changed
+            logB = self.expected_emission_loglik(mu_t, diag_var_t, F_t, mask)
+
         return {
-            "gamma": gamma.detach(),
-            "xi": xi.detach(),
-            "pi_star": self.pi_star.detach(),
-            "phi_hat": self.phi_hat.detach(),
-            "mu_hat": self.mu_hat.detach(),
-            "kappa_hat": self.kappa_hat.detach(),
-            "nu_hat": self.nu_hat.detach(),
+            "rhat": rhat.detach(),            # [T,K]
+            "xihat": xihat.detach(),          # [T-1,K,K]
+            "loglik": torch.tensor(ll),
+            "pi_star": pi.detach(),           # [K]
+            "ElogA": self._ElogA().detach(),  # [K,K]
+        }
+
+    # ---- accessors -----------------------------------------------------------
+    def get_posterior_params(self) -> Dict[str, torch.Tensor]:
+        return {
+            "mu": self.niw.mu.detach(),             # [K,D]
+            "kappa": self.niw.kappa.detach(),       # [K]
+            "Psi": self.niw.Psi.detach(),           # [K,D,D]
+            "nu": self.niw.nu.detach(),             # [K]
+            "phi": self.dir.phi.detach(),           # [K,K]
+            "beta_u": self.u_beta.detach(),         # [K]
         }

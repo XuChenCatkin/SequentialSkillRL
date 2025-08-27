@@ -810,489 +810,329 @@ def visualize_reconstructions(
 
 
 def analyze_latent_space(
-    model, dataset, device, 
-    save_path="vae_analysis/latent_analysis.png", 
-    max_samples=100, 
-    dataset_labels=None
+    model,
+    dataset,
+    device,
+    save_path="vae_analysis/latent_analysis.png",
+    max_samples=100,
+    dataset_labels=None,
+    tsne_on_pca=True,
+    jitter_eps=1e-5,
 ):
     """
-    Enhanced version of analyze_latent_space with support for multiple datasets
-    Automatically balances samples between training and testing datasets
-    
-    Args:
-        model: Trained MultiModalHackVAE model
-        dataset: List of batches from multiple datasets
-        device: Device to run inference on
-        save_path: Path to save the analysis plots
-        max_samples: Maximum number of samples to analyze
-        dataset_labels: List of labels for each batch indicating which dataset it comes from
+    Balanced latent-space analysis with MI/TC/DW that includes posterior noise.
+    - Aggregated posterior covariance: Var_x[mu_x] + E_x[diag_var_x + F_x F_x^T]
+    - Safer t-SNE, covariance shrinkage, and numerically stable logdets.
     """
+    import os, random
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    import torch
+
     model.eval()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
+
     if dataset_labels is None:
-        dataset_labels = ['unknown'] * len(dataset)
-    
-    # Separate datasets by type
-    train_batches = []
-    test_batches = []
-    train_labels = []
-    test_labels = []
-    
-    for batch, label in zip(dataset, dataset_labels):
-        if label == 'train':
-            train_batches.append(batch)
-            train_labels.append(label)
-        elif label == 'test':
-            test_batches.append(batch)
-            test_labels.append(label)
-        else:
-            # Unknown labels go to train by default
-            train_batches.append(batch)
-            train_labels.append('train')
-    
-    print(f"📊 Dataset composition: {len(train_batches)} train batches, {len(test_batches)} test batches")
-    
-    # Determine sample allocation
-    if len(train_batches) > 0 and len(test_batches) > 0:
-        # Both datasets available - split samples evenly
-        train_samples_target = max_samples // 2
-        test_samples_target = max_samples - train_samples_target
-        print(f"🎯 Target samples: {train_samples_target} train, {test_samples_target} test")
-    elif len(train_batches) > 0:
-        # Only training data available
-        train_samples_target = max_samples
-        test_samples_target = 0
-        print(f"🎯 Only training data available, using {train_samples_target} samples")
-    elif len(test_batches) > 0:
-        # Only testing data available  
-        train_samples_target = 0
-        test_samples_target = max_samples
-        print(f"🎯 Only testing data available, using {test_samples_target} samples")
+        dataset_labels = ['train'] * len(dataset)  # default to train
+
+    # --- split batches by label
+    train_batches, test_batches = [], []
+    for b, lbl in zip(dataset, dataset_labels):
+        (train_batches if lbl == 'train' else test_batches).append(b)
+
+    # --- target allocation
+    if len(train_batches) and len(test_batches):
+        n_train = max_samples // 2
+        n_test  = max_samples - n_train
+    elif len(train_batches):
+        n_train, n_test = max_samples, 0
+    elif len(test_batches):
+        n_train, n_test = 0, max_samples
     else:
-        raise ValueError("No valid datasets provided")
-    
-    # Shuffle datasets for random sampling
-    if len(train_batches) > 0:
-        train_indices = list(range(len(train_batches)))
-        random.shuffle(train_indices)
-        train_batches = [train_batches[i] for i in train_indices]
-        train_labels = [train_labels[i] for i in train_indices]
-    
-    if len(test_batches) > 0:
-        test_indices = list(range(len(test_batches)))
-        random.shuffle(test_indices)
-        test_batches = [test_batches[i] for i in test_indices]
-        test_labels = [test_labels[i] for i in test_indices]
-    
-    latent_vectors = []
-    batch_indices = []
-    sample_info = []
-    
-    def extract_samples_from_batches(batches, labels, target_samples, dataset_type):
-        """Extract samples from a list of batches"""
-        local_latent_vectors = []
-        local_sample_info = []
-        sample_count = 0
-        
+        raise ValueError("No valid datasets provided.")
+
+    random.shuffle(train_batches)
+    random.shuffle(test_batches)
+
+    # containers
+    mu_list, logvar_list, lowrank_list, ds_list = [], [], [], []
+
+    def _pull_from_batches(batches, target, tag):
+        nonlocal mu_list, logvar_list, lowrank_list, ds_list
+        got = 0
         with torch.no_grad():
-            for batch_idx, (batch, label) in enumerate(zip(batches, labels)):
-                if sample_count >= target_samples:
+            for batch in batches:
+                if got >= target:
                     break
-                    
-                # Move batch to device and reshape like in training
-                batch_device = {}
-                for key, value in batch.items():
-                    if value is not None and isinstance(value, torch.Tensor):
-                        value_device = value.to(device)
-                        # Reshape tensors from [B, T, ...] to [B*T, ...]
-                        B, T = value_device.shape[:2]
-                        remaining_dims = value_device.shape[2:]
-                        batch_device[key] = value_device.view(B * T, *remaining_dims)
-                    else:
-                        batch_device[key] = value
-                        
-                if 'valid_screen' in batch_device:
-                    valid_screen = batch_device['valid_screen'].cpu()  # [B*T]
-                else:
-                    valid_screen = torch.ones(batch_device['game_chars'].shape[0], dtype=torch.bool)
-                
-                # Get model output (includes mu, logvar, lowrank_factors)
-                samples_to_process = min(max(0, target_samples - sample_count), valid_screen.sum().item())
-                if samples_to_process == 0:
+                # Move to device & flatten [B,T,...] -> [B*T,...]
+                flat = {}
+                BT = None
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        v = v.to(device)
+                        if v.ndim >= 2:
+                            B, T = v.shape[:2]
+                            v = v.view(B * T, *v.shape[2:])
+                            BT = B * T if BT is None else BT
+                        flat[k] = v
+                valid = flat.get('valid_screen')
+                if valid is None:
+                    # assume everything valid
+                    N = next(iter(flat.values())).shape[0]
+                    valid = torch.ones(N, dtype=torch.bool, device=device)
+
+                idx = torch.where(valid)[0]
+                if idx.numel() == 0:
                     continue
-                    
-                valid_indices = torch.where(valid_screen)[0]
-                
-                # Randomly shuffle valid indices for more diverse sampling
-                perm = torch.randperm(len(valid_indices))
-                valid_indices = valid_indices[perm][:samples_to_process]
-                
-                # Create batch structure for model forward pass
-                batch_for_model = {
-                    'game_chars': batch_device['game_chars'][valid_indices],
-                    'game_colors': batch_device['game_colors'][valid_indices],
-                    'blstats': batch_device['blstats'][valid_indices],
-                    'message_chars': batch_device['message_chars'][valid_indices],
-                    'hero_info': batch_device['hero_info'][valid_indices]
+                # shuffle valid positions, take up to what's left
+                need = int(min(target - got, idx.numel()))
+                if need <= 0:
+                    break
+                perm = torch.randperm(idx.numel(), device=device)[:need]
+                idx = idx[perm]
+
+                feed = {
+                    'game_chars':    flat['game_chars'][idx],
+                    'game_colors':   flat['game_colors'][idx],
+                    'blstats':       flat['blstats'][idx],
+                    'message_chars': flat['message_chars'][idx],
+                    'hero_info':     flat['hero_info'][idx],
                 }
-                
-                model_output = model(batch_for_model)
-                
-                mu = model_output['mu']  # [samples_to_process, latent_dim]
-                
-                # Store latent representations
-                local_latent_vectors.append(mu.cpu().numpy())
-                
-                # Store sample info with dataset labels
-                batch_size = mu.shape[0]
-                for i in range(batch_size):
-                    local_sample_info.append({
-                        'batch_idx': batch_idx,
-                        'sample_idx': i,
-                        'dataset': dataset_type,
-                        'valid_screen': True,
-                        'global_batch_idx': len(sample_info) + len(local_sample_info)
-                    })
-                
-                sample_count += batch_size
-                
-                if sample_count % 50 == 0 or sample_count >= target_samples:
-                    print(f"  📈 Extracted {sample_count}/{target_samples} {dataset_type} samples...")
-        
-        return local_latent_vectors, local_sample_info
-    
-    # Extract samples from training dataset
-    if train_samples_target > 0:
-        print(f"🔄 Extracting samples from training dataset...")
-        train_latent_vectors, train_sample_info = extract_samples_from_batches(
-            train_batches, train_labels, train_samples_target, 'train'
-        )
-        latent_vectors.extend(train_latent_vectors)
-        sample_info.extend(train_sample_info)
-        print(f"✅ Extracted {len(train_sample_info)} training samples")
-    
-    # Extract samples from testing dataset
-    if test_samples_target > 0:
-        print(f"🔄 Extracting samples from testing dataset...")
-        test_latent_vectors, test_sample_info = extract_samples_from_batches(
-            test_batches, test_labels, test_samples_target, 'test'
-        )
-        latent_vectors.extend(test_latent_vectors)
-        sample_info.extend(test_sample_info)
-        print(f"✅ Extracted {len(test_sample_info)} testing samples")
-    
-    # Combine all latent vectors
-    if len(latent_vectors) == 0:
-        raise ValueError("No samples could be extracted from the datasets")
-    
-    latent_vectors = np.vstack(latent_vectors)
-    
-    # Create batch indices for backward compatibility
-    batch_indices = [info['global_batch_idx'] for info in sample_info]
-    
-    # Final shuffle for more uniform distribution in visualizations
-    sample_indices = list(range(len(latent_vectors)))
-    random.shuffle(sample_indices)
-    latent_vectors = latent_vectors[sample_indices]
-    sample_info = [sample_info[i] for i in sample_indices]
-    batch_indices = [batch_indices[i] for i in sample_indices]
-    
-    # Create dataset color mapping
-    unique_datasets = list(set([info['dataset'] for info in sample_info]))
-    dataset_colors = {}
-    colors = ['turquoise', 'lightcoral', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
-    for i, dataset in enumerate(unique_datasets):
-        dataset_colors[dataset] = colors[i % len(colors)]
-    
-    dataset_color_values = [dataset_colors[info['dataset']] for info in sample_info]
-    
-    print(f"📊 Enhanced Latent Space Analysis (Balanced Sampling):")
-    print(f"  - Total samples analyzed: {len(latent_vectors)}")
-    print(f"  - Datasets: {unique_datasets}")
-    
-    # Count samples per dataset after balancing
-    actual_counts = {}
-    for dataset in unique_datasets:
-        count = sum(1 for info in sample_info if info['dataset'] == dataset)
-        actual_counts[dataset] = count
-        print(f"  - {dataset} samples: {count}")
-    
-    print(f"  - Latent dimensionality: {latent_vectors.shape[1]}")
-    print(f"  - Latent mean: {np.mean(latent_vectors, axis=0)[:5]}...")
-    print(f"  - Latent std: {np.std(latent_vectors, axis=0)[:5]}...")
-    
-    # Compute PCA and t-SNE first for use in multiple plots
-    pca = PCA(n_components=min(10, latent_vectors.shape[1]))
-    latent_pca = pca.fit_transform(latent_vectors)
-    pca_explained_variance = pca.explained_variance_ratio_
-        
-    print("🔄 Computing t-SNE embedding (this may take a moment)...")
-    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(latent_vectors)//4))
-    latent_tsne = tsne.fit_transform(latent_vectors)
-    
-    # Compute statistics for plots
-    latent_vars = np.var(latent_vectors, axis=0)
-    latent_means = np.mean(latent_vectors, axis=0)
-    
-    # Create comprehensive visualization
-    fig, axes = plt.subplots(3, 3, figsize=(18, 18))
-    
-    # 1. PCA of latent space colored by dataset (moved to first position)
-    for dataset in unique_datasets:
-        mask = [info['dataset'] == dataset for info in sample_info]
-        if any(mask):
-            dataset_pca = latent_pca[mask]
-            axes[0, 0].scatter(dataset_pca[:, 0], dataset_pca[:, 1], 
-                                c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
-    
-    axes[0, 0].set_xlabel(f'PC1 ({pca_explained_variance[0]:.2%} variance)')
-    axes[0, 0].set_ylabel(f'PC2 ({pca_explained_variance[1]:.2%} variance)')
-    axes[0, 0].set_title('PCA of Latent Space (colored by dataset)')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # 2. t-SNE of latent space colored by dataset
-    if latent_tsne is not None:
-        for dataset in unique_datasets:
-            mask = [info['dataset'] == dataset for info in sample_info]
-            if any(mask):
-                dataset_tsne = latent_tsne[mask]
-                axes[0, 1].scatter(dataset_tsne[:, 0], dataset_tsne[:, 1], 
-                                    c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
-        
-        axes[0, 1].set_xlabel('t-SNE Dimension 1')
-        axes[0, 1].set_ylabel('t-SNE Dimension 2')
-        axes[0, 1].set_title('t-SNE of Latent Space (colored by dataset)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
+                out = model(feed)
+                mu      = out['mu']                        # [n,D]
+                logvar  = out.get('logvar', None)          # [n,D]
+                lowrank = out.get('lowrank_factors', None) # [n,D,R] or None
+
+                mu_list.append(mu.detach().cpu().numpy())
+                if logvar is not None:
+                    logvar_list.append(logvar.detach().cpu().numpy())
+                if lowrank is not None:
+                    lowrank_list.append(lowrank.detach().cpu().numpy())
+                ds_list.extend([tag] * mu.shape[0])
+                got += mu.shape[0]
+        return got
+
+    got_train = _pull_from_batches(train_batches, n_train, 'train') if n_train else 0
+    got_test  = _pull_from_batches(test_batches,  n_test,  'test')  if n_test  else 0
+    total = got_train + got_test
+    if total == 0:
+        raise RuntimeError("No valid samples collected. Check valid_screen and inputs.")
+
+    # --- stack
+    mu_all = np.vstack(mu_list)                            # [N,D]
+    D = mu_all.shape[1]
+    logvar_all  = np.vstack(logvar_list) if logvar_list else None
+    lowrank_all = np.vstack(lowrank_list) if lowrank_list else None  # shape: [N,D,R] collapsed ok
+
+    # --- compute aggregated posterior covariance: Var[mu] + E[diag(var)] + E[FF^T]
+    mu_mean = mu_all.mean(axis=0)                          # [D]
+    mu_centered = mu_all - mu_mean
+    cov_between = (mu_centered.T @ mu_centered) / (mu_all.shape[0] - 1 + 1e-6)  # Var_x[mu_x]  [D,D]
+
+    if logvar_all is not None:
+        E_diag = np.exp(logvar_all).mean(axis=0)           # [D]
     else:
-        # Fallback: show first two latent dimensions
-        for dataset in unique_datasets:
-            mask = [info['dataset'] == dataset for info in sample_info]
-            if any(mask):
-                dataset_latents = latent_vectors[mask]
-                axes[0, 1].scatter(dataset_latents[:, 0], dataset_latents[:, 1], 
-                                  c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
-        
-        axes[0, 1].set_xlabel('Latent Dimension 0')
-        axes[0, 1].set_ylabel('Latent Dimension 1')
-        axes[0, 1].set_title('Raw Latent Space (t-SNE unavailable)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-    
-    # 3. Variance per latent dimension
-    axes[0, 2].bar(range(len(latent_vars)), latent_vars)
-    axes[0, 2].set_xlabel('Latent Dimension')
-    axes[0, 2].set_ylabel('Variance')
-    axes[0, 2].set_title('Variance per Latent Dimension')
-    axes[0, 2].grid(True, alpha=0.3)
-    
-    # 4. Mean per latent dimension
-    axes[1, 0].bar(range(len(latent_means)), latent_means)
-    axes[1, 0].set_xlabel('Latent Dimension')
-    axes[1, 0].set_ylabel('Mean')
-    axes[1, 0].set_title('Mean per Latent Dimension')
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # 5. PC1 distribution by dataset (instead of first latent dimension)
-    dataset_pc1_values = []
-    for dataset in unique_datasets:
-        mask = [info['dataset'] == dataset for info in sample_info]
-        if any(mask):
-            dataset_pc1 = latent_pca[mask, 0]  # Get PC1 values for this dataset
-            dataset_pc1_values.append(dataset_pc1)
-        else:
-            dataset_pc1_values.append(np.array([]))  # Empty array if no samples
-    
-    # Only plot non-empty datasets
-    non_empty_datasets = [ds for ds, vals in zip(unique_datasets, dataset_pc1_values) if len(vals) > 0]
-    non_empty_values = [vals for vals in dataset_pc1_values if len(vals) > 0]
-    
-    if non_empty_values:
-        axes[1, 1].hist(non_empty_values, bins=30, alpha=0.7, label=non_empty_datasets, density=True)
-    
-    axes[1, 1].axvline(0, color='black', linestyle='--', alpha=0.7, label='Zero mean')
-    axes[1, 1].set_xlabel(f'PC1 Value ({pca_explained_variance[0]:.2%} variance)')
-    axes[1, 1].set_ylabel('Density')
-    axes[1, 1].set_title('PC1 Distribution by Dataset')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    # 6. Correlation matrix of first 10 raw latent dimensions
-    n_dims_to_show = min(10, latent_vectors.shape[1])
-    corr_matrix = np.corrcoef(latent_vectors[:, :n_dims_to_show].T)
-    im = axes[1, 2].imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
-    axes[1, 2].set_xlabel('Latent Dimension')
-    axes[1, 2].set_ylabel('Latent Dimension')
-    axes[1, 2].set_title(f'Raw Latent Correlation Matrix (first {n_dims_to_show} dims)')
-    
-    # Add correlation colorbar
-    cbar = plt.colorbar(im, ax=axes[1, 2])
-    cbar.set_label('Correlation')
-    
-    # 7. Per-dimension KL divergence histogram
-    # Compute per-dimension KL divergence: KL(q(z_i) || p(z_i)) for each dimension
-    # Assuming standard normal prior: KL = 0.5 * (var + mean^2 - 1 - log(var))
-    per_dim_kl = 0.5 * (latent_vars + latent_means**2 - 1 - np.log(np.maximum(latent_vars, 1e-8)))
-    
-    axes[2, 0].bar(range(len(per_dim_kl)), per_dim_kl)
-    axes[2, 0].axhline(0.05, color='red', linestyle='--', alpha=0.7, label='Threshold (0.05 nats)')
-    axes[2, 0].set_xlabel('Latent Dimension')
-    axes[2, 0].set_ylabel('KL Divergence (nats)')
-    axes[2, 0].set_title('Per-Dimension KL Divergence')
-    axes[2, 0].legend()
-    axes[2, 0].grid(True, alpha=0.3)
-    
-    # 8. Eigenvalues of posterior covariance matrix
-    posterior_cov = np.cov(latent_vectors.T)
-    eigenvalues = np.linalg.eigvals(posterior_cov)
-    eigenvalues = np.sort(eigenvalues)[::-1]  # Sort in descending order
-    
-    axes[2, 1].bar(range(len(eigenvalues)), eigenvalues)
-    axes[2, 1].axhline(1.0, color='red', linestyle='--', alpha=0.7, label='Unit variance threshold')
-    axes[2, 1].set_xlabel('Eigenvalue Index (sorted)')
-    axes[2, 1].set_ylabel('Eigenvalue')
-    axes[2, 1].set_title('Posterior Covariance Eigenvalues')
-    axes[2, 1].legend()
-    axes[2, 1].grid(True, alpha=0.3)
-    axes[2, 1].set_yscale('log')  # Log scale for better visualization
-    
-    # 9. Mutual Information and Total Correlation
-    # Use proper β-VAE decomposition: KL = MI + TC + DW-KL
-    
-    # First compute overall KL divergence KL(q(z) || p(z))
-    kl_total = 0.5 * (np.trace(posterior_cov) + np.sum(latent_means**2) - 
-                      latent_vectors.shape[1] - np.linalg.slogdet(posterior_cov)[1])
-    
-    # Dimension-wise KL: sum of KL(q(z_i) || p(z_i)) for each dimension
-    dimension_wise_kl = np.sum(per_dim_kl)
-    
-    # Total Correlation: -0.5 * log(det(R)) where R is normalized covariance
-    diag_vars = np.maximum(np.diag(posterior_cov), 1e-8)
-    D_sqrt_inv = np.diag(1.0 / np.sqrt(diag_vars))
-    R = D_sqrt_inv @ posterior_cov @ D_sqrt_inv  # Normalized covariance
-    R = 0.5 * (R + R.T) + 1e-8 * np.eye(R.shape[0])  # Ensure symmetry and stability
-    total_correlation = -0.5 * np.linalg.slogdet(R)[1]
-    
-    # Mutual Information: residual from the decomposition
-    mutual_info = kl_total - total_correlation - dimension_wise_kl
-    
-    metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL\n(sum)']
-    values = [mutual_info, total_correlation, dimension_wise_kl, kl_total]
-    colors = ['skyblue', 'lightcoral', 'lightgreen', 'gold']
-    
-    bars = axes[2, 2].bar(metrics, values, color=colors, alpha=0.7)
-    axes[2, 2].set_ylabel('Nats')
-    axes[2, 2].set_title('β-VAE KL Decomposition: KL = MI + TC + DW-KL')
-    axes[2, 2].grid(True, alpha=0.3)
-    
-    # Add value labels on bars
-    for bar, value in zip(bars, values):
-        height = bar.get_height()
-        axes[2, 2].text(bar.get_x() + bar.get_width()/2., height + 0.01*max(values),
-                       f'{value:.3f}', ha='center', va='bottom', fontsize=9)
-    
-    pca_explained_variance = pca.explained_variance_ratio_
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-    
-    # Generate TTY visualization grid using PCA components
-    print(f"\n🎮 Generating TTY visualization grid using PCA space...")
-    # Use first 2 PCA components for the grid
-    W = pca.components_[:2]  # [2, latent_dim] - first 2 principal components
+        E_diag = np.zeros(D, dtype=np.float64)
+
+    if lowrank_all is not None:
+        # lowrank_all: [N, D, R] -> average FF^T over samples (R is small, so this is cheap for ~100 samples)
+        N, D_, R = lowrank_all.shape
+        assert D_ == D
+        E_FFt = np.zeros((D, D), dtype=np.float64)
+        for i in range(N):
+            F = lowrank_all[i]                             # [D,R]
+            E_FFt += F @ F.T
+        E_FFt /= N
+    else:
+        E_FFt = np.zeros((D, D), dtype=np.float64)
+
+    Sigma_agg = cov_between + np.diag(E_diag) + E_FFt      # [D,D]
+    # numerical shrinkage
+    Sigma_agg = 0.5 * (Sigma_agg + Sigma_agg.T)
+    Sigma_agg += jitter_eps * np.eye(D)
+
+    # --- per-dim stats for plots
+    var_total = np.diag(Sigma_agg)                         # Var(z_i)
+    mean_total = mu_mean                                   # E[z_i]
+
+    # --- PCA (for plots & grid)
+    pca = PCA(n_components=min(10, D), svd_solver='auto', random_state=42)
+    latent_pca = pca.fit_transform(mu_all)                 # PCA of means for viz
+    pca_expl = pca.explained_variance_ratio_
+
+    # --- TSNE (on PCA-10 for stability / speed)
+    n = mu_all.shape[0]
+    if tsne_on_pca:
+        tsne_input = latent_pca
+    else:
+        tsne_input = mu_all
+    # clamp perplexity
+    perpl = max(5, min(30, n - 1, n // 4 if n >= 24 else 5))
+    try:
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perpl, init='pca', learning_rate='auto')
+        latent_tsne = tsne.fit_transform(tsne_input)
+    except Exception as e:
+        print(f"[t-SNE warning] {e} — falling back to first two PCs.")
+        latent_tsne = None
+
+    # --- KL decomposition (Gaussian assumption): KL(q(z)||N(0,I)) = MI + TC + DW
+    # Total KL with full Σ_agg and mean_total
+    sign, logdet = np.linalg.slogdet(Sigma_agg)
+    if sign <= 0:
+        # very rare after shrinkage; force PSD
+        w, V = np.linalg.eigh(Sigma_agg)
+        w_clipped = np.clip(w, jitter_eps, None)
+        logdet = np.log(w_clipped).sum()
+        Sigma_trace = w_clipped.sum()
+    else:
+        Sigma_trace = np.trace(Sigma_agg)
+    kl_total = 0.5 * (Sigma_trace + (mean_total @ mean_total) - D - logdet)
+
+    # Dimension-wise KL: sum_i KL(q(z_i)||N(0,1)) with Var(z_i)=var_total_i, mean=mean_total_i
+    dw_kl = 0.5 * np.sum(var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
+
+    # Total correlation: -0.5 * log det( R ),  R = D^{-1/2} Σ D^{-1/2}
+    Dinv2 = np.diag(1.0 / np.sqrt(np.clip(var_total, jitter_eps, None)))
+    R = Dinv2 @ Sigma_agg @ Dinv2
+    R = 0.5 * (R + R.T) + jitter_eps * np.eye(D)
+    _, logdetR = np.linalg.slogdet(R)
+    tc = -0.5 * logdetR
+
+    mi = float(kl_total - tc - dw_kl)
+
+    # --- Visualization
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(3, 3, figsize=(18, 18))
+
+    # dataset palette (avoid shadowing)
+    palette = ['turquoise', 'lightcoral', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
+    ds_unique = sorted(set(ds_list))
+    ds_to_color = {ds: palette[i % len(palette)] for i, ds in enumerate(ds_unique)}
+    ds_mask = {ds: np.array([d == ds for d in ds_list]) for ds in ds_unique}
+
+    # (0,0) PCA scatter
+    for ds in ds_unique:
+        m = ds_mask[ds]
+        axes[0,0].scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+    axes[0,0].set_title('PCA of Latent Means (by dataset)')
+    axes[0,0].set_xlabel(f'PC1 ({pca_expl[0]:.1%})'); axes[0,0].set_ylabel(f'PC2 ({pca_expl[1]:.1%})'); axes[0,0].legend(); axes[0,0].grid(alpha=0.3)
+
+    # (0,1) t-SNE
+    if latent_tsne is not None:
+        for ds in ds_unique:
+            m = ds_mask[ds]
+            axes[0,1].scatter(latent_tsne[m,0], latent_tsne[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+        axes[0,1].set_title(f't-SNE (perplexity={perpl})'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
+    else:
+        for ds in ds_unique:
+            m = ds_mask[ds]
+            axes[0,1].scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+        axes[0,1].set_title('Fallback: PC1 vs PC2'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
+
+    # (0,2) per-dim variance (from Σ_agg diagonal)
+    axes[0,2].bar(range(D), var_total)
+    axes[0,2].set_title('Variance per Latent (Σ_agg diag)'); axes[0,2].set_xlabel('dim'); axes[0,2].grid(alpha=0.3)
+
+    # (1,0) per-dim mean
+    axes[1,0].bar(range(D), mean_total)
+    axes[1,0].set_title('Mean per Latent'); axes[1,0].set_xlabel('dim'); axes[1,0].grid(alpha=0.3)
+
+    # (1,1) PC1 distribution by dataset
+    for ds in ds_unique:
+        m = ds_mask[ds]
+        if m.any():
+            axes[1,1].hist(latent_pca[m,0], bins=30, alpha=0.6, density=True, label=ds, color=ds_to_color[ds])
+    axes[1,1].axvline(0, color='k', ls='--', alpha=0.7)
+    axes[1,1].set_title('PC1 Distribution'); axes[1,1].legend(); axes[1,1].grid(alpha=0.3)
+
+    # (1,2) correlation of first 10 raw dims using Σ_agg
+    k = min(10, D)
+    Sigma_k = Sigma_agg[:k,:k]
+    d = np.sqrt(np.clip(np.diag(Sigma_k), jitter_eps, None))
+    Rk = (Sigma_k / d[:,None]) / d[None,:]
+    im = axes[1,2].imshow(Rk, vmin=-1, vmax=1, cmap='RdBu_r')
+    axes[1,2].set_title('Correlation (first 10 dims)'); fig.colorbar(im, ax=axes[1,2], label='corr')
+
+    # (2,0) per-dim KL
+    per_dim_kl = 0.5 * (var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
+    axes[2,0].bar(range(D), per_dim_kl)
+    axes[2,0].axhline(0.05, color='r', ls='--', alpha=0.7, label='0.05 nats'); axes[2,0].legend()
+    axes[2,0].set_title('Per-dim KL'); axes[2,0].grid(alpha=0.3)
+
+    # (2,1) eigen-spectrum
+    evals = np.linalg.eigvalsh(Sigma_agg)
+    evals = np.clip(evals, jitter_eps, None)
+    axes[2,1].bar(range(D), np.sort(evals)[::-1])
+    axes[2,1].set_yscale('log'); axes[2,1].set_title('Eigenvalues of Σ_agg (log)'); axes[2,1].grid(alpha=0.3)
+
+    # (2,2) KL decomposition
+    metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL']
+    vals = [mi, tc, dw_kl, kl_total]
+    bars = axes[2,2].bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
+    axes[2,2].set_ylabel('nats'); axes[2,2].set_title('KL = MI + TC + DW')
+    for b, v in zip(bars, vals):
+        axes[2,2].text(b.get_x() + b.get_width()/2., v * 1.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+    plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.show()
+
+    # --- PCA grid decode
+    print("\n🎮 Generating TTY visualization grid using PCA space...")
+    W = pca.components_[:2]                   # [2,D]
     num_per_axis = 5
-    points = torch.distributions.Normal(0,1).icdf(torch.linspace(0.01, 0.99, num_per_axis))
-    XX, YY = torch.meshgrid(points, points, indexing='ij')
-    XXYY = torch.stack((XX, YY)).reshape(2, -1).T  # [25, 2]
-    
-    # Transform from PCA space back to latent space
-    pca_grid = XXYY.numpy()  # [25, 2] in PCA space
-    # To go from PCA space to latent space: latent = pca_coords @ components + mean
-    latent_grid = pca_grid @ W + latent_means[np.newaxis, :]  # [25, latent_dim]
-    latent_grid = torch.tensor(latent_grid, dtype=torch.float32)
-    
+    q = torch.distributions.Normal(0,1).icdf(torch.linspace(0.01, 0.99, num_per_axis))
+    XX, YY = torch.meshgrid(q, q, indexing='ij')
+    grid_2d = torch.stack((XX, YY)).reshape(2, -1).T.numpy()     # [25,2]
+    latent_grid = grid_2d @ W + pca.mean_[None, :]               # [25,D]
+    latent_grid = torch.tensor(latent_grid, dtype=torch.float32, device=device)
+
     with torch.no_grad():
-        decode_output = model.sample(z=latent_grid.to(device))
-        # Use ego data instead of full map chars/colors
-        if 'ego_chars' in decode_output and 'ego_colors' in decode_output:
-            chars = decode_output['ego_chars'].cpu()
-            colors = decode_output['ego_colors'].cpu()
+        dec = model.sample(z=latent_grid)
+        if 'ego_chars' in dec and 'ego_colors' in dec:
+            ego_chars = dec['ego_chars'].detach().cpu()
+            ego_colors = dec['ego_colors'].detach().cpu()
         else:
-            print("⚠️ No ego_chars/ego_colors in decode output, creating dummy data")
-            chars = torch.full((latent_grid.shape[0], 8, 8), 32)  # 8x8 grid of spaces
-            colors = torch.zeros((latent_grid.shape[0], 8, 8))   # Black colors
+            print("⚠️ sample() lacks ego chars/colors; using placeholders.")
+            ego_chars  = torch.full((latent_grid.shape[0], 8, 8), 32)
+            ego_colors = torch.zeros_like(ego_chars)
 
-    # Create TTY grid visualization
-    tty_fig, tty_axes = plt.subplots(num_per_axis, num_per_axis, figsize=(20, 20))
-    tty_fig.suptitle('Generated NetHack Ego-Centric Views from PCA Latent Space Grid (5x5)', fontsize=16, y=0.98)
-
-    print(f"🎨 Rendering {num_per_axis * num_per_axis} NetHack ego-centric views...")
-    n = min(len(chars), num_per_axis * num_per_axis)
+    fig2, axs = plt.subplots(num_per_axis, num_per_axis, figsize=(20, 20))
+    fig2.suptitle('Generated Ego Views from PCA Grid (5x5)', fontsize=16, y=0.98)
+    import numpy as np
     imgs = [
-        _render_map_image(chars[i], colors[i],
+        _render_map_image(ego_chars[i], ego_colors[i],
                           font_path="DejaVuSansMono.ttf", font_size=12, bg=(0,0,0))
-        for i in range(n)
+        for i in range(min(len(ego_chars), num_per_axis**2))
     ]
-    tty_axes = tty_axes.ravel()
-    for i, ax in enumerate(tty_axes):
+    axs = axs.ravel()
+    for i, ax in enumerate(axs):
         ax.axis("off")
-        if i < n:
+        if i < len(imgs):
             ax.imshow(imgs[i], interpolation="nearest")
     plt.tight_layout()
-    
     tty_save_path = save_path.replace('.png', '_tty_grid.png')
-    plt.figure(tty_fig.number)
-    plt.savefig(tty_save_path, dpi=200, bbox_inches='tight')
-    plt.show()
-    
-    print(f"Enhanced latent space analysis saved to {save_path}")
-    print(f"TTY grid visualization saved to {tty_save_path}")
-    
-    # Enhanced statistics with PCA focus
-    print(f"\n📈 Enhanced Statistics (PCA-Focused Analysis):")
-    print(f"  - Effective dimensionality (dims with var > 0.01): {np.sum(latent_vars > 0.01)}")
-    print(f"  - High variance dimensions (var > 0.1): {np.sum(latent_vars > 0.1)}")
-    print(f"  - Dimensions close to N(0,1): {np.sum((np.abs(latent_means) < 0.1) & (np.abs(latent_vars - 1.0) < 0.2))}")
-    print(f"  - PCA components computed: {len(pca_explained_variance)}")
-    print(f"  - PCA explained variance (first 5 components): {pca_explained_variance[:5]}")
-    print(f"  - PCA cumulative variance (first 5): {np.cumsum(pca_explained_variance[:5])}")
-    print(f"  - t-SNE computation: successful")
-    
-    print(f"\n🎯 Dataset Balance Analysis:")
-    for dataset in unique_datasets:
-        mask = [info['dataset'] == dataset for info in sample_info]
-        dataset_latents = latent_vectors[mask]
-        if len(dataset_latents) > 0:
-            # Analyze in both raw latent space and PCA space
-            dataset_pca = latent_pca[mask]
-            dataset_mean_norm = np.linalg.norm(dataset_latents.mean(axis=0))
-            dataset_std_norm = np.linalg.norm(dataset_latents.std(axis=0))
-            dataset_pc1_mean = dataset_pca[:, 0].mean()
-            dataset_pc1_std = dataset_pca[:, 0].std()
-            print(f"  - {dataset} dataset:")
-            print(f"    * Samples: {len(dataset_latents)}")
-            print(f"    * Raw latent mean norm: {dataset_mean_norm:.3f}")
-            print(f"    * Raw latent std norm: {dataset_std_norm:.3f}")
-            print(f"    * PC1 mean: {dataset_pc1_mean:.3f}, PC1 std: {dataset_pc1_std:.3f}")
-            print(f"    * Latent range: [{dataset_latents.min():.3f}, {dataset_latents.max():.3f}]")
-            print(f"    * PC1 range: [{dataset_pca[:, 0].min():.3f}, {dataset_pca[:, 0].max():.3f}]")
-    
+    plt.figure(fig2.number); plt.savefig(tty_save_path, dpi=200, bbox_inches='tight'); plt.show()
+
+    # --- reporting
+    print(f"\n📊 Enhanced Latent Space Analysis")
+    print(f"  - Samples: {total} ({got_train} train, {got_test} test), D={D}")
+    print(f"  - KL total={kl_total:.3f}, MI={mi:.3f}, TC={tc:.3f}, DW={dw_kl:.3f}")
+    print(f"  - PCA first 5 explained: {pca_expl[:5]} (cum {np.cumsum(pca_expl[:5])})")
+
     return {
-        'latent_vectors': latent_vectors,
-        'batch_indices': batch_indices, 
-        'sample_info': sample_info,
-        'latent_means': latent_means,
-        'latent_vars': latent_vars,
+        'mu': mu_all,
+        'Sigma_agg': Sigma_agg,
+        'mean': mu_mean,
+        'var_diag': var_total,
         'pca_components': latent_pca,
-        'pca_explained_variance': pca_explained_variance,
-        'pca_model': pca,  # Include the fitted PCA model
+        'pca_model': pca,
         'tsne_components': latent_tsne,
-        'dataset_labels': unique_datasets,
-        'tty_grid_path': tty_save_path
+        'metrics': {'kl_total': float(kl_total), 'mi': float(mi), 'tc': float(tc), 'dw_kl': float(dw_kl)},
+        'dataset_labels': ds_list,
+        'plot_path': save_path,
+        'tty_grid_path': tty_save_path,
     }
+
 
 
 def create_visualization_demo(

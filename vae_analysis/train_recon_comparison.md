@@ -1,6 +1,6 @@
 # Enhanced VAE Reconstruction Comparison
 
-_Generated: 2025-08-27T08:15:40_
+_Generated: 2025-08-27T09:24:01_
 
 This analysis includes the following reconstructions:
 - **Ego View**: Character, color, and class predictions in ego-centric window
