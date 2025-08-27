@@ -614,6 +614,17 @@ def train_multimodalhack_vae(
                     # Calculate adaptive weights for this step
                     mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
                     
+                    # Optional head weight schedule: start at 0.5x → 1.0x over warm-up for pass/safety
+                    head_prog = min(global_step / max(int(total_train_steps * config.warmup_epoch_ratio), 1), 1.0)
+                    def _cosine(a, b, t):
+                        import math
+                        return a + 0.5*(b - a)*(1 - math.cos(math.pi * t))
+                    pass_safety_scalar = _cosine(0.5, 1.0, head_prog)
+                    weight_override = {
+                        'passability': config.raw_modality_weights.get('passability', 1.0) * pass_safety_scalar,
+                        'safety'     : config.raw_modality_weights.get('safety', 1.0) * pass_safety_scalar,
+                    }
+                    
                     # Calculate loss (vae_loss will handle dynamics internally)
                     train_loss_dict = vae_loss(
                         model_output=model_output,
@@ -621,7 +632,8 @@ def train_multimodalhack_vae(
                         config=config,  # Use the VAEConfig object
                         mi_beta=mi_beta,
                         tc_beta=tc_beta,
-                        dw_beta=dw_beta
+                        dw_beta=dw_beta,
+                        weight_override=weight_override
                     )
 
                     train_loss = train_loss_dict['total_loss']
@@ -643,10 +655,14 @@ def train_multimodalhack_vae(
                 # Backward pass with mixed precision scaling if enabled
                 if scaler is not None:
                     scaler.scale(train_loss).backward()
+                    # Allow grad clipping with AMP
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     train_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                 scheduler.step()  # Step-based learning rate scheduling
                 
@@ -785,6 +801,17 @@ def train_multimodalhack_vae(
                     # Calculate adaptive weights for this step (use current global step for consistency)
                     mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
                     
+                    # Optional head weight schedule: start at 0.5x → 1.0x over warm-up for pass/safety
+                    head_prog = min(global_step / max(int(total_train_steps * config.warmup_epoch_ratio), 1), 1.0)
+                    def _cosine(a, b, t):
+                        import math
+                        return a + 0.5*(b - a)*(1 - math.cos(math.pi * t))
+                    pass_safety_scalar = _cosine(0.5, 1.0, head_prog)
+                    weight_override = {
+                        'passability': config.raw_modality_weights.get('passability', 1.0) * pass_safety_scalar,
+                        'safety'     : config.raw_modality_weights.get('safety', 1.0) * pass_safety_scalar,
+                    }
+                    
                     # Calculate loss
                     test_loss_dict = vae_loss(
                         model_output=model_output,
@@ -792,7 +819,8 @@ def train_multimodalhack_vae(
                         config=config,
                         mi_beta=mi_beta,
                         tc_beta=tc_beta,
-                        dw_beta=dw_beta
+                        dw_beta=dw_beta,
+                        weight_override=weight_override
                     )
 
                     test_loss = test_loss_dict['total_loss']

@@ -280,14 +280,14 @@ if __name__ == "__main__":
             initial_mi_beta=1.0,
             final_mi_beta=1.0,
             mi_beta_shape='constant',
-            initial_tc_beta=10.0,
+            initial_tc_beta=0.0,
             final_tc_beta=10.0,
-            tc_beta_shape='constant',
+            tc_beta_shape='custom',
             initial_dw_beta=0.2,
             final_dw_beta=1.0,
             dw_beta_shape='custom',
             warmup_epoch_ratio=0.2,
-            free_bits=0.15,
+            free_bits=0.75,
             encoder_dropout=0.1,
             decoder_dropout=0.1
         )

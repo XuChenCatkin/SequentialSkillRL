@@ -2034,7 +2034,8 @@ def vae_loss(
     config: VAEConfig,
     mi_beta: float = 1.0,
     tc_beta: float = 1.0,
-    dw_beta: float = 1.0
+    dw_beta: float = 1.0,
+    weight_override: Dict[str, float] | None = None,
     ):
     """
     VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
@@ -2400,7 +2401,11 @@ def vae_loss(
         metrics.update({f'metrics/inverse/{k}': v for k, v in inv_metrics.items()})
 
     # Sum raw reconstruction losses
-    total_raw_loss = sum(raw_losses[k] * config.raw_modality_weights.get(k, 1.0) for k in raw_losses)
+    # Total raw reconstruction loss (weighted, with optional per-head override)
+    weights = dict(config.raw_modality_weights)
+    if weight_override:
+        weights.update(weight_override)
+    total_raw_loss = sum(raw_losses[k] * weights.get(k, 1.0) for k in raw_losses)
 
     # KL divergence
     # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
