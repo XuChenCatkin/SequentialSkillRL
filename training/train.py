@@ -1473,7 +1473,9 @@ def train_vae_with_sticky_hmm_em(
     )
     hmm = StickyHDPHMMVI(
         p=hmm_params,
-        niw_prior=niw
+        niw_prior=niw,
+        rho_emission=1.0,
+        rho_transition=1.0
     )
 
     # Track training info for final summary

@@ -876,6 +876,8 @@ def save_hmm_to_huggingface(
             'hmm_state_dict': hmm.state_dict(),
             'hmm_params': hmm_params,
             'niw_prior': niw_prior,
+            'rho_emission': hmm.get_rho_emission().cpu(),
+            'rho_transition': hmm.get_rho_transition().cpu(),
             'round': round_num,
             'total_rounds': total_rounds,
             'config': config,
@@ -1094,12 +1096,16 @@ def load_hmm_from_huggingface(
         config = hmm_checkpoint['config']
         hmm_params = hmm_checkpoint['hmm_params'] 
         niw_prior = hmm_checkpoint['niw_prior']
+        rho_emission = hmm_checkpoint['rho_emission']
+        rho_transition = hmm_checkpoint['rho_transition']
         
         # Recreate HMM
         from src.skill_space import StickyHDPHMMVI
         hmm = StickyHDPHMMVI(
             p=hmm_params,
-            niw_prior=niw_prior
+            niw_prior=niw_prior,
+            rho_emission=rho_emission,
+            rho_transition=rho_transition
         )
         hmm.load_state_dict(hmm_checkpoint['hmm_state_dict'])
         hmm = hmm.to(device)

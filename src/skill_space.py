@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 # --------- helpers ------------------------------------------------------------
 
@@ -70,7 +71,10 @@ class StickyHDPHMMVI(nn.Module):
     Supports encoder covariance of the form diag(sigma^2) + F F^T (optional).
     """
 
-    def __init__(self, p: StickyHDPHMMParams, niw_prior: NIWPrior):
+    def __init__(self, p: StickyHDPHMMParams, niw_prior: NIWPrior, rho_emission: float = 0.05, rho_transition: Optional[float] = None):
+        """
+        Initialize Sticky HDP-HMM with given parameters.
+        """
         super().__init__()
         self.p = p
 
@@ -104,6 +108,10 @@ class StickyHDPHMMVI(nn.Module):
         self.kappa0 = float(niw_prior.kappa0)
         self.register_buffer("Psi0", niw_prior.Psi0.to(dev=dev, dtype=dt))
         self.nu0 = float(niw_prior.nu0)
+        
+        # ---- streaming buffers (allocated lazily) ----
+        self.stream_rho = rho_emission             # default EMA step for emissions
+        self.stream_rho_trans = rho_transition     # default None -> use stream_rho for transitions too
 
     # ---- expectations for emissions -----------------------------------------
     def _refresh_emission_cache(self):
@@ -405,6 +413,64 @@ class StickyHDPHMMVI(nn.Module):
             beta = torch.sigmoid(self.u_beta)
             pi, _ = stick_breaking(beta)
         return pi.detach()
+    
+    # ---- streaming helpers ---------------------------------------------------
+    def _alloc_stream_buffers(self):
+        """Allocate running (EMA) sufficient statistics if not present."""
+        if hasattr(self, "S_Nk"):
+            return
+        K, D = self.p.K, self.p.D
+        dev, dt = self.mu0.device, self.mu0.dtype
+        self.register_buffer("S_Nk",      torch.zeros(K,        device=dev, dtype=dt))
+        self.register_buffer("S_M1",      torch.zeros(K, D,     device=dev, dtype=dt))
+        self.register_buffer("S_M2",      torch.zeros(K, D, D,  device=dev, dtype=dt))
+        self.register_buffer("S_counts",  torch.zeros(K, K,     device=dev, dtype=dt))
+        self.register_buffer("S_steps",   torch.tensor(0.0,     device=dev, dtype=dt))
+
+    def enable_streaming(self, rho: float = 0.05, rho_trans: float | None = None):
+        """
+        Turn on streaming/EMA updates.
+        rho in (0,1]: step for emission sufficient stats;
+        rho_trans: step for transition counts (defaults to rho if None).
+        """
+        self._alloc_stream_buffers()
+        self.stream_rho = float(max(0.0, min(1.0, rho)))
+        self.stream_rho_trans = float(max(0.0, min(1.0, rho_trans))) if rho_trans is not None else None
+
+    @torch.no_grad()
+    def streaming_reset(self):
+        """Zero the running sufficient statistics."""
+        self._alloc_stream_buffers()
+        self.S_Nk.zero_(); self.S_M1.zero_(); self.S_M2.zero_(); self.S_counts.zero_()
+        self.S_steps.fill_(0.0)
+
+    def get_stream_state(self) -> dict:
+        """Optionally persist streaming stats along with posterior params."""
+        if not hasattr(self, "S_Nk"):
+            return {}
+        return {
+            "S_Nk": self.S_Nk.detach().clone(),
+            "S_M1": self.S_M1.detach().clone(),
+            "S_M2": self.S_M2.detach().clone(),
+            "S_counts": self.S_counts.detach().clone(),
+            "S_steps": self.S_steps.detach().clone(),
+            "stream_rho": float(self.stream_rho),
+            "stream_rho_trans": float(self.stream_rho_trans) if self.stream_rho_trans is not None else None,
+        }
+
+    def load_stream_state(self, state: dict):
+        """Restore streaming stats (call after __init__)."""
+        if not state:
+            return
+        self._alloc_stream_buffers()
+        dev, dt = self.mu0.device, self.mu0.dtype
+        for k in ["S_Nk", "S_M1", "S_M2", "S_counts", "S_steps"]:
+            if k in state and state[k] is not None:
+                setattr(self, k, state[k].to(device=dev, dtype=dt))
+        if "stream_rho" in state and state["stream_rho"] is not None:
+            self.stream_rho = float(state["stream_rho"])
+        if "stream_rho_trans" in state:
+            self.stream_rho_trans = float(state["stream_rho_trans"]) if state["stream_rho_trans"] is not None else None
 
     # ---- public update API ---------------------------------------------------
     def update_from_encoder(
@@ -472,6 +538,107 @@ class StickyHDPHMMVI(nn.Module):
             "pi_star": pi.detach(),           # [K]
             "ElogA": self._ElogA().detach(),  # [K,K]
         }
+        
+    @torch.no_grad()
+    def update_streaming(
+        self,
+        mu_t: torch.Tensor,                     # [T,D] or [B,T,D]
+        diag_var_t: Optional[torch.Tensor] = None,  # same shape as mu_t
+        F_t: Optional[torch.Tensor] = None,         # [T,D,R] or [B,T,D,R]
+        mask: Optional[torch.Tensor] = None,        # [T] or [B,T]
+        rho: Optional[float] = None,                # override step; defaults to self.stream_rho
+        optimize_pi: bool = False,                  # rarely needed online
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Streaming (EMA) update using the current encoder outputs.
+        Steps:
+          1) E-step per sequence -> rhat, xihat.
+          2) Aggregate moments {Nk, M1, M2} and transition counts over the batch.
+          3) EMA-update running sufficient stats (S_*).
+          4) Refresh NIW/Dir posteriors from EMA stats.
+        Returns a small dict of diagnostics.
+        """
+        self._alloc_stream_buffers()
+        K, D = self.p.K, self.p.D
+
+        # choose step sizes
+        rho_e = float(self.stream_rho if rho is None else rho)
+        rho_a = float(self.stream_rho_trans if self.stream_rho_trans is not None else rho_e)
+        rho_e = max(0.0, min(1.0, rho_e))
+        rho_a = max(0.0, min(1.0, rho_a))
+
+        # prepare shapes and iterate sequences if needed
+        if mu_t.dim() == 2:
+            mu_bt = mu_t.unsqueeze(0)
+            dv_bt = diag_var_t.unsqueeze(0) if diag_var_t is not None else None
+            F_bt  = F_t.unsqueeze(0)        if F_t is not None else None
+            m_bt  = mask.unsqueeze(0)       if mask is not None else None
+        else:
+            mu_bt, dv_bt, F_bt, m_bt = mu_t, diag_var_t, F_t, mask
+
+        B = mu_bt.size(0)
+        pi_star = self._Epi()                                # [K]
+        log_pi  = torch.log(torch.clamp(pi_star, min=1e-30))
+        ElogA   = self._ElogA()                              # [K,K]
+
+        # aggregate moments and counts over the mini-batch
+        Nk_acc     = torch.zeros(K,       device=mu_bt.device, dtype=mu_bt.dtype)
+        M1_acc     = torch.zeros(K, D,    device=mu_bt.device, dtype=mu_bt.dtype)
+        M2_acc     = torch.zeros(K, D, D, device=mu_bt.device, dtype=mu_bt.dtype)
+        counts_acc = torch.zeros(K, K,    device=mu_bt.device, dtype=mu_bt.dtype)
+        ll_list = []
+
+        for b in range(B):
+            logB_b = self.expected_emission_loglik(
+                mu_bt[b],
+                dv_bt[b] if dv_bt is not None else None,
+                F_bt[b]  if F_bt  is not None else None,
+                m_bt[b]  if m_bt  is not None else None
+            )  # [T,K]
+            rhat_b, xihat_b, ll_b = self.forward_backward(log_pi, ElogA, logB_b)
+            Nk_b, M1_b, M2_b = self._moments_from_encoder(
+                mu_bt[b], rhat_b,
+                dv_bt[b] if dv_bt is not None else None,
+                F_bt[b]  if F_bt  is not None else None
+            )
+            Nk_acc += Nk_b; M1_acc += M1_b; M2_acc += M2_b
+            counts_acc += xihat_b.sum(dim=0)  # [K,K]
+            ll_list.append(ll_b)
+
+            if optimize_pi and b == 0:
+                # Optional: refine pi using first sequence’s rhat (cheap surrogate)
+                pi_star = self._optimize_pi(rhat_b)
+                log_pi  = torch.log(torch.clamp(pi_star, min=1e-30))
+
+        # ---- EMA update of sufficient stats ----
+        # emissions
+        self.S_Nk.mul_(1.0 - rho_e).add_(rho_e * Nk_acc)
+        self.S_M1.mul_(1.0 - rho_e).add_(rho_e * M1_acc)
+        self.S_M2.mul_(1.0 - rho_e).add_(rho_e * M2_acc)
+        # transitions
+        self.S_counts.mul_(1.0 - rho_a).add_(rho_a * counts_acc)
+        self.S_steps.add_(1.0)
+
+        # ---- refresh posteriors from running stats ----
+        # NIW from (S_Nk, S_M1, S_M2)
+        self._update_NIW(self.S_Nk, self.S_M1, self.S_M2)
+        # Dirichlet rows from EMA counts with sticky prior and current π*
+        K = self.p.K
+        alpha, kappa = self.p.alpha, self.p.kappa
+        I = torch.eye(K, device=self.S_counts.device, dtype=self.S_counts.dtype)
+        prior_rows = alpha * pi_star.view(1, K) + kappa * I
+        self.dir.phi = prior_rows + self.S_counts
+
+        # Diagnostics
+        out = {
+            "rho_emission": rho_e,
+            "rho_transition": rho_a,
+            "Nk_batch_sum": Nk_acc.sum().item(),
+            "ll_mean": float(np.mean(ll_list)) if len(ll_list) > 0 else float("nan"),
+            "pi_star": pi_star.detach(),
+            "ElogA": self._ElogA().detach(),
+        }
+        return out
 
     # ---- accessors -----------------------------------------------------------
     def get_posterior_params(self) -> Dict[str, torch.Tensor]:
@@ -491,7 +658,14 @@ class StickyHDPHMMVI(nn.Module):
         """
         return self.niw.mu, self._get_E_Lambda(), self._get_E_logdet_Lambda()
     
+    def get_streaming_rho_emission(self) -> float:
+        """Return the current emission streaming step."""
+        return float(self.stream_rho)
     
+    def get_streaming_rho_transition(self) -> Optional[float]:
+        """Return the current transition streaming step (or None)."""
+        return float(self.stream_rho_trans) if self.stream_rho_trans is not None else None
+
     def load_posterior_params(self, params: Dict[str, torch.Tensor]) -> None:
         """
         Inverse of get_posterior_params(): load NIW/Dir/β parameters from disk.
