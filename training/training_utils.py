@@ -873,7 +873,7 @@ def save_hmm_to_huggingface(
         import tempfile
         temp_hmm_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pt')
         hmm_data = {
-            'hmm_state_dict': hmm.state_dict(),
+            'hmm_posterior_params': hmm.get_posterior_params(),
             'hmm_params': hmm_params,
             'niw_prior': niw_prior,
             'rho_emission': hmm.get_rho_emission().cpu(),
@@ -1096,6 +1096,7 @@ def load_hmm_from_huggingface(
         config = hmm_checkpoint['config']
         hmm_params = hmm_checkpoint['hmm_params'] 
         niw_prior = hmm_checkpoint['niw_prior']
+        hmm_posterior_params = hmm_checkpoint['hmm_posterior_params']
         rho_emission = hmm_checkpoint['rho_emission']
         rho_transition = hmm_checkpoint['rho_transition']
         
@@ -1107,7 +1108,9 @@ def load_hmm_from_huggingface(
             rho_emission=rho_emission,
             rho_transition=rho_transition
         )
-        hmm.load_state_dict(hmm_checkpoint['hmm_state_dict'])
+        
+        # Load posterior parameters instead of state_dict
+        hmm.load_posterior_params(hmm_posterior_params)
         hmm = hmm.to(device)
         
         print(f"✅ HMM loaded successfully from HuggingFace: {repo_name}")

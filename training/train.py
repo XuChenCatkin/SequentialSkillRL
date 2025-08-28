@@ -106,6 +106,73 @@ def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress
 
 
 @torch.no_grad()
+def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int = 5, logger=None):
+    """
+    Compute HMM diagnostics on a subset of the dataset
+    """
+    model.eval()
+    n_batches = min(len(dataset), max_batches)
+    
+    all_mu = []
+    all_var = []
+    all_F = []
+    all_mask = []
+    
+    # Collect VAE outputs for diagnostics
+    with torch.no_grad():
+        for bi, batch in enumerate(dataset):
+            if bi >= n_batches: 
+                break
+                
+            batch_dev = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    x = v.to(device, non_blocking=True)
+                    if x.dim() >= 3 and k not in ('original_batch_shape',):
+                        B, T = x.shape[:2]
+                        batch_dev[k] = x.view(B*T, *x.shape[2:])
+                    else:
+                        batch_dev[k] = x
+                else:
+                    batch_dev[k] = v
+            
+            # Forward encode only
+            out = model(batch_dev)
+            mu = out['mu']
+            logvar = out['logvar']
+            F = out.get('lowrank_factors', None)
+            
+            B, T = batch['original_batch_shape']
+            valid = batch_dev['valid_screen'].view(B, T)
+            
+            # Reshape to [B,T,...]
+            mu_bt = mu.view(B, T, -1)
+            var_bt = logvar.exp().clamp_min(1e-6).view(B, T, -1)
+            F_bt = None if F is None else F.view(B, T, F.size(-2), F.size(-1))
+            
+            all_mu.append(mu_bt)
+            all_var.append(var_bt)
+            if F_bt is not None:
+                all_F.append(F_bt)
+            all_mask.append(valid)
+    
+    # Concatenate all data
+    mu_concat = torch.cat(all_mu, dim=0)  # [total_B, T, D]
+    var_concat = torch.cat(all_var, dim=0)
+    F_concat = torch.cat(all_F, dim=0) if all_F else None
+    mask_concat = torch.cat(all_mask, dim=0)
+    
+    # Compute diagnostics using HMM's built-in function
+    diagnostics = hmm.diagnostics(
+        mu_t=mu_concat,
+        diag_var_t=var_concat, 
+        F_t=F_concat,
+        mask=mask_concat
+    )
+    
+    return diagnostics
+
+
 def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streaming_rho: float = 1.0, max_batches: int | None = None, logger=None):
     """
     Run one E-step pass: update sticky-HDP-HMM variational posteriors using encoder outputs.
@@ -1481,15 +1548,30 @@ def train_vae_with_sticky_hmm_em(
         # E-step: Fit HMM posterior using current VAE representations
         fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, streaming_rho=1.0, logger=logger)
 
+        # Compute HMM diagnostics
+        if logger: logger.info(f"🔍 Computing HMM diagnostics...")
+        diagnostics = compute_hmm_diagnostics(model, train_dataset, device, hmm, logger=logger)
+        if logger: 
+            logger.info(f"📊 HMM Diagnostics for Round {r+1}:")
+            logger.info(f"  - Avg log-likelihood per step: {diagnostics['avg_loglik_per_step']:.4f}")
+            logger.info(f"  - State entropy: {diagnostics['state_entropy']:.4f}")
+            logger.info(f"  - Effective number of skills: {diagnostics['effective_K']:.2f}")
+            logger.info(f"  - Transition stickiness (diag): {diagnostics['stickiness_diag_mean']:.4f}")
+            logger.info(f"  - Top 5 skill occupancies: {diagnostics['top5_pi'].tolist()}")
+            logger.info(f"  - Top 5 skill indices: {diagnostics['top5_idx'].tolist()}")
+
         # Save HMM posterior locally
         hmm_path = os.path.join(save_dir, f"hmm_round{r+1}.pt")
         hmm_save_data = {
-            'hmm_state_dict': hmm.state_dict(),
+            'hmm_posterior_params': hmm.get_posterior_params(),
             'hmm_params': hmm_params,
             'niw_prior': niw,
+            'rho_emission': hmm.get_rho_emission().cpu(),
+            'rho_transition': hmm.get_rho_transition().cpu(),
             'round': r + 1,
             'config': config,
             'training_timestamp': datetime.now().isoformat(),
+            'diagnostics': diagnostics,  # Include diagnostics in save
         }
         torch.save(hmm_save_data, hmm_path)
         training_info['hmm_paths'].append(hmm_path)
@@ -1563,15 +1645,18 @@ def train_vae_with_sticky_hmm_em(
         vae_hmm_save_data = {
             'model_state_dict': model.state_dict(),
             'config': config,
-            'hmm_state_dict': hmm.state_dict(),
+            'hmm_posterior_params': hmm.get_posterior_params(),
             'hmm_params': hmm_params,
             'niw_prior': niw,
+            'rho_emission': hmm.get_rho_emission().cpu(),
+            'rho_transition': hmm.get_rho_transition().cpu(),
             'round': r + 1,
             'train_losses': train_losses,
             'test_losses': test_losses,
             'final_train_loss': train_losses[-1] if train_losses else None,
             'final_test_loss': test_losses[-1] if test_losses else None,
             'training_timestamp': datetime.now().isoformat(),
+            'diagnostics': diagnostics,  # Include diagnostics in VAE+HMM save
         }
         torch.save(vae_hmm_save_data, vae_hmm_path)
         training_info['vae_hmm_paths'].append(vae_hmm_path)
@@ -1648,56 +1733,4 @@ def train_vae_with_sticky_hmm_em(
         if hub_repo_id_vae_hmm and not hmm_only:
             if logger: logger.info(f"    * VAE+HMM: https://huggingface.co/{hub_repo_id_vae_hmm}")
 
-    return model, hmm, training_info
-
-def example_train_vae_with_hmm():
-    """
-    Example usage of train_vae_with_sticky_hmm_em function
-    """
-    import logging
-    
-    # Set up logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-    
-    # Example: Load pre-trained VAE from HuggingFace and train with HMM
-    model, hmm, training_info = train_vae_with_sticky_hmm_em(
-        # Load from HuggingFace
-        pretrained_hf_repo="username/nethack-vae-pretrained",
-        
-        # Or load from local checkpoint
-        # pretrained_ckpt_path="checkpoints/checkpoint_epoch_0015.pth",
-        
-        # Datasets (you need to prepare these beforehand)
-        train_dataset=None,  # Your training dataset
-        test_dataset=None,   # Your testing dataset
-        
-        # HMM parameters
-        alpha=5.0,
-        kappa=20.0,
-        gamma=5.0,
-        hmm_only=False,  # Set to True to only fit HMM without VAE fine-tuning
-        em_rounds=3,
-        m_epochs_per_round=2,
-        
-        # HuggingFace integration
-        push_to_hub=True,
-        hub_repo_id_hmm="username/nethack-hmm",
-        hub_repo_id_vae_hmm="username/nethack-vae-hmm",
-        hf_token="your_hf_token",  # Or set HF_TOKEN environment variable
-        hf_private=True,
-        
-        # Training parameters
-        use_bf16=True,
-        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-        logger=logger,
-        
-        # Additional training arguments passed to M-step
-        max_learning_rate=1e-4,  # Lower learning rate for fine-tuning
-    )
-    
-    print(f"✅ Training completed!")
-    print(f"📊 HMM checkpoints: {len(training_info['hmm_paths'])}")
-    print(f"📊 VAE+HMM checkpoints: {len(training_info['vae_hmm_paths'])}")
-    
     return model, hmm, training_info

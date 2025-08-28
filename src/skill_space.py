@@ -94,7 +94,7 @@ class StickyHDPHMMVI(nn.Module):
         self.niw = NIWPosterior(
             mu=torch.zeros(K, D, device=dev, dtype=dt),
             kappa=torch.full((K,), niw_prior.kappa0, device=dev, dtype=dt),
-            Psi=torch.stack([niw_prior.Psi0.clone().to(dev=dev, dtype=dt) for _ in range(K)], dim=0),
+            Psi=torch.stack([niw_prior.Psi0.clone().to(device=dev, dtype=dt) for _ in range(K)], dim=0),
             nu=torch.full((K,), niw_prior.nu0, device=dev, dtype=dt),
         )
 
@@ -112,9 +112,9 @@ class StickyHDPHMMVI(nn.Module):
         self._E_logdet_Lambda = None  # [K]
 
         # Save NIW prior
-        self.register_buffer("mu0", niw_prior.mu0.to(dev=dev, dtype=dt))
+        self.register_buffer("mu0", niw_prior.mu0.to(device=dev, dtype=dt))
         self.kappa0 = float(niw_prior.kappa0)
-        self.register_buffer("Psi0", niw_prior.Psi0.to(dev=dev, dtype=dt))
+        self.register_buffer("Psi0", niw_prior.Psi0.to(device=dev, dtype=dt))
         self.nu0 = float(niw_prior.nu0)
 
         # Streaming defaults + lazy buffers
@@ -249,7 +249,7 @@ class StickyHDPHMMVI(nn.Module):
                 + logB[t + 1].unsqueeze(0) + log_beta[t + 1].unsqueeze(0)
                 - ll
             )  # [K,K]
-            xihat[t] = torch.softmax(tmp, dim=(0, 1))
+            xihat[t] = torch.softmax(tmp.view(-1), dim=0).view(K, K)
 
         return rhat, xihat, float(ll.item())
 
@@ -522,12 +522,12 @@ class StickyHDPHMMVI(nn.Module):
 
     def load_posterior_params(self, params: Dict[str, torch.Tensor]) -> None:
         dev, dt = self.mu0.device, self.mu0.dtype
-        self.niw.mu    = params["mu"].to(dev=dev, dtype=dt)
-        self.niw.kappa = params["kappa"].to(dev=dev, dtype=dt)
-        self.niw.Psi   = params["Psi"].to(dev=dev, dtype=dt)
-        self.niw.nu    = params["nu"].to(dev=dev, dtype=dt)
-        if "phi" in params:     self.dir.phi.copy_(params["phi"].to(dev=dev, dtype=dt))
-        if "beta_u" in params:  self.u_beta.data.copy_(params["beta_u"].to(dev=dev, dtype=dt))
+        self.niw.mu    = params["mu"].to(device=dev, dtype=dt)
+        self.niw.kappa = params["kappa"].to(device=dev, dtype=dt)
+        self.niw.Psi   = params["Psi"].to(device=dev, dtype=dt)
+        self.niw.nu    = params["nu"].to(device=dev, dtype=dt)
+        if "phi" in params:     self.dir.phi.copy_(params["phi"].to(device=dev, dtype=dt))
+        if "beta_u" in params:  self.u_beta.data.copy_(params["beta_u"].to(device=dev, dtype=dt))
         self._cache_fresh = False
 
     # ---- diagnostics ---------------------------------------------------------

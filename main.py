@@ -1,9 +1,10 @@
+import logging
 import os
 import sys
 import torch
 from datetime import datetime
 from src.data_collection import NetHackDataCollector, BLStatsAdapter
-from training.train import train_multimodalhack_vae, VAEConfig, load_datasets
+from training.train import train_multimodalhack_vae, VAEConfig, load_datasets, train_vae_with_sticky_hmm_em
 from utils.analysis import create_visualization_demo, analyze_glyph_char_color_pairs, plot_glyph_char_color_pairs_from_saved
 
 if __name__ == "__main__":
@@ -310,6 +311,10 @@ if __name__ == "__main__":
             force_recollect=False
         )
         
+        # Set up logging
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        
         if sys.argv[2] == "vae_only":
             # Train with pre-loaded datasets
             model, train_losses, test_losses = train_multimodalhack_vae(
@@ -320,6 +325,7 @@ if __name__ == "__main__":
                 max_learning_rate=1e-3,
                 save_path="models/nethack-vae.pth",
                 device='cuda' if torch.cuda.is_available() else 'cpu',
+                logger=logger,
                 use_bf16=False,  # Enable BF16 mixed precision training
                 shuffle_batches=True,  # Shuffle training batches each epoch for better training
                 shuffle_within_batch=True,  # Shuffle within each batch for more variety
@@ -359,3 +365,44 @@ if __name__ == "__main__":
             print(f"\n🎉 Full VAE training run completed successfully!")
             print(f"   📈 Train losses: {train_losses}")
             print(f"   📈 Test losses: {test_losses}")
+            
+        else:
+            if sys.argv[2] == "hmm_only":
+                hmm_only = True
+            elif sys.argv[2] == "vae_hmm":
+                hmm_only = False
+            else:
+                print("❌ Invalid argument. Use 'vae_only', 'hmm_only', or 'vae_hmm'.")
+                sys.exit(1)
+            model, hmm, training_info = train_vae_with_sticky_hmm_em(
+                # Load from HuggingFace
+                pretrained_hf_repo="CatkinChen/nethack-vae",
+                # Datasets
+                train_dataset=train_dataset, 
+                test_dataset=test_dataset,  
+                
+                # HMM parameters
+                alpha=5.0,
+                kappa=20.0,
+                gamma=5.0,
+                hmm_only=hmm_only,
+                em_rounds=1 if hmm_only else 3,
+                m_epochs_per_round=2,
+                
+                # HuggingFace integration
+                push_to_hub=True,
+                hub_repo_id_hmm="CatkinChen/nethack-hmm",
+                hub_repo_id_vae_hmm="CatkinChen/nethack-vae-hmm",
+                
+                # Training parameters
+                use_bf16=False,
+                device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                logger=logger,
+                
+                # Additional training arguments passed to M-step
+                max_learning_rate=1e-4,  # Lower learning rate for fine-tuning
+            )
+            
+            print(f"✅ Training completed!")
+            print(f"📊 HMM checkpoints: {len(training_info['hmm_paths'])}")
+            print(f"📊 VAE+HMM checkpoints: {len(training_info['vae_hmm_paths'])}")
