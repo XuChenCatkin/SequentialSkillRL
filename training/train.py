@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple, Optional, Callable
 import warnings
 import logging
 from datetime import datetime
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR, ConstantLR
 from src.skill_space import StickyHDPHMMVI, StickyHDPHMMParams, NIWPrior
 import copy
 
@@ -308,6 +308,9 @@ def train_multimodalhack_vae(
     # Custom KL beta function (optional override)
     custom_kl_beta_function: Optional[Callable[[float, float, float], float]] = None,
     
+    # Learning rate scheduler parameters
+    lr_scheduler: str = "onecycle",  # "onecycle" | "constant"
+    
     # Model saving and checkpointing parameters
     save_path: str = "models/nethack-vae.pth",
     save_checkpoints: bool = False,
@@ -364,6 +367,7 @@ def train_multimodalhack_vae(
         shuffle_within_batch: Whether to shuffle games within each batch (preserves temporal order within each game)
         use_bf16: Whether to use BF16 mixed precision training for memory efficiency
         custom_kl_beta_function: Optional custom function for KL beta ramping (overrides config beta curves)
+        lr_scheduler: Learning rate scheduler type. Options: "onecycle" (default), "constant"
         save_path: Path to save the trained model
         save_checkpoints: Whether to save checkpoints during training
         checkpoint_dir: Directory to save checkpoints
@@ -432,6 +436,7 @@ def train_multimodalhack_vae(
             "sequence_size": sequence_size,
             "device": str(device),
             "use_bf16": use_bf16,
+            "lr_scheduler": lr_scheduler,
             "shuffle_batches": shuffle_batches,
             "shuffle_within_batch": shuffle_within_batch,
             "vae_config": {
@@ -447,6 +452,9 @@ def train_multimodalhack_vae(
                 "initial_dw_beta": config.initial_dw_beta,
                 "final_dw_beta": config.final_dw_beta,
                 "dw_beta_shape": config.dw_beta_shape,
+                "initial_prior_blend_alpha": config.initial_prior_blend_alpha,
+                "final_prior_blend_alpha": config.final_prior_blend_alpha,
+                "prior_blend_shape": config.prior_blend_shape,
                 "warmup_epoch_ratio": config.warmup_epoch_ratio,
                 "free_bits": config.free_bits,
                 "focal_loss_alpha": config.focal_loss_alpha,
@@ -462,6 +470,9 @@ def train_multimodalhack_vae(
                 "initial_dw_beta": config.initial_dw_beta,
                 "final_dw_beta": config.final_dw_beta,
                 "dw_beta_shape": config.dw_beta_shape,
+                "initial_prior_blend_alpha": config.initial_prior_blend_alpha,
+                "final_prior_blend_alpha": config.final_prior_blend_alpha,
+                "prior_blend_shape": config.prior_blend_shape,
                 "warmup_epoch_ratio": config.warmup_epoch_ratio
             },
             "regularization": {
@@ -505,6 +516,7 @@ def train_multimodalhack_vae(
     logger.info(f"   Sequence size: {sequence_size}")
     logger.info(f"   Device: {device}")
     logger.info(f"   Mixed Precision: BF16 = {use_bf16}")
+    logger.info(f"   LR Scheduler: {lr_scheduler}")
     logger.info(f"   Shuffle batches: {shuffle_batches}")
     logger.info(f"   Shuffle within batch: {shuffle_within_batch}")
     logger.info(f"   VAE Configuration:")
@@ -515,6 +527,7 @@ def train_multimodalhack_vae(
     logger.info(f"     - MI beta: {config.initial_mi_beta:.3f} → {config.final_mi_beta:.3f}")
     logger.info(f"     - TC beta: {config.initial_tc_beta:.3f} → {config.final_tc_beta:.3f}")
     logger.info(f"     - DW beta: {config.initial_dw_beta:.3f} → {config.final_dw_beta:.3f}")
+    logger.info(f"     - Blend alpha: {config.initial_prior_blend_alpha:.3f} → {config.final_prior_blend_alpha:.3f}")
     logger.info(f"     - Warmup epochs: {int(config.warmup_epoch_ratio * epochs)} out of {epochs} total epochs")
     logger.info(f"   Free bits: {config.free_bits}")
     logger.info(f"   Focal loss: alpha={config.focal_loss_alpha}, gamma={config.focal_loss_gamma}")
@@ -526,7 +539,7 @@ def train_multimodalhack_vae(
     if hmm is not None:
         logger.info(f"   HMM Prior: {'Enabled' if use_hmm_prior else 'Available but disabled'}")
 
-    def get_adaptive_weights(global_step: int, total_steps: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float]:
+    def get_adaptive_weights(global_step: int, total_steps: int, f: Optional[Callable[[float, float, float], float]]) -> Tuple[float, float, float, float]:
         """Calculate adaptive weights based on current global training step"""
         # Calculate progress based on global step for smoother transitions
         progress = min(global_step / max(total_steps - 1, 1), 1.0)
@@ -555,11 +568,19 @@ def train_multimodalhack_vae(
             f=f
         )
         
+        # Prior blend alpha: blend between standard and HMM priors
+        blend_alpha = ramp_weight(initial_weight=config.initial_prior_blend_alpha, 
+            final_weight=config.final_prior_blend_alpha, 
+            shape=config.prior_blend_shape, 
+            progress=progress,
+            f=f
+        )
+        
         # Log the adaptive weights (only occasionally to avoid spam)
         if global_step % 100 == 0:
-            logger.debug(f"Step {global_step}/{total_steps} - Adaptive weights: mi_beta={mi_beta:.3f}, tc_beta={tc_beta:.3f}, dw_beta={dw_beta:.3f}")
+            logger.debug(f"Step {global_step}/{total_steps} - Adaptive weights: mi_beta={mi_beta:.3f}, tc_beta={tc_beta:.3f}, dw_beta={dw_beta:.3f}, blend_alpha={blend_alpha:.3f}")
 
-        return mi_beta, tc_beta, dw_beta
+        return mi_beta, tc_beta, dw_beta, blend_alpha
 
     # Resume from checkpoint if specified
     if resume_checkpoint_path and os.path.exists(resume_checkpoint_path):
@@ -595,16 +616,22 @@ def train_multimodalhack_vae(
         total_train_steps = len(train_dataset) * epochs
         warmup_steps = int(config.warmup_epoch_ratio * total_train_steps) if config.warmup_epoch_ratio > 0 else 0
 
-        scheduler = OneCycleLR(
-            optimizer, 
-            max_lr=max_learning_rate, 
-            total_steps=total_train_steps, 
-            pct_start=config.warmup_epoch_ratio,
-            anneal_strategy='cos',
-            div_factor=2.0,
-            final_div_factor=5.0,
-            cycle_momentum=False
-        )
+        if lr_scheduler == "onecycle":
+            scheduler = OneCycleLR(
+                optimizer, 
+                max_lr=max_learning_rate, 
+                total_steps=total_train_steps, 
+                pct_start=config.warmup_epoch_ratio,
+                anneal_strategy='cos',
+                div_factor=2.0,
+                final_div_factor=5.0,
+                cycle_momentum=False
+            )
+        elif lr_scheduler == "constant":
+            scheduler = ConstantLR(optimizer, factor=1.0, total_iters=total_train_steps)
+        else:
+            raise ValueError(f"Unsupported lr_scheduler: {lr_scheduler}. Choose from 'onecycle' or 'constant'")
+            
         scheduler.load_state_dict(checkpoint['scheduler_state_dict']) if 'scheduler_state_dict' in checkpoint else None
         optimizer.load_state_dict(checkpoint['optimizer_state_dict']) if 'optimizer_state_dict' in checkpoint else None
         
@@ -625,16 +652,21 @@ def train_multimodalhack_vae(
         total_train_steps = len(train_dataset) * epochs
         warmup_steps = int(config.warmup_epoch_ratio * total_train_steps) if config.warmup_epoch_ratio > 0 else 0
         
-        scheduler = OneCycleLR(
-            optimizer, 
-            max_lr=max_learning_rate, 
-            total_steps=total_train_steps, 
-            pct_start=config.warmup_epoch_ratio,
-            anneal_strategy='cos',
-            div_factor=2.0,
-            final_div_factor=5.0,
-            cycle_momentum=False
-        )
+        if lr_scheduler == "onecycle":
+            scheduler = OneCycleLR(
+                optimizer, 
+                max_lr=max_learning_rate, 
+                total_steps=total_train_steps, 
+                pct_start=config.warmup_epoch_ratio,
+                anneal_strategy='cos',
+                div_factor=2.0,
+                final_div_factor=5.0,
+                cycle_momentum=False
+            )
+        elif lr_scheduler == "constant":
+            scheduler = ConstantLR(optimizer, factor=1.0, total_iters=total_train_steps)
+        else:
+            raise ValueError(f"Unsupported lr_scheduler: {lr_scheduler}. Choose from 'onecycle' or 'constant'")
         
         # Initialize loss tracking
         train_losses = []
@@ -748,9 +780,39 @@ def train_multimodalhack_vae(
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
                     model_output = model(batch_device)
+                    
+                    # ==== (M‑step) HMM prior cache for this batch (no gradients) ====
+                    if use_hmm_prior and (hmm is not None):
+                        with torch.no_grad():
+                            B,T = batch_device['original_batch_shape']
+                            valid_bt = batch_device['valid_screen'].view(B,T)
+                            mu_bt    = model_output['mu'].view(B,T,-1)
+                            var_bt   = model_output['logvar'].exp().clamp_min(1e-6).view(B,T,-1)
+                            F_btr    = model_output.get('lowrank_factors', None)
+                            F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
+                            # emission expected log-likelihood per (b,t,k)
+                            logB = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
+                            pi_star  = hmm._Epi()                              # [K]
+                            ElogA    = hmm._ElogA()                            # [K,K]
+                            log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
+                            r_hat, xi_hat, ll = hmm.forward_backward(log_pi, ElogA, logB)
+                            # prior Gaussians
+                            mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
+                            # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
+                            logdet_Sigma_k = -torch.logdet(E_Lambda + 1e-6*torch.eye(E_Lambda.size(-1), device=E_Lambda.device)).to(mu_bt.dtype)
+                            # flatten responsibilities to align with valid_screen
+                            r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
+                        # stash cache into batch so vae_loss can pick it up
+                        batch_device['sticky_hmm'] = hmm
+                        batch_device['hmm_cache'] = {
+                            'mu_k': mu_k.to(model_output['mu'].dtype),
+                            'E_Lambda': E_Lambda.to(model_output['mu'].dtype),
+                            'logdet_Sigma_k': logdet_Sigma_k.to(model_output['mu'].dtype),
+                            'r_hat_flat': r_hat_flat.to(model_output['mu'].dtype),
+                        }
 
                     # Calculate adaptive weights for this step
-                    mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
+                    mi_beta, tc_beta, dw_beta, blend_alpha = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
                     
                     # Optional head weight schedule: start at 0.5x → 1.0x over warm-up for pass/safety
                     head_prog = min(global_step / max(int(total_train_steps * config.warmup_epoch_ratio), 1), 1.0)
@@ -771,7 +833,8 @@ def train_multimodalhack_vae(
                         mi_beta=mi_beta,
                         tc_beta=tc_beta,
                         dw_beta=dw_beta,
-                        weight_override=weight_override
+                        weight_override=weight_override,
+                        prior_blend_alpha=blend_alpha
                     )
 
                     train_loss = train_loss_dict['total_loss']
@@ -855,6 +918,7 @@ def train_multimodalhack_vae(
                         "adaptive_weights/mi_beta": mi_beta,
                         "adaptive_weights/tc_beta": tc_beta,
                         "adaptive_weights/dw_beta": dw_beta,
+                        "adaptive_weights/blend_alpha": blend_alpha,
                         
                         # Model diagnostics
                         "model/mu_var": safe_tensor_for_wandb(mu.var(dim=0)),
@@ -936,8 +1000,38 @@ def train_multimodalhack_vae(
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
                     model_output = model(batch_device)
                     
+                    # ==== (M‑step) HMM prior cache for this batch (no gradients) ====
+                    if use_hmm_prior and (hmm is not None):
+                        with torch.no_grad():
+                            B,T = batch_device['original_batch_shape']
+                            valid_bt = batch_device['valid_screen'].view(B,T)
+                            mu_bt    = model_output['mu'].view(B,T,-1)
+                            var_bt   = model_output['logvar'].exp().clamp_min(1e-6).view(B,T,-1)
+                            F_btr    = model_output.get('lowrank_factors', None)
+                            F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
+                            # emission expected log-likelihood per (b,t,k)
+                            logB = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
+                            pi_star  = hmm._Epi()                              # [K]
+                            ElogA    = hmm._ElogA()                            # [K,K]
+                            log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
+                            r_hat, xi_hat, ll = hmm.forward_backward(log_pi, ElogA, logB)
+                            # prior Gaussians
+                            mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
+                            # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
+                            logdet_Sigma_k = -torch.logdet(E_Lambda + 1e-6*torch.eye(E_Lambda.size(-1), device=E_Lambda.device)).to(mu_bt.dtype)
+                            # flatten responsibilities to align with valid_screen
+                            r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
+                        # stash cache into batch so vae_loss can pick it up
+                        batch_device['sticky_hmm'] = hmm
+                        batch_device['hmm_cache'] = {
+                            'mu_k': mu_k.to(model_output['mu'].dtype),
+                            'E_Lambda': E_Lambda.to(model_output['mu'].dtype),
+                            'logdet_Sigma_k': logdet_Sigma_k.to(model_output['mu'].dtype),
+                            'r_hat_flat': r_hat_flat.to(model_output['mu'].dtype),
+                        }
+                        
                     # Calculate adaptive weights for this step (use current global step for consistency)
-                    mi_beta, tc_beta, dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
+                    mi_beta, tc_beta, dw_beta, blend_alpha = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
                     
                     # Optional head weight schedule: start at 0.5x → 1.0x over warm-up for pass/safety
                     head_prog = min(global_step / max(int(total_train_steps * config.warmup_epoch_ratio), 1), 1.0)
@@ -958,7 +1052,8 @@ def train_multimodalhack_vae(
                         mi_beta=mi_beta,
                         tc_beta=tc_beta,
                         dw_beta=dw_beta,
-                        weight_override=weight_override
+                        weight_override=weight_override,
+                        prior_blend_alpha=blend_alpha
                     )
 
                     test_loss = test_loss_dict['total_loss']
@@ -1053,13 +1148,13 @@ def train_multimodalhack_vae(
         
         # Log epoch summary
         # Calculate current adaptive weights for display
-        current_mi_beta, current_tc_beta, current_dw_beta = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
+        current_mi_beta, current_tc_beta, current_dw_beta, current_blend_alpha = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
         
         logger.info(f"\n=== Epoch {epoch+1}/{epochs} Summary ===")
         logger.info(f"Average Train Loss: {avg_train_loss:.3f} | Average Test Loss: {avg_test_loss:.3f}")
         if early_stopping:
             logger.info(f"Early Stopping: Best Test Loss: {best_test_loss:.4f} (epoch {best_epoch+1}) | Counter: {early_stopping_counter}/{early_stopping_patience}")
-        logger.info(f"Current KL Betas: mi={current_mi_beta:.3f}, tc={current_tc_beta:.3f}, dw={current_dw_beta:.3f}")
+        logger.info(f"Current KL Betas: mi={current_mi_beta:.3f}, tc={current_tc_beta:.3f}, dw={current_dw_beta:.3f}, blend_alpha={current_blend_alpha:.3f}")
         logger.info(f"Global Step: {global_step}/{total_train_steps} ({100*global_step/total_train_steps:.1f}%)")
         
         # Show detailed modality breakdown for the last batch of training and testing

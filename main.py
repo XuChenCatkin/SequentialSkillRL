@@ -277,22 +277,6 @@ if __name__ == "__main__":
             ],
         }
 
-        vae_config = VAEConfig(
-            initial_mi_beta=1.0,
-            final_mi_beta=1.0,
-            mi_beta_shape='constant',
-            initial_tc_beta=0.0,
-            final_tc_beta=10.0,
-            tc_beta_shape='custom',
-            initial_dw_beta=0.2,
-            final_dw_beta=1.0,
-            dw_beta_shape='custom',
-            warmup_epoch_ratio=0.2,
-            free_bits=0.75,
-            encoder_dropout=0.1,
-            decoder_dropout=0.1
-        )
-
         print(f"\n🧪 Starting train_multimodalhack_vae...")
         
         # Load datasets first
@@ -316,6 +300,22 @@ if __name__ == "__main__":
         logger = logging.getLogger(__name__)
         
         if sys.argv[2] == "vae_only":
+            vae_config = VAEConfig(
+                initial_mi_beta=1.0,
+                final_mi_beta=1.0,
+                mi_beta_shape='constant',
+                initial_tc_beta=0.0,
+                final_tc_beta=10.0,
+                tc_beta_shape='custom',
+                initial_dw_beta=0.2,
+                final_dw_beta=1.0,
+                dw_beta_shape='custom',
+                warmup_epoch_ratio=0.2,
+                free_bits=0.75,
+                encoder_dropout=0.1,
+                decoder_dropout=0.1,
+                prior_mode="standard",
+            )
             # Train with pre-loaded datasets
             model, train_losses, test_losses = train_multimodalhack_vae(
                 train_dataset=train_dataset,
@@ -374,6 +374,25 @@ if __name__ == "__main__":
             else:
                 print("❌ Invalid argument. Use 'vae_only', 'hmm_only', or 'vae_hmm'.")
                 sys.exit(1)
+            vae_config = VAEConfig(
+                initial_mi_beta=1.0,
+                final_mi_beta=1.0,
+                mi_beta_shape='constant',
+                initial_tc_beta=0.0,
+                final_tc_beta=10.0,
+                tc_beta_shape='custom',
+                initial_dw_beta=0.2,
+                final_dw_beta=1.0,
+                dw_beta_shape='custom',
+                warmup_epoch_ratio=0.2,
+                free_bits=0.75,
+                encoder_dropout=0.1,
+                decoder_dropout=0.1,
+                prior_mode="blend",
+                initial_prior_blend_alpha=0.3,
+                final_prior_blend_alpha=1.0,
+                prior_blend_shape='custom'
+            )
             model, hmm, training_info = train_vae_with_sticky_hmm_em(
                 # Load from HuggingFace
                 pretrained_hf_repo="CatkinChen/nethack-vae",
@@ -387,7 +406,7 @@ if __name__ == "__main__":
                 gamma=5.0,
                 hmm_only=hmm_only,
                 em_rounds=1 if hmm_only else 3,
-                m_epochs_per_round=2,
+                m_epochs_per_round=3,
                 
                 # HuggingFace integration
                 push_to_hub=True,
@@ -398,9 +417,10 @@ if __name__ == "__main__":
                 use_bf16=False,
                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                 logger=logger,
-                
+                custom_kl_beta_function = lambda init, end, progress: init + (end - init) * min(progress, 0.2) * 5.0, 
                 # Additional training arguments passed to M-step
                 max_learning_rate=1e-4,  # Lower learning rate for fine-tuning
+                lr_scheduler="constant"   # Use constant LR scheduler for stability
             )
             
             print(f"✅ Training completed!")
