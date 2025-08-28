@@ -14,9 +14,11 @@ from collections import Counter
 from tqdm import tqdm
 from datetime import datetime
 import json
+import math
 
 from src.model import bag_presence_to_glyph_sets, make_pair_bag, MapDecoder
 from training.train import load_model_from_huggingface, load_model_from_local
+from src.skill_space import StickyHDPHMMVI
 
 # Import NetHackCategory from data_collection
 try:
@@ -1865,3 +1867,237 @@ def plot_glyph_char_color_pairs_from_saved(
     }
     
     return results
+
+
+@torch.no_grad()
+def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_sequences: int = 6, max_batches: int = 4):
+    """
+    Collect a few sequences' responsibility argmax per time step for raster plots.
+    Returns: (rasters: List[np.ndarray], lengths: List[int])
+    """
+    rasters, lengths = [], []
+    grabbed = 0
+    for bi, batch in enumerate(dataset):
+        if grabbed >= max_sequences or bi >= max_batches: break
+        # Move to device and keep [B,T,...] shapes
+        batch_dev = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch_dev[k] = v.to(device, non_blocking=True)
+            else:
+                batch_dev[k] = v
+        if 'game_chars' not in batch_dev: 
+            continue
+        B, T = batch_dev['game_chars'].shape[:2]
+        with torch.no_grad():
+            # Flatten to [B*T,...] for model forward, then reshape back
+            flat = {}
+            for k,v in batch_dev.items():
+                if isinstance(v, torch.Tensor) and v.dim() >= 3 and k not in ('original_batch_shape',):
+                    flat[k] = v.view(B*T, *v.shape[2:])
+                else:
+                    flat[k] = v
+            out = model(flat)
+            mu_bt  = out['mu'].view(B, T, -1)
+            var_bt = out['logvar'].exp().clamp_min(1e-6).view(B, T, -1)
+            F_btr  = out.get('lowrank_factors', None)
+            F_bt   = None if F_btr is None else F_btr.view(B, T, F_btr.size(-2), F_btr.size(-1))
+            valid  = flat['valid_screen'].view(B, T).bool()
+
+            logB  = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt, mask=valid)  # [B,T,K]
+            log_pi = torch.log(torch.clamp(hmm._Epi(), min=1e-30))
+            ElogA = hmm._ElogA()
+            r_hat, _, _ = hmm.forward_backward(log_pi, ElogA, logB)                # [B,T,K]
+            # turn into argmax labels on valid frames only
+            for b in range(B):
+                if grabbed >= max_sequences: break
+                m = valid[b].cpu().numpy().astype(bool)
+                if m.sum() == 0: 
+                    continue
+                labels = r_hat[b].argmax(-1).cpu().numpy()  # [T]
+                labels = labels[m]
+                rasters.append(labels)
+                lengths.append(len(labels))
+                grabbed += 1
+        if grabbed >= max_sequences:
+            break
+    return rasters, lengths
+
+@torch.no_grad()
+def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int = 5, logger=None):
+    """
+    Compute HMM diagnostics on a subset of the dataset
+    """
+    model.eval()
+    n_batches = min(len(dataset), max_batches)
+    
+    all_mu = []
+    all_var = []
+    all_F = []
+    all_mask = []
+    
+    # Collect VAE outputs for diagnostics
+    with torch.no_grad():
+        for bi, batch in enumerate(dataset):
+            if bi >= n_batches: 
+                break
+                
+            batch_dev = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    x = v.to(device, non_blocking=True)
+                    if x.dim() >= 3 and k not in ('original_batch_shape',):
+                        B, T = x.shape[:2]
+                        batch_dev[k] = x.view(B*T, *x.shape[2:])
+                    else:
+                        batch_dev[k] = x
+                else:
+                    batch_dev[k] = v
+            
+            # Forward encode only
+            out = model(batch_dev)
+            mu = out['mu']
+            logvar = out['logvar']
+            F = out.get('lowrank_factors', None)
+            
+            B, T = batch['original_batch_shape']
+            valid = batch_dev['valid_screen'].view(B, T)
+            
+            # Reshape to [B,T,...]
+            mu_bt = mu.view(B, T, -1)
+            var_bt = logvar.exp().clamp_min(1e-6).view(B, T, -1)
+            F_bt = None if F is None else F.view(B, T, F.size(-2), F.size(-1))
+            
+            all_mu.append(mu_bt)
+            all_var.append(var_bt)
+            if F_bt is not None:
+                all_F.append(F_bt)
+            all_mask.append(valid)
+    
+    # Concatenate all data
+    mu_concat = torch.cat(all_mu, dim=0)  # [total_B, T, D]
+    var_concat = torch.cat(all_var, dim=0)
+    F_concat = torch.cat(all_F, dim=0) if all_F else None
+    mask_concat = torch.cat(all_mask, dim=0)
+    
+    # Compute diagnostics using HMM's built-in function
+    diagnostics = hmm.diagnostics(
+        mu_t=mu_concat,
+        diag_var_t=var_concat, 
+        F_t=F_concat,
+        mask=mask_concat
+    )
+    
+    return diagnostics
+
+@torch.no_grad()
+def visualize_hmm_after_estep(
+    model, dataset, device, hmm: StickyHDPHMMVI, save_dir: str, round_idx: int,
+    logger=None, max_diags_batches: int = 5, max_raster_sequences: int = 6
+):
+    """
+    Produce a small set of plots summarizing the HMM after the E-step.
+    Saves figures under {save_dir}/round_{round_idx:02d}/ and returns a dict of paths.
+    """
+    round_dir = os.path.join(save_dir, f"round_{round_idx:02d}")
+    os.makedirs(round_dir, exist_ok=True)
+
+    # 1) quick diagnostics and basic tensors
+    diags = compute_hmm_diagnostics(model, dataset, device, hmm, max_batches=max_diags_batches, logger=logger)
+    pi_hat = diags["occupancy_pi_hat"].cpu().numpy()
+    A_bar  = torch.softmax(hmm._ElogA(), dim=1).cpu().numpy()  # proxy for E[A]
+    mu_k, E_Lambda, _ = hmm.get_emission_expectations()        # [K,D], [K,D,D], [K]
+    mu_k = mu_k.cpu().numpy()
+
+    # 2) figure: occupancy bar
+    f1 = plt.figure(figsize=(8, 3))
+    xs = np.arange(len(pi_hat))
+    plt.bar(xs, pi_hat)
+    plt.xlabel("Skill k")
+    plt.ylabel("Occupancy $\hat{\\pi}_k$")
+    plt.title(f"Round {round_idx}: Skill occupancy (effK={diags['effective_K']:.2f})")
+    plt.tight_layout()
+    path_pi = os.path.join(round_dir, f"round{round_idx:02d}_pi_bar.png")
+    f1.savefig(path_pi, dpi=160); plt.close(f1)
+
+    # 3) figure: transition heatmap
+    f2 = plt.figure(figsize=(6, 5))
+    plt.imshow(A_bar, origin="lower", aspect="auto")
+    plt.colorbar(label="Softmax(ElogA)")
+    plt.xlabel("Next state")
+    plt.ylabel("Current state")
+    diag_mean = float(np.mean(np.diag(A_bar)))
+    plt.title(f"Round {round_idx}: Transition matrix (diag mean={diag_mean:.3f})")
+    plt.tight_layout()
+    path_A = os.path.join(round_dir, f"round{round_idx:02d}_A_heatmap.png")
+    f2.savefig(path_A, dpi=160); plt.close(f2)
+
+    # 4) figure: PCA of mu_k (+ optional ellipses from E[Lambda]^{-1})
+    try:
+        from sklearn.decomposition import PCA
+        comps = min(2, mu_k.shape[1]); pca = PCA(n_components=comps).fit(mu_k)
+        xy = pca.transform(mu_k)
+        f3 = plt.figure(figsize=(6, 5))
+        plt.scatter(xy[:,0], xy[:,1], s=50*(pi_hat / (pi_hat.max()+1e-8) + 0.2))
+        for i in range(mu_k.shape[0]):
+            # small 1σ ellipse from covariance approx inv(E_Lambda)
+            try:
+                cov = np.linalg.inv(E_Lambda[i].cpu().numpy())
+                cov = 0.5*(cov + cov.T)
+                w, V = np.linalg.eigh(cov)
+                w = np.clip(w, 1e-8, None)
+                angle = math.degrees(math.atan2(V[1, -1], V[0, -1]))
+                r1, r2 = np.sqrt(w[-1]), np.sqrt(w[-2]) if len(w) > 1 else np.sqrt(w[-1])
+                from matplotlib.patches import Ellipse
+                e = Ellipse(xy[i], 2*r1, 2*r2, angle=angle, fill=False, alpha=0.4)
+                ax = plt.gca(); ax.add_patch(e)
+            except Exception:
+                pass
+        plt.xlabel("PC1"); plt.ylabel("PC2")
+        plt.title(f"Round {round_idx}: PCA of emission means (size ∝ $\\hat\\pi_k$)")
+        plt.tight_layout()
+        path_pca = os.path.join(round_dir, f"round{round_idx:02d}_mu_pca.png")
+        f3.savefig(path_pca, dpi=160); plt.close(f3)
+    except Exception as e:
+        path_pca = None
+
+    # 5) figure: skill rasters on a few sequences
+    rasters, lengths = _collect_sample_rasters(model, dataset, device, hmm, max_sequences=max_raster_sequences)
+    if len(rasters) > 0:
+        maxT = max(lengths)
+        canvas = np.full((len(rasters), maxT), fill_value=-1, dtype=np.int32)
+        for i, lab in enumerate(rasters):
+            canvas[i, :len(lab)] = lab
+        f4 = plt.figure(figsize=(10, 1.2 + 0.35*len(rasters)))
+        plt.imshow(canvas, interpolation="nearest", aspect="auto", origin="lower", cmap="tab20")
+        plt.colorbar(label="Skill id", fraction=0.025, pad=0.02)
+        plt.xlabel("t (valid frames)"); plt.ylabel("sequence #")
+        plt.title(f"Round {round_idx}: Skill raster (argmax responsibilities)")
+        plt.tight_layout()
+        path_raster = os.path.join(round_dir, f"round{round_idx:02d}_skill_raster.png")
+        f4.savefig(path_raster, dpi=160); plt.close(f4)
+    else:
+        path_raster = None
+
+    # Save a small JSON snapshot for quick diffing
+    snap = {
+        "round": round_idx,
+        "avg_loglik_per_step": float(diags["avg_loglik_per_step"]),
+        "state_entropy": float(diags["state_entropy"]),
+        "effective_K": float(diags["effective_K"]),
+        "stickiness_diag_mean": float(diags["stickiness_diag_mean"]),
+        "top5_pi": [float(x) for x in diags["top5_pi"]],
+        "top5_idx": [int(x) for x in diags["top5_idx"]],
+    }
+    json_path = os.path.join(round_dir, f"round{round_idx:02d}_diags.json")
+    with open(json_path, "w") as f:
+        json.dump(snap, f, indent=2)
+
+    return {
+        "dir": round_dir,
+        "pi_bar": path_pi,
+        "A_heatmap": path_A,
+        "mu_pca": path_pca,
+        "skill_raster": path_raster,
+        "diags_json": json_path,
+    }

@@ -530,6 +530,18 @@ class StickyHDPHMMVI(nn.Module):
         if "beta_u" in params:  self.u_beta.data.copy_(params["beta_u"].to(device=dev, dtype=dt))
         self._cache_fresh = False
 
+    # --- compact accessors (compatibility with train_new.py) -----------------
+    @torch.no_grad()
+    def get_rho_emission(self) -> torch.Tensor:
+        """Alias for streaming rho used in code paths that expect get_rho_emission()."""
+        return torch.tensor(float(self.stream_rho), device=self.mu0.device, dtype=self.mu0.dtype)
+
+    @torch.no_grad()
+    def get_rho_transition(self) -> torch.Tensor:
+        """Alias for transition streaming rho."""
+        val = float(self.stream_rho_trans) if self.stream_rho_trans is not None else float('nan')
+        return torch.tensor(val, device=self.mu0.device, dtype=self.mu0.dtype)
+
     # ---- diagnostics ---------------------------------------------------------
     @torch.no_grad()
     def diagnostics(

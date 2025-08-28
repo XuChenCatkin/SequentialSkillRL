@@ -398,7 +398,9 @@ if __name__ == "__main__":
                 pretrained_hf_repo="CatkinChen/nethack-vae",
                 # Datasets
                 train_dataset=train_dataset, 
-                test_dataset=test_dataset,  
+                test_dataset=test_dataset,
+                
+                config=vae_config,  
                 
                 # HMM parameters
                 alpha=5.0,

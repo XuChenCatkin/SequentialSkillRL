@@ -66,7 +66,7 @@ from training.training_utils import save_checkpoint, save_model_to_huggingface, 
     upload_training_artifacts_to_huggingface, create_model_demo_notebook, load_model_from_local
 
 # Import our utility functions
-from utils.analysis import visualize_reconstructions, analyze_latent_space
+from utils.analysis import compute_hmm_diagnostics, visualize_hmm_after_estep
 
 
 def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress: float, rate: float = 10.0, centre: float = 0.5, f: Optional[Callable[[float, float, float], float]] = None) -> float:
@@ -103,74 +103,6 @@ def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress
         return f(initial_weight, final_weight, progress)
     else:
         raise ValueError(f"Unknown shape: {shape}. Supported shapes: linear, cubic, sigmoid, cosine, exponential, constant, custom.")
-
-
-@torch.no_grad()
-def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int = 5, logger=None):
-    """
-    Compute HMM diagnostics on a subset of the dataset
-    """
-    model.eval()
-    n_batches = min(len(dataset), max_batches)
-    
-    all_mu = []
-    all_var = []
-    all_F = []
-    all_mask = []
-    
-    # Collect VAE outputs for diagnostics
-    with torch.no_grad():
-        for bi, batch in enumerate(dataset):
-            if bi >= n_batches: 
-                break
-                
-            batch_dev = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    x = v.to(device, non_blocking=True)
-                    if x.dim() >= 3 and k not in ('original_batch_shape',):
-                        B, T = x.shape[:2]
-                        batch_dev[k] = x.view(B*T, *x.shape[2:])
-                    else:
-                        batch_dev[k] = x
-                else:
-                    batch_dev[k] = v
-            
-            # Forward encode only
-            out = model(batch_dev)
-            mu = out['mu']
-            logvar = out['logvar']
-            F = out.get('lowrank_factors', None)
-            
-            B, T = batch['original_batch_shape']
-            valid = batch_dev['valid_screen'].view(B, T)
-            
-            # Reshape to [B,T,...]
-            mu_bt = mu.view(B, T, -1)
-            var_bt = logvar.exp().clamp_min(1e-6).view(B, T, -1)
-            F_bt = None if F is None else F.view(B, T, F.size(-2), F.size(-1))
-            
-            all_mu.append(mu_bt)
-            all_var.append(var_bt)
-            if F_bt is not None:
-                all_F.append(F_bt)
-            all_mask.append(valid)
-    
-    # Concatenate all data
-    mu_concat = torch.cat(all_mu, dim=0)  # [total_B, T, D]
-    var_concat = torch.cat(all_var, dim=0)
-    F_concat = torch.cat(all_F, dim=0) if all_F else None
-    mask_concat = torch.cat(all_mask, dim=0)
-    
-    # Compute diagnostics using HMM's built-in function
-    diagnostics = hmm.diagnostics(
-        mu_t=mu_concat,
-        diag_var_t=var_concat, 
-        F_t=F_concat,
-        mask=mask_concat
-    )
-    
-    return diagnostics
 
 
 def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streaming_rho: float = 1.0, max_batches: int | None = None, logger=None):
@@ -1654,6 +1586,14 @@ def train_vae_with_sticky_hmm_em(
             logger.info(f"  - Transition stickiness (diag): {diagnostics['stickiness_diag_mean']:.4f}")
             logger.info(f"  - Top 5 skill occupancies: {diagnostics['top5_pi'].tolist()}")
             logger.info(f"  - Top 5 skill indices: {diagnostics['top5_idx'].tolist()}")
+
+        # Visualization artifacts
+        if logger: logger.info(f"🖼️  Rendering HMM visualizations for round {r+1}")
+        viz_paths = visualize_hmm_after_estep(
+            model=model, dataset=train_dataset, device=device, hmm=hmm,
+            save_dir="hmm_analysis", round_idx=r+1, logger=logger
+        )
+        training_info.setdefault('viz_paths', []).append(viz_paths)
 
         # Save HMM posterior locally
         hmm_path = os.path.join(save_dir, f"hmm_round{r+1}.pt")
