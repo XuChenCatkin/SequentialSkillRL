@@ -111,6 +111,10 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
     """
     model.eval()
     n_batches = len(dataset) if max_batches is None else min(len(dataset), max_batches)
+    # assert the dataset is in [B, T, ...] format
+    B, T = dataset[0]['tty_chars'].shape[:2]
+    
+    # Temporarily enable gradients for HMM optimization
     for bi, batch in enumerate(dataset):
         if bi >= n_batches: break
         batch_dev = {}
@@ -118,23 +122,30 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
             if isinstance(v, torch.Tensor):
                 x = v.to(device, non_blocking=True)
                 if x.dim() >= 3 and k not in ('original_batch_shape',):
-                    B,T = x.shape[:2]; batch_dev[k] = x.view(B*T, *x.shape[2:])
+                    batch_dev[k] = x.view(B*T, *x.shape[2:])
                 else:
                     batch_dev[k] = x
             else:
                 batch_dev[k] = v
-        # forward encode only
-        out = model(batch_dev)  # returns 'mu', 'logvar', optionally 'lowrank_factors'
-        mu    = out['mu']
-        logvar= out['logvar']
-        F     = out.get('lowrank_factors', None)
-        B, T = batch['original_batch_shape']
-        valid = batch_dev['valid_screen'].view(B,T)
-        # reshape to [B,T,...]
-        mu_bt = mu.view(B,T,-1)
-        var_bt = logvar.exp().clamp_min(1e-6).view(B,T,-1)
-        F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
-        hmm.update(mu_bt, var_bt, F_bt, mask=valid, rho=streaming_rho, optimize_pi=True)
+        
+        # forward encode only (keep no_grad for model inference)
+        with torch.no_grad():
+            out = model(batch_dev)  # returns 'mu', 'logvar', optionally 'lowrank_factors'
+            mu    = out['mu'].detach()  # Detach from computation graph
+            logvar= out['logvar'].detach()  # Detach from computation graph
+            F     = out.get('lowrank_factors', None)
+            if F is not None:
+                F = F.detach()  # Detach from computation graph
+            valid = batch_dev['valid_screen'].view(B,T)
+            # reshape to [B,T,...]
+            mu_bt = mu.view(B,T,-1)
+            var_bt = logvar.exp().clamp_min(1e-6).view(B,T,-1)
+            F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
+        
+        # Enable gradients for HMM parameter optimization
+        with torch.enable_grad():
+            hmm.update(mu_bt, var_bt, F_bt, mask=valid, rho=streaming_rho, optimize_pi=True)
+        
         if logger and (bi+1) % 50 == 0:
             logger.info(f"[E-step] processed {bi+1}/{n_batches} batches")
     return hmm
