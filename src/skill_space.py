@@ -108,7 +108,9 @@ class StickyHDPHMMVI(nn.Module):
         )
 
         # Global sticks β for the first K components; π_{K+1} is the remainder mass
-        self.u_beta = nn.Parameter(torch.zeros(K, device=dev, dtype=dt))
+        beta = torch.tensor([1.0 / (K + 2 - k) for k in range(1, K+1)], device=dev, dtype=dt)
+        u_beta_init = torch.log(beta) - torch.log1p(-beta)
+        self.u_beta = nn.Parameter(u_beta_init)
 
         # Cache for E[Λ], E[log|Λ|]
         self._cache_fresh = False
@@ -400,8 +402,10 @@ class StickyHDPHMMVI(nn.Module):
             pi = torch.cat([piK, rest.view(1)], dim=0) # [Kp1]
             # Dirichlet prior rows a_k = α π + κ δ_k, with π sum=1
             a = alpha * pi.unsqueeze(0) + kappa * torch.eye(K + 1, device=pi.device, dtype=pi.dtype)  # [Kp1,Kp1]
+            a = a.clamp(min=1e-8)  # avoid NaNs
             # E_q[log p(Φ | π)] under q(Φ) with row-wise Dirichlet φ
-            L1 = ((a - 1.0) * ElogA).sum() - (torch.lgamma(a).sum(dim=1) - torch.lgamma(a.sum(dim=1))).sum()
+            const = (K + 1) * torch.lgamma(torch.tensor(alpha + kappa, device=pi.device, dtype=pi.dtype))
+            L1 = ((a - 1.0) * ElogA).sum() - torch.lgamma(a).sum() + const
             # E_q[log p(h1 | π)]
             L2 = torch.sum(r1 * torch.log(torch.clamp(pi, min=1e-30)))
             # log p(β) with Beta(1,γ) sticks: ∑ (γ-1) log(1-β_k)
