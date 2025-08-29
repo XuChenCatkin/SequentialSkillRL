@@ -1907,14 +1907,20 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
             logB  = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt, mask=valid)  # [B,T,K]
             log_pi = torch.log(torch.clamp(hmm._Epi(), min=1e-30))
             ElogA = hmm._ElogA()
-            r_hat, _, _ = hmm.forward_backward(log_pi, ElogA, logB)                # [B,T,K]
-            # turn into argmax labels on valid frames only
+            
+            # Process each sequence in the batch separately since forward_backward expects [T,K]
             for b in range(B):
                 if grabbed >= max_sequences: break
                 m = valid[b].cpu().numpy().astype(bool)
                 if m.sum() == 0: 
                     continue
-                labels = r_hat[b].argmax(-1).cpu().numpy()  # [T]
+                
+                # Extract single sequence and run forward_backward
+                logB_single = logB[b]  # [T,K]
+                r_hat_single, _, _ = hmm.forward_backward(log_pi, ElogA, logB_single)  # [T,K]
+                
+                # turn into argmax labels on valid frames only
+                labels = r_hat_single.argmax(-1).cpu().numpy()  # [T]
                 labels = labels[m]
                 rasters.append(labels)
                 lengths.append(len(labels))
@@ -1930,6 +1936,7 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
     """
     model.eval()
     n_batches = min(len(dataset), max_batches)
+    B, T = dataset[0]['tty_chars'].shape[:2]
     
     all_mu = []
     all_var = []
@@ -1947,7 +1954,6 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
                 if isinstance(v, torch.Tensor):
                     x = v.to(device, non_blocking=True)
                     if x.dim() >= 3 and k not in ('original_batch_shape',):
-                        B, T = x.shape[:2]
                         batch_dev[k] = x.view(B*T, *x.shape[2:])
                     else:
                         batch_dev[k] = x
@@ -1960,7 +1966,6 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
             logvar = out['logvar']
             F = out.get('lowrank_factors', None)
             
-            B, T = batch['original_batch_shape']
             valid = batch_dev['valid_screen'].view(B, T)
             
             # Reshape to [B,T,...]

@@ -404,7 +404,7 @@ if __name__ == "__main__":
                 
                 # HMM parameters
                 alpha=5.0,
-                kappa=20.0,
+                kappa=5.0,
                 gamma=5.0,
                 hmm_only=hmm_only,
                 em_rounds=1 if hmm_only else 3,

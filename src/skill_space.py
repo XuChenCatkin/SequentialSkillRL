@@ -345,33 +345,41 @@ class StickyHDPHMMVI(nn.Module):
         prior_rows = alpha * pi_star.view(1, K) + kappa * torch.eye(K, device=counts.device, dtype=counts.dtype)
         self.dir.phi = prior_rows + counts
 
-    def _optimize_pi_from_r1(self, r1: torch.Tensor) -> torch.Tensor:
+    def _optimize_pi_from_r1(self, r1: torch.Tensor, steps: int = 200, lr: float = 0.05) -> torch.Tensor:
         """
-        Optimize β (thus π) using only the initial-state term and transition prior term.
-        r1: [K] average responsibilities at t=0 across sequences.
+        Optimize global sticks β (via logits u_beta) using a β-restricted ELBO:
+            L(β) = E_q[log p(Φ | π)] + E_q[log p(h1 | π)] + log p(β),
+        with π = SB(σ(u_beta)). Uses autograd only through u_beta.
+        Args:
+            r1: average initial-state responsibilities (K,)
+        Returns:
+            π* (detached, shape [K])
         """
         K = self.p.K
         alpha, kappa, gamma = self.p.alpha, self.p.kappa, self.p.gamma
+        # Treat these as constants for this step
         ElogA = self._ElogA().detach()
-
-        opt = torch.optim.Adam([self.u_beta], lr=0.05)
-        for _ in range(200):
-            opt.zero_grad()
-            beta = torch.sigmoid(self.u_beta)              # [K]
-            pi, _ = stick_breaking(beta)                   # [K]
+        r1 = r1.detach()
+        opt = torch.optim.Adam([self.u_beta], lr=lr)
+        for _ in range(steps):
+            opt.zero_grad(set_to_none=True)
+            beta = torch.sigmoid(self.u_beta)          # [K]
+            pi, _ = stick_breaking(beta)               # [K]
+            # Dirichlet prior rows a_k = α π + κ δ_k
             a = alpha * pi.unsqueeze(0) + kappa * torch.eye(K, device=pi.device, dtype=pi.dtype)  # [K,K]
-
-            term1 = (a - 1.0) * ElogA
-            lnorm = torch.lgamma(a).sum(dim=1) - torch.lgamma(a.sum(dim=1))
-            L1 = term1.sum() - lnorm.sum()
-
+            # E_q[log p(Φ | π)] under q(Φ) with row-wise Dirichlet φ
+            L1 = ((a - 1.0) * ElogA).sum() - (torch.lgamma(a).sum(dim=1) - torch.lgamma(a.sum(dim=1))).sum()
+            # E_q[log p(h1 | π)]
             L2 = torch.sum(r1 * torch.log(torch.clamp(pi, min=1e-30)))
+            # log p(β) with Beta(1,γ) sticks: ∑ (γ-1) log(1-β_k)
             L3 = (gamma - 1.0) * torch.sum(torch.log(torch.clamp(1.0 - beta, min=1e-30)))
-
-            L = -(L1 + L2 + L3)
-            L.backward()
+            loss = -(L1 + L2 + L3)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([self.u_beta], max_norm=10.0)
             opt.step()
-
+            with torch.no_grad():
+                # keep logits in a sane range for stability
+                self.u_beta.clamp_(-10.0, 10.0)
         with torch.no_grad():
             beta = torch.sigmoid(self.u_beta)
             pi, _ = stick_breaking(beta)
@@ -464,6 +472,8 @@ class StickyHDPHMMVI(nn.Module):
 
                 # transitions
                 self._update_transitions(xihat, pi)
+                # accumulate transition counts for streaming diagnostics/EMA
+                acc_counts += xihat.sum(dim=0)
 
                 # recompute logB with updated NIW
                 # (NOTE: we update NIW only after stats blending below to keep unified path)
@@ -481,7 +491,7 @@ class StickyHDPHMMVI(nn.Module):
         self.S_Nk     = (1.0 - rho)  * self.S_Nk     + rho  * acc_Nk
         self.S_M1     = (1.0 - rho)  * self.S_M1     + rho  * acc_M1
         self.S_M2     = (1.0 - rho)  * self.S_M2     + rho  * acc_M2
-        self.S_counts = (1.0 - rho_t) * self.S_counts + rho_t * acc_counts  # acc_counts added below
+        self.S_counts = (1.0 - rho_t) * self.S_counts + rho_t * acc_counts
 
         # Note: xihat was used inside _update_transitions per sequence to maintain φ rows.
         # If you prefer to base φ strictly on the blended counts, uncomment next line and comment per-seq update:
@@ -494,9 +504,13 @@ class StickyHDPHMMVI(nn.Module):
         if optimize_pi and B > 0:
             r1_mean = (r1_sum / B).clamp_min(1e-12)
             r1_mean = r1_mean / r1_mean.sum()
-            pi_star = self._optimize_pi_from_r1(r1_mean)
+            # ensure grads are enabled even if caller wrapped update() in no_grad
+            self.u_beta.requires_grad_(True)
+            with torch.enable_grad():
+                pi_star = self._optimize_pi_from_r1(r1_mean)
         else:
-            pi_star = self._Epi()
+            with torch.no_grad():
+                pi_star = self._Epi()
 
         return {
             "rhat": last_out["rhat"],
