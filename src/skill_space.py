@@ -127,6 +127,76 @@ class StickyHDPHMMVI(nn.Module):
         self.stream_rho = float(rho_emission)
         self.stream_rho_trans = float(rho_transition) if rho_transition is not None else None
         self._stream_allocated = False
+        
+    # --- ELBO terms ------------------------------------------
+
+    @staticmethod
+    def _dirichlet_logC(row_params: torch.Tensor) -> torch.Tensor:
+        """
+        Sum over rows of Dirichlet log-normalizer:
+        log C(α) = log Γ(∑ α_j) - ∑ log Γ(α_j)
+        row_params: [Kp1,Kp1]
+        """
+        row = torch.clamp(row_params, min=1e-8)
+        return torch.lgamma(row.sum(dim=1)).sum() - torch.lgamma(row).sum()
+
+    @staticmethod
+    def _logZ_invwishart(Psi: torch.Tensor, nu: torch.Tensor) -> torch.Tensor:
+        """
+        log normalizer of IW(Ψ, ν), summed over rows if batched:
+        log Z_IW = (ν D /2) log 2 + (D(D-1)/4) log π + (ν/2) log|Ψ| + ∑_i log Γ((ν+1-i)/2)
+        Psi: [Kp1,D,D] or [D,D]
+        nu:  [Kp1]      or scalar
+        returns scalar (sum across rows if batched)
+        """
+        if Psi.dim() == 2:
+            Psi = Psi.unsqueeze(0)
+            nu = nu.view(1)
+        Kp1, D, _ = Psi.shape
+        # log|Ψ|
+        _, logdet_Psi = chol_inv_logdet(Psi)
+        # multivariate gamma term
+        i = torch.arange(1, D + 1, device=Psi.device, dtype=Psi.dtype).view(1, D)
+        lgamma_sum = torch.sum(torch.lgamma((nu.view(Kp1, 1) + 1.0 - i) / 2.0), dim=1)  # [Kp1]
+        term = (nu * D / 2.0) * torch.log(torch.tensor(2.0, device=Psi.device, dtype=Psi.dtype)) \
+            + (D * (D - 1) / 4.0) * torch.log(torch.tensor(torch.pi, device=Psi.device, dtype=Psi.dtype)) \
+            + 0.5 * nu * logdet_Psi + lgamma_sum
+        return term.sum()
+
+    def _niw_elbo_term(self) -> torch.Tensor:
+        """
+        Sum_k ( E_q[log p(μ_k,Σ_k)] - E_q[log q(μ_k,Σ_k)] ) under NIW prior/posterior.
+        Uses the same parameterization as this module (Σ ~ IW(Ψ, ν), μ|Σ ~ N(μ0, Σ/κ0)).
+        Returns scalar tensor.
+        """
+        mu0, k0, Psi0, nu0 = self.mu0, self.kappa0, self.Psi0, self.nu0
+        mu_hat, k_hat, Psi_hat, nu_hat = self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu
+        Kp1, D = mu_hat.shape[0], mu_hat.shape[1]
+
+        # Expectations under q
+        E_Lambda = self._get_E_Lambda()               # [Kp1,D,D]
+        # E[log|Σ|] under IW(Ψ_hat, ν_hat)
+        i = torch.arange(1, D + 1, device=Psi_hat.device, dtype=Psi_hat.dtype).view(1, D)
+        E_logdet_Sigma = torch.sum(torch.special.digamma((nu_hat.view(Kp1, 1) + 1.0 - i) / 2.0), dim=1) \
+                        - D * torch.log(torch.tensor(2.0, device=Psi_hat.device, dtype=Psi_hat.dtype)) \
+                        - torch.linalg.slogdet(Psi_hat)[1]  # [Kp1]
+
+        # IW part: E_q[log IW(Σ | Ψ0, ν0)] - E_q[log IW(Σ | Ψ_hat, ν_hat)]
+        # = -logZ_IW(Ψ0,ν0) + logZ_IW(Ψ_hat,ν_hat)
+        #   - 0.5 * ∑_k [ (ν0 - ν_hat_k) * E[log|Σ|]_k + Tr( (Ψ0 - Ψ_hat_k) E[Λ]_k ) ]
+        LZ = - self._logZ_invwishart(Psi0, torch.tensor(nu0, device=Psi_hat.device, dtype=Psi_hat.dtype)) \
+            + self._logZ_invwishart(Psi_hat, nu_hat)
+        tr_term = torch.einsum('kdd,kdd->k', 
+                            (Psi0.unsqueeze(0).expand(Kp1, D, D) - Psi_hat), E_Lambda)  # [Kp1]
+        iw_term = LZ - 0.5 * ( (nu0 - nu_hat) * E_logdet_Sigma + tr_term ).sum()
+
+        # Normal part: E_q[log N(μ | μ0, Σ/κ0)] - E_q[log N(μ | μ_hat, Σ/κ_hat)]
+        # = 0.5 * ∑_k [ D*(1 - κ0/κ_hat_k) - κ0 (μ_hat_k - μ0)^T E[Λ]_k (μ_hat_k - μ0) ]
+        diff = (mu_hat - mu0.view(1, D)).unsqueeze(-1)           # [Kp1,D,1]
+        quad = torch.einsum('kde,kef,kdf->k', E_Lambda, diff, diff)  # [Kp1]
+        normal_term = 0.5 * ( D * (1.0 - (k0 / k_hat)) - k0 * quad ).sum()
+
+        return iw_term + normal_term
 
     # ---- cache E[Λ], E[log|Λ|] -----------------------------------------------
     def _refresh_emission_cache(self):
@@ -450,15 +520,21 @@ class StickyHDPHMMVI(nn.Module):
         diag_var_t: Optional[torch.Tensor] = None,     # same shape as mu_t
         F_t: Optional[torch.Tensor] = None,            # [T,D,R] or [B,T,D,R]
         mask: Optional[torch.Tensor] = None,           # [T] or [B,T]
-        n_e_steps: int = 1,
+        max_iters: int = 7,                            # inner full-loop limit
+        tol: float = 1e-4,                             # ELBO gain tolerance
+        patience: int = 1,                             # consec. iters below tol to stop
+        min_iters: int = 1,                            # do at least this many
         rho: Optional[float] = 1.0,                    # 1.0 => non-streaming; 0<rho<1 => EMA
         optimize_pi: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
-        One outer VI step that also updates parameters either:
-          - non-streaming (rho=1.0): replace sufficient stats with current batch
-          - streaming (0<rho<1): EMA blend with running stats
-        Returns dict with rhat/xihat/loglik from the last processed sequence and current ElogA, pi*.
+        Batch-global full inner loop:
+        (1) build logB from current NIW
+        (2) FB for all sequences -> rhat/xi, accumulate batch stats
+        (3) blend stats (EMA/non-streaming) -> update NIW and Dir rows
+        (4) optionally optimize π using mean r1
+        (5) evaluate full inner ELBO; early stop if plateau
+        Returns diagnostics from the last pass.
         """
         self._alloc_stream_buffers()
 
