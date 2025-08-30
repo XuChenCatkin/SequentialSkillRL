@@ -523,7 +523,7 @@ class StickyHDPHMMVI(nn.Module):
         max_iters: int = 7,                            # inner full-loop limit
         tol: float = 1e-4,                             # ELBO gain tolerance
         patience: int = 1,                             # consec. iters below tol to stop
-        min_iters: int = 1,                            # do at least this many
+        min_iters: int = 1,                            # always do at least this many
         rho: Optional[float] = 1.0,                    # 1.0 => non-streaming; 0<rho<1 => EMA
         optimize_pi: bool = True
     ) -> Dict[str, torch.Tensor]:
@@ -531,96 +531,134 @@ class StickyHDPHMMVI(nn.Module):
         Batch-global full inner loop:
         (1) build logB from current NIW
         (2) FB for all sequences -> rhat/xi, accumulate batch stats
-        (3) blend stats (EMA/non-streaming) -> update NIW and Dir rows
+        (3) blend stats (EMA/non-streaming) -> update NIW
         (4) optionally optimize π using mean r1
-        (5) evaluate full inner ELBO; early stop if plateau
+        (5) update transitions with blended counts via _update_transitions
+        (6) evaluate full inner ELBO; early stop if plateau
+
         Returns diagnostics from the last pass.
         """
         self._alloc_stream_buffers()
 
-        # Build emission log-likelihoods
-        logB = self.expected_emission_loglik(mu_t, diag_var_t, F_t, mask)  # [T,Kp1] or [B,T,Kp1]
+        # Ensure [B,T,D] shapes for a uniform code path
+        if mu_t.dim() == 2:
+            mu_t = mu_t.unsqueeze(0)
+            if diag_var_t is not None: diag_var_t = diag_var_t.unsqueeze(0)
+            if F_t is not None: F_t = F_t.unsqueeze(0)
+            if mask is not None: mask = mask.unsqueeze(0)
 
-        # Iterate sequences if batched
-        is_batched = (logB.dim() == 3)
-        B = logB.size(0) if is_batched else 1
+        B, T, D = mu_t.shape
+        Kp1 = self.niw.mu.shape[0]
 
-        # Accumulate sufficient stats over the batch
-        Kp1, D = self.niw.mu.shape[0], self.p.D
-        acc_counts = torch.zeros(Kp1, Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
-        acc_Nk     = torch.zeros(Kp1,    device=self.mu0.device, dtype=self.mu0.dtype)
-        acc_M1     = torch.zeros(Kp1, D, device=self.mu0.device, dtype=self.mu0.dtype)
-        acc_M2     = torch.zeros(Kp1, D, D, device=self.mu0.device, dtype=self.mu0.dtype)
+        # Resolve streaming coefficients
+        if rho is None:
+            rho_eff = self.stream_rho
+        else:
+            rho_eff = float(max(0.0, min(1.0, rho)))
+        rho_tr = self.stream_rho_trans if self.stream_rho_trans is not None else rho_eff
+        rho_tr = float(max(0.0, min(1.0, rho_tr)))
+
+        # ELBO trackers
+        best_elbo = -float('inf')
+        elbo_history = []
+        no_improve = 0
 
         last_out = None
-        r1_sum = torch.zeros(Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
 
-        for b in range(B):
-            _logB = logB[b] if is_batched else logB          # [T,Kp1]
-            _mu   = mu_t[b] if is_batched else mu_t          # [T,D]
-            _dv   = (diag_var_t[b] if (is_batched and diag_var_t is not None) else diag_var_t)
-            _F    = (F_t[b] if (is_batched and F_t is not None) else F_t)
-            _msk  = (mask[b] if (is_batched and mask is not None) else mask)
-
-            # initial π (K+1)
-            with torch.no_grad():
-                pi_full = self._Epi()                        # [Kp1]
+        # ---- inner full loop ----------------------------------------------------
+        for it in range(max(1, int(max_iters))):
+            # (1) Emission potentials with current NIW
+            logB = self.expected_emission_loglik(mu_t, diag_var_t, F_t, mask)  # [B,T,Kp1]
+            ElogA = self._ElogA()
+            pi_full = self._Epi()
             log_pi = torch.log(torch.clamp(pi_full, min=1e-30))
 
-            # inner E/M (can repeat n times; logB is fixed within this outer loop)
-            rhat = xihat = ll = None
-            for _ in range(n_e_steps):
-                ElogA = self._ElogA()                        # [Kp1,Kp1]
-                rhat, xihat, ll = self.forward_backward(log_pi, ElogA, _logB)
+            # (2) FB across batch -> batch-level sufficient statistics
+            acc_counts = torch.zeros(Kp1, Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
+            acc_Nk     = torch.zeros(Kp1,    device=self.mu0.device, dtype=self.mu0.dtype)
+            acc_M1     = torch.zeros(Kp1, D, device=self.mu0.device, dtype=self.mu0.dtype)
+            acc_M2     = torch.zeros(Kp1, D, D, device=self.mu0.device, dtype=self.mu0.dtype)
+            r1_sum = torch.zeros(Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
 
-                # emissions
-                Nk, M1, M2 = self._moments_from_encoder(_mu, rhat, _dv, _F, _msk)
-                # accumulate
+            for b in range(B):
+                rhat, xihat, ll = self.forward_backward(log_pi, ElogA, logB[b])
+                Nk, M1, M2 = self._moments_from_encoder(
+                    mu_t[b],
+                    rhat,
+                    (diag_var_t[b] if diag_var_t is not None else None),
+                    (F_t[b] if F_t is not None else None),
+                    (mask[b] if mask is not None else None)
+                )
                 acc_Nk += Nk; acc_M1 += M1; acc_M2 += M2
-
-                # π step uses average r1 across sequences
-                r1_sum += rhat[0]
-
-                # transitions
-                self._update_transitions(xihat, pi_full)
                 acc_counts += xihat.sum(dim=0)
+                r1_sum += rhat[0]
+                last_out = {"rhat": rhat.detach(), "xihat": xihat.detach(), "loglik": torch.tensor(ll)}
 
-            last_out = {"rhat": rhat.detach(), "xihat": xihat.detach(), "loglik": torch.tensor(ll)}
+            # (3) Blend stats (EMA or full replace) and update NIW
+            self.S_Nk     = (1.0 - rho_eff) * self.S_Nk     + rho_eff * acc_Nk
+            self.S_M1     = (1.0 - rho_eff) * self.S_M1     + rho_eff * acc_M1
+            self.S_M2     = (1.0 - rho_eff) * self.S_M2     + rho_eff * acc_M2
+            self.S_counts = (1.0 - rho_tr)   * self.S_counts + rho_tr  * acc_counts
 
-        # Blend sufficient stats (EMA or full replace)
-        if rho is None:
-            rho = self.stream_rho
-        rho_t = self.stream_rho_trans if self.stream_rho_trans is not None else rho
-        rho = float(max(0.0, min(1.0, rho)))
-        rho_t = float(max(0.0, min(1.0, rho_t)))
+            self._update_NIW(self.S_Nk, self.S_M1, self.S_M2)
 
-        self.S_Nk     = (1.0 - rho)  * self.S_Nk     + rho  * acc_Nk
-        self.S_M1     = (1.0 - rho)  * self.S_M1     + rho  * acc_M1
-        self.S_M2     = (1.0 - rho)  * self.S_M2     + rho  * acc_M2
-        self.S_counts = (1.0 - rho_t) * self.S_counts + rho_t * acc_counts
+            # (4) Optimize β/π from average r1 across sequences
+            if optimize_pi and B > 0:
+                r1_mean = (r1_sum / B).clamp_min(1e-12)
+                r1_mean = r1_mean / r1_mean.sum()
+                self.u_beta.requires_grad_(True)
+                with torch.enable_grad():
+                    _ = self._optimize_pi_from_r1(r1_mean)
+            pi_full = self._Epi()
 
-        # Update emissions from blended stats
-        self._update_NIW(self.S_Nk, self.S_M1, self.S_M2)
+            # (5) Update transitions from *blended* counts using helper
+            #     Make a single "time-slice" that sums to S_counts so the helper
+            #     sees exactly those counts.
+            self._update_transitions(self.S_counts.unsqueeze(0), pi_full)
 
-        # Optimize β/π using average r1 across sequences (stable)
-        if optimize_pi and B > 0:
-            r1_mean = (r1_sum / B).clamp_min(1e-12)
-            r1_mean = r1_mean / r1_mean.sum()
-            # ensure grads are enabled even if caller wrapped update() in no_grad
-            self.u_beta.requires_grad_(True)
-            with torch.enable_grad():
-                pi_star = self._optimize_pi_from_r1(r1_mean)  # [Kp1]
-        else:
-            with torch.no_grad():
-                pi_star = self._Epi()
+            # (6) Evaluate full inner ELBO with updated NIW/rows
+            #     We recompute logZ under current NIW/ElogA for a meaningful objective.
+            #     (Adds one extra FB pass per iteration; cheap and stable.)
+            logB_eval = self.expected_emission_loglik(mu_t, diag_var_t, F_t, mask)   # [B,T,Kp1]
+            ElogA_eval = self._ElogA()
+            log_pi_eval = torch.log(torch.clamp(pi_full, min=1e-30))
+            total_ll = 0.0
+            for b in range(B):
+                total_ll += self.forward_backward(log_pi_eval, ElogA_eval, logB_eval[b])[2]
+
+            # Dirichlet term: ∑_k [E log p(Φ_k|a_k) - E log q(Φ_k)]
+            a = self.p.alpha * pi_full.unsqueeze(0) \
+            + self.p.kappa * torch.eye(Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
+            dir_term = (self._dirichlet_logC(a) - self._dirichlet_logC(self.dir.phi)
+                        + ((a - self.dir.phi) * ElogA_eval).sum()).item()
+
+            # NIW term: ∑_k [E log p(μ_k,Σ_k) - E log q(μ_k,Σ_k)]
+            niw_term = float(self._niw_elbo_term().item())
+
+            elbo = total_ll + dir_term + niw_term
+            elbo_history.append(elbo)
+
+            # Early stopping
+            if it >= min_iters:
+                if elbo - best_elbo < tol:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        break
+                else:
+                    no_improve = 0
+            best_elbo = max(best_elbo, elbo)
 
         return {
             "rhat": last_out["rhat"],
             "xihat": last_out["xihat"],
             "loglik": last_out["loglik"],
-            "pi_star": pi_star.detach(),           # [Kp1]
-            "ElogA": self._ElogA().detach(),       # [Kp1,Kp1]
+            "pi_star": self._Epi().detach(),   # [K+1]
+            "ElogA": self._ElogA().detach(),   # [K+1,K+1]
+            "inner_elbo": torch.tensor(best_elbo),
+            "elbo_history": torch.tensor(elbo_history),
+            "n_iterations": len(elbo_history)
         }
+
 
     # ---- accessors & (de)serialization --------------------------------------
     def get_posterior_params(self) -> Dict[str, torch.Tensor]:

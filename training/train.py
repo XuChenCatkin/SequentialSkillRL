@@ -105,7 +105,7 @@ def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress
         raise ValueError(f"Unknown shape: {shape}. Supported shapes: linear, cubic, sigmoid, cosine, exponential, constant, custom.")
 
 
-def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streaming_rho: float = 1.0, max_batches: int | None = None, logger=None):
+def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streaming_rho: float = 1.0, max_batches: int | None = None, logger=None, use_wandb: bool = False):
     """
     Run one E-step pass: update sticky-HDP-HMM variational posteriors using encoder outputs.
     """
@@ -144,7 +144,16 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                 F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
             
             # HMM update without pi optimization to avoid gradient issues
-            hmm.update(mu_bt, var_bt, F_bt, mask=valid, n_e_steps=200, rho=streaming_rho, optimize_pi=True)
+            hmm_out = hmm.update(mu_bt, var_bt, F_bt, mask=valid, max_iters=10, rho=streaming_rho, optimize_pi=True)
+            
+            # Extract ELBO from HMM update
+            inner_elbo = hmm_out.get('inner_elbo', torch.tensor(float('nan')))
+            elbo_history = hmm_out.get('elbo_history', torch.tensor([]))
+            n_iterations = hmm_out.get('n_iterations', 0)
+            
+            # Log to wandb if enabled
+            if use_wandb and torch.isfinite(inner_elbo):
+                log_hmm_elbo_to_wandb(bi, inner_elbo.item(), elbo_history, n_iterations, use_wandb)
             
             # Compute diagnostics every 10 batches to monitor progress
             if (bi + 1) % 10 == 0 or bi == 0:
@@ -160,15 +169,25 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                     top5_probs = diag_results['top5_pi'].tolist()
                     logger.info(f"[E-step] Batch {bi+1}/{n_batches} - HMM Diagnostics:")
                     logger.info(f"  - Avg log-likelihood per step: {diag_results['avg_loglik_per_step']:.4f}")
+                    logger.info(f"  - Inner ELBO (final): {inner_elbo.item():.4f}")
+                    if len(elbo_history) > 1:
+                        elbo_improve = elbo_history[-1] - elbo_history[0]
+                        logger.info(f"  - ELBO progression ({n_iterations} iters): {format_elbo_progression(elbo_history)} (Δ={elbo_improve.item():.4f})")
                     logger.info(f"  - Effective number of skills: {diag_results['effective_K']:.2f}")
                     logger.info(f"  - State entropy: {diag_results['state_entropy']:.3f}")
                     logger.info(f"  - Transition stickiness: {diag_results['stickiness_diag_mean']:.3f}")
                     logger.info(f"  - Top 5 skills: {top5_skills} (probs: {[f'{p:.3f}' for p in top5_probs]})")
             else:
-                # Update progress bar with basic info only
+                # Update progress bar with basic info including ELBO
+                elbo_change = ""
+                if len(elbo_history) > 1:
+                    elbo_improve = elbo_history[-1] - elbo_history[0]
+                    elbo_change = f" (Δ{elbo_improve.item():+.2f})"
                 pbar.set_postfix({
                     'batch': f"{bi+1}/{n_batches}",
-                    'rho': f"{streaming_rho:.3f}"
+                    'rho': f"{streaming_rho:.3f}",
+                    'elbo': f"{inner_elbo.item():.2f}{elbo_change}" if torch.isfinite(inner_elbo) else "nan",
+                    'iters': f"{n_iterations}"
                 })
                 
                 if logger and (bi+1) % 50 == 0:
@@ -1461,6 +1480,13 @@ def train_vae_with_sticky_hmm_em(
     device: torch.device = torch.device('cuda'),
     use_bf16: bool = False,
     logger=None,
+    # Weights & Biases monitoring parameters  
+    use_wandb: bool = False,
+    wandb_project: str = "nethack-hmm-em",
+    wandb_entity: str = None,
+    wandb_run_name: str = None,
+    wandb_tags: List[str] = None,
+    wandb_notes: str = None,
     # HuggingFace integration
     push_to_hub: bool = False,
     hub_repo_id_hmm: str | None = None,
@@ -1499,6 +1525,12 @@ def train_vae_with_sticky_hmm_em(
         device: Device for training
         use_bf16: Whether to use BF16 mixed precision
         logger: Logger instance
+        use_wandb: Whether to use Weights & Biases for monitoring HMM training
+        wandb_project: Weights & Biases project name for EM training
+        wandb_entity: Weights & Biases entity (team/user)
+        wandb_run_name: Name for the Weights & Biases run
+        wandb_tags: Tags for the Weights & Biases run
+        wandb_notes: Notes for the Weights & Biases run
         push_to_hub: Whether to push models to HuggingFace Hub
         hub_repo_id_hmm: HuggingFace repo ID for HMM models (e.g., "username/nethack-hmm")
         hub_repo_id_vae_hmm: HuggingFace repo ID for VAE+HMM models (e.g., "username/nethack-vae-hmm")
@@ -1513,6 +1545,47 @@ def train_vae_with_sticky_hmm_em(
     from .training_utils import load_model_from_huggingface, load_model_from_local, save_model_to_huggingface
     
     os.makedirs(save_dir, exist_ok=True)
+    
+    # Initialize Weights & Biases if requested
+    if use_wandb and WANDB_AVAILABLE:
+        # Prepare configuration for wandb
+        wandb_config = {
+            "em_rounds": em_rounds,
+            "m_epochs_per_round": m_epochs_per_round,
+            "hmm_only": hmm_only,
+            "train_batches": len(train_dataset) if train_dataset else 0,
+            "test_batches": len(test_dataset) if test_dataset else 0,
+            "device": str(device),
+            "use_bf16": use_bf16,
+            "hmm_params": {
+                "alpha": alpha,
+                "kappa": kappa,
+                "gamma": gamma,
+                "K": config.skill_num if config else 32,
+                "D": config.latent_dim if config else 96
+            },
+            "niw_params": {
+                "mu0": niw_mu0,
+                "kappa0": niw_kappa0,
+                "Psi0": niw_Psi0,
+                "nu0": niw_nu0
+            }
+        }
+        
+        # Initialize wandb run
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            config=wandb_config,
+            tags=wandb_tags,
+            notes=wandb_notes
+        )
+        
+        if logger: logger.info("Weights & Biases initialized for EM training")
+        
+    elif use_wandb and not WANDB_AVAILABLE:
+        if logger: logger.warning("⚠️  wandb requested but not available. Install with: pip install wandb")
     
     # 1) Load the pretrained VAE from HuggingFace or local checkpoint
     if pretrained_hf_repo:
@@ -1649,8 +1722,16 @@ def train_vae_with_sticky_hmm_em(
     for r in range(em_rounds):
         if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: E-step ==========")
         
+        # Log EM round start to wandb
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.log({
+                "em/round": r + 1,
+                "em/phase": "E-step",
+                "em/progress": (r + 1) / em_rounds
+            })
+        
         # E-step: Fit HMM posterior using current VAE representations
-        fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, streaming_rho=1.0, logger=logger)
+        fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, streaming_rho=1.0, logger=logger, use_wandb=use_wandb)
 
         # Compute HMM diagnostics
         if logger: logger.info(f"🔍 Computing HMM diagnostics...")
@@ -1663,6 +1744,17 @@ def train_vae_with_sticky_hmm_em(
             logger.info(f"  - Transition stickiness (diag): {diagnostics['stickiness_diag_mean']:.4f}")
             logger.info(f"  - Top 5 skill occupancies: {diagnostics['top5_pi'].tolist()}")
             logger.info(f"  - Top 5 skill indices: {diagnostics['top5_idx'].tolist()}")
+
+        # Log HMM diagnostics to wandb
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.log({
+                f"em_round_{r+1}/avg_loglik_per_step": diagnostics['avg_loglik_per_step'],
+                f"em_round_{r+1}/state_entropy": diagnostics['state_entropy'],
+                f"em_round_{r+1}/effective_K": diagnostics['effective_K'],
+                f"em_round_{r+1}/stickiness_diag_mean": diagnostics['stickiness_diag_mean'],
+                f"em_round_{r+1}/top5_pi": diagnostics['top5_pi'].tolist(),
+                f"em_round_{r+1}/top5_idx": diagnostics['top5_idx'].tolist(),
+            })
 
         # Visualization artifacts
         if logger: logger.info(f"🖼️  Rendering HMM visualizations for round {r+1}")
@@ -1720,6 +1812,13 @@ def train_vae_with_sticky_hmm_em(
 
         if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: M-step ==========")
         
+        # Log M-step start to wandb
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.log({
+                "em/round": r + 1,
+                "em/phase": "M-step"
+            })
+        
         # M-step: Fine-tune VAE with current HMM prior using train_multimodalhack_vae
         if logger: logger.info(f"🔧 Fine-tuning VAE with HMM prior for {m_epochs_per_round} epochs...")
         
@@ -1751,6 +1850,14 @@ def train_vae_with_sticky_hmm_em(
             if logger: logger.debug(f"🗑️  Removed temporary file: {temp_file}")
         
         if logger: logger.info(f"✅ M-step completed: final_train_loss={train_losses[-1]:.4f}, final_test_loss={test_losses[-1]:.4f}")
+        
+        # Log M-step completion to wandb
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.log({
+                f"em_round_{r+1}/m_step_final_train_loss": train_losses[-1] if train_losses else float('nan'),
+                f"em_round_{r+1}/m_step_final_test_loss": test_losses[-1] if test_losses else float('nan'),
+                f"em_round_{r+1}/m_step_epochs": m_epochs_per_round
+            })
         
         # Save the VAE+HMM locally
         vae_hmm_path = os.path.join(save_dir, f"vae_with_hmm_round{r+1}.pt")
@@ -1845,4 +1952,74 @@ def train_vae_with_sticky_hmm_em(
         if hub_repo_id_vae_hmm and not hmm_only:
             if logger: logger.info(f"    * VAE+HMM: https://huggingface.co/{hub_repo_id_vae_hmm}")
 
+    # Final wandb logging and cleanup
+    if use_wandb and WANDB_AVAILABLE:
+        # Log final EM training summary
+        final_log_dict = {
+            "em_training/completed": True,
+            "em_training/total_rounds": em_rounds,
+            "em_training/hmm_only": hmm_only,
+            "em_training/m_epochs_per_round": m_epochs_per_round,
+            "em_training/hmm_checkpoints": len(training_info['hmm_paths']),
+            "em_training/vae_hmm_checkpoints": len(training_info['vae_hmm_paths']),
+        }
+        
+        wandb.log(final_log_dict)
+        
+        # Mark run as finished
+        wandb.finish()
+
     return model, hmm, training_info
+
+def format_elbo_progression(elbo_history):
+    """Format ELBO progression for display with smart number of values shown."""
+    if len(elbo_history) == 0:
+        return "[]"
+    elif len(elbo_history) <= 3:
+        return f"[{', '.join(f'{x.item():.2f}' for x in elbo_history)}]"
+    else:
+        # Show first, last, and maybe one middle value
+        first = elbo_history[0].item()
+        last = elbo_history[-1].item()
+        if len(elbo_history) == 4:
+            mid = elbo_history[len(elbo_history)//2].item()
+            return f"[{first:.2f}, {mid:.2f}, {last:.2f}]"
+        else:
+            return f"[{first:.2f}, ..., {last:.2f}]"
+
+
+def log_hmm_elbo_to_wandb(batch_idx, inner_elbo, elbo_history, n_iterations, use_wandb):
+    """Log HMM ELBO metrics to Weights & Biases."""
+    if not use_wandb or not WANDB_AVAILABLE:
+        return
+    
+    # Calculate ELBO improvement if we have history
+    elbo_improvement = 0.0
+    if len(elbo_history) > 1:
+        elbo_improvement = (elbo_history[-1] - elbo_history[0]).item()
+    
+    # Calculate convergence rate (average improvement per iteration)
+    convergence_rate = elbo_improvement / max(n_iterations - 1, 1) if n_iterations > 1 else 0.0
+    
+    # Log HMM metrics to wandb
+    wandb_hmm_log = {
+        "hmm/inner_elbo": inner_elbo,
+        "hmm/elbo_improvement": elbo_improvement,
+        "hmm/n_iterations": n_iterations,
+        "hmm/convergence_rate": convergence_rate,
+        "hmm/batch_idx": batch_idx,
+    }
+    
+    # Add ELBO history if available
+    if len(elbo_history) > 0:
+        wandb_hmm_log.update({
+            "hmm/elbo_first": elbo_history[0].item(),
+            "hmm/elbo_final": elbo_history[-1].item(),
+        })
+        
+        # Log full ELBO progression for detailed analysis (if not too many iterations)
+        if len(elbo_history) <= 20:
+            for i, elbo_val in enumerate(elbo_history):
+                wandb_hmm_log[f"hmm/elbo_iter_{i:02d}"] = elbo_val.item()
+    
+    wandb.log(wandb_hmm_log)
