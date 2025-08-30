@@ -176,10 +176,7 @@ class StickyHDPHMMVI(nn.Module):
         # Expectations under q
         E_Lambda = self._get_E_Lambda()               # [Kp1,D,D]
         # E[log|Σ|] under IW(Ψ_hat, ν_hat)
-        i = torch.arange(1, D + 1, device=Psi_hat.device, dtype=Psi_hat.dtype).view(1, D)
-        E_logdet_Sigma = torch.sum(torch.special.digamma((nu_hat.view(Kp1, 1) + 1.0 - i) / 2.0), dim=1) \
-                        - D * torch.log(torch.tensor(2.0, device=Psi_hat.device, dtype=Psi_hat.dtype)) \
-                        - torch.linalg.slogdet(Psi_hat)[1]  # [Kp1]
+        E_logdet_Sigma = - self._get_E_logdet_Lambda()  # [Kp1]
 
         # IW part: E_q[log IW(Σ | Ψ0, ν0)] - E_q[log IW(Σ | Ψ_hat, ν_hat)]
         # = -logZ_IW(Ψ0,ν0) + logZ_IW(Ψ_hat,ν_hat)
@@ -191,10 +188,11 @@ class StickyHDPHMMVI(nn.Module):
         iw_term = LZ - 0.5 * ( (nu0 - nu_hat) * E_logdet_Sigma + tr_term ).sum()
 
         # Normal part: E_q[log N(μ | μ0, Σ/κ0)] - E_q[log N(μ | μ_hat, Σ/κ_hat)]
-        # = 0.5 * ∑_k [ D*(1 - κ0/κ_hat_k) - κ0 (μ_hat_k - μ0)^T E[Λ]_k (μ_hat_k - μ0) ]
+        # = 0.5 * ∑_k [ D*(log(κ0/κ_hat) + 1 - κ0/κ_hat) - κ0 (μ_hat_k - μ0)^T E[Λ]_k (μ_hat_k - μ0) ]
         diff = (mu_hat - mu0.view(1, D)).unsqueeze(-1)           # [Kp1,D,1]
         quad = torch.einsum('kde,kef,kdf->k', E_Lambda, diff, diff)  # [Kp1]
-        normal_term = 0.5 * ( D * (1.0 - (k0 / k_hat)) - k0 * quad ).sum()
+        log_k_ratio = torch.log(torch.clamp(k0 / k_hat, min=1e-9))
+        normal_term = 0.5 * (D * (log_k_ratio + 1.0 - (k0 / k_hat)) - k0 * quad).sum()
 
         return iw_term + normal_term
 
@@ -622,20 +620,28 @@ class StickyHDPHMMVI(nn.Module):
             logB_eval = self.expected_emission_loglik(mu_t, diag_var_t, F_t, mask)   # [B,T,Kp1]
             ElogA_eval = self._ElogA()
             log_pi_eval = torch.log(torch.clamp(pi_full, min=1e-30))
-            total_ll = 0.0
-            for b in range(B):
-                total_ll += self.forward_backward(log_pi_eval, ElogA_eval, logB_eval[b])[2]
+            
+            # Sum log-likelihoods across the batch correctly
+            batch_lls = torch.tensor([self.forward_backward(log_pi_eval, ElogA_eval, logB_eval[b])[2] for b in range(B)], device=mu_t.device)
+            total_ll = torch.sum(batch_lls).item()
 
-            # Dirichlet term: ∑_k [E log p(Φ_k|a_k) - E log q(Φ_k)]
+            # Dirichlet term: E_q[log p(Φ)] - E_q[log q(Φ)] = -KL(q(Φ)||p(Φ))
             a = self.p.alpha * pi_full.unsqueeze(0) \
             + self.p.kappa * torch.eye(Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
+            # KL(q||p) = logC(φ) - logC(a) + (φ-a)ᵀ E[logΦ]
+            # ELBO term is -KL, so we have logC(a) - logC(φ) - (φ-a)ᵀ E[logΦ]
+            #            = logC(a) - logC(φ) + (a-φ)ᵀ E[logΦ]
             dir_term = (self._dirichlet_logC(a) - self._dirichlet_logC(self.dir.phi)
                         + ((a - self.dir.phi) * ElogA_eval).sum()).item()
+
+            # Stick-breaking prior term for β: E_q[log p(β|γ)]
+            beta = torch.sigmoid(self.u_beta)
+            logp_beta = ((self.p.gamma - 1.0) * torch.log(torch.clamp(1.0 - beta, min=1e-30))).sum()
 
             # NIW term: ∑_k [E log p(μ_k,Σ_k) - E log q(μ_k,Σ_k)]
             niw_term = float(self._niw_elbo_term().item())
 
-            elbo = total_ll + dir_term + niw_term
+            elbo = total_ll + dir_term + niw_term + logp_beta.item()
             elbo_history.append(elbo)
 
             # Early stopping
