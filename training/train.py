@@ -169,7 +169,7 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                     top5_probs = diag_results['top5_pi'].tolist()
                     logger.info(f"[E-step] Batch {bi+1}/{n_batches} - HMM Diagnostics:")
                     logger.info(f"  - Avg log-likelihood per step: {diag_results['avg_loglik_per_step']:.4f}")
-                    logger.info(f"  - Inner ELBO (final): {inner_elbo.item():.4f}")
+                    logger.info(f"  - Inner ELBO (final): {inner_elbo:.4f}")
                     if len(elbo_history) > 1:
                         elbo_improve = elbo_history[-1] - elbo_history[0]
                         logger.info(f"  - ELBO progression ({n_iterations} iters): {format_elbo_progression(elbo_history)} (Δ={elbo_improve.item():.4f})")
@@ -186,7 +186,7 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                 pbar.set_postfix({
                     'batch': f"{bi+1}/{n_batches}",
                     'rho': f"{streaming_rho:.3f}",
-                    'elbo': f"{inner_elbo.item():.2f}{elbo_change}" if torch.isfinite(inner_elbo) else "nan",
+                    'elbo': f"{inner_elbo:.2f}{elbo_change}",
                     'iters': f"{n_iterations}"
                 })
                 
