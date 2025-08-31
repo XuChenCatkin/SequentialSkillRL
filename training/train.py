@@ -143,8 +143,8 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                 var_bt = logvar.exp().clamp_min(1e-6).view(B,T,-1)
                 F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
             
-            # HMM update without pi optimization to avoid gradient issues
-            hmm_out = hmm.update(mu_bt, var_bt, F_bt, mask=valid, max_iters=10, rho=streaming_rho, optimize_pi=True)
+            # HMM update
+            hmm_out = hmm.update(mu_bt, var_bt, F_bt, mask=valid, max_iters=10, rho=streaming_rho, optimize_pi=((bi + 1) % 5 == 0), pi_steps=50, pi_lr=0.01, offline=True)
             
             # Extract ELBO from HMM update
             inner_elbo = hmm_out.get('inner_elbo', torch.tensor(float('nan')))
@@ -155,8 +155,8 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
             if use_wandb and torch.isfinite(inner_elbo):
                 log_hmm_elbo_to_wandb(bi, inner_elbo.item(), elbo_history, n_iterations, use_wandb)
             
-            # Compute diagnostics every 10 batches to monitor progress
-            if (bi + 1) % 10 == 0 or bi == 0:
+            # Compute diagnostics every 5 batches to monitor progress
+            if (bi + 1) % 1 == 0 or bi == 0:
                 with torch.no_grad():
                     diag_results = hmm.diagnostics(
                         mu_t=mu_bt,

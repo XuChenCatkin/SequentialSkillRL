@@ -102,9 +102,9 @@ class StickyHDPHMMVI(nn.Module):
         )
 
         # Global sticks β for the first K components; π_{K+1} is the remainder mass
-        # beta = torch.tensor([1.0 / (K + 2 - k) for k in range(1, K+1)], device=dev, dtype=dt)
-        torch.manual_seed(42)
-        beta = torch.rand(K, device=dev, dtype=dt).clamp(min=1e-2, max=1-1e-2)  # [K]
+        beta = torch.tensor([1.0 / (K + 2 - k) for k in range(1, K+1)], device=dev, dtype=dt)
+        # torch.manual_seed(42)
+        # beta = torch.rand(K, device=dev, dtype=dt).clamp(min=1e-2, max=1-1e-2)  # [K]
         self.u_beta = torch.log(beta) - torch.log1p(-beta)
         
         # Transition posteriors q(Φ_k)=Dir(φ_k), rows and cols = K+1
@@ -128,6 +128,7 @@ class StickyHDPHMMVI(nn.Module):
         self.stream_rho = float(rho_emission)
         self.stream_rho_trans = float(rho_transition) if rho_transition is not None else None
         self._stream_allocated = False
+        self.streaming_reset()
         
     # --- ELBO terms ------------------------------------------
 
@@ -427,28 +428,27 @@ class StickyHDPHMMVI(nn.Module):
         Nk: torch.Tensor,
         M1: torch.Tensor,
         M2: torch.Tensor,
-        xi_counts: torch.Tensor,
-        rho_emission: float,
-        rho_transition: float
+        xi_counts: torch.Tensor
     ) -> None:
         """
         Update sufficient statistics for the NIW prior.
         """
-        self.S_Nk = (1.0 - rho_emission) * self.S_Nk + rho_emission * Nk
-        self.S_M1 = (1.0 - rho_emission) * self.S_M1 + rho_emission * M1
-        self.S_M2 = (1.0 - rho_emission) * self.S_M2 + rho_emission * M2
-        self.S_counts = (1.0 - rho_transition) * self.S_counts + rho_transition * xi_counts
+        self.S_Nk = Nk
+        self.S_M1 = M1
+        self.S_M2 = M2
+        self.S_counts = xi_counts
 
     @torch.no_grad()
     def _calc_NIW_posterior(self, Nk, M1, M2) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute NIW posterior parameters from soft moments."""
         Kp1, D = M1.shape[0], M1.shape[1]
-        mu, kappa, Psi, nu = self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu
-        k_hat = kappa + Nk
-        mu_hat = (kappa.unsqueeze(1) * mu + M1) / k_hat.unsqueeze(1)
-        nu_hat = nu + Nk
+        mu0, k0, Psi0, nu0 = self.mu0, self.kappa0, self.Psi0, self.nu0
+        k_hat = k0 + Nk
+        mu_hat = (k0 * mu0.unsqueeze(0) + M1) / k_hat.unsqueeze(1)
+        nu_hat = nu0 + Nk
 
-        Psi_hat = Psi + M2 + kappa.view(-1, 1, 1) * torch.einsum('kd,ke->kde', mu, mu) \
+        Psi_hat = Psi0.unsqueeze(0).expand(Kp1, D, D).clone()
+        Psi_hat = Psi_hat + M2 + k0 * torch.einsum('d,e->de', mu0, mu0).unsqueeze(0) \
                   - torch.einsum('k,kd,ke->kde', k_hat, mu_hat, mu_hat)
 
         # small jitter to keep SPD
@@ -506,7 +506,7 @@ class StickyHDPHMMVI(nn.Module):
         returns phi: [Kp1,Kp1]
         """
         Kp1 = pi_star.shape[0]
-        phi = self.dir.phi - self._Epi() * self.p.alpha + pi_star.view(1, Kp1) * self.p.alpha + xihat
+        phi = self.p.alpha * pi_star.view(1, Kp1) + self.p.kappa * torch.eye(Kp1, device=xihat.device, dtype=xihat.dtype) + xihat
         return phi
 
     @torch.no_grad()
@@ -647,10 +647,11 @@ class StickyHDPHMMVI(nn.Module):
         mask: Optional[torch.Tensor] = None,           # [T] or [B,T]
         max_iters: int = 7,                            # inner full-loop limit
         tol: float = 1e-4,                             # ELBO gain tolerance
-        patience: int = 1,                             # consec. iters below tol to stop
-        min_iters: int = 1,                            # always do at least this many
         rho: Optional[float] = 1.0,                    # 1.0 => non-streaming; 0<rho<1 => EMA
-        optimize_pi: bool = True
+        optimize_pi: bool = True,                      # optimize π using mean r1
+        pi_steps: int = 200,                           # π opt steps
+        pi_lr: float = 0.05,                           # π opt learning rate
+        offline: bool = False                          # offline π opt (full data) if True
     ) -> Dict[str, torch.Tensor]:
         """
         Batch-global full inner loop:
@@ -735,11 +736,11 @@ class StickyHDPHMMVI(nn.Module):
                 last_out = {"rhat": rhat.detach(), "xihat": xihat.detach(), "loglik": torch.tensor(ll)}
 
             # (3) Blend stats (EMA or full replace) and update NIW
-            this_S_Nk     = (1.0 - rho_eff) * self.S_Nk     + rho_eff * this_acc_Nk
-            this_S_M1     = (1.0 - rho_eff) * self.S_M1     + rho_eff * this_acc_M1
-            this_S_M2     = (1.0 - rho_eff) * self.S_M2     + rho_eff * this_acc_M2
-            this_S_counts = (1.0 - rho_tr)   * self.S_counts + rho_tr  * this_acc_counts
-            
+            this_S_Nk     = (1.0 if offline else (1.0 - rho_eff)) * self.S_Nk     + rho_eff * this_acc_Nk
+            this_S_M1     = (1.0 if offline else (1.0 - rho_eff)) * self.S_M1     + rho_eff * this_acc_M1
+            this_S_M2     = (1.0 if offline else (1.0 - rho_eff)) * self.S_M2     + rho_eff * this_acc_M2
+            this_S_counts = (1.0 if offline else (1.0 - rho_tr)) * self.S_counts + rho_tr  * this_acc_counts
+
             this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat = \
                 self._calc_NIW_posterior(this_S_Nk, this_S_M1, this_S_M2)
 
@@ -750,7 +751,7 @@ class StickyHDPHMMVI(nn.Module):
                 this_u_beta = StickyHDPHMMVI._optimize_u_beta(
                     this_u_beta, r1_mean, this_ElogA,
                     self.p.alpha, self.p.kappa, self.p.gamma, self.p.K,
-                    steps=200, lr=0.05
+                    steps=pi_steps, lr=pi_lr
                 )
                 this_pi_full = StickyHDPHMMVI._calc_Epi(this_u_beta)
 
@@ -796,20 +797,19 @@ class StickyHDPHMMVI(nn.Module):
             logp_beta_history.append(float(logp_beta.item()))
 
             # Early stopping
-            if it >= min_iters:
-                if len(elbo_history) > 1 and elbo_history[-1] - elbo_history[-2] < tol:
-                    early_stopping = True
-                    self._update_NIW(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat)
-                    self._update_transitions(this_phi)
-                    self._update_u_beta(this_u_beta)
-                    self._update_moments(this_S_Nk, this_S_M1, this_S_M2, this_S_counts, rho_eff, rho_tr)
-                    break
+            if len(elbo_history) > 1 and elbo_history[-1] - elbo_history[-2] < tol:
+                early_stopping = True
+                self._update_NIW(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat)
+                self._update_transitions(this_phi)
+                self._update_u_beta(this_u_beta)
+                self._update_moments(this_S_Nk, this_S_M1, this_S_M2, this_S_counts)
+                break
                 
         if not early_stopping:
             self._update_NIW(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat)
             self._update_transitions(this_phi)
             self._update_u_beta(this_u_beta)
-            self._update_moments(this_S_Nk, this_S_M1, this_S_M2, this_S_counts, rho_eff, rho_tr)
+            self._update_moments(this_S_Nk, this_S_M1, this_S_M2, this_S_counts)
 
         return {
             "rhat": last_out["rhat"],
