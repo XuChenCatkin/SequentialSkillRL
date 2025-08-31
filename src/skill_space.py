@@ -95,7 +95,7 @@ class StickyHDPHMMVI(nn.Module):
 
         # Emission NIW posteriors (now K+1 states)
         self.niw = NIWPosterior(
-            mu=torch.zeros(Kp1, D, device=dev, dtype=dt),
+            mu=torch.stack([niw_prior.mu0.clone().to(device=dev, dtype=dt) for _ in range(Kp1)], dim=0),
             kappa=torch.full((Kp1,), niw_prior.kappa0, device=dev, dtype=dt),
             Psi=torch.stack([niw_prior.Psi0.clone().to(device=dev, dtype=dt) for _ in range(Kp1)], dim=0),
             nu=torch.full((Kp1,), niw_prior.nu0, device=dev, dtype=dt),
