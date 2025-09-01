@@ -144,8 +144,8 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                 F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
 
             # HMM update
-            hmm_out = hmm.update(mu_bt, var_bt, F_bt, mask=valid, max_iters=10, elbo_drop_tol=10.0, rho=streaming_rho, optimize_pi=((bi + 1) % 5 == 0), pi_steps=50, pi_lr=5e-4, offline=True)
-            
+            hmm_out = hmm.update(mu_bt, var_bt, F_bt, mask=valid, max_iters=10, elbo_drop_tol=10.0, rho=streaming_rho, optimize_pi=((bi + 1) % 10 == 0), pi_steps=50, pi_lr=1e-4, offline=True)
+
             # Extract ELBO from HMM update
             inner_elbo = hmm_out.get('inner_elbo', torch.tensor(float('nan')))
             elbo_history = hmm_out.get('elbo_history', torch.tensor([]))
@@ -176,6 +176,7 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                     logger.info(f"  - Effective number of skills: {diag_results['effective_K']:.2f}")
                     logger.info(f"  - State entropy: {diag_results['state_entropy']:.3f}")
                     logger.info(f"  - Transition stickiness: {diag_results['stickiness_diag_mean']:.3f}")
+                    logger.info(f"  - Expected dwell lengths per state: {diag_results['expected_dwell_length_per_state'].cpu().numpy().tolist()}")
                     logger.info(f"  - Top 5 skills: {top5_skills} (probs: {[f'{p:.3f}' for p in top5_probs]})")
             else:
                 # Update progress bar with basic info including ELBO
@@ -1628,7 +1629,7 @@ def train_vae_with_sticky_hmm_em(
 
     # 2) Instantiate HMM
     D = config.latent_dim
-    K = config.skill_num
+    K = config.skill_num  # include the remainder
     if logger: logger.info(f"🧠 Initializing Sticky-HDP-HMM: latent_dim={D}, skills={K}")
     
     niw = NIWPrior(
@@ -1641,7 +1642,7 @@ def train_vae_with_sticky_hmm_em(
         alpha=alpha, 
         kappa=kappa, 
         gamma=gamma,
-        K=K,
+        K=K-1, # exclude the remainder
         D=D,
         device=device
     )
@@ -1742,6 +1743,7 @@ def train_vae_with_sticky_hmm_em(
             logger.info(f"  - State entropy: {diagnostics['state_entropy']:.4f}")
             logger.info(f"  - Effective number of skills: {diagnostics['effective_K']:.2f}")
             logger.info(f"  - Transition stickiness (diag): {diagnostics['stickiness_diag_mean']:.4f}")
+            logger.info(f"  - Expected dwell lengths per state: {diagnostics['expected_dwell_length_per_state'].cpu().numpy().tolist()}")
             logger.info(f"  - Top 5 skill occupancies: {diagnostics['top5_pi'].tolist()}")
             logger.info(f"  - Top 5 skill indices: {diagnostics['top5_idx'].tolist()}")
 
@@ -1752,6 +1754,7 @@ def train_vae_with_sticky_hmm_em(
                 f"em_round_{r+1}/state_entropy": diagnostics['state_entropy'],
                 f"em_round_{r+1}/effective_K": diagnostics['effective_K'],
                 f"em_round_{r+1}/stickiness_diag_mean": diagnostics['stickiness_diag_mean'],
+                f"em_round_{r+1}/expected_dwell_length_per_state": diagnostics['expected_dwell_length_per_state'].cpu().numpy().tolist(),
                 f"em_round_{r+1}/top5_pi": diagnostics['top5_pi'].tolist(),
                 f"em_round_{r+1}/top5_idx": diagnostics['top5_idx'].tolist(),
             })

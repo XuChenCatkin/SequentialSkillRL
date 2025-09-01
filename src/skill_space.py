@@ -1038,7 +1038,7 @@ class StickyHDPHMMVI(nn.Module):
         ent = (- (r_cat.clamp_min(1e-9) * r_cat.clamp_min(1e-9).log()).sum(dim=1)).mean().item()
 
         # transition diagnostics from ElogA proxy
-        A_bar = torch.softmax(self._ElogA(), dim=1)  # not exact E[A], but a reasonable proxy
+        A_bar = self.dir.phi / self.dir.phi.sum(dim=1, keepdim=True)   # [Kp1,Kp1]
         diag_ratio = float(torch.diagonal(A_bar, dim1=0, dim2=1).mean().item())
 
         # effective number of skills
@@ -1055,6 +1055,7 @@ class StickyHDPHMMVI(nn.Module):
             "top5_pi": topk_vals,
             "top5_idx": topk_idx,
             "stickiness_diag_mean": diag_ratio,
+            "expected_dwell_length_per_state": 1.0 / (1.0 - A_bar.detach().diag())
         }
 
 

@@ -230,6 +230,118 @@ if __name__ == "__main__":
         
         print(f"\n🎉 Bin count analysis completed!")
     
+    elif len(sys.argv) > 1 and sys.argv[1] == "hmm_analysis":
+        # HMM analysis mode: python main.py hmm_analysis <repo_name> [round_num] [revision_name]
+        if len(sys.argv) < 3:
+            print("❌ Usage: python main.py hmm_analysis <repo_name> [round_num] [revision_name]")
+            print("   Example: python main.py hmm_analysis CatkinChen/nethack-hmm 1")
+            sys.exit(1)
+        
+        repo_name = sys.argv[2]
+        round_num = int(sys.argv[3]) if len(sys.argv) > 3 else None
+        revision_name = sys.argv[4] if len(sys.argv) > 4 else None
+        
+        print(f"🧠 Running HMM Analysis")
+        print(f"📦 Repository: {repo_name}")
+        print(f"🔄 Round: {round_num if round_num is not None else 'latest'}")
+        print(f"📋 Revision: {revision_name or 'main'}")
+        
+        # Set device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"🖥️  Using device: {device}")
+        
+        # Load datasets for analysis
+        print(f"📊 Loading datasets...")
+        collector = NetHackDataCollector('ttyrecs.db')
+        adapter = BLStatsAdapter()
+        
+        train_dataset = collector.collect_or_load_data(
+            dataset_name=train_file,
+            adapter=adapter,
+            save_path=train_cache_file,
+            max_batches=max_training_batches,
+            batch_size=batch_size,
+            seq_length=sequence_size,
+            force_recollect=False
+        )
+        
+        # Load HMM from HuggingFace
+        print(f"🔄 Loading HMM from HuggingFace...")
+        try:
+            # Import here to avoid circular imports
+            from training.training_utils import load_hmm_from_huggingface
+            
+            hmm, config, hmm_params, niw_prior, metadata = load_hmm_from_huggingface(
+                repo_name=repo_name,
+                round_num=round_num,
+                revision_name=revision_name,
+                device=str(device)
+            )
+            
+            print(f"✅ HMM loaded successfully!")
+            print(f"   📊 States: {hmm.p.K}")
+            print(f"   📐 Latent dim: {hmm.p.D}")
+            if metadata:
+                print(f"   🏷️  Round: {metadata.get('round', 'unknown')}")
+                print(f"   📅 Created: {metadata.get('created', 'unknown')}")
+            
+            # Load VAE model for encoding data
+            print(f"🎨 Loading VAE model for data encoding...")
+            
+            # Try to load VAE from a related repo or use a default
+            vae_repo = repo_name.replace('-hmm', '-vae')  # e.g., nethack-hmm -> nethack-vae
+            try:
+                from training.train import load_model_from_huggingface
+                model = load_model_from_huggingface(vae_repo, device=str(device))
+                print(f"✅ VAE loaded from {vae_repo}")
+            except Exception as e:
+                print(f"⚠️  Could not load VAE from {vae_repo}: {e}")
+                print(f"🔄 Trying fallback VAE repo...")
+                model = load_model_from_huggingface("CatkinChen/nethack-vae", device=str(device))
+                print(f"✅ VAE loaded from fallback repo")
+            
+            # Set up analysis directory
+            analysis_dir = "hmm_analysis"
+            os.makedirs(analysis_dir, exist_ok=True)
+            
+            # Set up logging
+            import logging
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+            
+            # Import visualization function here to avoid circular imports
+            from utils.analysis import visualize_hmm_after_estep
+            
+            # Run HMM visualization
+            print(f"📊 Running HMM visualization analysis...")
+            analysis_round = round_num if round_num is not None else metadata.get('round', 1)
+            
+            results = visualize_hmm_after_estep(
+                model=model,
+                dataset=train_dataset,
+                device=device,
+                hmm=hmm,
+                save_dir=analysis_dir,
+                round_idx=analysis_round,
+                logger=logger,
+                max_diags_batches=5,
+                max_raster_sequences=10
+            )
+            
+            print(f"✅ HMM analysis completed!")
+            print(f"📁 Results saved to: {analysis_dir}/round_{analysis_round:02d}/")
+            print(f"📊 Generated plots:")
+            for key, path in results.items():
+                if path and os.path.exists(path):
+                    print(f"   📈 {key}: {path}")
+            
+        except Exception as e:
+            print(f"❌ HMM analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"💡 Make sure the repository exists and contains HMM checkpoints")
+            print(f"💡 Check the round number and revision name")
+    
     elif len(sys.argv) > 1 and sys.argv[1] == "plot_bin_count":
         # Plot from saved data mode: python train.py plot_bin_count <data_path> [top_k] [exclude_space]
         if len(sys.argv) < 3:
@@ -403,16 +515,16 @@ if __name__ == "__main__":
                 config=vae_config,  
                 
                 # HMM parameters
-                alpha=40.0,
-                kappa=3.0,
+                alpha=10.0,
+                kappa=50.0,
                 gamma=5.0,
                 hmm_only=hmm_only,
                 em_rounds=1 if hmm_only else 3,
                 m_epochs_per_round=3,
                 niw_mu0 = 0.0, 
-                niw_kappa0 = 25.0, 
-                niw_Psi0 = 20.0,
-                niw_nu0 = vae_config.latent_dim + 5,
+                niw_kappa0 = 5.0, 
+                niw_Psi0 = 0.01,
+                niw_nu0 = vae_config.latent_dim + 2,
 
                 # HuggingFace integration
                 push_to_hub=True,

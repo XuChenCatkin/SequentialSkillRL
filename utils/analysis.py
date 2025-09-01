@@ -17,7 +17,8 @@ import json
 import math
 
 from src.model import bag_presence_to_glyph_sets, make_pair_bag, MapDecoder
-from training.train import load_model_from_huggingface, load_model_from_local
+# Conditional import to avoid circular dependency
+# from training.train import load_model_from_huggingface, load_model_from_local
 from src.skill_space import StickyHDPHMMVI
 
 # Import NetHackCategory from data_collection
@@ -1265,6 +1266,8 @@ def create_visualization_demo(
     model = None
     
     try:
+        # Import here to avoid circular dependency
+        from training.train import load_model_from_huggingface
         model = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
     except Exception as e:
         print(f"⚠️  Failed to load from HuggingFace: {e}")
@@ -1300,6 +1303,8 @@ def create_visualization_demo(
         
         if local_checkpoint_path is not None:
             try:
+                # Import here to avoid circular dependency
+                from training.train import load_model_from_local
                 model = load_model_from_local(local_checkpoint_path, device=device)
                 print(f"✅ Successfully loaded model from local checkpoint")
             except Exception as local_e:
@@ -2154,6 +2159,7 @@ def visualize_hmm_after_estep(
         "state_entropy": float(diags["state_entropy"]),
         "effective_K": float(diags["effective_K"]),
         "stickiness_diag_mean": float(diags["stickiness_diag_mean"]),
+        "expected_dwell_length_per_state": [float(x) for x in diags["expected_dwell_length_per_state"]],
         "top5_pi": [float(x) for x in diags["top5_pi"]],
         "top5_idx": [int(x) for x in diags["top5_idx"]],
     }
