@@ -1870,15 +1870,39 @@ def plot_glyph_char_color_pairs_from_saved(
 
 
 @torch.no_grad()
-def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_sequences: int = 6, max_batches: int = 4):
+def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_sequences: int = 6, max_batches: int = 4, random_seed: int = 42):
     """
-    Collect a few sequences' responsibility argmax per time step for raster plots.
-    Returns: (rasters: List[np.ndarray], lengths: List[int])
+    Collect a few sequences' Viterbi paths for raster plots.
+    Uses Viterbi algorithm to find the most likely state sequence, rather than argmax per timestep.
+    
+    Args:
+        model: VAE model for encoding
+        dataset: Dataset to sample from
+        device: Device to run on
+        hmm: HMM model
+        max_sequences: Maximum number of sequences to collect
+        max_batches: Maximum number of batches to process
+        random_seed: Random seed for reproducible sampling
+        
+    Returns: 
+        (rasters: List[np.ndarray], lengths: List[int])
     """
+    import random
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
     rasters, lengths = [], []
     grabbed = 0
-    for bi, batch in enumerate(dataset):
-        if grabbed >= max_sequences or bi >= max_batches: break
+    
+    # Create randomized batch indices
+    batch_indices = list(range(min(len(dataset), max_batches * 3)))  # Sample from more batches
+    random.shuffle(batch_indices)
+    
+    for bi_idx, bi in enumerate(batch_indices):
+        if grabbed >= max_sequences or bi_idx >= max_batches: break
+        
+        batch = dataset[bi]  # Get the actual batch
+        
         # Move to device and keep [B,T,...] shapes
         batch_dev = {}
         for k, v in batch.items():
@@ -1889,6 +1913,11 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
         if 'game_chars' not in batch_dev: 
             continue
         B, T = batch_dev['game_chars'].shape[:2]
+        
+        # Randomly select which sequences to use from this batch
+        seq_indices = list(range(B))
+        random.shuffle(seq_indices)
+        
         with torch.no_grad():
             # Flatten to [B*T,...] for model forward, then reshape back
             flat = {}
@@ -1904,23 +1933,23 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
             F_bt   = None if F_btr is None else F_btr.view(B, T, F_btr.size(-2), F_btr.size(-1))
             valid  = flat['valid_screen'].view(B, T).bool()
 
-            logB  = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt, mask=valid)  # [B,T,K]
+            logB  = hmm.expected_emission_loglik(
+                hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu,
+                mu_bt, var_bt, F_bt, mask=valid)  # [B,T,K]
             log_pi = torch.log(torch.clamp(hmm._Epi(), min=1e-30))
             ElogA = hmm._ElogA()
             
             # Process each sequence in the batch separately since forward_backward expects [T,K]
-            for b in range(B):
+            for b in seq_indices:
                 if grabbed >= max_sequences: break
                 m = valid[b].cpu().numpy().astype(bool)
                 if m.sum() == 0: 
                     continue
                 
-                # Extract single sequence and run forward_backward
+                # Extract single sequence and run Viterbi algorithm
                 logB_single = logB[b]  # [T,K]
-                r_hat_single, _, _ = hmm.forward_backward(log_pi, ElogA, logB_single)  # [T,K]
-                
-                # turn into argmax labels on valid frames only
-                labels = r_hat_single.argmax(-1).cpu().numpy()  # [T]
+                labels, _ = StickyHDPHMMVI.viterbi(log_pi, ElogA, logB_single)  # [T]
+                labels = labels.cpu().numpy().astype(int)
                 labels = labels[m]
                 rasters.append(labels)
                 lengths.append(len(labels))
@@ -2037,31 +2066,65 @@ def visualize_hmm_after_estep(
     path_A = os.path.join(round_dir, f"round{round_idx:02d}_A_heatmap.png")
     f2.savefig(path_A, dpi=160); plt.close(f2)
 
-    # 4) figure: PCA of mu_k (+ optional ellipses from E[Lambda]^{-1})
+    # 4) figure: t-SNE of mu_k (+ optional ellipses from E[Lambda]^{-1})
     try:
+        from sklearn.manifold import TSNE
         from sklearn.decomposition import PCA
-        comps = min(2, mu_k.shape[1]); pca = PCA(n_components=comps).fit(mu_k)
-        xy = pca.transform(mu_k)
-        f3 = plt.figure(figsize=(6, 5))
-        plt.scatter(xy[:,0], xy[:,1], s=50*(pi_hat / (pi_hat.max()+1e-8) + 0.2))
-        for i in range(mu_k.shape[0]):
-            # small 1σ ellipse from covariance approx inv(E_Lambda)
+        
+        # Use t-SNE for better cluster visualization, but fallback to PCA if needed
+        if mu_k.shape[0] > 3 and mu_k.shape[1] > 2:  # Need enough points and dimensions for t-SNE
             try:
-                cov = np.linalg.inv(E_Lambda[i].cpu().numpy())
-                cov = 0.5*(cov + cov.T)
-                w, V = np.linalg.eigh(cov)
-                w = np.clip(w, 1e-8, None)
-                angle = math.degrees(math.atan2(V[1, -1], V[0, -1]))
-                r1, r2 = np.sqrt(w[-1]), np.sqrt(w[-2]) if len(w) > 1 else np.sqrt(w[-1])
-                from matplotlib.patches import Ellipse
-                e = Ellipse(xy[i], 2*r1, 2*r2, angle=angle, fill=False, alpha=0.4)
-                ax = plt.gca(); ax.add_patch(e)
+                # Preprocess with PCA if dimensionality is very high
+                if mu_k.shape[1] > 128:
+                    pca_prep = PCA(n_components=50).fit(mu_k)
+                    mu_prep = pca_prep.transform(mu_k)
+                else:
+                    mu_prep = mu_k
+                
+                tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, mu_k.shape[0]-1))
+                xy = tsne.fit_transform(mu_prep)
+                method_name = "t-SNE"
             except Exception:
-                pass
-        plt.xlabel("PC1"); plt.ylabel("PC2")
-        plt.title(f"Round {round_idx}: PCA of emission means (size ∝ $\\hat\\pi_k$)")
+                # Fallback to PCA if t-SNE fails
+                comps = min(2, mu_k.shape[1])
+                pca = PCA(n_components=comps).fit(mu_k)
+                xy = pca.transform(mu_k)
+                method_name = "PCA"
+        else:
+            # Use PCA for small datasets
+            comps = min(2, mu_k.shape[1])
+            pca = PCA(n_components=comps).fit(mu_k)
+            xy = pca.transform(mu_k)
+            method_name = "PCA"
+            
+        f3 = plt.figure(figsize=(6, 5))
+        plt.scatter(xy[:,0], xy[:,1], s=50*(pi_hat / (pi_hat.max()+1e-8) + 0.2), alpha=0.7)
+        
+        # Add skill labels for clarity
+        for i in range(mu_k.shape[0]):
+            plt.annotate(f'{i}', (xy[i,0], xy[i,1]), xytext=(3, 3), 
+                        textcoords='offset points', fontsize=8, alpha=0.8)
+        
+        # Only add ellipses for PCA (they don't make sense for t-SNE transformed space)
+        if method_name == "PCA":
+            for i in range(mu_k.shape[0]):
+                try:
+                    cov = np.linalg.inv(E_Lambda[i].cpu().numpy())
+                    cov = 0.5*(cov + cov.T)
+                    w, V = np.linalg.eigh(cov)
+                    w = np.clip(w, 1e-8, None)
+                    angle = math.degrees(math.atan2(V[1, -1], V[0, -1]))
+                    r1, r2 = np.sqrt(w[-1]), np.sqrt(w[-2]) if len(w) > 1 else np.sqrt(w[-1])
+                    from matplotlib.patches import Ellipse
+                    e = Ellipse(xy[i], 2*r1, 2*r2, angle=angle, fill=False, alpha=0.4)
+                    ax = plt.gca(); ax.add_patch(e)
+                except Exception:
+                    pass
+                    
+        plt.xlabel(f"{method_name} 1"); plt.ylabel(f"{method_name} 2")
+        plt.title(f"Round {round_idx}: {method_name} of emission means (size ∝ $\\hat\\pi_k$)")
         plt.tight_layout()
-        path_pca = os.path.join(round_dir, f"round{round_idx:02d}_mu_pca.png")
+        path_pca = os.path.join(round_dir, f"round{round_idx:02d}_mu_{method_name.lower()}.png")
         f3.savefig(path_pca, dpi=160); plt.close(f3)
     except Exception as e:
         path_pca = None
@@ -2077,7 +2140,7 @@ def visualize_hmm_after_estep(
         plt.imshow(canvas, interpolation="nearest", aspect="auto", origin="lower", cmap="tab20")
         plt.colorbar(label="Skill id", fraction=0.025, pad=0.02)
         plt.xlabel("t (valid frames)"); plt.ylabel("sequence #")
-        plt.title(f"Round {round_idx}: Skill raster (argmax responsibilities)")
+        plt.title(f"Round {round_idx}: Skill raster (Viterbi optimal paths)")
         plt.tight_layout()
         path_raster = os.path.join(round_dir, f"round{round_idx:02d}_skill_raster.png")
         f4.savefig(path_raster, dpi=160); plt.close(f4)

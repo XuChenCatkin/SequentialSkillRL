@@ -159,9 +159,9 @@ class StickyHDPHMMVI(nn.Module):
         # multivariate gamma term
         i = torch.arange(1, D + 1, device=Psi.device, dtype=Psi.dtype).view(1, D)
         lgamma_sum = torch.sum(torch.lgamma((nu.view(Kp1, 1) + 1.0 - i) / 2.0), dim=1)  # [Kp1]
-        term = (nu * D / 2.0) * torch.log(torch.tensor(2.0, device=Psi.device, dtype=Psi.dtype)) \
-            + (D * (D - 1) / 4.0) * torch.log(torch.tensor(torch.pi, device=Psi.device, dtype=Psi.dtype)) \
-            - 0.5 * nu * logdet_Psi + lgamma_sum
+        term = -(nu * D / 2.0) * torch.log(torch.tensor(2.0, device=Psi.device, dtype=Psi.dtype)) \
+            - (D * (D - 1) / 4.0) * torch.log(torch.tensor(torch.pi, device=Psi.device, dtype=Psi.dtype)) \
+            + 0.5 * nu * logdet_Psi - lgamma_sum
         return term.sum()
 
     def _niw_elbo_term(self, mu_hat, k_hat, Psi_hat, nu_hat) -> torch.Tensor:
@@ -177,10 +177,10 @@ class StickyHDPHMMVI(nn.Module):
         E_Lambda, E_logdet_Lambda = StickyHDPHMMVI._calc_Lambda_expectations(Psi_hat, nu_hat)  # [Kp1,D,D]
 
         # --- IW part: -KL(q(Σ)||p(Σ)) ---
-        # log Z_IW(q) - log Z_IW(p)
+        # log Z_IW(p) - log Z_IW(q)
         logZ_p = StickyHDPHMMVI._logZ_invwishart(Psi0, torch.tensor(nu0, device=Psi_hat.device, dtype=Psi_hat.dtype))
         logZ_q = StickyHDPHMMVI._logZ_invwishart(Psi_hat, nu_hat)
-        logZ_term = logZ_q - logZ_p * Kp1
+        logZ_term = logZ_p * Kp1 - logZ_q
 
         # -0.5 * (ν_hat - ν₀) * E_q[log|Λ|]
         # Note: E_q[log|Σ|] = -E_q[log|Λ|]
@@ -356,6 +356,53 @@ class StickyHDPHMMVI(nn.Module):
             xihat[t] = torch.softmax(tmp.view(-1), dim=0).view(Kp1, Kp1)
 
         return rhat, xihat, float(ll.item())
+
+    @staticmethod
+    @torch.no_grad()
+    def viterbi(
+        log_pi: torch.Tensor,   # [Kp1]
+        ElogA: torch.Tensor,    # [Kp1,Kp1]
+        logB: torch.Tensor      # [T,Kp1]
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        Viterbi algorithm to find the most likely state sequence.
+        
+        Args:
+            log_pi: Log initial state probabilities [Kp1]
+            ElogA: Log transition matrix [Kp1,Kp1] 
+            logB: Log emission probabilities [T,Kp1]
+            
+        Returns:
+            path: Most likely state sequence [T] (int64)
+            log_prob: Log probability of the most likely path (scalar)
+        """
+        T, Kp1 = logB.shape
+        
+        # Viterbi forward pass: compute max probabilities and backtrack pointers
+        log_delta = torch.full((T, Kp1), -float('inf'), device=logB.device, dtype=logB.dtype)
+        psi = torch.zeros((T, Kp1), dtype=torch.long, device=logB.device)
+        
+        # Initialize
+        log_delta[0] = log_pi + logB[0]
+        
+        # Forward pass
+        for t in range(1, T):
+            # For each state k at time t, find the best previous state
+            prev_scores = log_delta[t-1].unsqueeze(1) + ElogA  # [Kp1,Kp1]
+            log_delta[t], psi[t] = torch.max(prev_scores, dim=0)  # [Kp1], [Kp1]
+            log_delta[t] = log_delta[t] + logB[t]
+        
+        # Find the best final state
+        log_prob, best_last_state = torch.max(log_delta[-1], dim=0)
+        
+        # Backward pass: reconstruct the path
+        path = torch.zeros(T, dtype=torch.long, device=logB.device)
+        path[-1] = best_last_state
+        
+        for t in range(T-2, -1, -1):
+            path[t] = psi[t+1, path[t+1]]
+            
+        return path, float(log_prob.item())
 
     # ---- M-step: sufficient stats from encoder -------------------------------
     @torch.no_grad()
@@ -647,6 +694,7 @@ class StickyHDPHMMVI(nn.Module):
         mask: Optional[torch.Tensor] = None,           # [T] or [B,T]
         max_iters: int = 7,                            # inner full-loop limit
         tol: float = 1e-4,                             # ELBO gain tolerance
+        elbo_drop_tol: float = 10.0,                   # ELBO drop tolerance for early stopping
         rho: Optional[float] = 1.0,                    # 1.0 => non-streaming; 0<rho<1 => EMA
         optimize_pi: bool = True,                      # optimize π using mean r1
         pi_steps: int = 200,                           # π opt steps
@@ -660,7 +708,12 @@ class StickyHDPHMMVI(nn.Module):
         (3) blend stats (EMA/non-streaming) -> update NIW
         (4) optionally optimize π using mean r1
         (5) update transitions with blended counts via _update_transitions
-        (6) evaluate full inner ELBO; early stop if plateau
+        (6) evaluate full inner ELBO; early stop if plateau or large drop
+
+        Early stopping logic:
+        - If ELBO increases but change < tol: stop and use current parameters
+        - If ELBO drops by more than elbo_drop_tol: stop and use previous best parameters
+        - Otherwise continue optimization
 
         Returns diagnostics from the last pass.
         """
@@ -703,6 +756,18 @@ class StickyHDPHMMVI(nn.Module):
         this_S_M2 = self.S_M2.clone()
         this_S_counts = self.S_counts.clone()
         early_stopping = False
+        
+        # Track best parameters for early stopping
+        best_mu_hat = None
+        best_k_hat = None
+        best_Psi_hat = None
+        best_nu_hat = None
+        best_phi = None
+        best_u_beta = None
+        best_S_Nk = None
+        best_S_M1 = None
+        best_S_M2 = None
+        best_S_counts = None
 
         # ---- inner full loop ----------------------------------------------------
         for it in range(max(1, int(max_iters))):
@@ -720,6 +785,7 @@ class StickyHDPHMMVI(nn.Module):
             this_acc_M1     = torch.zeros(Kp1, D, device=self.mu0.device, dtype=self.mu0.dtype)
             this_acc_M2     = torch.zeros(Kp1, D, D, device=self.mu0.device, dtype=self.mu0.dtype)
             this_r1_sum = torch.zeros(Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
+            this_r_sum = torch.zeros(T, Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
 
             for b in range(B):
                 rhat, xihat, ll = StickyHDPHMMVI.forward_backward(this_log_pi, this_ElogA, this_logB[b])
@@ -731,8 +797,16 @@ class StickyHDPHMMVI(nn.Module):
                     (mask[b] if mask is not None else None)
                 )
                 this_acc_Nk += Nk; this_acc_M1 += M1; this_acc_M2 += M2
+                if mask is not None:
+                    m = mask[b]
+                    pair_m = (m[:-1] * m[1:]).view(-1, 1, 1)  # [T-1,1,1]
+                    xihat = xihat * pair_m  # zero out transitions from/to masked frames
+                    t0 = int(torch.nonzero(m, as_tuple=False)[0])
+                else:
+                    t0 = 0
                 this_acc_counts += xihat.sum(dim=0)
-                this_r1_sum += rhat[0]
+                this_r1_sum += rhat[t0]
+                this_r_sum += rhat
                 last_out = {"rhat": rhat.detach(), "xihat": xihat.detach(), "loglik": torch.tensor(ll)}
 
             # (3) Blend stats (EMA or full replace) and update NIW
@@ -770,22 +844,13 @@ class StickyHDPHMMVI(nn.Module):
             log_pi_eval = torch.log(torch.clamp(this_pi_full, min=1e-30))
             
             # Compute expected complete data log-likelihood components with single FB call per batch
-            data_ll = 0.0
-            trans_ll = 0.0 
-            init_ll = 0.0
+            ll = 0.0
             
             for b in range(B):
                 # Single forward-backward call per batch
-                rhat_b, xihat_b, _ = StickyHDPHMMVI.forward_backward(log_pi_eval, ElogA_eval, logB_eval[b])
-                
-                # E_q[log p(z_t | h_t)] = ∑_t ∑_k r_{tk} * E_q[log p(z_t | h_t=k)]
-                data_ll += torch.sum(rhat_b * logB_eval[b]).item()
-                
-                # E_q[log p(h_t | h_{t-1})] = ∑_t ∑_i ∑_j ξ_{t,ij} * E_q[log A_{ij}]
-                trans_ll += torch.sum(xihat_b * ElogA_eval.unsqueeze(0)).item()
-                
-                # E_q[log p(h_1)] = ∑_k r_{1k} * log π_k
-                init_ll += torch.sum(rhat_b[0] * log_pi_eval).item()
+                _, _, ll_b = StickyHDPHMMVI.forward_backward(log_pi_eval, ElogA_eval, logB_eval[b])
+
+                ll += ll_b
 
             # Dirichlet term: E_q[log p(Φ)] - E_q[log q(Φ)] = -KL(q(Φ)||p(Φ))
             a = self.p.alpha * this_pi_full.unsqueeze(0) \
@@ -804,27 +869,76 @@ class StickyHDPHMMVI(nn.Module):
             niw_term = float(self._niw_elbo_term(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat).item())
 
             # Complete ELBO: expected complete data log-likelihood + priors - entropies
-            elbo = data_ll + trans_ll + init_ll + dir_term + niw_term + logp_beta.item()
+            elbo = ll + dir_term + niw_term + logp_beta.item()
             elbo_history.append(elbo)
-            total_ll_history.append(data_ll + trans_ll + init_ll)  # Combined likelihood terms
+            total_ll_history.append(ll) 
             dir_term_history.append(dir_term)
             iw_term_history.append(niw_term)
             logp_beta_history.append(float(logp_beta.item()))
 
-            # Early stopping
-            if len(elbo_history) > 1 and fabs(elbo_history[-1] - elbo_history[-2]) < tol:
-                early_stopping = True
-                self._update_NIW(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat)
-                self._update_transitions(this_phi)
-                self._update_u_beta(this_u_beta)
-                self._update_moments(this_S_Nk, this_S_M1, this_S_M2, this_S_counts)
-                break
+            # Improved Early stopping logic
+            if len(elbo_history) == 1:
+                # First iteration: save as best
+                best_mu_hat = this_mu_hat.clone()
+                best_k_hat = this_k_hat.clone()
+                best_Psi_hat = this_Psi_hat.clone()
+                best_nu_hat = this_nu_hat.clone()
+                best_phi = this_phi.clone()
+                best_u_beta = this_u_beta.clone()
+                best_S_Nk = this_S_Nk.clone()
+                best_S_M1 = this_S_M1.clone()
+                best_S_M2 = this_S_M2.clone()
+                best_S_counts = this_S_counts.clone()
+            elif len(elbo_history) > 1:
+                prev_elbo = elbo_history[-2]
+                curr_elbo = elbo_history[-1]
+                elbo_change = curr_elbo - prev_elbo
+                
+                if elbo_change > 0:
+                    # ELBO improved: update best parameters
+                    best_mu_hat = this_mu_hat.clone()
+                    best_k_hat = this_k_hat.clone()
+                    best_Psi_hat = this_Psi_hat.clone()
+                    best_nu_hat = this_nu_hat.clone()
+                    best_phi = this_phi.clone()
+                    best_u_beta = this_u_beta.clone()
+                    best_S_Nk = this_S_Nk.clone()
+                    best_S_M1 = this_S_M1.clone()
+                    best_S_M2 = this_S_M2.clone()
+                    best_S_counts = this_S_counts.clone()
+                    
+                    # Check if improvement is small enough to stop
+                    if elbo_change < tol:
+                        early_stopping = True
+                        # Use current (best) iteration parameters
+                        self._update_NIW(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat)
+                        self._update_transitions(this_phi)
+                        self._update_u_beta(this_u_beta)
+                        self._update_moments(this_S_Nk, this_S_M1, this_S_M2, this_S_counts)
+                        break
+                else:
+                    # ELBO decreased: check if drop is too large
+                    if abs(elbo_change) > elbo_drop_tol:
+                        early_stopping = True
+                        # Use previous (best) iteration parameters
+                        self._update_NIW(best_mu_hat, best_k_hat, best_Psi_hat, best_nu_hat)
+                        self._update_transitions(best_phi)
+                        self._update_u_beta(best_u_beta)
+                        self._update_moments(best_S_Nk, best_S_M1, best_S_M2, best_S_counts)
+                        break
                 
         if not early_stopping:
-            self._update_NIW(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat)
-            self._update_transitions(this_phi)
-            self._update_u_beta(this_u_beta)
-            self._update_moments(this_S_Nk, this_S_M1, this_S_M2, this_S_counts)
+            # Use the best parameters from the last iteration
+            self._update_NIW(best_mu_hat if best_mu_hat is not None else this_mu_hat, 
+                            best_k_hat if best_k_hat is not None else this_k_hat, 
+                            best_Psi_hat if best_Psi_hat is not None else this_Psi_hat, 
+                            best_nu_hat if best_nu_hat is not None else this_nu_hat)
+            self._update_transitions(best_phi if best_phi is not None else this_phi)
+            self._update_u_beta(best_u_beta if best_u_beta is not None else this_u_beta)
+            self._update_moments(best_S_Nk if best_S_Nk is not None else this_S_Nk, 
+                               best_S_M1 if best_S_M1 is not None else this_S_M1, 
+                               best_S_M2 if best_S_M2 is not None else this_S_M2, 
+                               best_S_counts if best_S_counts is not None else this_S_counts)
 
         return {
             "rhat": last_out["rhat"],
@@ -942,3 +1056,18 @@ class StickyHDPHMMVI(nn.Module):
             "top5_idx": topk_idx,
             "stickiness_diag_mean": diag_ratio,
         }
+
+
+def viterbi(log_pi: torch.Tensor, ElogA: torch.Tensor, logB: torch.Tensor) -> torch.Tensor:
+    """
+    Standalone Viterbi algorithm to find the most likely state sequence.
+    
+    Args:
+        log_pi: Log initial state probabilities [Kp1]
+        ElogA: Log transition matrix [Kp1,Kp1] 
+        logB: Log emission probabilities [T,Kp1]
+        
+    Returns:
+        path: Most likely state sequence [T] (int64)
+    """
+    return StickyHDPHMMVI.viterbi(log_pi, ElogA, logB)[0]  # Return only the path, not log_prob

@@ -142,9 +142,9 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                 mu_bt = mu.view(B,T,-1)
                 var_bt = logvar.exp().clamp_min(1e-6).view(B,T,-1)
                 F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
-            
+
             # HMM update
-            hmm_out = hmm.update(mu_bt, var_bt, F_bt, mask=valid, max_iters=10, rho=streaming_rho, optimize_pi=((bi + 1) % 5 == 0), pi_steps=50, pi_lr=0.01, offline=True)
+            hmm_out = hmm.update(mu_bt, var_bt, F_bt, mask=valid, max_iters=10, elbo_drop_tol=10.0, rho=streaming_rho, optimize_pi=((bi + 1) % 5 == 0), pi_steps=50, pi_lr=5e-4, offline=True)
             
             # Extract ELBO from HMM update
             inner_elbo = hmm_out.get('inner_elbo', torch.tensor(float('nan')))
@@ -1652,45 +1652,45 @@ def train_vae_with_sticky_hmm_em(
         rho_transition=1.0
     )
     
-    # if 'SKLEARN_AVAILABLE' in globals() and SKLEARN_AVAILABLE:
-    #     from sklearn.cluster import KMeans
-    #     def _kmeans_init_hmm(hmm, model, dataset, device, max_frames=20000):
-    #         model.eval()
-    #         X = []
-    #         collected = 0
-    #         B, T = dataset[0]['tty_chars'].shape[:2]
-    #         for batch in dataset:
-    #             with torch.no_grad():
-    #                 bdev = {}
-    #                 for k, v in batch.items():
-    #                     if isinstance(v, torch.Tensor):
-    #                         x = v.to(device, non_blocking=True)
-    #                         if x.dim() >= 3 and k not in ('original_batch_shape',):
-    #                             bdev[k] = x.view(B*T, *x.shape[2:])
-    #                         else:
-    #                             bdev[k] = x
-    #                     else:
-    #                         bdev[k] = v
-    #                 out = model(bdev)
-    #                 mu_bt = out['mu'].view(B, T, -1).detach().cpu()
-    #                 valid = bdev['valid_screen'].view(B, T).cpu().bool()
-    #                 X.append(mu_bt[valid])
-    #                 collected += int(valid.sum().item())
-    #             if collected >= max_frames:
-    #                 break
-    #         if not X:
-    #             return
-    #         X = torch.cat(X, dim=0).numpy()
-    #         Kp1 = hmm.niw.mu.shape[0]
-    #         kmeans = KMeans(n_clusters=Kp1, n_init=8, max_iter=200, random_state=0)
-    #         labels = kmeans.fit_predict(X)
-    #         centers = torch.from_numpy(kmeans.cluster_centers_).to(hmm.niw.mu.device, dtype=hmm.niw.mu.dtype)
-    #         with torch.no_grad():
-    #             hmm.niw.mu[:Kp1] = centers[:Kp1].to(hmm.niw.mu)
-    #             hmm._cache_fresh = False
-    #     _kmeans_init_hmm(hmm, model, train_dataset, device)
-    # else:
-    #     if logger: logger.warning("scikit-learn not available; skipping k-means warm start for HMM.")
+    if 'SKLEARN_AVAILABLE' in globals() and SKLEARN_AVAILABLE:
+        from sklearn.cluster import KMeans
+        def _kmeans_init_hmm(hmm, model, dataset, device, max_frames=20000):
+            model.eval()
+            X = []
+            collected = 0
+            B, T = dataset[0]['tty_chars'].shape[:2]
+            for batch in dataset:
+                with torch.no_grad():
+                    bdev = {}
+                    for k, v in batch.items():
+                        if isinstance(v, torch.Tensor):
+                            x = v.to(device, non_blocking=True)
+                            if x.dim() >= 3 and k not in ('original_batch_shape',):
+                                bdev[k] = x.view(B*T, *x.shape[2:])
+                            else:
+                                bdev[k] = x
+                        else:
+                            bdev[k] = v
+                    out = model(bdev)
+                    mu_bt = out['mu'].view(B, T, -1).detach().cpu()
+                    valid = bdev['valid_screen'].view(B, T).cpu().bool()
+                    X.append(mu_bt[valid])
+                    collected += int(valid.sum().item())
+                if collected >= max_frames:
+                    break
+            if not X:
+                return
+            X = torch.cat(X, dim=0).numpy()
+            Kp1 = hmm.niw.mu.shape[0]
+            kmeans = KMeans(n_clusters=Kp1, n_init=8, max_iter=200, random_state=0)
+            labels = kmeans.fit_predict(X)
+            centers = torch.from_numpy(kmeans.cluster_centers_).to(hmm.niw.mu.device, dtype=hmm.niw.mu.dtype)
+            with torch.no_grad():
+                hmm.niw.mu[:Kp1] = centers[:Kp1].to(hmm.niw.mu)
+                hmm._cache_fresh = False
+        _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
+    else:
+        if logger: logger.warning("scikit-learn not available; skipping k-means warm start for HMM.")
 
     # Track training info for final summary
     training_info = {
