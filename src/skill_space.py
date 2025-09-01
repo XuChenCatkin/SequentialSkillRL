@@ -177,7 +177,7 @@ class StickyHDPHMMVI(nn.Module):
         E_Lambda, E_logdet_Lambda = StickyHDPHMMVI._calc_Lambda_expectations(Psi_hat, nu_hat)  # [Kp1,D,D]
 
         # --- IW part: -KL(q(Σ)||p(Σ)) ---
-        # log Z_IW(p) - log Z_IW(q)
+        # log Z_IW(q) - log Z_IW(p)
         logZ_p = StickyHDPHMMVI._logZ_invwishart(Psi0, torch.tensor(nu0, device=Psi_hat.device, dtype=Psi_hat.dtype))
         logZ_q = StickyHDPHMMVI._logZ_invwishart(Psi_hat, nu_hat)
         logZ_term = logZ_q - logZ_p * Kp1
