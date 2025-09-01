@@ -404,14 +404,14 @@ if __name__ == "__main__":
                 
                 # HMM parameters
                 alpha=40.0,
-                kappa=25.0,
+                kappa=5.0,
                 gamma=5.0,
                 hmm_only=hmm_only,
                 em_rounds=1 if hmm_only else 3,
                 m_epochs_per_round=3,
                 niw_mu0 = 0.0, 
-                niw_kappa0 = 1.0, 
-                niw_Psi0 = 1.0,
+                niw_kappa0 = 25.0, 
+                niw_Psi0 = 0.5,
                 niw_nu0 = vae_config.latent_dim + 5,
 
                 # HuggingFace integration
