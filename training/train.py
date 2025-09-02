@@ -1743,9 +1743,10 @@ def train_vae_with_sticky_hmm_em(
             logger.info(f"  - State entropy: {diagnostics['state_entropy']:.4f}")
             logger.info(f"  - Effective number of skills: {diagnostics['effective_K']:.2f}")
             logger.info(f"  - Transition stickiness (diag): {diagnostics['stickiness_diag_mean']:.4f}")
-            logger.info(f"  - Expected dwell lengths per state: {diagnostics['expected_dwell_length_per_state'].cpu().numpy().tolist()}")
             logger.info(f"  - Top 5 skill occupancies: {diagnostics['top5_pi'].tolist()}")
             logger.info(f"  - Top 5 skill indices: {diagnostics['top5_idx'].tolist()}")
+            for k in torch.argsort(diagnostics['p_stay'], descending=True)[:5]:
+                logger.info(f"    - Skill {k}: emp={diagnostics['empirical_dwell_length_per_state'][k]:6.2f}  E[1/(1-p)]:{float(diagnostics['expected_dwell_length_per_state'][k]):6.2f}  p_stay={float(diagnostics['p_stay'][k]):.3f}")
 
         # Log HMM diagnostics to wandb
         if use_wandb and WANDB_AVAILABLE:
@@ -1755,6 +1756,7 @@ def train_vae_with_sticky_hmm_em(
                 f"em_round_{r+1}/effective_K": diagnostics['effective_K'],
                 f"em_round_{r+1}/stickiness_diag_mean": diagnostics['stickiness_diag_mean'],
                 f"em_round_{r+1}/expected_dwell_length_per_state": diagnostics['expected_dwell_length_per_state'].cpu().numpy().tolist(),
+                f"em_round_{r+1}/empirical_dwell_length_per_state": diagnostics['empirical_dwell_length_per_state'].cpu().numpy().tolist(),
                 f"em_round_{r+1}/top5_pi": diagnostics['top5_pi'].tolist(),
                 f"em_round_{r+1}/top5_idx": diagnostics['top5_idx'].tolist(),
             })

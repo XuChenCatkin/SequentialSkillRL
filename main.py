@@ -324,8 +324,9 @@ if __name__ == "__main__":
                 save_dir=analysis_dir,
                 round_idx=analysis_round,
                 logger=logger,
-                max_diags_batches=5,
-                max_raster_sequences=10
+                max_diags_batches=20,
+                max_raster_sequences=10,
+                random_seed=100
             )
             
             print(f"✅ HMM analysis completed!")

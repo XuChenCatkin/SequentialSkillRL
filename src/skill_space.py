@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Dict, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 # ---------- helpers ----------------------------------------------------------
 
@@ -403,6 +404,52 @@ class StickyHDPHMMVI(nn.Module):
             path[t] = psi[t+1, path[t+1]]
             
         return path, float(log_prob.item())
+    
+    @torch.no_grad()
+    def viterbi_paths(
+        self,
+        mu_t, diag_var_t=None, F_t=None, mask=None
+    ):
+        """Decode each sequence; return list of 1D long tensors (one per sequence)."""
+        logB = StickyHDPHMMVI.expected_emission_loglik(
+            self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
+            mu_t, diag_var_t, F_t, mask
+        )
+        if logB.dim() == 2: logB = logB.unsqueeze(0)
+        B, T, K = logB.shape
+        log_pi = torch.log(torch.clamp(self._Epi(), min=1e-30))
+        logA = self._ElogA()
+        paths = []
+        for b in range(B):
+            lb = logB[b]
+            if mask is not None:
+                m = mask[b].bool()
+                z_full = torch.full((T,), K-1, dtype=torch.long, device=lb.device)  # any default
+                z_obs, _ = StickyHDPHMMVI.viterbi(log_pi, logA, lb[m])
+                z_full[m] = z_obs
+                z = z_full[m]    # only valid frames
+            else:
+                z, _ = StickyHDPHMMVI.viterbi(log_pi, logA, lb)
+            paths.append(z)
+        return paths
+
+    @staticmethod
+    @torch.no_grad()
+    def dwell_stats_from_path(z: torch.Tensor, K: int):
+        """Return per-state list of run-lengths and their means from a 1D path."""
+        lens = [[] for _ in range(K)]
+        if z.numel() == 0: return lens, [0. for _ in range(K)]
+        prev, r = int(z[0]), 1
+        for t in range(1, z.numel()):
+            cur = int(z[t])
+            if cur == prev:
+                r += 1
+            else:
+                lens[prev].append(r)
+                prev, r = cur, 1
+        lens[prev].append(r)
+        means = [float(torch.tensor(ls).float().mean().item()) if len(ls) else 0. for ls in lens]
+        return lens, means
 
     # ---- M-step: sufficient stats from encoder -------------------------------
     @torch.no_grad()
@@ -520,6 +567,12 @@ class StickyHDPHMMVI(nn.Module):
         self.u_beta.data.copy_(u_beta.detach())
 
     # ---- transitions & π -----------------------------------------------------
+    @torch.no_grad()
+    def _EA(self) -> torch.Tensor:
+        """Row-wise mean of transitions under Dirichlet posterior."""
+        phi = torch.clamp(self.dir.phi, min=1e-8)
+        return phi / phi.sum(dim=1, keepdim=True)
+    
     def _ElogA(self) -> torch.Tensor:
         phi = self.dir.phi  # [Kp1,Kp1]
         return torch.special.digamma(phi) - torch.special.digamma(phi.sum(dim=1, keepdim=True))
@@ -1038,14 +1091,26 @@ class StickyHDPHMMVI(nn.Module):
         ent = (- (r_cat.clamp_min(1e-9) * r_cat.clamp_min(1e-9).log()).sum(dim=1)).mean().item()
 
         # transition diagnostics from ElogA proxy
-        A_bar = self.dir.phi / self.dir.phi.sum(dim=1, keepdim=True)   # [Kp1,Kp1]
-        diag_ratio = float(torch.diagonal(A_bar, dim1=0, dim2=1).mean().item())
+        EA = self._EA().cpu()  # [Kp1,Kp1]
+        diag_ratio = float(torch.diagonal(EA, dim1=0, dim2=1).mean().item())
 
         # effective number of skills
         effK = float(torch.exp(-(pi_hat * (pi_hat + 1e-12).log()).sum()).item())
 
         topk_vals, topk_idx = torch.topk(pi_hat, k=min(5, self.niw.mu.shape[0]))
         avg_ll_per_step = float(ll_total / max(steps, 1))
+
+        paths = self.viterbi_paths(mu_t, diag_var_t, F_t, mask=mask)
+        Kp1 = self.niw.mu.size(0)
+        all_lens = [[] for _ in range(Kp1)]
+        for z in paths:
+            lens, _ = StickyHDPHMMVI.dwell_stats_from_path(z, Kp1)
+            for k in range(Kp1):
+                all_lens[k].extend(lens[k])
+
+        p_stay = EA.diag()                     # E[A_kk]
+        mean_geo = (1.0 / (1.0 - p_stay)).clamp(max=1e6)  # expected dwell for geometric
+        emp_mean = torch.tensor([np.mean(L) if len(L) else 0. for L in all_lens])
 
         return {
             "avg_loglik_per_step": avg_ll_per_step,
@@ -1055,7 +1120,10 @@ class StickyHDPHMMVI(nn.Module):
             "top5_pi": topk_vals,
             "top5_idx": topk_idx,
             "stickiness_diag_mean": diag_ratio,
-            "expected_dwell_length_per_state": 1.0 / (1.0 - A_bar.detach().diag())
+            "p_stay": p_stay,
+            "expected_dwell_length_per_state": mean_geo,
+            "empirical_dwell_length_per_state": emp_mean,
+            "all_lengths": all_lens
         }
 
 

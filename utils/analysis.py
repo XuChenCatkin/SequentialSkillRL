@@ -1964,13 +1964,30 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
     return rasters, lengths
 
 @torch.no_grad()
-def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int = 5, logger=None):
+def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int = 5, logger=None, random_seed: int = 42):
     """
     Compute HMM diagnostics on a subset of the dataset
+    
+    Args:
+        model: VAE model for encoding
+        dataset: Dataset to sample from
+        device: Device to run on
+        hmm: HMM model
+        max_batches: Maximum number of batches to process
+        logger: Optional logger
+        random_seed: Random seed for reproducible sampling
     """
+    import random
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
     model.eval()
     n_batches = min(len(dataset), max_batches)
     B, T = dataset[0]['tty_chars'].shape[:2]
+    
+    # Create shuffled indices for random sampling
+    dataset_indices = list(range(len(dataset)))
+    random.shuffle(dataset_indices)
     
     all_mu = []
     all_var = []
@@ -1979,9 +1996,11 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
     
     # Collect VAE outputs for diagnostics
     with torch.no_grad():
-        for bi, batch in enumerate(dataset):
-            if bi >= n_batches: 
+        for i in range(n_batches):
+            if i >= len(dataset_indices):
                 break
+            bi = dataset_indices[i]
+            batch = dataset[bi]
                 
             batch_dev = {}
             for k, v in batch.items():
@@ -2032,19 +2051,31 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
 @torch.no_grad()
 def visualize_hmm_after_estep(
     model, dataset, device, hmm: StickyHDPHMMVI, save_dir: str, round_idx: int,
-    logger=None, max_diags_batches: int = 5, max_raster_sequences: int = 6
+    logger=None, max_diags_batches: int = 5, max_raster_sequences: int = 6, random_seed: int = 42
 ):
     """
     Produce a small set of plots summarizing the HMM after the E-step.
     Saves figures under {save_dir}/round_{round_idx:02d}/ and returns a dict of paths.
+    
+    Args:
+        model: VAE model for encoding
+        dataset: Dataset to sample from
+        device: Device to run on
+        hmm: HMM model
+        save_dir: Directory to save results
+        round_idx: Round index for naming
+        logger: Optional logger
+        max_diags_batches: Maximum number of batches for diagnostics
+        max_raster_sequences: Maximum number of sequences for raster plots
+        random_seed: Random seed for reproducible sampling
     """
     round_dir = os.path.join(save_dir, f"round_{round_idx:02d}")
     os.makedirs(round_dir, exist_ok=True)
 
     # 1) quick diagnostics and basic tensors
-    diags = compute_hmm_diagnostics(model, dataset, device, hmm, max_batches=max_diags_batches, logger=logger)
+    diags = compute_hmm_diagnostics(model, dataset, device, hmm, max_batches=max_diags_batches, logger=logger, random_seed=random_seed)
     pi_hat = diags["occupancy_pi_hat"].cpu().numpy()
-    A_bar  = torch.softmax(hmm._ElogA(), dim=1).cpu().numpy()  # proxy for E[A]
+    A = hmm._EA().cpu().numpy()  # E[A]
     mu_k, E_Lambda, _ = hmm.get_emission_expectations()        # [K,D], [K,D,D], [K]
     mu_k = mu_k.cpu().numpy()
 
@@ -2061,11 +2092,11 @@ def visualize_hmm_after_estep(
 
     # 3) figure: transition heatmap
     f2 = plt.figure(figsize=(6, 5))
-    plt.imshow(A_bar, origin="lower", aspect="auto")
-    plt.colorbar(label="Softmax(ElogA)")
+    plt.imshow(A, origin="lower", aspect="auto", vmin=0., vmax=1., interpolation='nearest')
+    plt.colorbar(label="E[A_ij]")
     plt.xlabel("Next state")
     plt.ylabel("Current state")
-    diag_mean = float(np.mean(np.diag(A_bar)))
+    diag_mean = float(np.mean(np.diag(A)))
     plt.title(f"Round {round_idx}: Transition matrix (diag mean={diag_mean:.3f})")
     plt.tight_layout()
     path_A = os.path.join(round_dir, f"round{round_idx:02d}_A_heatmap.png")
@@ -2135,7 +2166,7 @@ def visualize_hmm_after_estep(
         path_pca = None
 
     # 5) figure: skill rasters on a few sequences
-    rasters, lengths = _collect_sample_rasters(model, dataset, device, hmm, max_sequences=max_raster_sequences)
+    rasters, lengths = _collect_sample_rasters(model, dataset, device, hmm, max_sequences=max_raster_sequences, random_seed=random_seed)
     if len(rasters) > 0:
         maxT = max(lengths)
         canvas = np.full((len(rasters), maxT), fill_value=-1, dtype=np.int32)
@@ -2151,6 +2182,80 @@ def visualize_hmm_after_estep(
         f4.savefig(path_raster, dpi=160); plt.close(f4)
     else:
         path_raster = None
+
+    # 6) figure: Top 5 empirical dwell-time PMFs with geometric overlay
+    try:
+        if "all_lengths" in diags and "p_stay" in diags and "top5_idx" in diags:
+            all_lengths = diags["all_lengths"]
+            p_stay = diags["p_stay"].cpu().numpy()
+            top5_idx = diags["top5_idx"].cpu().numpy()
+            
+            # Create subplot grid: 2x3 (will use 5 subplots)
+            f5, axes = plt.subplots(2, 3, figsize=(15, 8))
+            axes = axes.flatten()
+            
+            max_bins = 50  # Maximum number of bins to show
+            
+            for i, state_idx in enumerate(top5_idx[:5]):  # Top 5 states
+                ax = axes[i]
+                state_idx = int(state_idx)
+                
+                # Get empirical dwell lengths for this state
+                empirical_lengths = all_lengths[state_idx]
+                
+                if len(empirical_lengths) > 0:
+                    # Create histogram of empirical lengths
+                    max_len = min(max(empirical_lengths), max_bins)
+                    bins = np.arange(1, max_len + 2) - 0.5  # Bins centered on integers
+                    counts, _ = np.histogram(empirical_lengths, bins=bins)
+                    pmf_empirical = counts / counts.sum()
+                    
+                    # Plot empirical PMF
+                    x_vals = np.arange(1, max_len + 1)
+                    ax.bar(x_vals, pmf_empirical, alpha=0.7, label='Empirical', color='steelblue')
+                    
+                    # Compute and overlay geometric PMF
+                    p_stay_state = p_stay[state_idx]
+                    if p_stay_state < 0.999:  # Avoid division by zero
+                        p_exit = 1.0 - p_stay_state
+                        # Geometric PMF: P(L=k) = (1-p)^(k-1) * p for k=1,2,3,...
+                        geometric_pmf = [(p_stay_state**(k-1)) * p_exit for k in x_vals]
+                        ax.plot(x_vals, geometric_pmf, 'r-', linewidth=2, label='Geometric', alpha=0.8)
+                    
+                    # Formatting
+                    ax.set_xlabel('Dwell length')
+                    ax.set_ylabel('Probability')
+                    ax.set_title(f'State {state_idx} (π̂={pi_hat[state_idx]:.3f})')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Set reasonable axis limits
+                    ax.set_xlim(0.5, min(max_len + 0.5, max_bins + 0.5))
+                    
+                else:
+                    # No data for this state
+                    ax.text(0.5, 0.5, f'State {state_idx}\\nNo dwell data', 
+                           transform=ax.transAxes, ha='center', va='center', fontsize=12)
+                    ax.set_xlabel('Dwell length')
+                    ax.set_ylabel('Probability')
+                    ax.set_title(f'State {state_idx} (π̂={pi_hat[state_idx]:.3f})')
+            
+            # Hide the last subplot if we have only 5 states
+            if len(top5_idx) < 6:
+                axes[5].set_visible(False)
+            
+            plt.suptitle(f'Round {round_idx}: Top 5 States - Empirical vs Geometric Dwell-time PMFs', fontsize=14)
+            plt.tight_layout()
+            
+            path_dwell = os.path.join(round_dir, f"round{round_idx:02d}_dwell_pmfs.png")
+            f5.savefig(path_dwell, dpi=160, bbox_inches='tight')
+            plt.close(f5)
+        else:
+            path_dwell = None
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to create dwell-time PMF plot: {e}")
+        path_dwell = None
 
     # Save a small JSON snapshot for quick diffing
     snap = {
@@ -2173,5 +2278,6 @@ def visualize_hmm_after_estep(
         "A_heatmap": path_A,
         "mu_pca": path_pca,
         "skill_raster": path_raster,
+        "dwell_pmfs": path_dwell,
         "diags_json": json_path,
     }
