@@ -1125,18 +1125,3 @@ class StickyHDPHMMVI(nn.Module):
             "empirical_dwell_length_per_state": emp_mean,
             "all_lengths": all_lens
         }
-
-
-def viterbi(log_pi: torch.Tensor, ElogA: torch.Tensor, logB: torch.Tensor) -> torch.Tensor:
-    """
-    Standalone Viterbi algorithm to find the most likely state sequence.
-    
-    Args:
-        log_pi: Log initial state probabilities [Kp1]
-        ElogA: Log transition matrix [Kp1,Kp1] 
-        logB: Log emission probabilities [T,Kp1]
-        
-    Returns:
-        path: Most likely state sequence [T] (int64)
-    """
-    return StickyHDPHMMVI.viterbi(log_pi, ElogA, logB)[0]  # Return only the path, not log_prob

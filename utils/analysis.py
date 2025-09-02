@@ -1875,7 +1875,7 @@ def plot_glyph_char_color_pairs_from_saved(
 
 
 @torch.no_grad()
-def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_sequences: int = 6, max_batches: int = 4, random_seed: int = 42):
+def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_sequences: int = 6, max_batches: int = 4, random_seed: int = 42, batch_multiples: int = 1):
     """
     Collect a few sequences' Viterbi paths for raster plots.
     Uses Viterbi algorithm to find the most likely state sequence, rather than argmax per timestep.
@@ -1888,6 +1888,7 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
         max_sequences: Maximum number of sequences to collect
         max_batches: Maximum number of batches to process
         random_seed: Random seed for reproducible sampling
+        batch_multiples: Number of batches to concatenate along time dimension for each processing group
         
     Returns: 
         (rasters: List[np.ndarray], lengths: List[int])
@@ -1899,48 +1900,83 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
     rasters, lengths = [], []
     grabbed = 0
     
-    # Create randomized batch indices
-    batch_indices = list(range(min(len(dataset), max_batches * 3)))  # Sample from more batches
-    random.shuffle(batch_indices)
+    # Get batch dimensions and shuffle B indices once
+    B, T = dataset[0]['tty_chars'].shape[:2] if 'tty_chars' in dataset[0] else dataset[0]['game_chars'].shape[:2]
+    B_indices = list(range(B))
+    random.shuffle(B_indices)
     
-    for bi_idx, bi in enumerate(batch_indices):
-        if grabbed >= max_sequences or bi_idx >= max_batches: break
+    # Process in groups of batch_multiples consecutive batches
+    for group_idx in range(max_batches):
+        if grabbed >= max_sequences:
+            break
+            
+        start_batch_idx = group_idx * batch_multiples
         
-        batch = dataset[bi]  # Get the actual batch
+        # Collect batch_multiples consecutive batches for concatenation
+        group_batches = []
+        for i in range(batch_multiples):
+            batch_idx = start_batch_idx + i
+            if batch_idx >= len(dataset):
+                break
+            batch = dataset[batch_idx]
+            group_batches.append(batch)
         
-        # Move to device and keep [B,T,...] shapes
+        if not group_batches:
+            continue
+            
+        # Concatenate batches along time dimension with B shuffling
+        concatenated_batch = {}
+        
+        for k in group_batches[0].keys():
+            if isinstance(group_batches[0][k], torch.Tensor):
+                # Apply B shuffling to each batch, then concatenate along time dimension (dim=1)
+                tensors_to_cat = []
+                for batch in group_batches:
+                    if k in batch:
+                        tensor = batch[k]
+                        if tensor.dim() >= 2:
+                            tensor = tensor[B_indices]  # Shuffle along batch dimension
+                        tensors_to_cat.append(tensor)
+                if tensors_to_cat:
+                    concatenated_batch[k] = torch.cat(tensors_to_cat, dim=1)
+            else:
+                # For non-tensor data, just use the first batch's value
+                concatenated_batch[k] = group_batches[0][k]
+        
+        # Move to device and keep [B,T*batch_multiples,...] shapes
         batch_dev = {}
-        for k, v in batch.items():
+        for k, v in concatenated_batch.items():
             if isinstance(v, torch.Tensor):
                 batch_dev[k] = v.to(device, non_blocking=True)
             else:
                 batch_dev[k] = v
+        
         if 'game_chars' not in batch_dev: 
             continue
-        B, T = batch_dev['game_chars'].shape[:2]
+            
+        B, extended_T = batch_dev['game_chars'].shape[:2]  # extended_T = T * batch_multiples
         
-        # Randomly select which sequences to use from this batch
+        # Since we already shuffled B indices, just take sequences in order
         seq_indices = list(range(B))
-        random.shuffle(seq_indices)
         
         with torch.no_grad():
-            # Flatten to [B*T,...] for model forward, then reshape back
+            # Flatten to [B*extended_T,...] for model forward, then reshape back
             flat = {}
             for k,v in batch_dev.items():
                 if isinstance(v, torch.Tensor) and v.dim() >= 3 and k not in ('original_batch_shape',):
-                    flat[k] = v.view(B*T, *v.shape[2:])
+                    flat[k] = v.view(B*extended_T, *v.shape[2:])
                 else:
                     flat[k] = v
             out = model(flat)
-            mu_bt  = out['mu'].view(B, T, -1)
-            var_bt = out['logvar'].exp().clamp_min(1e-6).view(B, T, -1)
+            mu_bt  = out['mu'].view(B, extended_T, -1)
+            var_bt = out['logvar'].exp().clamp_min(1e-6).view(B, extended_T, -1)
             F_btr  = out.get('lowrank_factors', None)
-            F_bt   = None if F_btr is None else F_btr.view(B, T, F_btr.size(-2), F_btr.size(-1))
-            valid  = flat['valid_screen'].view(B, T).bool()
+            F_bt   = None if F_btr is None else F_btr.view(B, extended_T, F_btr.size(-2), F_btr.size(-1))
+            valid  = flat['valid_screen'].view(B, extended_T).bool()
 
             logB  = hmm.expected_emission_loglik(
                 hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu,
-                mu_bt, var_bt, F_bt, mask=valid)  # [B,T,K]
+                mu_bt, var_bt, F_bt, mask=valid)  # [B,extended_T,K]
             log_pi = torch.log(torch.clamp(hmm._Epi(), min=1e-30))
             ElogA = hmm._ElogA()
             
@@ -1952,8 +1988,8 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
                     continue
                 
                 # Extract single sequence and run Viterbi algorithm
-                logB_single = logB[b]  # [T,K]
-                labels, _ = StickyHDPHMMVI.viterbi(log_pi, ElogA, logB_single)  # [T]
+                logB_single = logB[b]  # [extended_T,K]
+                labels, _ = StickyHDPHMMVI.viterbi(log_pi, ElogA, logB_single)  # [extended_T]
                 labels = labels.cpu().numpy().astype(int)
                 labels = labels[m]
                 rasters.append(labels)
@@ -1964,7 +2000,7 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
     return rasters, lengths
 
 @torch.no_grad()
-def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int = 5, logger=None, random_seed: int = 42):
+def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int = 5, logger=None, random_seed: int = 42, batch_multiples: int = 1):
     """
     Compute HMM diagnostics on a subset of the dataset
     
@@ -1976,18 +2012,20 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
         max_batches: Maximum number of batches to process
         logger: Optional logger
         random_seed: Random seed for reproducible sampling
+        batch_multiples: Number of batches to concatenate along time dimension for each diagnostic computation
     """
     import random
     random.seed(random_seed)
     np.random.seed(random_seed)
     
     model.eval()
-    n_batches = min(len(dataset), max_batches)
+    total_batches_needed = max_batches * batch_multiples
+    n_batches = min(len(dataset), total_batches_needed)
     B, T = dataset[0]['tty_chars'].shape[:2]
     
-    # Create shuffled indices for random sampling
-    dataset_indices = list(range(len(dataset)))
-    random.shuffle(dataset_indices)
+    # Shuffle B indices once and apply to all batches to maintain temporal continuity
+    B_indices = list(range(B))
+    random.shuffle(B_indices)
     
     all_mu = []
     all_var = []
@@ -1996,41 +2034,69 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
     
     # Collect VAE outputs for diagnostics
     with torch.no_grad():
-        for i in range(n_batches):
-            if i >= len(dataset_indices):
-                break
-            bi = dataset_indices[i]
-            batch = dataset[bi]
+        # Process in groups of batch_multiples consecutive batches
+        for group_idx in range(max_batches):
+            start_batch_idx = group_idx * batch_multiples
+            
+            # Collect batch_multiples consecutive batches for concatenation
+            group_mu = []
+            group_var = []
+            group_F = []
+            group_mask = []
+            
+            # Process batch_multiples consecutive batches
+            for i in range(batch_multiples):
+                batch_idx = start_batch_idx + i
+                if batch_idx >= len(dataset):
+                    break
+                    
+                batch = dataset[batch_idx]
                 
-            batch_dev = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    x = v.to(device, non_blocking=True)
-                    if x.dim() >= 3 and k not in ('original_batch_shape',):
-                        batch_dev[k] = x.view(B*T, *x.shape[2:])
+                batch_dev = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        x = v.to(device, non_blocking=True)
+                        # Apply B shuffling here
+                        if x.dim() >= 2:
+                            x = x[B_indices]  # Shuffle along batch dimension
+                        if x.dim() >= 3 and k not in ('original_batch_shape',):
+                            batch_dev[k] = x.view(B*T, *x.shape[2:])
+                        else:
+                            batch_dev[k] = x
                     else:
-                        batch_dev[k] = x
-                else:
-                    batch_dev[k] = v
+                        batch_dev[k] = v
+                
+                # Forward encode only
+                out = model(batch_dev)
+                mu = out['mu']
+                logvar = out['logvar']
+                F = out.get('lowrank_factors', None)
+                
+                valid = batch_dev['valid_screen'].view(B, T)
+                
+                # Reshape to [B,T,...]
+                mu_bt = mu.view(B, T, -1)
+                var_bt = logvar.exp().clamp_min(1e-6).view(B, T, -1)
+                F_bt = None if F is None else F.view(B, T, F.size(-2), F.size(-1))
+                
+                group_mu.append(mu_bt)
+                group_var.append(var_bt)
+                if F_bt is not None:
+                    group_F.append(F_bt)
+                group_mask.append(valid)
             
-            # Forward encode only
-            out = model(batch_dev)
-            mu = out['mu']
-            logvar = out['logvar']
-            F = out.get('lowrank_factors', None)
-            
-            valid = batch_dev['valid_screen'].view(B, T)
-            
-            # Reshape to [B,T,...]
-            mu_bt = mu.view(B, T, -1)
-            var_bt = logvar.exp().clamp_min(1e-6).view(B, T, -1)
-            F_bt = None if F is None else F.view(B, T, F.size(-2), F.size(-1))
-            
-            all_mu.append(mu_bt)
-            all_var.append(var_bt)
-            if F_bt is not None:
-                all_F.append(F_bt)
-            all_mask.append(valid)
+            # Concatenate along time dimension for this group
+            if group_mu:
+                group_mu_concat = torch.cat(group_mu, dim=1)  # [B, T*batch_multiples, D]
+                group_var_concat = torch.cat(group_var, dim=1)  # [B, T*batch_multiples, D]
+                group_F_concat = torch.cat(group_F, dim=1) if group_F else None  # [B, T*batch_multiples, ...]
+                group_mask_concat = torch.cat(group_mask, dim=1)  # [B, T*batch_multiples]
+                
+                all_mu.append(group_mu_concat)
+                all_var.append(group_var_concat)
+                if group_F_concat is not None:
+                    all_F.append(group_F_concat)
+                all_mask.append(group_mask_concat)
     
     # Concatenate all data
     mu_concat = torch.cat(all_mu, dim=0)  # [total_B, T, D]
@@ -2051,7 +2117,7 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
 @torch.no_grad()
 def visualize_hmm_after_estep(
     model, dataset, device, hmm: StickyHDPHMMVI, save_dir: str, round_idx: int,
-    logger=None, max_diags_batches: int = 5, max_raster_sequences: int = 6, random_seed: int = 42
+    logger=None, max_diags_batches: int = 5, max_raster_sequences: int = 6, random_seed: int = 42, batch_multiples: int = 1
 ):
     """
     Produce a small set of plots summarizing the HMM after the E-step.
@@ -2068,12 +2134,13 @@ def visualize_hmm_after_estep(
         max_diags_batches: Maximum number of batches for diagnostics
         max_raster_sequences: Maximum number of sequences for raster plots
         random_seed: Random seed for reproducible sampling
+        batch_multiples: Number of batches to concatenate along time dimension for each processing group
     """
     round_dir = os.path.join(save_dir, f"round_{round_idx:02d}")
     os.makedirs(round_dir, exist_ok=True)
 
     # 1) quick diagnostics and basic tensors
-    diags = compute_hmm_diagnostics(model, dataset, device, hmm, max_batches=max_diags_batches, logger=logger, random_seed=random_seed)
+    diags = compute_hmm_diagnostics(model, dataset, device, hmm, max_batches=max_diags_batches, logger=logger, random_seed=random_seed, batch_multiples=batch_multiples)
     pi_hat = diags["occupancy_pi_hat"].cpu().numpy()
     A = hmm._EA().cpu().numpy()  # E[A]
     mu_k, E_Lambda, _ = hmm.get_emission_expectations()        # [K,D], [K,D,D], [K]
@@ -2166,7 +2233,7 @@ def visualize_hmm_after_estep(
         path_pca = None
 
     # 5) figure: skill rasters on a few sequences
-    rasters, lengths = _collect_sample_rasters(model, dataset, device, hmm, max_sequences=max_raster_sequences, random_seed=random_seed)
+    rasters, lengths = _collect_sample_rasters(model, dataset, device, hmm, max_sequences=max_raster_sequences, random_seed=random_seed, batch_multiples=batch_multiples)
     if len(rasters) > 0:
         maxT = max(lengths)
         canvas = np.full((len(rasters), maxT), fill_value=-1, dtype=np.int32)

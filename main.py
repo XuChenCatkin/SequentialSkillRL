@@ -324,7 +324,7 @@ if __name__ == "__main__":
                 save_dir=analysis_dir,
                 round_idx=analysis_round,
                 logger=logger,
-                max_diags_batches=20,
+                max_diags_batches=50,
                 max_raster_sequences=10,
                 random_seed=100
             )
@@ -514,18 +514,25 @@ if __name__ == "__main__":
                 test_dataset=test_dataset,
                 
                 config=vae_config,  
-                
+                batch_multiples=10,
                 # HMM parameters
-                alpha=10.0,
-                kappa=50.0,
-                gamma=5.0,
+                alpha=150.0,
+                kappa=10.0,
+                gamma=10.0,
                 hmm_only=hmm_only,
                 em_rounds=1 if hmm_only else 3,
                 m_epochs_per_round=3,
                 niw_mu0 = 0.0, 
-                niw_kappa0 = 5.0, 
-                niw_Psi0 = 0.01,
-                niw_nu0 = vae_config.latent_dim + 2,
+                niw_kappa0 = vae_config.latent_dim + 50, 
+                niw_Psi0 = 30.0,
+                niw_nu0 = vae_config.latent_dim + 10,
+                offline = True,
+                streaming_rho = 0.7,
+                max_iters = 10,
+                elbo_drop_tol = 1000.0,
+                optimize_pi_every_n_steps = 1,
+                pi_iters = 10,
+                pi_lr = 5.0e-4,
 
                 # HuggingFace integration
                 push_to_hub=True,

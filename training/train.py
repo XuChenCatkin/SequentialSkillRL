@@ -47,13 +47,8 @@ except ImportError:
     print("⚠️  HuggingFace Hub not available. Install with: pip install huggingface_hub")
     HF_AVAILABLE = False
 
-# Scikit-learn availability check
-try:
-    from sklearn.decomposition import PCA
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    print("⚠️  scikit-learn not available. Install with: pip install scikit-learn")
-    SKLEARN_AVAILABLE = False
+# Scikit-learn
+from sklearn.cluster import KMeans
 
 from src.model import MultiModalHackVAE, vae_loss, CHAR_DIM, VAEConfig
 import torch.optim as optim
@@ -105,46 +100,120 @@ def ramp_weight(initial_weight: float, final_weight: float, shape: str, progress
         raise ValueError(f"Unknown shape: {shape}. Supported shapes: linear, cubic, sigmoid, cosine, exponential, constant, custom.")
 
 
-def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streaming_rho: float = 1.0, max_batches: int | None = None, logger=None, use_wandb: bool = False):
+def fit_sticky_hmm_one_pass(
+    model, 
+    dataset, 
+    device, 
+    hmm: StickyHDPHMMVI, 
+    offline: bool = True,
+    streaming_rho: float = 1.0, 
+    max_iters: int = 10,
+    elbo_drop_tol: float = 10.0,
+    optimize_pi_every_n_steps: int = 5,
+    pi_iters: int = 10,
+    pi_lr: float = 0.001,
+    max_batches: int | None = None, 
+    batch_multiples: int = 1,
+    logger=None, 
+    use_wandb: bool = False):
     """
     Run one E-step pass: update sticky-HDP-HMM variational posteriors using encoder outputs.
+    
+    Args:
+        model: VAE model for encoding
+        dataset: Dataset to process
+        device: Device to run on
+        hmm: HMM model to update
+        offline: Whether to use offline mode
+        streaming_rho: Streaming parameter
+        max_iters: Maximum iterations for HMM update
+        elbo_drop_tol: ELBO drop tolerance
+        optimize_pi_every_n_steps: How often to optimize pi
+        pi_iters: Number of pi iterations
+        pi_lr: Learning rate for pi optimization
+        max_batches: Maximum number of batches to process
+        batch_multiples: Number of batches to concatenate along time dimension (creates [B, batch_multiples*T, ...])
+        logger: Logger instance
+        use_wandb: Whether to use wandb logging
     """
     model.eval()
     n_batches = len(dataset) if max_batches is None else min(len(dataset), max_batches)
     # assert the dataset is in [B, T, ...] format
     B, T = dataset[0]['tty_chars'].shape[:2]
     
+    # Adjust effective number of batches based on batch_multiples
+    effective_batches = n_batches // batch_multiples
+    if n_batches % batch_multiples != 0:
+        if logger:
+            logger.warning(f"Number of batches ({n_batches}) not divisible by batch_multiples ({batch_multiples}). "
+                         f"Using {effective_batches} effective batches, ignoring {n_batches % batch_multiples} batches.")
+    
     # Create progress bar for HMM E-step
-    dataset_slice = dataset[:n_batches] if n_batches < len(dataset) else dataset
-    with tqdm(dataset_slice, desc="HMM E-step", unit="batch") as pbar:
-        for bi, batch in enumerate(pbar):
-            batch_dev = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    x = v.to(device, non_blocking=True)
-                    if x.dim() >= 3 and k not in ('original_batch_shape',):
-                        batch_dev[k] = x.view(B*T, *x.shape[2:])
-                    else:
-                        batch_dev[k] = x
-                else:
-                    batch_dev[k] = v
+    dataset_slice = dataset[:effective_batches * batch_multiples] if effective_batches * batch_multiples < len(dataset) else dataset
+    
+    with tqdm(range(effective_batches), desc="HMM E-step", unit="multi-batch") as pbar:
+        for multi_batch_idx in pbar:
+            # Collect multiple batches to concatenate
+            multi_batch_data = []
+            for sub_idx in range(batch_multiples):
+                batch_idx = multi_batch_idx * batch_multiples + sub_idx
+                if batch_idx >= len(dataset_slice):
+                    break
+                multi_batch_data.append(dataset_slice[batch_idx])
             
-            # forward encode only (keep no_grad for model inference)
-            with torch.no_grad():
-                out = model(batch_dev)  # returns 'mu', 'logvar', optionally 'lowrank_factors'
-                mu    = out['mu'].detach()  # Detach from computation graph
-                logvar= out['logvar'].detach()  # Detach from computation graph
-                F     = out.get('lowrank_factors', None)
-                if F is not None:
-                    F = F.detach()  # Detach from computation graph
-                valid = batch_dev['valid_screen'].view(B,T)
-                # reshape to [B,T,...]
-                mu_bt = mu.view(B,T,-1)
-                var_bt = logvar.exp().clamp_min(1e-6).view(B,T,-1)
-                F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
+            if not multi_batch_data:
+                continue
+                
+            # Process each batch and collect encoded outputs
+            mu_list = []
+            var_list = []
+            F_list = []
+            valid_list = []
+            
+            for batch in multi_batch_data:
+                batch_dev = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        x = v.to(device, non_blocking=True)
+                        if x.dim() >= 3 and k not in ('original_batch_shape',):
+                            batch_dev[k] = x.view(B*T, *x.shape[2:])
+                        else:
+                            batch_dev[k] = x
+                    else:
+                        batch_dev[k] = v
+                
+                # forward encode only (keep no_grad for model inference)
+                with torch.no_grad():
+                    out = model(batch_dev)  # returns 'mu', 'logvar', optionally 'lowrank_factors'
+                    mu    = out['mu'].detach()  # Detach from computation graph
+                    logvar= out['logvar'].detach()  # Detach from computation graph
+                    F     = out.get('lowrank_factors', None)
+                    if F is not None:
+                        F = F.detach()  # Detach from computation graph
+                    valid = batch_dev['valid_screen'].view(B,T)
+                    # reshape to [B,T,...]
+                    mu_bt = mu.view(B,T,-1)
+                    var_bt = logvar.exp().clamp_min(1e-6).view(B,T,-1)
+                    F_bt  = None if F is None else F.view(B,T,F.size(-2),F.size(-1))
+                
+                # Collect outputs for concatenation
+                mu_list.append(mu_bt)
+                var_list.append(var_bt)
+                if F_bt is not None:
+                    F_list.append(F_bt)
+                valid_list.append(valid)
+            
+            # Concatenate along time dimension to create [B, batch_multiples*T, ...]
+            mu_combined = torch.cat(mu_list, dim=1)  # [B, batch_multiples*T, D]
+            var_combined = torch.cat(var_list, dim=1)  # [B, batch_multiples*T, D]
+            F_combined = torch.cat(F_list, dim=1) if F_list else None  # [B, batch_multiples*T, ...]
+            valid_combined = torch.cat(valid_list, dim=1)  # [B, batch_multiples*T]
 
-            # HMM update
-            hmm_out = hmm.update(mu_bt, var_bt, F_bt, mask=valid, max_iters=10, elbo_drop_tol=10.0, rho=streaming_rho, optimize_pi=((bi + 1) % 10 == 0), pi_steps=50, pi_lr=1e-4, offline=True)
+            # HMM update with combined batch
+            hmm_out = hmm.update(mu_combined, var_combined, F_combined, mask=valid_combined, 
+                               max_iters=max_iters, elbo_drop_tol=elbo_drop_tol, rho=streaming_rho, 
+                               optimize_pi=((multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
+                               pi_steps=pi_iters, pi_lr=pi_lr, offline=offline)
 
             # Extract ELBO from HMM update
             inner_elbo = hmm_out.get('inner_elbo', torch.tensor(float('nan')))
@@ -153,21 +222,21 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
             
             # Log to wandb if enabled
             if use_wandb and torch.isfinite(inner_elbo):
-                log_hmm_elbo_to_wandb(bi, inner_elbo.item(), elbo_history, n_iterations, use_wandb)
+                log_hmm_elbo_to_wandb(multi_batch_idx, inner_elbo.item(), elbo_history, n_iterations, use_wandb)
             
-            # Compute diagnostics every 5 batches to monitor progress
-            if (bi + 1) % 1 == 0 or bi == 0:
+            # Compute diagnostics every few multi-batches to monitor progress
+            if (multi_batch_idx + 1) % 1 == 0 or multi_batch_idx == 0:
                 with torch.no_grad():
                     diag_results = hmm.diagnostics(
-                        mu_t=mu_bt,
-                        diag_var_t=var_bt,
-                        F_t=F_bt,
-                        mask=valid
+                        mu_t=mu_combined,
+                        diag_var_t=var_combined,
+                        F_t=F_combined,
+                        mask=valid_combined
                     )
                     
                     top5_skills = diag_results['top5_idx'].tolist()
                     top5_probs = diag_results['top5_pi'].tolist()
-                    logger.info(f"[E-step] Batch {bi+1}/{n_batches} - HMM Diagnostics:")
+                    logger.info(f"[E-step] Multi-batch {multi_batch_idx+1}/{effective_batches} (x{batch_multiples} batches) - HMM Diagnostics:")
                     logger.info(f"  - Avg log-likelihood per step: {diag_results['avg_loglik_per_step']:.4f}")
                     logger.info(f"  - Inner ELBO (final): {inner_elbo:.4f}")
                     if len(elbo_history) > 1:
@@ -176,8 +245,8 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                     logger.info(f"  - Effective number of skills: {diag_results['effective_K']:.2f}")
                     logger.info(f"  - State entropy: {diag_results['state_entropy']:.3f}")
                     logger.info(f"  - Transition stickiness: {diag_results['stickiness_diag_mean']:.3f}")
-                    logger.info(f"  - Expected dwell lengths per state: {diag_results['expected_dwell_length_per_state'].cpu().numpy().tolist()}")
                     logger.info(f"  - Top 5 skills: {top5_skills} (probs: {[f'{p:.3f}' for p in top5_probs]})")
+                    logger.info(f"  - Combined time length: {mu_combined.shape[1]} (original T={T}, multiples={batch_multiples})")
             else:
                 # Update progress bar with basic info including ELBO
                 elbo_change = ""
@@ -185,14 +254,15 @@ def fit_sticky_hmm_one_pass(model, dataset, device, hmm: StickyHDPHMMVI, streami
                     elbo_improve = elbo_history[-1] - elbo_history[0]
                     elbo_change = f" (Δ{elbo_improve.item():+.2f})"
                 pbar.set_postfix({
-                    'batch': f"{bi+1}/{n_batches}",
+                    'multi_batch': f"{multi_batch_idx+1}/{effective_batches}",
+                    'time_len': f"{mu_combined.shape[1]}",
                     'rho': f"{streaming_rho:.3f}",
                     'elbo': f"{inner_elbo:.2f}{elbo_change}",
                     'iters': f"{n_iterations}"
                 })
                 
-                if logger and (bi+1) % 50 == 0:
-                    logger.info(f"[E-step] processed {bi+1}/{n_batches} batches")
+                if logger and (multi_batch_idx+1) % 50 == 0:
+                    logger.info(f"[E-step] processed {multi_batch_idx+1}/{effective_batches} multi-batches")
     
     return hmm
 
@@ -1465,6 +1535,7 @@ def train_vae_with_sticky_hmm_em(
     train_dataset=None, 
     test_dataset=None,
     config: VAEConfig = None,
+    batch_multiples: int = 1,
     # Sticky-HDP-HMM params
     alpha: float = 5.0, 
     kappa: float = 20.0, 
@@ -1474,6 +1545,7 @@ def train_vae_with_sticky_hmm_em(
     niw_kappa0: float = 0.1, 
     niw_Psi0: float = 1.0,
     niw_nu0: int = 96 + 2,
+    init_niw_mu_with_kmean: bool = True,
     hmm_only: bool = False,
     em_rounds: int = 3, 
     m_epochs_per_round: int = 1,
@@ -1481,7 +1553,14 @@ def train_vae_with_sticky_hmm_em(
     device: torch.device = torch.device('cuda'),
     use_bf16: bool = False,
     logger=None,
-    # Weights & Biases monitoring parameters  
+    offline: bool = True,
+    streaming_rho: float = 1.0,
+    max_iters: int = 10,
+    elbo_drop_tol: float = 10.0,
+    optimize_pi_every_n_steps: int = 5,
+    pi_iters: int = 10,
+    pi_lr: float = 0.001,
+    # Weights & Biases monitoring parameters
     use_wandb: bool = False,
     wandb_project: str = "nethack-hmm-em",
     wandb_entity: str = None,
@@ -1512,6 +1591,7 @@ def train_vae_with_sticky_hmm_em(
         train_dataset: Training dataset for HMM fitting and VAE fine-tuning
         test_dataset: Testing dataset for VAE fine-tuning
         config: VAEConfig object. If None, will be loaded from checkpoint/HF repo
+        batch_multiples: Number of batches to combine for each training step
         alpha: DP concentration parameter for sticky-HDP-HMM
         kappa: Sticky parameter (self-transition bias)
         gamma: Top-level DP concentration parameter  
@@ -1519,6 +1599,7 @@ def train_vae_with_sticky_hmm_em(
         niw_kappa0: NIW prior concentration parameter
         niw_Psi0: NIW prior scale matrix parameter
         niw_nu0: NIW prior degrees of freedom
+        init_niw_mu_with_kmean: If True, initializes NIW mean with k-means
         hmm_only: If True, only fits HMM without VAE fine-tuning
         em_rounds: Number of EM iterations
         m_epochs_per_round: Number of VAE training epochs per M-step
@@ -1526,6 +1607,13 @@ def train_vae_with_sticky_hmm_em(
         device: Device for training
         use_bf16: Whether to use BF16 mixed precision
         logger: Logger instance
+        offline: Whether to use offline mode (no streaming)
+        streaming_rho: rho used for streaming on statistics
+        max_iters: max iterations in hmm update
+        elbo_drop_tol: tolerance for ELBO drop
+        optimize_pi_every_n_steps: how often to optimize pi
+        pi_iters: number of iterations for pi optimization
+        pi_lr: learning rate for pi optimization
         use_wandb: Whether to use Weights & Biases for monitoring HMM training
         wandb_project: Weights & Biases project name for EM training
         wandb_entity: Weights & Biases entity (team/user)
@@ -1652,46 +1740,45 @@ def train_vae_with_sticky_hmm_em(
         rho_emission=1.0,
         rho_transition=1.0
     )
-    
-    if 'SKLEARN_AVAILABLE' in globals() and SKLEARN_AVAILABLE:
-        from sklearn.cluster import KMeans
-        def _kmeans_init_hmm(hmm, model, dataset, device, max_frames=20000):
-            model.eval()
-            X = []
-            collected = 0
-            B, T = dataset[0]['tty_chars'].shape[:2]
-            for batch in dataset:
-                with torch.no_grad():
-                    bdev = {}
-                    for k, v in batch.items():
-                        if isinstance(v, torch.Tensor):
-                            x = v.to(device, non_blocking=True)
-                            if x.dim() >= 3 and k not in ('original_batch_shape',):
-                                bdev[k] = x.view(B*T, *x.shape[2:])
-                            else:
-                                bdev[k] = x
-                        else:
-                            bdev[k] = v
-                    out = model(bdev)
-                    mu_bt = out['mu'].view(B, T, -1).detach().cpu()
-                    valid = bdev['valid_screen'].view(B, T).cpu().bool()
-                    X.append(mu_bt[valid])
-                    collected += int(valid.sum().item())
-                if collected >= max_frames:
-                    break
-            if not X:
-                return
-            X = torch.cat(X, dim=0).numpy()
-            Kp1 = hmm.niw.mu.shape[0]
-            kmeans = KMeans(n_clusters=Kp1, n_init=8, max_iter=200, random_state=0)
-            labels = kmeans.fit_predict(X)
-            centers = torch.from_numpy(kmeans.cluster_centers_).to(hmm.niw.mu.device, dtype=hmm.niw.mu.dtype)
+
+    def _kmeans_init_hmm(hmm, model, dataset, device, max_frames=20000):
+        model.eval()
+        X = []
+        collected = 0
+        B, T = dataset[0]['tty_chars'].shape[:2]
+        for batch in dataset:
             with torch.no_grad():
-                hmm.niw.mu[:Kp1] = centers[:Kp1].to(hmm.niw.mu)
-                hmm._cache_fresh = False
+                bdev = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        x = v.to(device, non_blocking=True)
+                        if x.dim() >= 3 and k not in ('original_batch_shape',):
+                            bdev[k] = x.view(B*T, *x.shape[2:])
+                        else:
+                            bdev[k] = x
+                    else:
+                        bdev[k] = v
+                out = model(bdev)
+                mu_bt = out['mu'].view(B, T, -1).detach().cpu()
+                valid = bdev['valid_screen'].view(B, T).cpu().bool()
+                X.append(mu_bt[valid])
+                collected += int(valid.sum().item())
+            if collected >= max_frames:
+                break
+        if not X:
+            return
+        X = torch.cat(X, dim=0).numpy()
+        Kp1 = hmm.niw.mu.shape[0]
+        kmeans = KMeans(n_clusters=Kp1, n_init=8, max_iter=200, random_state=0)
+        labels = kmeans.fit_predict(X)
+        centers = torch.from_numpy(kmeans.cluster_centers_).to(hmm.niw.mu.device, dtype=hmm.niw.mu.dtype)
+        with torch.no_grad():
+            hmm.niw.mu[:Kp1] = centers[:Kp1].to(hmm.niw.mu)
+            hmm._cache_fresh = False
+
+    if init_niw_mu_with_kmean:
+        if logger: logger.info("🔍 Initializing NIW mean with k-means on VAE latents...")
         _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
-    else:
-        if logger: logger.warning("scikit-learn not available; skipping k-means warm start for HMM.")
 
     # Track training info for final summary
     training_info = {
@@ -1732,11 +1819,17 @@ def train_vae_with_sticky_hmm_em(
             })
         
         # E-step: Fit HMM posterior using current VAE representations
-        fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, streaming_rho=1.0, logger=logger, use_wandb=use_wandb)
+        fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
+                                offline=offline, streaming_rho=streaming_rho, 
+                                max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
+                                optimize_pi_every_n_steps=optimize_pi_every_n_steps,
+                                pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
+                                logger=logger, use_wandb=use_wandb)
 
         # Compute HMM diagnostics
         if logger: logger.info(f"🔍 Computing HMM diagnostics...")
-        diagnostics = compute_hmm_diagnostics(model, train_dataset, device, hmm, logger=logger)
+        diagnostics = compute_hmm_diagnostics(model, train_dataset, device, hmm, 
+                                              logger=logger, max_batches=100, random_seed=50)
         if logger: 
             logger.info(f"📊 HMM Diagnostics for Round {r+1}:")
             logger.info(f"  - Avg log-likelihood per step: {diagnostics['avg_loglik_per_step']:.4f}")
@@ -1765,7 +1858,8 @@ def train_vae_with_sticky_hmm_em(
         if logger: logger.info(f"🖼️  Rendering HMM visualizations for round {r+1}")
         viz_paths = visualize_hmm_after_estep(
             model=model, dataset=train_dataset, device=device, hmm=hmm,
-            save_dir="hmm_analysis", round_idx=r+1, logger=logger
+            save_dir="hmm_analysis", round_idx=r+1, logger=logger,
+            max_diags_batches=50, max_raster_sequences=10, random_seed=100
         )
         training_info.setdefault('viz_paths', []).append(viz_paths)
 
