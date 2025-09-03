@@ -7,17 +7,19 @@ Usage:
 Commands:
     collect_data                    - Collect and cache NetHack data
     group_data_by_id               - Group collected data by game ID for game-based training
-    train <mode> [game_grouped]    - Train VAE and/or HMM models
+    train <mode> [options...]      - Train VAE and/or HMM models
         Modes:
             vae_only               - Train only VAE
-            hmm_only [game_grouped] - Train only HMM (optionally using game-grouped data)
-            vae_hmm [game_grouped]  - Train VAE+HMM (optionally using game-grouped data)
+            hmm_only [options...]  - Train only HMM with optional E-step modes
+            vae_hmm [options...]   - Train VAE+HMM with optional E-step modes
         
-        Game-grouped mode:
-            - Standard mode: HMM E-step uses batched data [B, T, D] from multiple games
-            - Game-grouped mode: HMM E-step processes one complete game at a time [1, game_length, D]
-            - Benefits of game-grouped: Better temporal modeling, respects game boundaries
-            - Use when: Games have varying lengths, want pure single-game HMM training
+        E-step Options (can be combined):
+            game_grouped           - Use game-grouped data for E-step (one game at a time)
+            batch_accumulation     - Add batch accumulation pass after regular E-step
+        
+        Standard mode: HMM E-step uses batched data [B, T, D] from multiple games
+        Game-grouped mode: HMM E-step processes one complete game at a time [1, game_length, D]
+        Batch accumulation: Additional pass that freezes HMM, accumulates statistics, then batch updates
     
     vae_analysis <repo_name>       - Run VAE analysis and visualization
     bin_count_analysis [top_k]     - Analyze glyph character/color distributions  
@@ -28,8 +30,9 @@ Examples:
     python main.py collect_data
     python main.py group_data_by_id
     python main.py train hmm_only game_grouped
+    python main.py train hmm_only batch_accumulation
+    python main.py train hmm_only game_grouped batch_accumulation
     python main.py train vae_hmm game_grouped
-    python main.py vae_analysis CatkinChen/nethack-vae
 """
 import logging
 import os
@@ -462,8 +465,9 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger(__name__)
         
-        # Check for game-grouped data training mode
-        use_game_grouped = len(sys.argv) > 3 and sys.argv[3] == "game_grouped"
+        # Check for game-grouped data training mode and batch accumulation
+        use_game_grouped = "game_grouped" in sys.argv[3:] if len(sys.argv) > 3 else False
+        use_batch_accumulation = "batch_accumulation" in sys.argv[3:] if len(sys.argv) > 3 else False
         
         if sys.argv[2] == "vae_only":
             vae_config = VAEConfig(
@@ -539,9 +543,13 @@ if __name__ == "__main__":
                 hmm_only = False
             else:
                 print("❌ Invalid argument. Use 'vae_only', 'hmm_only', or 'vae_hmm'.")
-                print("   💡 To use game-grouped data for E-step, add 'game_grouped' as the 4th argument:")
+                print("   💡 To use game-grouped data for E-step, add 'game_grouped' as an argument:")
                 print("      python main.py train hmm_only game_grouped")
                 print("      python main.py train vae_hmm game_grouped")
+                print("   💡 To use batch accumulation, add 'batch_accumulation' as an argument:")
+                print("      python main.py train hmm_only batch_accumulation")
+                print("   💡 Options can be combined:")
+                print("      python main.py train hmm_only game_grouped batch_accumulation")
                 sys.exit(1)
             vae_config = VAEConfig(
                 initial_mi_beta=1.0,
@@ -595,6 +603,10 @@ if __name__ == "__main__":
                 game_grouped_data_path=os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}_group.pt") if use_game_grouped else None,
                 max_games_per_estep=None,  # Process all games
 
+                # Batch accumulation options
+                use_batch_accumulation=use_batch_accumulation,
+                accumulation_max_batches=None,  # Process all batches
+
                 # HuggingFace integration
                 push_to_hub=True,
                 hub_repo_id_hmm="CatkinChen/nethack-hmm",
@@ -616,6 +628,12 @@ if __name__ == "__main__":
                 print(f"   🎯 HMM will be trained on individual games instead of batched data")
             else:
                 print(f"📦 Using standard batched data for E-step HMM training")
+            
+            if use_batch_accumulation:
+                print(f"🔄 Using batch accumulation for clean batch updates")
+                print(f"   ❄️  HMM parameters will be frozen during accumulation pass")
+                print(f"   📊 Statistics will be accumulated then batch updated")
+                print(f"   🎯 π will be optimized once from aggregated r1")
             
             print(f"✅ Training completed!")
             print(f"📊 HMM checkpoints: {len(training_info['hmm_paths'])}")

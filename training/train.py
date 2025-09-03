@@ -266,6 +266,235 @@ def fit_sticky_hmm_one_pass(
     
     return hmm
 
+def fit_sticky_hmm_with_batch_accumulation(
+    model, 
+    dataset, 
+    device, 
+    hmm: StickyHDPHMMVI, 
+    max_batches: int | None = None,
+    pi_iters: int = 10,
+    pi_lr: float = 0.001,
+    logger=None, 
+    use_wandb: bool = False):
+    """
+    Run one E-step pass with batch accumulation: freeze HMM parameters and do a full pass
+    over all batched data, accumulating sufficient statistics, then perform a single
+    batch update of NIW and Dirichlet posteriors and optimize π once from aggregated r1.
+    
+    This is useful for getting a clean batch estimate without streaming updates.
+    
+    Args:
+        model: VAE model for encoding
+        dataset: Dataset to process
+        device: Device to run on
+        hmm: HMM model to update (will be frozen during accumulation)
+        max_batches: Maximum number of batches to process (None = all batches)
+        pi_iters: Number of π optimization iterations
+        pi_lr: Learning rate for π optimization
+        logger: Logger instance
+        use_wandb: Whether to use wandb logging
+    """
+    model.eval()
+    n_batches = len(dataset) if max_batches is None else min(len(dataset), max_batches)
+    B, T = dataset[0]['tty_chars'].shape[:2]
+    
+    if logger:
+        logger.info(f"🔄 Starting batch accumulation E-step with {n_batches} batches")
+    
+    # Get HMM dimensions
+    Kp1 = hmm.niw.mu.shape[0]  # K+1 states
+    D = hmm.niw.mu.shape[1]    # latent dimension
+    
+    # Initialize accumulators for sufficient statistics
+    accumulated_counts = torch.zeros(Kp1, Kp1, device=device, dtype=hmm.niw.mu.dtype)
+    accumulated_Nk = torch.zeros(Kp1, device=device, dtype=hmm.niw.mu.dtype)
+    accumulated_M1 = torch.zeros(Kp1, D, device=device, dtype=hmm.niw.mu.dtype)
+    accumulated_M2 = torch.zeros(Kp1, D, D, device=device, dtype=hmm.niw.mu.dtype)
+    accumulated_r1_sum = torch.zeros(Kp1, device=device, dtype=hmm.niw.mu.dtype)
+    total_sequences = 0
+    
+    # Freeze HMM parameters - get current state for consistent FB passes
+    with torch.no_grad():
+        # Get current parameter values (these will remain fixed during accumulation)
+        current_u_beta = hmm.u_beta.clone()
+        current_phi = hmm.phi.clone()
+        
+        # Calculate derived parameters once
+        current_pi_full = hmm._calc_Epi(current_u_beta)
+        current_ElogA = hmm._calc_ElogA(current_phi)
+        current_log_pi = torch.log(torch.clamp(current_pi_full, min=1e-30))
+        
+        # Get current NIW parameters for emission likelihoods
+        current_mu = hmm.niw.mu.clone()
+        current_kappa = hmm.niw.kappa.clone()
+        current_Psi = hmm.niw.Psi.clone()
+        current_nu = hmm.niw.nu.clone()
+    
+    # Process all batches with frozen parameters
+    with tqdm(range(n_batches), desc="Batch accumulation E-step", unit="batch") as pbar:
+        for batch_idx in pbar:
+            batch = dataset[batch_idx]
+            
+            # Move batch to device and reshape for encoding
+            batch_dev = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    x = v.to(device, non_blocking=True)
+                    if x.dim() >= 3 and k not in ('original_batch_shape',):
+                        batch_dev[k] = x.view(B*T, *x.shape[2:])
+                    else:
+                        batch_dev[k] = x
+                else:
+                    batch_dev[k] = v
+            
+            # Encode with VAE (fixed parameters)
+            with torch.no_grad():
+                out = model(batch_dev)
+                mu = out['mu'].detach()
+                logvar = out['logvar'].detach()
+                F = out.get('lowrank_factors', None)
+                if F is not None:
+                    F = F.detach()
+                
+                valid = batch_dev['valid_screen'].view(B, T)
+                
+                # Reshape to [B, T, ...] format
+                mu_bt = mu.view(B, T, -1)
+                var_bt = logvar.exp().clamp_min(1e-6).view(B, T, -1)
+                F_bt = None if F is None else F.view(B, T, F.size(-2), F.size(-1))
+            
+            # Compute emission log-likelihoods with frozen NIW parameters
+            with torch.no_grad():
+                logB = hmm.expected_emission_loglik(
+                    current_mu, current_kappa, current_Psi, current_nu,
+                    mu_bt, var_bt, F_bt, valid
+                )  # [B, T, Kp1]
+            
+            # Forward-backward for each sequence in batch and accumulate statistics
+            for b in range(B):
+                with torch.no_grad():
+                    rhat, xihat, ll = hmm.forward_backward(current_log_pi, current_ElogA, logB[b])
+                    
+                    # Compute sufficient statistics for this sequence
+                    Nk, M1, M2 = hmm._moments_from_encoder(
+                        mu_bt[b],
+                        rhat,
+                        (var_bt[b] if var_bt is not None else None),
+                        (F_bt[b] if F_bt is not None else None),
+                        (valid[b] if valid is not None else None)
+                    )
+                    
+                    # Accumulate statistics
+                    accumulated_Nk += Nk
+                    accumulated_M1 += M1
+                    accumulated_M2 += M2
+                    
+                    # Handle transition counts
+                    if valid is not None:
+                        m = valid[b]
+                        pair_m = (m[:-1] * m[1:]).view(-1, 1, 1)  # [T-1, 1, 1]
+                        xihat = xihat * pair_m  # zero out transitions from/to masked frames
+                        t0 = int(torch.nonzero(m, as_tuple=False)[0]) if m.any() else 0
+                    else:
+                        t0 = 0
+                    
+                    accumulated_counts += xihat.sum(dim=0)
+                    accumulated_r1_sum += rhat[t0]
+                    total_sequences += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'batch': f"{batch_idx+1}/{n_batches}",
+                'sequences': f"{total_sequences}",
+                'avg_Nk': f"{accumulated_Nk.mean():.2f}"
+            })
+    
+    # Now perform batch update with accumulated statistics
+    if logger:
+        logger.info(f"📊 Performing batch update with accumulated statistics from {total_sequences} sequences")
+    
+    with torch.no_grad():
+        # 1. Update NIW posteriors first (observation parameters)
+        hmm._update_moments(accumulated_Nk, accumulated_M1, accumulated_M2, accumulated_counts)
+        
+        # Calculate new NIW posterior parameters
+        mu_hat, kappa_hat, Psi_hat, nu_hat = hmm._calc_NIW_posterior(
+            accumulated_Nk, accumulated_M1, accumulated_M2
+        )
+        
+        hmm._update_NIW_posterior(mu_hat, kappa_hat, Psi_hat, nu_hat)
+        
+        # 2. Update φ (Dirichlet transition posteriors) with current π
+        current_pi = hmm._calc_Epi(hmm.u_beta)
+        updated_phi = hmm._calc_dir_posterior(accumulated_counts, current_pi)
+        hmm._update_transitions(updated_phi)
+
+        # 3. Optimize π from aggregated r1 (single optimization from all data)
+        if total_sequences > 0:
+            r1_mean = (accumulated_r1_sum / total_sequences).clamp_min(1e-12)
+            r1_mean = r1_mean / r1_mean.sum()
+            
+            if logger:
+                logger.info(f"🎯 Optimizing π from aggregated r1: {r1_mean.cpu().numpy()}")
+            
+            # Get current transition parameters for π optimization
+            ElogA_for_pi = hmm._calc_ElogA(hmm.dir.phi)
+            
+            optimized_u_beta = hmm._optimize_u_beta(
+                hmm.u_beta, r1_mean, ElogA_for_pi,
+                hmm.p.alpha, hmm.p.kappa, hmm.p.gamma, hmm.p.K,
+                steps=pi_iters, lr=pi_lr
+            )
+            
+            # Update β parameters
+            hmm._update_u_beta(optimized_u_beta)
+    
+    # Final diagnostics and logging
+    with torch.no_grad():
+        # Compute final ELBO/diagnostics with updated parameters
+        final_pi = hmm._calc_Epi(hmm.u_beta)
+        final_ElogA = hmm._calc_ElogA(hmm.dir.phi)
+
+        # Get a sample batch for diagnostics
+        sample_batch = dataset[0]
+        sample_batch_dev = {}
+        for k, v in sample_batch.items():
+            if isinstance(v, torch.Tensor):
+                x = v.to(device, non_blocking=True)
+                if x.dim() >= 3 and k not in ('original_batch_shape',):
+                    sample_batch_dev[k] = x.view(B*T, *x.shape[2:])
+                else:
+                    sample_batch_dev[k] = x
+            else:
+                sample_batch_dev[k] = v
+        
+        # Quick diagnostics on sample
+        with torch.no_grad():
+            out = model(sample_batch_dev)
+            mu = out['mu'].view(B, T, -1)
+            var = out['logvar'].exp().clamp_min(1e-6).view(B, T, -1)
+            valid = sample_batch_dev['valid_screen'].view(B, T)
+            
+            diag_results = hmm.diagnostics(mu_t=mu, diag_var_t=var, F_t=None, mask=valid)
+    
+    if logger:
+        logger.info(f"✅ Batch accumulation complete:")
+        logger.info(f"  - Processed {total_sequences} sequences from {n_batches} batches")
+        logger.info(f"  - Final π: {final_pi.cpu().numpy()}")
+        logger.info(f"  - Effective number of skills: {diag_results['effective_K']:.2f}")
+        logger.info(f"  - State entropy: {diag_results['state_entropy']:.3f}")
+    
+    # Log to wandb if enabled
+    if use_wandb and torch.isfinite(torch.tensor(0.0)):  # Always log since no ELBO tracking
+        if WANDB_AVAILABLE:
+            wandb.log({
+                "batch_accumulation/total_sequences": total_sequences,
+                "batch_accumulation/total_batches": n_batches,
+                "batch_accumulation/final_pi": final_pi.cpu().numpy().tolist(),
+                "batch_accumulation/effective_K": diag_results['effective_K'],
+                "batch_accumulation/state_entropy": diag_results['state_entropy']
+            })
+
 def fit_sticky_hmm_with_game_grouped_data(
     model, 
     grouped_data: Dict, 
@@ -1759,6 +1988,9 @@ def train_vae_with_sticky_hmm_em(
     use_game_grouped_data: bool = False,
     game_grouped_data_path: str = None,
     max_games_per_estep: int = None,
+    # Batch accumulation option for E-step
+    use_batch_accumulation: bool = False,
+    accumulation_max_batches: int = None,
     # Weights & Biases monitoring parameters
     use_wandb: bool = False,
     wandb_project: str = "nethack-hmm-em",
@@ -1816,6 +2048,8 @@ def train_vae_with_sticky_hmm_em(
         use_game_grouped_data: If True, use game-id grouped data for E-step instead of batched data
         game_grouped_data_path: Path to game-grouped data file (if None, will group from train_dataset)
         max_games_per_estep: Maximum number of games to process per E-step (None = all games)
+        use_batch_accumulation: If True, freeze HMM after initial fit and do a full pass accumulating counts, then batch update NIW/Dir and optimize π once
+        accumulation_max_batches: Maximum number of batches to process during accumulation pass (None = all batches)
         use_wandb: Whether to use Weights & Biases for monitoring HMM training
         wandb_project: Weights & Biases project name for EM training
         wandb_entity: Weights & Biases entity (team/user)
@@ -1850,6 +2084,8 @@ def train_vae_with_sticky_hmm_em(
             "use_bf16": use_bf16,
             "use_game_grouped_data": use_game_grouped_data,
             "max_games_per_estep": max_games_per_estep,
+            "use_batch_accumulation": use_batch_accumulation,
+            "accumulation_max_batches": accumulation_max_batches,
             "hmm_params": {
                 "alpha": alpha,
                 "kappa": kappa,
@@ -2055,6 +2291,16 @@ def train_vae_with_sticky_hmm_em(
                                     optimize_pi_every_n_steps=optimize_pi_every_n_steps,
                                     pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
                                     logger=logger, use_wandb=use_wandb)
+        
+        # Optional: Additional batch accumulation pass after initial HMM fitting
+        if use_batch_accumulation:
+            if logger: logger.info(f"🔄 Running additional batch accumulation pass...")
+            fit_sticky_hmm_with_batch_accumulation(
+                model, train_dataset, device, hmm,
+                max_batches=accumulation_max_batches,
+                pi_iters=pi_iters, pi_lr=pi_lr,
+                logger=logger, use_wandb=use_wandb
+            )
 
         # Compute HMM diagnostics
         if logger: logger.info(f"🔍 Computing HMM diagnostics...")
