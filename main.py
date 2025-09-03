@@ -573,7 +573,7 @@ if __name__ == "__main__":
                 batch_multiples=10,
                 # HMM parameters
                 alpha=150.0,
-                kappa=10.0,
+                kappa=2.0,
                 gamma=10.0,
                 hmm_only=hmm_only,
                 em_rounds=1 if hmm_only else 3,

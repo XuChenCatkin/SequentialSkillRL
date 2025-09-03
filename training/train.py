@@ -323,29 +323,38 @@ def fit_sticky_hmm_with_game_grouped_data(
             if total_length < 2:
                 continue
             
-            # Prepare the game data for encoding
+            # Prepare the game data for encoding in a single loop
             # The sequence_data contains tensors of shape [T, ...] where T is the game length
-            batch_dev = {}
+            batch_flat = {}
+            batch_dev = {}  
+            
             for k, v in sequence_data.items():
                 if isinstance(v, torch.Tensor):
-                    # Reshape to [1, T, ...] to create a batch of size 1
-                    if v.dim() >= 2:
-                        batch_dev[k] = v.unsqueeze(0).to(device, non_blocking=True)  # [1, T, ...]
+                    # Move to device first
+                    v_device = v.to(device, non_blocking=True)
+                    
+                    if v_device.dim() >= 2:
+                        # Create [1, T, ...] version for batch_dev
+                        v_batched = v_device.unsqueeze(0)  # [1, T, ...]
+                        batch_dev[k] = v_batched
+                        
+                        # Determine final shape for batch_flat
+                        if v_batched.dim() >= 3 and k not in ('valid_screen', 'gameids'):
+                            # Flatten spatial dimensions: [1, T, ...] -> [T, ...]
+                            T = v_batched.shape[1]
+                            batch_flat[k] = v_batched.view(T, *v_batched.shape[2:])
+                        elif k == 'valid_screen':
+                            # Keep [1, T] shape for valid_screen
+                            batch_flat[k] = v_batched
+                        else:
+                            batch_flat[k] = v_batched
                     else:
-                        batch_dev[k] = v.to(device, non_blocking=True)
+                        # 1D tensors - no unsqueeze needed
+                        batch_dev[k] = v_device
+                        batch_flat[k] = v_device
                 else:
+                    # Non-tensor values
                     batch_dev[k] = v
-            
-            # Flatten spatial dimensions for VAE encoding: [1, T, ...] -> [T, ...]
-            batch_flat = {}
-            for k, v in batch_dev.items():
-                if isinstance(v, torch.Tensor) and v.dim() >= 3 and k not in ('valid_screen', 'gameids'):
-                    # Keep [1, T] structure for valid_screen, flatten others to [T, ...]
-                    T = v.shape[1]
-                    batch_flat[k] = v.view(T, *v.shape[2:])
-                elif k == 'valid_screen':
-                    batch_flat[k] = v  # Keep [1, T] shape
-                else:
                     batch_flat[k] = v
             
             # Encode the game sequence
@@ -400,27 +409,52 @@ def fit_sticky_hmm_with_game_grouped_data(
             if use_wandb and torch.isfinite(inner_elbo):
                 log_hmm_elbo_to_wandb(game_idx, inner_elbo.item(), elbo_history, n_iterations, use_wandb)
             
-            # Update progress bar
-            status = "complete" if game_info['is_complete'] else "incomplete"
-            elbo_change = ""
-            if len(elbo_history) > 1:
-                elbo_improve = elbo_history[-1] - elbo_history[0]
-                elbo_change = f" (Δ{elbo_improve.item():+.2f})"
-            
-            pbar.set_postfix({
-                'game_id': f"{game_id}",
-                'length': f"{total_length}",
-                'status': status,
-                'elbo': f"{inner_elbo:.2f}{elbo_change}",
-                'iters': f"{n_iterations}"
-            })
-            
-            # Log details for first few games or every N games
-            if game_idx < 5 or (game_idx + 1) % 50 == 0:
-                if logger:
-                    logger.info(f"[E-step] Game {game_id} ({game_idx+1}/{n_games}): "
-                               f"length={total_length}, status={status}, "
-                               f"elbo={inner_elbo:.4f}, iters={n_iterations}")
+            # Compute diagnostics for detailed logging
+            if (game_idx + 1) % 1 == 0 or game_idx == 0:
+                with torch.no_grad():
+                    diag_results = hmm.diagnostics(
+                        mu_t=mu_bt,
+                        diag_var_t=var_bt,
+                        F_t=F_bt,
+                        mask=valid
+                    )
+                    
+                    top5_skills = diag_results['top5_idx'].tolist()
+                    top5_probs = diag_results['top5_pi'].tolist()
+                    status = "complete" if game_info['is_complete'] else "incomplete"
+                    
+                    if logger:
+                        logger.info(f"[E-step] Game {game_id} ({game_idx+1}/{n_games}) - HMM Diagnostics:")
+                        logger.info(f"  - Game length: {total_length}, status: {status}")
+                        logger.info(f"  - Avg log-likelihood per step: {diag_results['avg_loglik_per_step']:.4f}")
+                        logger.info(f"  - Inner ELBO (final): {inner_elbo:.4f}")
+                        if len(elbo_history) > 1:
+                            elbo_improve = elbo_history[-1] - elbo_history[0]
+                            logger.info(f"  - ELBO progression ({n_iterations} iters): {format_elbo_progression(elbo_history)} (Δ={elbo_improve.item():.4f})")
+                        logger.info(f"  - Effective number of skills: {diag_results['effective_K']:.2f}")
+                        logger.info(f"  - State entropy: {diag_results['state_entropy']:.3f}")
+                        logger.info(f"  - Transition stickiness: {diag_results['stickiness_diag_mean']:.3f}")
+                        logger.info(f"  - Top 5 skills: {top5_skills} (probs: {[f'{p:.3f}' for p in top5_probs]})")
+            else:
+                # Update progress bar with basic info including ELBO
+                status = "complete" if game_info['is_complete'] else "incomplete"
+                elbo_change = ""
+                if len(elbo_history) > 1:
+                    elbo_improve = elbo_history[-1] - elbo_history[0]
+                    elbo_change = f" (Δ{elbo_improve.item():+.2f})"
+                
+                pbar.set_postfix({
+                    'game_id': f"{game_id}",
+                    'length': f"{total_length}",
+                    'status': status,
+                    'elbo': f"{inner_elbo:.2f}{elbo_change}",
+                    'iters': f"{n_iterations}"
+                })
+                
+                # Log summary for batches of games
+                if (game_idx + 1) % 50 == 0:
+                    if logger:
+                        logger.info(f"[E-step] Processed {game_idx+1}/{n_games} games")
     
     if logger:
         logger.info(f"[E-step] Completed processing {n_games} games with game-grouped data")
@@ -1991,14 +2025,12 @@ def train_vae_with_sticky_hmm_em(
         # E-step: Fit HMM posterior using current VAE representations
         if use_game_grouped_data:
             # Load or create game-grouped data
+            collector = NetHackDataCollector('ttyrecs.db')
             if game_grouped_data_path and os.path.exists(game_grouped_data_path):
                 if logger: logger.info(f"📂 Loading game-grouped data from: {game_grouped_data_path}")
-                grouped_data = torch.load(game_grouped_data_path, map_location='cpu')
+                grouped_data = collector.load_grouped_sequences(game_grouped_data_path)
             else:
                 if logger: logger.info(f"🔄 Creating game-grouped data from train_dataset...")
-                # Import data collector to group the data
-                from src.data_collection import NetHackDataCollector
-                collector = NetHackDataCollector('ttyrecs.db')  # dummy db path
                 grouped_data = collector.group_sequences_by_game(
                     collected_batches=train_dataset,
                     save_path=game_grouped_data_path  # Save for future use
@@ -2132,6 +2164,8 @@ def train_vae_with_sticky_hmm_em(
             'use_hmm_prior': True,  # Always use HMM prior in M-step
             'save_path': os.path.join(save_dir, f"vae_hmm_round{r+1}_temp.pth"),
             'use_wandb': False,  # Disable wandb for M-step to avoid conflicts
+            'wandb_project': f"nethack-vae-hmm-round{r+1}",
+            'log_every_n_steps': 2,
             'upload_to_hf': False,  # Don't upload intermediate M-step results
             'early_stopping': False,  # Disable early stopping for short M-step training
             **train_kwargs  # Include any additional training arguments
