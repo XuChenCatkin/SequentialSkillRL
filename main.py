@@ -1,3 +1,36 @@
+"""
+Complete VAE+HMM training pipeline for NetHack Learning Dataset.
+
+Usage:
+    python main.py <command> [args...]
+
+Commands:
+    collect_data                    - Collect and cache NetHack data
+    group_data_by_id               - Group collected data by game ID for game-based training
+    train <mode> [game_grouped]    - Train VAE and/or HMM models
+        Modes:
+            vae_only               - Train only VAE
+            hmm_only [game_grouped] - Train only HMM (optionally using game-grouped data)
+            vae_hmm [game_grouped]  - Train VAE+HMM (optionally using game-grouped data)
+        
+        Game-grouped mode:
+            - Standard mode: HMM E-step uses batched data [B, T, D] from multiple games
+            - Game-grouped mode: HMM E-step processes one complete game at a time [1, game_length, D]
+            - Benefits of game-grouped: Better temporal modeling, respects game boundaries
+            - Use when: Games have varying lengths, want pure single-game HMM training
+    
+    vae_analysis <repo_name>       - Run VAE analysis and visualization
+    bin_count_analysis [top_k]     - Analyze glyph character/color distributions  
+    hmm_analysis <repo_name>       - Run HMM analysis and visualization
+    plot_bin_count <data_path>     - Plot from saved bin count data
+
+Examples:
+    python main.py collect_data
+    python main.py group_data_by_id
+    python main.py train hmm_only game_grouped
+    python main.py train vae_hmm game_grouped
+    python main.py vae_analysis CatkinChen/nethack-vae
+"""
 import logging
 import os
 import sys
@@ -132,7 +165,24 @@ if __name__ == "__main__":
         print(f"✅ Data collection completed!")
         print(f"   📊 Train batches: {len(train_dataset)}")
         print(f"   📊 Test batches: {len(test_dataset)}")
-    
+        
+    elif len(sys.argv) > 1 and sys.argv[1] == "group_data_by_id":
+        collector = NetHackDataCollector('ttyrecs.db')
+        adapter = BLStatsAdapter()
+        train_dataset = collector.collect_or_load_data(
+            dataset_name=train_file,
+            adapter=adapter,
+            save_path=train_cache_file,
+            max_batches=max_training_batches,
+            batch_size=batch_size,
+            seq_length=sequence_size,
+            force_recollect=False
+        )
+        train_group_cache_file = os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}_group.pt")
+        grouped_data = collector.group_sequences_by_game(train_dataset, save_path=train_group_cache_file)
+        
+        print(f"✅ Data grouping completed!")
+
     elif len(sys.argv) > 1 and sys.argv[1] == "bin_count_analysis":
         # Bin count analysis mode: python train.py bin_count_analysis [top_k] [dataset_type]
         top_k = int(sys.argv[2]) if len(sys.argv) > 2 else 50
@@ -412,6 +462,9 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger(__name__)
         
+        # Check for game-grouped data training mode
+        use_game_grouped = len(sys.argv) > 3 and sys.argv[3] == "game_grouped"
+        
         if sys.argv[2] == "vae_only":
             vae_config = VAEConfig(
                 initial_mi_beta=1.0,
@@ -486,6 +539,9 @@ if __name__ == "__main__":
                 hmm_only = False
             else:
                 print("❌ Invalid argument. Use 'vae_only', 'hmm_only', or 'vae_hmm'.")
+                print("   💡 To use game-grouped data for E-step, add 'game_grouped' as the 4th argument:")
+                print("      python main.py train hmm_only game_grouped")
+                print("      python main.py train vae_hmm game_grouped")
                 sys.exit(1)
             vae_config = VAEConfig(
                 initial_mi_beta=1.0,
@@ -534,6 +590,11 @@ if __name__ == "__main__":
                 pi_iters = 10,
                 pi_lr = 5.0e-4,
 
+                # Game-grouped data options
+                use_game_grouped_data=use_game_grouped,
+                game_grouped_data_path=os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}_group.pt") if use_game_grouped else None,
+                max_games_per_estep=None,  # Process all games
+
                 # HuggingFace integration
                 push_to_hub=True,
                 hub_repo_id_hmm="CatkinChen/nethack-hmm",
@@ -548,6 +609,13 @@ if __name__ == "__main__":
                 max_learning_rate=1e-4,  # Lower learning rate for fine-tuning
                 lr_scheduler="constant"   # Use constant LR scheduler for stability
             )
+            
+            if use_game_grouped:
+                print(f"🎮 Using game-grouped data for E-step HMM training")
+                print(f"   📂 Game data will be saved/loaded from: {os.path.join(data_cache_dir, f'{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}_group.pt')}")
+                print(f"   🎯 HMM will be trained on individual games instead of batched data")
+            else:
+                print(f"📦 Using standard batched data for E-step HMM training")
             
             print(f"✅ Training completed!")
             print(f"📊 HMM checkpoints: {len(training_info['hmm_paths'])}")

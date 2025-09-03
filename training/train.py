@@ -266,6 +266,167 @@ def fit_sticky_hmm_one_pass(
     
     return hmm
 
+def fit_sticky_hmm_with_game_grouped_data(
+    model, 
+    grouped_data: Dict, 
+    device, 
+    hmm: StickyHDPHMMVI, 
+    offline: bool = True,
+    streaming_rho: float = 1.0, 
+    max_iters: int = 10,
+    elbo_drop_tol: float = 10.0,
+    optimize_pi_every_n_steps: int = 5,
+    pi_iters: int = 10,
+    pi_lr: float = 0.001,
+    max_games: int | None = None,
+    logger=None, 
+    use_wandb: bool = False):
+    """
+    Run one E-step pass using game-grouped data: update sticky-HDP-HMM variational posteriors 
+    by processing one game at a time instead of batched data.
+    
+    Args:
+        model: VAE model for encoding
+        grouped_data: Dictionary with game_id -> {'sequence_data': {...}, 'total_length': int, 'is_complete': bool}
+        device: Device to run on
+        hmm: HMM model to update
+        offline: Whether to use offline mode
+        streaming_rho: Streaming parameter
+        max_iters: Maximum iterations for HMM update
+        elbo_drop_tol: ELBO drop tolerance
+        optimize_pi_every_n_steps: How often to optimize pi
+        pi_iters: Number of pi iterations
+        pi_lr: Learning rate for pi optimization
+        max_games: Maximum number of games to process (None = all games)
+        logger: Logger instance
+        use_wandb: Whether to use wandb logging
+    """
+    model.eval()
+    
+    # Get list of games, optionally limiting the number
+    game_ids = list(grouped_data.keys())
+    if max_games is not None:
+        game_ids = game_ids[:max_games]
+    
+    n_games = len(game_ids)
+    if logger:
+        logger.info(f"Processing {n_games} games for E-step with game-grouped data")
+    
+    # Create progress bar for HMM E-step
+    with tqdm(enumerate(game_ids), total=n_games, desc="HMM E-step (game-by-game)", unit="game") as pbar:
+        for game_idx, game_id in pbar:
+            game_info = grouped_data[game_id]
+            sequence_data = game_info['sequence_data']
+            total_length = game_info['total_length']
+            
+            # Skip games that are too short
+            if total_length < 2:
+                continue
+            
+            # Prepare the game data for encoding
+            # The sequence_data contains tensors of shape [T, ...] where T is the game length
+            batch_dev = {}
+            for k, v in sequence_data.items():
+                if isinstance(v, torch.Tensor):
+                    # Reshape to [1, T, ...] to create a batch of size 1
+                    if v.dim() >= 2:
+                        batch_dev[k] = v.unsqueeze(0).to(device, non_blocking=True)  # [1, T, ...]
+                    else:
+                        batch_dev[k] = v.to(device, non_blocking=True)
+                else:
+                    batch_dev[k] = v
+            
+            # Flatten spatial dimensions for VAE encoding: [1, T, ...] -> [T, ...]
+            batch_flat = {}
+            for k, v in batch_dev.items():
+                if isinstance(v, torch.Tensor) and v.dim() >= 3 and k not in ('valid_screen', 'gameids'):
+                    # Keep [1, T] structure for valid_screen, flatten others to [T, ...]
+                    T = v.shape[1]
+                    batch_flat[k] = v.view(T, *v.shape[2:])
+                elif k == 'valid_screen':
+                    batch_flat[k] = v  # Keep [1, T] shape
+                else:
+                    batch_flat[k] = v
+            
+            # Encode the game sequence
+            with torch.no_grad():
+                out = model(batch_flat)  # returns 'mu', 'logvar', optionally 'lowrank_factors'
+                mu = out['mu'].detach()  # [T, D]
+                logvar = out['logvar'].detach()  # [T, D]
+                F = out.get('lowrank_factors', None)
+                if F is not None:
+                    F = F.detach()  # [T, ...]
+                
+                # Get valid mask
+                if 'valid_screen' in batch_dev:
+                    valid = batch_dev['valid_screen']  # [1, T]
+                else:
+                    # If no valid mask, assume all timesteps are valid
+                    valid = torch.ones(1, total_length, dtype=torch.bool, device=device)
+                
+                # Ensure valid mask has correct shape and all True values for complete games
+                if valid.dim() == 1:
+                    valid = valid.unsqueeze(0)  # Make it [1, T]
+                
+                # For game-grouped data, typically all timesteps in a game are valid
+                if valid.shape[1] != total_length:
+                    # Adjust mask to match the sequence length
+                    valid = torch.ones(1, total_length, dtype=torch.bool, device=device)
+                
+                # Reshape back to [1, T, D] format for HMM
+                mu_bt = mu.unsqueeze(0)  # [1, T, D]
+                var_bt = logvar.exp().clamp_min(1e-6).unsqueeze(0)  # [1, T, D]
+                F_bt = None if F is None else F.unsqueeze(0)  # [1, T, ...]
+            
+            # Update HMM with this single game
+            hmm_out = hmm.update(
+                mu_bt, var_bt, F_bt, 
+                mask=valid, 
+                max_iters=max_iters, 
+                elbo_drop_tol=elbo_drop_tol, 
+                rho=streaming_rho, 
+                optimize_pi=((game_idx + 1) % optimize_pi_every_n_steps == 0), 
+                pi_steps=pi_iters, 
+                pi_lr=pi_lr, 
+                offline=offline
+            )
+            
+            # Extract ELBO from HMM update
+            inner_elbo = hmm_out.get('inner_elbo', torch.tensor(float('nan')))
+            elbo_history = hmm_out.get('elbo_history', torch.tensor([]))
+            n_iterations = hmm_out.get('n_iterations', 0)
+            
+            # Log to wandb if enabled
+            if use_wandb and torch.isfinite(inner_elbo):
+                log_hmm_elbo_to_wandb(game_idx, inner_elbo.item(), elbo_history, n_iterations, use_wandb)
+            
+            # Update progress bar
+            status = "complete" if game_info['is_complete'] else "incomplete"
+            elbo_change = ""
+            if len(elbo_history) > 1:
+                elbo_improve = elbo_history[-1] - elbo_history[0]
+                elbo_change = f" (Δ{elbo_improve.item():+.2f})"
+            
+            pbar.set_postfix({
+                'game_id': f"{game_id}",
+                'length': f"{total_length}",
+                'status': status,
+                'elbo': f"{inner_elbo:.2f}{elbo_change}",
+                'iters': f"{n_iterations}"
+            })
+            
+            # Log details for first few games or every N games
+            if game_idx < 5 or (game_idx + 1) % 50 == 0:
+                if logger:
+                    logger.info(f"[E-step] Game {game_id} ({game_idx+1}/{n_games}): "
+                               f"length={total_length}, status={status}, "
+                               f"elbo={inner_elbo:.4f}, iters={n_iterations}")
+    
+    if logger:
+        logger.info(f"[E-step] Completed processing {n_games} games with game-grouped data")
+    
+    return hmm
+
 def load_datasets(
     train_file: str, 
     test_file: str,                     
@@ -1560,6 +1721,10 @@ def train_vae_with_sticky_hmm_em(
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    # Game-grouped data options for E-step
+    use_game_grouped_data: bool = False,
+    game_grouped_data_path: str = None,
+    max_games_per_estep: int = None,
     # Weights & Biases monitoring parameters
     use_wandb: bool = False,
     wandb_project: str = "nethack-hmm-em",
@@ -1614,6 +1779,9 @@ def train_vae_with_sticky_hmm_em(
         optimize_pi_every_n_steps: how often to optimize pi
         pi_iters: number of iterations for pi optimization
         pi_lr: learning rate for pi optimization
+        use_game_grouped_data: If True, use game-id grouped data for E-step instead of batched data
+        game_grouped_data_path: Path to game-grouped data file (if None, will group from train_dataset)
+        max_games_per_estep: Maximum number of games to process per E-step (None = all games)
         use_wandb: Whether to use Weights & Biases for monitoring HMM training
         wandb_project: Weights & Biases project name for EM training
         wandb_entity: Weights & Biases entity (team/user)
@@ -1646,6 +1814,8 @@ def train_vae_with_sticky_hmm_em(
             "test_batches": len(test_dataset) if test_dataset else 0,
             "device": str(device),
             "use_bf16": use_bf16,
+            "use_game_grouped_data": use_game_grouped_data,
+            "max_games_per_estep": max_games_per_estep,
             "hmm_params": {
                 "alpha": alpha,
                 "kappa": kappa,
@@ -1819,12 +1989,40 @@ def train_vae_with_sticky_hmm_em(
             })
         
         # E-step: Fit HMM posterior using current VAE representations
-        fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
-                                offline=offline, streaming_rho=streaming_rho, 
-                                max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
-                                optimize_pi_every_n_steps=optimize_pi_every_n_steps,
-                                pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
-                                logger=logger, use_wandb=use_wandb)
+        if use_game_grouped_data:
+            # Load or create game-grouped data
+            if game_grouped_data_path and os.path.exists(game_grouped_data_path):
+                if logger: logger.info(f"📂 Loading game-grouped data from: {game_grouped_data_path}")
+                grouped_data = torch.load(game_grouped_data_path, map_location='cpu')
+            else:
+                if logger: logger.info(f"🔄 Creating game-grouped data from train_dataset...")
+                # Import data collector to group the data
+                from src.data_collection import NetHackDataCollector
+                collector = NetHackDataCollector('ttyrecs.db')  # dummy db path
+                grouped_data = collector.group_sequences_by_game(
+                    collected_batches=train_dataset,
+                    save_path=game_grouped_data_path  # Save for future use
+                )
+                if logger: logger.info(f"✅ Created game-grouped data with {len(grouped_data)} games")
+            
+            # Use game-grouped E-step
+            fit_sticky_hmm_with_game_grouped_data(
+                model, grouped_data, device, hmm, 
+                offline=offline, streaming_rho=streaming_rho, 
+                max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
+                optimize_pi_every_n_steps=optimize_pi_every_n_steps,
+                pi_iters=pi_iters, pi_lr=pi_lr, 
+                max_games=max_games_per_estep,
+                logger=logger, use_wandb=use_wandb
+            )
+        else:
+            # Use standard batched E-step
+            fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
+                                    offline=offline, streaming_rho=streaming_rho, 
+                                    max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
+                                    optimize_pi_every_n_steps=optimize_pi_every_n_steps,
+                                    pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
+                                    logger=logger, use_wandb=use_wandb)
 
         # Compute HMM diagnostics
         if logger: logger.info(f"🔍 Computing HMM diagnostics...")

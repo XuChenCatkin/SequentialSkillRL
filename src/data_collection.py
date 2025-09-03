@@ -946,6 +946,11 @@ class NetHackDataCollector:
         groups the temporal sequences by game ID. It properly handles game transitions:
         when a game ends (done=True), the next timestep in that batch position starts a new game.
         
+        IMPORTANT: Game IDs can be reused across different episodes. All occurrences of the
+        same game ID are concatenated into a single sequence, regardless of when/where they
+        appear in the dataset. This means a game marked as 'complete' may still have
+        additional data from later episodes with the same ID.
+        
         Args:
             collected_batches: List of batch dictionaries from collect_data_batch
             save_path: Optional path to save the grouped sequences
@@ -956,7 +961,7 @@ class NetHackDataCollector:
                 game_id: {
                     'sequence_data': {key: tensor_with_shape_[total_T, ...]},
                     'total_length': int,
-                    'is_complete': bool  # True if sequence ended with done=True
+                    'is_complete': bool  # True if any episode ended with done=True
                 }
             }
         """
@@ -1002,33 +1007,29 @@ class NetHackDataCollector:
                     
                     game_info = game_sequences[current_game_id]
                     
-                    # Skip if this game is already complete
-                    if game_info['is_complete']:
-                        # Find next game transition or end of sequence
-                        next_transition = t + 1
-                        while next_transition < T and game_id_sequence[next_transition] == current_game_id:
-                            next_transition += 1
-                        t = next_transition
-                        continue
+                    # NOTE: Removed the "skip if complete" logic because game IDs can be reused
+                    # for different episodes. Each occurrence should be processed independently.
                     
-                    # Find where this game segment ends in this batch
+                    # Find where this game segment ends in this batch using correct done semantics
+                    # done[k] = 1 means the game ended at timestep k-1, so timestep k is the start of a new game
                     segment_end = t
+                    episode_complete = False
+                    
                     while segment_end < T and game_id_sequence[segment_end] == current_game_id:
-                        if done_sequence[segment_end] == 1:
-                            # Game ends here
-                            segment_end += 1  # Include the terminal timestep
-                            game_info['is_complete'] = True
+                        segment_end += 1  # Include this timestep in current game
+                        
+                        # Check if next timestep indicates current game ended
+                        if segment_end < T and done_sequence[segment_end] == 1:
+                            # done[segment_end] = 1 means game ended at segment_end-1
+                            # So our current game ends at segment_end-1, which we've already included
+                            episode_complete = True
                             break
-                        segment_end += 1
                     
                     # Extract data for this game segment [t:segment_end]
                     segment_length = segment_end - t
                     
                     if segment_length > 0:
                         for key, value in batch.items():
-                            if key == 'gameids':
-                                continue  # Skip gameids
-                            
                             if isinstance(value, torch.Tensor):
                                 # Extract this game's segment: [segment_length, ...]
                                 game_segment = value[batch_pos, t:segment_end]
@@ -1047,8 +1048,10 @@ class NetHackDataCollector:
                                 if key not in game_info['sequence_data']:
                                     game_info['sequence_data'][key] = value
                         
-                        # Update total length
+                        # Update total length and completion status  
                         game_info['total_length'] += segment_length
+                        if episode_complete:
+                            game_info['is_complete'] = True
                         
                         # Debug info for significant games
                         if batch_idx < 3 and batch_pos < 3:  # First few batches and positions
