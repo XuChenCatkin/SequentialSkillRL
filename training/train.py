@@ -1274,11 +1274,11 @@ def train_multimodalhack_vae(
                             F_btr    = model_output.get('lowrank_factors', None)
                             F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
                             # emission expected log-likelihood per (b,t,k)
-                            logB = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
+                            logB = StickyHDPHMMVI.expected_emission_loglik(hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu, mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
                             pi_star  = hmm._Epi()                              # [K]
                             ElogA    = hmm._ElogA()                            # [K,K]
                             log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
-                            r_hat, xi_hat, ll = hmm.forward_backward(log_pi, ElogA, logB)
+                            r_hat, xi_hat, ll = StickyHDPHMMVI.forward_backward(log_pi, ElogA, logB)
                             # prior Gaussians
                             mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
                             # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
@@ -1493,11 +1493,11 @@ def train_multimodalhack_vae(
                             F_btr    = model_output.get('lowrank_factors', None)
                             F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
                             # emission expected log-likelihood per (b,t,k)
-                            logB = hmm.expected_emission_loglik(mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
+                            logB = StickyHDPHMMVI.expected_emission_loglik(hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu, mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
                             pi_star  = hmm._Epi()                              # [K]
                             ElogA    = hmm._ElogA()                            # [K,K]
                             log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
-                            r_hat, xi_hat, ll = hmm.forward_backward(log_pi, ElogA, logB)
+                            r_hat, xi_hat, ll = StickyHDPHMMVI.forward_backward(log_pi, ElogA, logB)
                             # prior Gaussians
                             mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
                             # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
