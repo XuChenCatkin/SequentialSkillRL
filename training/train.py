@@ -317,7 +317,7 @@ def fit_sticky_hmm_with_batch_accumulation(
     with torch.no_grad():
         # Get current parameter values (these will remain fixed during accumulation)
         current_u_beta = hmm.u_beta.clone()
-        current_phi = hmm.phi.clone()
+        current_phi = hmm.dir.phi.clone()
         
         # Calculate derived parameters once
         current_pi_full = hmm._calc_Epi(current_u_beta)
@@ -422,7 +422,7 @@ def fit_sticky_hmm_with_batch_accumulation(
             accumulated_Nk, accumulated_M1, accumulated_M2
         )
         
-        hmm._update_NIW_posterior(mu_hat, kappa_hat, Psi_hat, nu_hat)
+        hmm._update_NIW(mu_hat, kappa_hat, Psi_hat, nu_hat)
         
         # 2. Update φ (Dirichlet transition posteriors) with current π
         current_pi = hmm._calc_Epi(hmm.u_beta)
