@@ -1128,6 +1128,7 @@ class StickyHDPHMMVI(nn.Module):
             if logger is not None:
                 logger.debug(f"Iter {it}: ELBO after Dirichlet update: {elbo_after_dir:.4f} (Trans LL {trans_after:.4f}, Dir term {dir_after:.4f}, Δ={(dir_after + trans_after - dir_before_val - trans_before_val):.4f})")
             trans_before_val = trans_after
+            dir_before_val = dir_after
 
             # (5) Optimize β/π from average r1 across sequences
             if optimize_pi and B > 0:
@@ -1145,16 +1146,17 @@ class StickyHDPHMMVI(nn.Module):
                 )
                 logp_beta_after = elbo_after_beta_all["logp_beta"]
                 init_after = elbo_after_beta_all["init"]
+                dir_after = elbo_after_beta_all["dir_term"]
                 assert abs(trans_before_val - elbo_after_beta_all["trans"]) < 1e-4, "Transitional term changed after β update!"
                 assert abs(emit_before_val - elbo_after_beta_all["emit"]) < 1e-4, "Emission term changed after β update!"
                 assert abs(entropy_before_val - elbo_after_beta_all["entropy"]) < 1e-4, "Entropy term changed after β update!"
                 assert abs(niw_after - elbo_after_beta_all["niw_term"]) < 1e-4, "NIW term changed after β update!"
-                assert abs(dir_after - elbo_after_beta_all["dir_term"]) < 1e-4, "Dirichlet term changed after β update!"
                 this_ll = this_ll - init_before_val + init_after
                 elbo_after_beta = this_ll + dir_after + niw_after + logp_beta_after
                 if logger is not None:
-                    logger.debug(f"Iter {it}: ELBO after β update: {elbo_after_beta:.4f} (Init LL {init_after:.4f}, logp(β) {logp_beta_after:.4f}, Δ={(logp_beta_after + init_after - logp_beta_before_val - init_before_val):.4f})")
+                    logger.debug(f"Iter {it}: ELBO after β update: {elbo_after_beta:.4f} (Init LL {init_after:.4f}, Dir term {dir_after:.4f}, logp(β) {logp_beta_after:.4f}, Δ={(logp_beta_after + init_after + dir_after - logp_beta_before_val - init_before_val - dir_before_val):.4f})")
                 init_before_val = init_after
+                dir_before_val = dir_after
             else:
                 logp_beta_after = logp_beta_before_val
                 elbo_after_beta = elbo_after_dir
@@ -1165,7 +1167,6 @@ class StickyHDPHMMVI(nn.Module):
             iw_term_history.append(niw_after)
             logp_beta_history.append(logp_beta_after)
             ll_before_val = this_ll
-            dir_before_val = dir_after
             niw_before_val = niw_after
             logp_beta_before_val = logp_beta_after
 
