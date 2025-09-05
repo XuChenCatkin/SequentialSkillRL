@@ -2505,7 +2505,7 @@ def vae_loss(
         kl_hmm = (kl_bk * r_hat).sum(dim=1)   # [valid_B]
         
         # Blend the two KL losses
-        kl_per_sample = alpha * kl_standard + (1.0 - alpha) * kl_hmm
+        kl_per_sample = alpha * kl_hmm + (1.0 - alpha) * kl_standard
         kl_loss = kl_per_sample.mean()
         kl_mode = f'blend_alpha_{alpha:.2f}'
         

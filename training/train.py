@@ -211,8 +211,8 @@ def fit_sticky_hmm_one_pass(
 
             # HMM update with combined batch
             hmm_out = hmm.update(mu_combined, var_combined, F_combined, mask=valid_combined, 
-                               max_iters=max_iters, elbo_drop_tol=elbo_drop_tol, rho=streaming_rho, 
-                               optimize_pi=((multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
+                               max_iters=(1 if multi_batch_idx < 0 else max_iters), elbo_drop_tol=elbo_drop_tol, rho=streaming_rho, 
+                               optimize_pi=(multi_batch_idx > -1 and (multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
                                pi_steps=pi_iters, pi_lr=pi_lr, offline=offline)
 
             # Extract ELBO from HMM update
@@ -620,10 +620,10 @@ def fit_sticky_hmm_with_game_grouped_data(
             hmm_out = hmm.update(
                 mu_bt, var_bt, F_bt, 
                 mask=valid, 
-                max_iters=max_iters, 
+                max_iters=1 if game_idx < 10 else max_iters, 
                 elbo_drop_tol=elbo_drop_tol, 
                 rho=streaming_rho, 
-                optimize_pi=((game_idx + 1) % optimize_pi_every_n_steps == 0), 
+                optimize_pi=(game_idx > 9 and (game_idx + 1) % optimize_pi_every_n_steps == 0), 
                 pi_steps=pi_iters, 
                 pi_lr=pi_lr, 
                 offline=offline
@@ -1278,7 +1278,14 @@ def train_multimodalhack_vae(
                             pi_star  = hmm._Epi()                              # [K]
                             ElogA    = hmm._ElogA()                            # [K,K]
                             log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
-                            r_hat, xi_hat, ll = StickyHDPHMMVI.forward_backward(log_pi, ElogA, logB)
+                            
+                            # Process each sequence in the batch individually
+                            r_hat_list = []
+                            for b in range(B):
+                                r_hat_b, xi_hat_b, ll_b = hmm.forward_backward(log_pi, ElogA, logB[b])
+                                r_hat_list.append(r_hat_b)
+                            r_hat = torch.stack(r_hat_list, dim=0)  # [B,T,K]
+                            
                             # prior Gaussians
                             mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
                             # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
@@ -1497,7 +1504,14 @@ def train_multimodalhack_vae(
                             pi_star  = hmm._Epi()                              # [K]
                             ElogA    = hmm._ElogA()                            # [K,K]
                             log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
-                            r_hat, xi_hat, ll = StickyHDPHMMVI.forward_backward(log_pi, ElogA, logB)
+                            
+                            # Process each sequence in the batch individually
+                            r_hat_list = []
+                            for b in range(B):
+                                r_hat_b, xi_hat_b, ll_b = hmm.forward_backward(log_pi, ElogA, logB[b])
+                                r_hat_list.append(r_hat_b)
+                            r_hat = torch.stack(r_hat_list, dim=0)  # [B,T,K]
+                            
                             # prior Gaussians
                             mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
                             # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
@@ -1971,6 +1985,9 @@ def train_vae_with_sticky_hmm_em(
     niw_nu0: int = 96 + 2,
     init_niw_mu_with_kmean: bool = True,
     hmm_only: bool = False,
+    vae_only_with_hmm: bool = False,
+    pretrained_hmm_hf_repo: str = None,
+    pretrained_hmm_round: int = None,
     em_rounds: int = 3, 
     m_epochs_per_round: int = 1,
     save_dir: str = "checkpoints_hmm",
@@ -2032,6 +2049,9 @@ def train_vae_with_sticky_hmm_em(
         niw_nu0: NIW prior degrees of freedom
         init_niw_mu_with_kmean: If True, initializes NIW mean with k-means
         hmm_only: If True, only fits HMM without VAE fine-tuning
+        vae_only_with_hmm: If True, only trains VAE with pre-trained HMM (no E-step HMM training)
+        pretrained_hmm_hf_repo: HuggingFace repo ID to load pre-trained HMM from (required if vae_only_with_hmm=True)
+        pretrained_hmm_round: Round number of pre-trained HMM to load (None for latest)
         em_rounds: Number of EM iterations
         m_epochs_per_round: Number of VAE training epochs per M-step
         save_dir: Local directory to save checkpoints
@@ -2078,6 +2098,9 @@ def train_vae_with_sticky_hmm_em(
             "em_rounds": em_rounds,
             "m_epochs_per_round": m_epochs_per_round,
             "hmm_only": hmm_only,
+            "vae_only_with_hmm": vae_only_with_hmm,
+            "pretrained_hmm_hf_repo": pretrained_hmm_hf_repo,
+            "pretrained_hmm_round": pretrained_hmm_round,
             "train_batches": len(train_dataset) if train_dataset else 0,
             "test_batches": len(test_dataset) if test_dataset else 0,
             "device": str(device),
@@ -2155,31 +2178,63 @@ def train_vae_with_sticky_hmm_em(
     model = model.to(device)
     if logger: logger.info("✅ Loaded pretrained VAE checkpoint (plain prior).")
 
-    # 2) Instantiate HMM
+    # Validate parameter combinations
+    if hmm_only and vae_only_with_hmm:
+        raise ValueError("Cannot set both hmm_only=True and vae_only_with_hmm=True")
+    
+    if vae_only_with_hmm and not pretrained_hmm_hf_repo:
+        raise ValueError("pretrained_hmm_hf_repo must be provided when vae_only_with_hmm=True")
+
+    # 2) Instantiate or Load HMM
     D = config.latent_dim
     K = config.skill_num  # include the remainder
-    if logger: logger.info(f"🧠 Initializing Sticky-HDP-HMM: latent_dim={D}, skills={K}")
     
-    niw = NIWPrior(
-        mu0=torch.full((D,), niw_mu0, device=device), 
-        kappa0=niw_kappa0,
-        Psi0=torch.eye(D, device=device) * niw_Psi0,
-        nu0=niw_nu0
-    )
-    hmm_params = StickyHDPHMMParams(
-        alpha=alpha, 
-        kappa=kappa, 
-        gamma=gamma,
-        K=K-1, # exclude the remainder
-        D=D,
-        device=device
-    )
-    hmm = StickyHDPHMMVI(
-        p=hmm_params,
-        niw_prior=niw,
-        rho_emission=1.0,
-        rho_transition=1.0
-    )
+    if vae_only_with_hmm:
+        # Load pre-trained HMM from HuggingFace
+        if logger: logger.info(f"� Loading pre-trained HMM from HuggingFace: {pretrained_hmm_hf_repo}")
+        from .training_utils import load_hmm_from_huggingface
+        
+        hmm, loaded_config, hmm_params, niw, metadata = load_hmm_from_huggingface(
+            repo_name=pretrained_hmm_hf_repo,
+            round_num=pretrained_hmm_round,  # None means latest
+            device=str(device)
+        )
+        
+        if logger: logger.info(f"✅ Loaded pre-trained HMM: latent_dim={hmm.p.D}, skills={hmm.p.K+1}")
+        if metadata:
+            if logger: logger.info(f"   🏷️  HMM Round: {metadata.get('round', 'unknown')}")
+            if logger: logger.info(f"   📅 Created: {metadata.get('created', 'unknown')}")
+        
+        # Verify HMM dimensions match VAE config
+        if hmm.p.D != D:
+            raise ValueError(f"HMM latent dimension ({hmm.p.D}) does not match VAE config ({D})")
+        if hmm.p.K + 1 != K:
+            if logger: logger.warning(f"⚠️  HMM skill count ({hmm.p.K + 1}) does not match VAE config ({K}). Continuing...")
+    
+    else:
+        # Initialize new HMM
+        if logger: logger.info(f"�🧠 Initializing new Sticky-HDP-HMM: latent_dim={D}, skills={K}")
+        
+        niw = NIWPrior(
+            mu0=torch.full((D,), niw_mu0, device=device), 
+            kappa0=niw_kappa0,
+            Psi0=torch.eye(D, device=device) * niw_Psi0,
+            nu0=niw_nu0
+        )
+        hmm_params = StickyHDPHMMParams(
+            alpha=alpha, 
+            kappa=kappa, 
+            gamma=gamma,
+            K=K-1, # exclude the remainder
+            D=D,
+            device=device
+        )
+        hmm = StickyHDPHMMVI(
+            p=hmm_params,
+            niw_prior=niw,
+            rho_emission=1.0,
+            rho_transition=1.0
+        )
 
     def _kmeans_init_hmm(hmm, model, dataset, device, max_frames=20000):
         model.eval()
@@ -2216,13 +2271,16 @@ def train_vae_with_sticky_hmm_em(
             hmm.niw.mu[:Kp1] = centers[:Kp1].to(hmm.niw.mu)
             hmm._cache_fresh = False
 
-    if init_niw_mu_with_kmean:
+    if init_niw_mu_with_kmean and not vae_only_with_hmm:
         if logger: logger.info("🔍 Initializing NIW mean with k-means on VAE latents...")
         _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
+    elif vae_only_with_hmm:
+        if logger: logger.info("🔒 Skipping k-means initialization (using pre-trained HMM)")
 
     # Track training info for final summary
     training_info = {
         'hmm_only': hmm_only,
+        'vae_only_with_hmm': vae_only_with_hmm,
         'em_rounds': em_rounds,
         'm_epochs_per_round': m_epochs_per_round,
         'hmm_params': {
@@ -2248,137 +2306,144 @@ def train_vae_with_sticky_hmm_em(
 
     # 3) EM Algorithm: Alternating E-steps (HMM fitting) and M-steps (VAE fine-tuning)
     for r in range(em_rounds):
-        if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: E-step ==========")
         
-        # Log EM round start to wandb
-        if use_wandb and WANDB_AVAILABLE:
-            wandb.log({
-                "em/round": r + 1,
-                "em/phase": "E-step",
-                "em/progress": (r + 1) / em_rounds
-            })
-        
-        # E-step: Fit HMM posterior using current VAE representations
-        if use_game_grouped_data:
-            # Load or create game-grouped data
-            collector = NetHackDataCollector('ttyrecs.db')
-            if game_grouped_data_path and os.path.exists(game_grouped_data_path):
-                if logger: logger.info(f"📂 Loading game-grouped data from: {game_grouped_data_path}")
-                grouped_data = collector.load_grouped_sequences(game_grouped_data_path)
-            else:
-                if logger: logger.info(f"🔄 Creating game-grouped data from train_dataset...")
-                grouped_data = collector.group_sequences_by_game(
-                    collected_batches=train_dataset,
-                    save_path=game_grouped_data_path  # Save for future use
-                )
-                if logger: logger.info(f"✅ Created game-grouped data with {len(grouped_data)} games")
-            
-            # Use game-grouped E-step
-            fit_sticky_hmm_with_game_grouped_data(
-                model, grouped_data, device, hmm, 
-                offline=offline, streaming_rho=streaming_rho, 
-                max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
-                optimize_pi_every_n_steps=optimize_pi_every_n_steps,
-                pi_iters=pi_iters, pi_lr=pi_lr, 
-                max_games=max_games_per_estep,
-                logger=logger, use_wandb=use_wandb
-            )
+        # Skip E-step if using pre-trained HMM (vae_only_with_hmm mode)
+        if vae_only_with_hmm:
+            if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: Skipping E-step (using pre-trained HMM) ==========")
         else:
-            # Use standard batched E-step
-            fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
-                                    offline=offline, streaming_rho=streaming_rho, 
-                                    max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
-                                    optimize_pi_every_n_steps=optimize_pi_every_n_steps,
-                                    pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
-                                    logger=logger, use_wandb=use_wandb)
-        
-        # Optional: Additional batch accumulation pass after initial HMM fitting
-        if use_batch_accumulation:
-            if logger: logger.info(f"🔄 Running additional batch accumulation pass...")
-            fit_sticky_hmm_with_batch_accumulation(
-                model, train_dataset, device, hmm,
-                max_batches=accumulation_max_batches,
-                pi_iters=pi_iters, pi_lr=pi_lr,
-                logger=logger, use_wandb=use_wandb
-            )
+            if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: E-step ==========")
+            
+            # Log EM round start to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    "em/round": r + 1,
+                    "em/phase": "E-step",
+                    "em/progress": (r + 1) / em_rounds
+                })
 
-        # Compute HMM diagnostics
-        if logger: logger.info(f"🔍 Computing HMM diagnostics...")
-        diagnostics = compute_hmm_diagnostics(model, train_dataset, device, hmm, 
-                                              logger=logger, max_batches=100, random_seed=50)
-        if logger: 
-            logger.info(f"📊 HMM Diagnostics for Round {r+1}:")
-            logger.info(f"  - Avg log-likelihood per step: {diagnostics['avg_loglik_per_step']:.4f}")
-            logger.info(f"  - State entropy: {diagnostics['state_entropy']:.4f}")
-            logger.info(f"  - Effective number of skills: {diagnostics['effective_K']:.2f}")
-            logger.info(f"  - Transition stickiness (diag): {diagnostics['stickiness_diag_mean']:.4f}")
-            logger.info(f"  - Top 5 skill occupancies: {diagnostics['top5_pi'].tolist()}")
-            logger.info(f"  - Top 5 skill indices: {diagnostics['top5_idx'].tolist()}")
-            for k in torch.argsort(diagnostics['p_stay'], descending=True)[:5]:
-                logger.info(f"    - Skill {k}: emp={diagnostics['empirical_dwell_length_per_state'][k]:6.2f}  E[1/(1-p)]:{float(diagnostics['expected_dwell_length_per_state'][k]):6.2f}  p_stay={float(diagnostics['p_stay'][k]):.3f}")
-
-        # Log HMM diagnostics to wandb
-        if use_wandb and WANDB_AVAILABLE:
-            wandb.log({
-                f"em_round_{r+1}/avg_loglik_per_step": diagnostics['avg_loglik_per_step'],
-                f"em_round_{r+1}/state_entropy": diagnostics['state_entropy'],
-                f"em_round_{r+1}/effective_K": diagnostics['effective_K'],
-                f"em_round_{r+1}/stickiness_diag_mean": diagnostics['stickiness_diag_mean'],
-                f"em_round_{r+1}/expected_dwell_length_per_state": diagnostics['expected_dwell_length_per_state'].cpu().numpy().tolist(),
-                f"em_round_{r+1}/empirical_dwell_length_per_state": diagnostics['empirical_dwell_length_per_state'].cpu().numpy().tolist(),
-                f"em_round_{r+1}/top5_pi": diagnostics['top5_pi'].tolist(),
-                f"em_round_{r+1}/top5_idx": diagnostics['top5_idx'].tolist(),
-            })
-
-        # Visualization artifacts
-        if logger: logger.info(f"🖼️  Rendering HMM visualizations for round {r+1}")
-        viz_paths = visualize_hmm_after_estep(
-            model=model, dataset=train_dataset, device=device, hmm=hmm,
-            save_dir="hmm_analysis", round_idx=r+1, logger=logger,
-            max_diags_batches=50, max_raster_sequences=10, random_seed=100
-        )
-        training_info.setdefault('viz_paths', []).append(viz_paths)
-
-        # Save HMM posterior locally
-        hmm_path = os.path.join(save_dir, f"hmm_round{r+1}.pt")
-        hmm_save_data = {
-            'hmm_posterior_params': hmm.get_posterior_params(),
-            'hmm_params': hmm_params,
-            'niw_prior': niw,
-            'rho_emission': hmm.get_rho_emission().cpu(),
-            'rho_transition': hmm.get_rho_transition().cpu(),
-            'round': r + 1,
-            'config': config,
-            'training_timestamp': datetime.now().isoformat(),
-            'diagnostics': diagnostics,  # Include diagnostics in save
-        }
-        torch.save(hmm_save_data, hmm_path)
-        training_info['hmm_paths'].append(hmm_path)
-        if logger: logger.info(f"💾 Saved HMM posterior → {hmm_path}")
-        
-        # Push HMM to HuggingFace if requested
-        if push_to_hub and hub_repo_id_hmm:
-            try:
-                if logger: logger.info(f"🤗 Uploading HMM round {r+1} to HuggingFace: {hub_repo_id_hmm}")
+            hmm.streaming_reset()
+            
+            # E-step: Fit HMM posterior using current VAE representations
+            if use_game_grouped_data:
+                # Load or create game-grouped data
+                collector = NetHackDataCollector('ttyrecs.db')
+                if game_grouped_data_path and os.path.exists(game_grouped_data_path):
+                    if logger: logger.info(f"📂 Loading game-grouped data from: {game_grouped_data_path}")
+                    grouped_data = collector.load_grouped_sequences(game_grouped_data_path)
+                else:
+                    if logger: logger.info(f"🔄 Creating game-grouped data from train_dataset...")
+                    grouped_data = collector.group_sequences_by_game(
+                        collected_batches=train_dataset,
+                        save_path=game_grouped_data_path  # Save for future use
+                    )
+                    if logger: logger.info(f"✅ Created game-grouped data with {len(grouped_data)} games")
                 
-                from .training_utils import save_hmm_to_huggingface
-                repo_url = save_hmm_to_huggingface(
-                    hmm=hmm,
-                    hmm_params=hmm_params,
-                    niw_prior=niw,
-                    config=config,
-                    repo_name=hub_repo_id_hmm,
-                    round_num=r + 1,
-                    total_rounds=em_rounds,
-                    token=hf_token,
-                    private=hf_private,
-                    commit_message=f"Upload Sticky-HDP-HMM round {r+1}/{em_rounds}",
-                    base_vae_repo=pretrained_hf_repo if pretrained_hf_repo else "local_checkpoint"
+                # Use game-grouped E-step
+                fit_sticky_hmm_with_game_grouped_data(
+                    model, grouped_data, device, hmm, 
+                    offline=offline, streaming_rho=streaming_rho, 
+                    max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
+                    optimize_pi_every_n_steps=optimize_pi_every_n_steps,
+                    pi_iters=pi_iters, pi_lr=pi_lr, 
+                    max_games=max_games_per_estep,
+                    logger=logger, use_wandb=use_wandb
                 )
-                if logger: logger.info(f"✅ HMM uploaded to: {repo_url}")
-                
-            except Exception as e:
-                if logger: logger.error(f"❌ Failed to upload HMM to HuggingFace: {e}")
+            else:
+                # Use standard batched E-step
+                fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
+                                        offline=offline, streaming_rho=streaming_rho, 
+                                        max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
+                                        optimize_pi_every_n_steps=optimize_pi_every_n_steps,
+                                        pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
+                                        logger=logger, use_wandb=use_wandb)
+            
+            # Optional: Additional batch accumulation pass after initial HMM fitting
+            if use_batch_accumulation:
+                if logger: logger.info(f"🔄 Running additional batch accumulation pass...")
+                fit_sticky_hmm_with_batch_accumulation(
+                    model, train_dataset, device, hmm,
+                    max_batches=accumulation_max_batches,
+                    pi_iters=pi_iters, pi_lr=pi_lr,
+                    logger=logger, use_wandb=use_wandb
+                )
+
+            # Compute HMM diagnostics
+            if logger: logger.info(f"🔍 Computing HMM diagnostics...")
+            diagnostics = compute_hmm_diagnostics(model, train_dataset, device, hmm, 
+                                                  logger=logger, max_batches=100, random_seed=50)
+            if logger: 
+                logger.info(f"📊 HMM Diagnostics for Round {r+1}:")
+                logger.info(f"  - Avg log-likelihood per step: {diagnostics['avg_loglik_per_step']:.4f}")
+                logger.info(f"  - State entropy: {diagnostics['state_entropy']:.4f}")
+                logger.info(f"  - Effective number of skills: {diagnostics['effective_K']:.2f}")
+                logger.info(f"  - Transition stickiness (diag): {diagnostics['stickiness_diag_mean']:.4f}")
+                logger.info(f"  - Top 5 skill occupancies: {diagnostics['top5_pi'].tolist()}")
+                logger.info(f"  - Top 5 skill indices: {diagnostics['top5_idx'].tolist()}")
+                for k in torch.argsort(diagnostics['p_stay'], descending=True)[:5]:
+                    logger.info(f"    - Skill {k}: emp={diagnostics['empirical_dwell_length_per_state'][k]:6.2f}  E[1/(1-p)]:{float(diagnostics['expected_dwell_length_per_state'][k]):6.2f}  p_stay={float(diagnostics['p_stay'][k]):.3f}")
+
+            # Log HMM diagnostics to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    f"em_round_{r+1}/avg_loglik_per_step": diagnostics['avg_loglik_per_step'],
+                    f"em_round_{r+1}/state_entropy": diagnostics['state_entropy'],
+                    f"em_round_{r+1}/effective_K": diagnostics['effective_K'],
+                    f"em_round_{r+1}/stickiness_diag_mean": diagnostics['stickiness_diag_mean'],
+                    f"em_round_{r+1}/expected_dwell_length_per_state": diagnostics['expected_dwell_length_per_state'].cpu().numpy().tolist(),
+                    f"em_round_{r+1}/empirical_dwell_length_per_state": diagnostics['empirical_dwell_length_per_state'].cpu().numpy().tolist(),
+                    f"em_round_{r+1}/top5_pi": diagnostics['top5_pi'].tolist(),
+                    f"em_round_{r+1}/top5_idx": diagnostics['top5_idx'].tolist(),
+                })
+
+            # Visualization artifacts
+            if logger: logger.info(f"🖼️  Rendering HMM visualizations for round {r+1}")
+            viz_paths = visualize_hmm_after_estep(
+                model=model, dataset=train_dataset, device=device, hmm=hmm,
+                save_dir="hmm_analysis", round_idx=r+1, logger=logger,
+                max_diags_batches=50, max_raster_sequences=10, random_seed=100, batch_multiples=batch_multiples
+            )
+            training_info.setdefault('viz_paths', []).append(viz_paths)
+
+            # Save HMM posterior locally
+            hmm_path = os.path.join(save_dir, f"hmm_round{r+1}.pt")
+            hmm_save_data = {
+                'hmm_posterior_params': hmm.get_posterior_params(),
+                'hmm_params': hmm_params,
+                'niw_prior': niw,
+                'rho_emission': hmm.get_rho_emission().cpu(),
+                'rho_transition': hmm.get_rho_transition().cpu(),
+                'round': r + 1,
+                'config': config,
+                'training_timestamp': datetime.now().isoformat(),
+                'diagnostics': diagnostics,  # Include diagnostics in save
+            }
+            torch.save(hmm_save_data, hmm_path)
+            training_info['hmm_paths'].append(hmm_path)
+            if logger: logger.info(f"💾 Saved HMM posterior → {hmm_path}")
+            
+            # Push HMM to HuggingFace if requested
+            if push_to_hub and hub_repo_id_hmm:
+                try:
+                    if logger: logger.info(f"🤗 Uploading HMM round {r+1} to HuggingFace: {hub_repo_id_hmm}")
+                    
+                    from .training_utils import save_hmm_to_huggingface
+                    repo_url = save_hmm_to_huggingface(
+                        hmm=hmm,
+                        hmm_params=hmm_params,
+                        niw_prior=niw,
+                        config=config,
+                        repo_name=hub_repo_id_hmm,
+                        round_num=r + 1,
+                        total_rounds=em_rounds,
+                        token=hf_token,
+                        private=hf_private,
+                        commit_message=f"Upload Sticky-HDP-HMM round {r+1}/{em_rounds}",
+                        base_vae_repo=pretrained_hf_repo if pretrained_hf_repo else "local_checkpoint"
+                    )
+                    if logger: logger.info(f"✅ HMM uploaded to: {repo_url}")
+                    
+                except Exception as e:
+                    if logger: logger.error(f"❌ Failed to upload HMM to HuggingFace: {e}")
 
         # Skip M-step if hmm_only is True
         if hmm_only:
@@ -2387,21 +2452,86 @@ def train_vae_with_sticky_hmm_em(
 
         if logger: logger.info(f"========== EM Round {r+1}/{em_rounds}: M-step ==========")
         
+        # M-step: Fine-tune VAE with current HMM prior using train_multimodalhack_vae
+        if logger: logger.info(f"🔧 Fine-tuning VAE with HMM prior for {m_epochs_per_round} epochs...")
+        
+        # Adjust VAE training parameters for this M-step round
+        m_step_config = copy.deepcopy(config)
+        
+        # Define per-round parameter schedules
+        if r == 0:  # First M-step (round 1)
+            m_step_config.initial_prior_blend_alpha = 0.3
+            m_step_config.final_prior_blend_alpha = 0.4
+            m_step_config.prior_blend_shape = "cosine"
+            m_step_config.initial_mi_beta = 0.2
+            m_step_config.final_mi_beta = 0.2 + (0.6 - 0.2) * (1/3)  # 0.333
+            m_step_config.initial_tc_beta = 0.0
+            m_step_config.final_tc_beta = 0.0 + (0.2 - 0.0) * (1/3)  # 0.067
+            m_step_config.initial_dw_beta = 0.5
+            m_step_config.final_dw_beta = 0.5 + (1.0 - 0.5) * (1/3)  # 0.667
+        elif r == 1:  # Second M-step (round 2)
+            m_step_config.initial_prior_blend_alpha = 0.4
+            m_step_config.final_prior_blend_alpha = 0.6
+            m_step_config.prior_blend_shape = "cosine"
+            m_step_config.initial_mi_beta = 0.2 + (0.6 - 0.2) * (1/3)  # 0.333
+            m_step_config.final_mi_beta = 0.2 + (0.6 - 0.2) * (2/3)  # 0.467
+            m_step_config.initial_tc_beta = 0.0 + (0.2 - 0.0) * (1/3)  # 0.067
+            m_step_config.final_tc_beta = 0.0 + (0.2 - 0.0) * (2/3)  # 0.133
+            m_step_config.initial_dw_beta = 0.5 + (1.0 - 0.5) * (1/3)  # 0.667
+            m_step_config.final_dw_beta = 0.5 + (1.0 - 0.5) * (2/3)  # 0.833
+        elif r == 2:  # Third M-step (round 3)
+            m_step_config.initial_prior_blend_alpha = 0.6
+            m_step_config.final_prior_blend_alpha = 0.8
+            m_step_config.prior_blend_shape = "cosine"
+            m_step_config.initial_mi_beta = 0.2 + (0.6 - 0.2) * (2/3)  # 0.467
+            m_step_config.final_mi_beta = 0.6
+            m_step_config.initial_tc_beta = 0.0 + (0.2 - 0.0) * (2/3)  # 0.133
+            m_step_config.final_tc_beta = 0.2
+            m_step_config.initial_dw_beta = 0.5 + (1.0 - 0.5) * (2/3)  # 0.833
+            m_step_config.final_dw_beta = 1.0
+        else:  # Additional rounds beyond 3
+            m_step_config.initial_prior_blend_alpha = 0.8
+            m_step_config.final_prior_blend_alpha = 0.8
+            m_step_config.prior_blend_shape = "constant"
+            m_step_config.initial_mi_beta = 0.6
+            m_step_config.final_mi_beta = 0.6
+            m_step_config.initial_tc_beta = 0.2
+            m_step_config.final_tc_beta = 0.2
+            m_step_config.initial_dw_beta = 1.0
+            m_step_config.final_dw_beta = 1.0
+        
+        # Set the beta curve shapes (you can customize these)
+        m_step_config.mi_beta_shape = "linear" 
+        m_step_config.tc_beta_shape = "linear"
+        m_step_config.dw_beta_shape = "linear"
+        
+        if logger: 
+            logger.info(f"📊 M-step {r+1} parameter schedule:")
+            logger.info(f"  - prior_blend_alpha: {m_step_config.initial_prior_blend_alpha:.3f} → {m_step_config.final_prior_blend_alpha:.3f} ({m_step_config.prior_blend_shape})")
+            logger.info(f"  - mi_beta: {m_step_config.initial_mi_beta:.3f} → {m_step_config.final_mi_beta:.3f} ({m_step_config.mi_beta_shape})")
+            logger.info(f"  - tc_beta: {m_step_config.initial_tc_beta:.3f} → {m_step_config.final_tc_beta:.3f} ({m_step_config.tc_beta_shape})")
+            logger.info(f"  - dw_beta: {m_step_config.initial_dw_beta:.3f} → {m_step_config.final_dw_beta:.3f} ({m_step_config.dw_beta_shape})")
+        
         # Log M-step start to wandb
         if use_wandb and WANDB_AVAILABLE:
             wandb.log({
                 "em/round": r + 1,
-                "em/phase": "M-step"
+                "em/phase": "M-step",
+                f"em_round_{r+1}/m_step_config/initial_prior_blend_alpha": m_step_config.initial_prior_blend_alpha,
+                f"em_round_{r+1}/m_step_config/final_prior_blend_alpha": m_step_config.final_prior_blend_alpha,
+                f"em_round_{r+1}/m_step_config/initial_mi_beta": m_step_config.initial_mi_beta,
+                f"em_round_{r+1}/m_step_config/final_mi_beta": m_step_config.final_mi_beta,
+                f"em_round_{r+1}/m_step_config/initial_tc_beta": m_step_config.initial_tc_beta,
+                f"em_round_{r+1}/m_step_config/final_tc_beta": m_step_config.final_tc_beta,
+                f"em_round_{r+1}/m_step_config/initial_dw_beta": m_step_config.initial_dw_beta,
+                f"em_round_{r+1}/m_step_config/final_dw_beta": m_step_config.final_dw_beta,
             })
-        
-        # M-step: Fine-tune VAE with current HMM prior using train_multimodalhack_vae
-        if logger: logger.info(f"🔧 Fine-tuning VAE with HMM prior for {m_epochs_per_round} epochs...")
         
         # Prepare training arguments for M-step
         m_step_kwargs = {
             'train_dataset': train_dataset,
             'test_dataset': test_dataset,
-            'config': config,
+            'config': m_step_config,  # Use the adjusted config for this M-step
             'epochs': m_epochs_per_round,
             'device': device,
             'logger': logger,
@@ -2409,8 +2539,9 @@ def train_vae_with_sticky_hmm_em(
             'hmm': hmm,
             'use_hmm_prior': True,  # Always use HMM prior in M-step
             'save_path': os.path.join(save_dir, f"vae_hmm_round{r+1}_temp.pth"),
-            'use_wandb': False,  # Disable wandb for M-step to avoid conflicts
+            'use_wandb': True,  # Disable wandb for M-step to avoid conflicts
             'wandb_project': f"nethack-vae-hmm-round{r+1}",
+            'wandb_run_name': f"vae_hmm_em_round{r+1}_{datetime.now().strftime('%Y%m%d-%H%M%S')}",
             'log_every_n_steps': 2,
             'upload_to_hf': False,  # Don't upload intermediate M-step results
             'early_stopping': False,  # Disable early stopping for short M-step training
@@ -2452,7 +2583,7 @@ def train_vae_with_sticky_hmm_em(
             'final_train_loss': train_losses[-1] if train_losses else None,
             'final_test_loss': test_losses[-1] if test_losses else None,
             'training_timestamp': datetime.now().isoformat(),
-            'diagnostics': diagnostics,  # Include diagnostics in VAE+HMM save
+            'diagnostics': None if vae_only_with_hmm else diagnostics,  # Include diagnostics in VAE+HMM save
         }
         torch.save(vae_hmm_save_data, vae_hmm_path)
         training_info['vae_hmm_paths'].append(vae_hmm_path)

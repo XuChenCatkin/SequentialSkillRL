@@ -12,14 +12,16 @@ Commands:
             vae_only               - Train only VAE
             hmm_only [options...]  - Train only HMM with optional E-step modes
             vae_hmm [options...]   - Train VAE+HMM with optional E-step modes
+            vae_only_with_hmm <hmm_repo> [round] - Train only VAE with pre-trained HMM from HuggingFace
         
-        E-step Options (can be combined):
+        E-step Options (can be combined with hmm_only and vae_hmm):
             game_grouped           - Use game-grouped data for E-step (one game at a time)
             batch_accumulation     - Add batch accumulation pass after regular E-step
         
         Standard mode: HMM E-step uses batched data [B, T, D] from multiple games
         Game-grouped mode: HMM E-step processes one complete game at a time [1, game_length, D]
         Batch accumulation: Additional pass that freezes HMM, accumulates statistics, then batch updates
+        VAE-only with HMM: Skip E-step HMM training, load pre-trained HMM, only train VAE with HMM prior
     
     vae_analysis <repo_name>       - Run VAE analysis and visualization
     bin_count_analysis [top_k]     - Analyze glyph character/color distributions  
@@ -33,6 +35,8 @@ Examples:
     python main.py train hmm_only batch_accumulation
     python main.py train hmm_only game_grouped batch_accumulation
     python main.py train vae_hmm game_grouped
+    python main.py train vae_only_with_hmm CatkinChen/nethack-hmm
+    python main.py train vae_only_with_hmm CatkinChen/nethack-hmm 2
 """
 import logging
 import os
@@ -379,7 +383,8 @@ if __name__ == "__main__":
                 logger=logger,
                 max_diags_batches=50,
                 max_raster_sequences=10,
-                random_seed=100
+                random_seed=100,
+                batch_multiples=100
             )
             
             print(f"✅ HMM analysis completed!")
@@ -539,10 +544,24 @@ if __name__ == "__main__":
         else:
             if sys.argv[2] == "hmm_only":
                 hmm_only = True
+                vae_only_with_hmm = False
             elif sys.argv[2] == "vae_hmm":
                 hmm_only = False
+                vae_only_with_hmm = False
+            elif sys.argv[2] == "vae_only_with_hmm":
+                # Parse HMM repo and optional round number
+                if len(sys.argv) < 4:
+                    print("❌ vae_only_with_hmm requires HMM repository argument.")
+                    print("   Usage: python main.py train vae_only_with_hmm <hmm_repo> [round_number]")
+                    print("   Example: python main.py train vae_only_with_hmm CatkinChen/nethack-hmm")
+                    print("   Example: python main.py train vae_only_with_hmm CatkinChen/nethack-hmm 2")
+                    sys.exit(1)
+                hmm_only = False
+                vae_only_with_hmm = True
+                pretrained_hmm_repo = sys.argv[3]
+                pretrained_hmm_round = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else None
             else:
-                print("❌ Invalid argument. Use 'vae_only', 'hmm_only', or 'vae_hmm'.")
+                print("❌ Invalid argument. Use 'vae_only', 'hmm_only', 'vae_hmm', or 'vae_only_with_hmm'.")
                 print("   💡 To use game-grouped data for E-step, add 'game_grouped' as an argument:")
                 print("      python main.py train hmm_only game_grouped")
                 print("      python main.py train vae_hmm game_grouped")
@@ -550,6 +569,9 @@ if __name__ == "__main__":
                 print("      python main.py train hmm_only batch_accumulation")
                 print("   💡 Options can be combined:")
                 print("      python main.py train hmm_only game_grouped batch_accumulation")
+                print("   💡 To train VAE with pre-trained HMM:")
+                print("      python main.py train vae_only_with_hmm CatkinChen/nethack-hmm")
+                print("      python main.py train vae_only_with_hmm CatkinChen/nethack-hmm 2")
                 sys.exit(1)
             vae_config = VAEConfig(
                 initial_mi_beta=1.0,
@@ -566,9 +588,9 @@ if __name__ == "__main__":
                 encoder_dropout=0.1,
                 decoder_dropout=0.1,
                 prior_mode="blend",
-                initial_prior_blend_alpha=0.3,
-                final_prior_blend_alpha=1.0,
-                prior_blend_shape='custom'
+                initial_prior_blend_alpha=0.1,
+                final_prior_blend_alpha=0.6,
+                prior_blend_shape='cosine'
             )
             model, hmm, training_info = train_vae_with_sticky_hmm_em(
                 # Load from HuggingFace
@@ -578,14 +600,17 @@ if __name__ == "__main__":
                 test_dataset=test_dataset,
                 
                 config=vae_config,  
-                batch_multiples=10,
+                batch_multiples=100,
                 # HMM parameters
-                alpha=150.0,
+                alpha=50.0,
                 kappa=2.0,
                 gamma=10.0,
                 hmm_only=hmm_only,
+                vae_only_with_hmm=vae_only_with_hmm if 'vae_only_with_hmm' in locals() else False,
+                pretrained_hmm_hf_repo=pretrained_hmm_repo if 'pretrained_hmm_repo' in locals() else None,
+                pretrained_hmm_round=pretrained_hmm_round if 'pretrained_hmm_round' in locals() else None,
                 em_rounds=1 if hmm_only else 3,
-                m_epochs_per_round=3,
+                m_epochs_per_round=1,
                 niw_mu0 = 0.0, 
                 niw_kappa0 = vae_config.latent_dim + 50, 
                 niw_Psi0 = 30.0,
@@ -593,9 +618,9 @@ if __name__ == "__main__":
                 offline = True,
                 streaming_rho = 0.7,
                 max_iters = 10,
-                elbo_drop_tol = 1000.0,
+                elbo_drop_tol = float("inf"),
                 optimize_pi_every_n_steps = 1,
-                pi_iters = 10,
+                pi_iters = 200,
                 pi_lr = 5.0e-4,
 
                 # Game-grouped data options

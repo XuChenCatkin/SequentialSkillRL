@@ -1960,41 +1960,70 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
         seq_indices = list(range(B))
         
         with torch.no_grad():
-            # Flatten to [B*extended_T,...] for model forward, then reshape back
-            flat = {}
-            for k,v in batch_dev.items():
-                if isinstance(v, torch.Tensor) and v.dim() >= 3 and k not in ('original_batch_shape',):
-                    flat[k] = v.view(B*extended_T, *v.shape[2:])
-                else:
-                    flat[k] = v
-            out = model(flat)
-            mu_bt  = out['mu'].view(B, extended_T, -1)
-            var_bt = out['logvar'].exp().clamp_min(1e-6).view(B, extended_T, -1)
-            F_btr  = out.get('lowrank_factors', None)
-            F_bt   = None if F_btr is None else F_btr.view(B, extended_T, F_btr.size(-2), F_btr.size(-1))
-            valid  = flat['valid_screen'].view(B, extended_T).bool()
-
-            logB  = hmm.expected_emission_loglik(
-                hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu,
-                mu_bt, var_bt, F_bt, mask=valid)  # [B,extended_T,K]
-            log_pi = torch.log(torch.clamp(hmm._Epi(), min=1e-30))
-            ElogA = hmm._ElogA()
-            
-            # Process each sequence in the batch separately since forward_backward expects [T,K]
+            # Process each sequence separately to avoid memory issues
             for b in seq_indices:
                 if grabbed >= max_sequences: break
-                m = valid[b].cpu().numpy().astype(bool)
-                if m.sum() == 0: 
-                    continue
                 
-                # Extract single sequence and run Viterbi algorithm
-                logB_single = logB[b]  # [extended_T,K]
-                labels, _ = StickyHDPHMMVI.viterbi(log_pi, ElogA, logB_single)  # [extended_T]
-                labels = labels.cpu().numpy().astype(int)
-                labels = labels[m]
-                rasters.append(labels)
-                lengths.append(len(labels))
-                grabbed += 1
+                # Extract single sequence data
+                seq_data = {}
+                for k, v in batch_dev.items():
+                    if isinstance(v, torch.Tensor) and v.dim() >= 2 and k not in ('original_batch_shape',):
+                        seq_data[k] = v[b:b+1]  # Keep batch dimension [1, T, ...]
+                    else:
+                        seq_data[k] = v
+                
+                # Flatten sequence for model forward: [1, T, ...] -> [T, ...]
+                flat = {}
+                for k, v in seq_data.items():
+                    if isinstance(v, torch.Tensor) and v.dim() >= 3 and k not in ('original_batch_shape',):
+                        flat[k] = v.view(extended_T, *v.shape[2:])  # [T, ...]
+                    else:
+                        flat[k] = v
+                
+                # Forward pass for single sequence
+                try:
+                    out = model(flat)
+                    mu_t = out['mu'].view(extended_T, -1)  # [T, latent_dim]
+                    var_t = out['logvar'].exp().clamp_min(1e-6).view(extended_T, -1)  # [T, latent_dim]
+                    F_tr = out.get('lowrank_factors', None)
+                    F_t = None if F_tr is None else F_tr.view(extended_T, F_tr.size(-2), F_tr.size(-1))
+                    valid = flat['valid_screen'].view(extended_T).bool()
+                    
+                    # Check if sequence has any valid frames
+                    m = valid.cpu().numpy().astype(bool)
+                    if m.sum() == 0: 
+                        continue
+                    
+                    # Compute emission log-likelihoods for this sequence
+                    mu_t_unsqueezed = mu_t.unsqueeze(0)  # [1, T, latent_dim]
+                    var_t_unsqueezed = var_t.unsqueeze(0)  # [1, T, latent_dim]
+                    F_t_unsqueezed = None if F_t is None else F_t.unsqueeze(0)  # [1, T, ...]
+                    valid_unsqueezed = valid.unsqueeze(0)  # [1, T]
+                    
+                    logB_t = hmm.expected_emission_loglik(
+                        hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu,
+                        mu_t_unsqueezed, var_t_unsqueezed, F_t_unsqueezed, mask=valid_unsqueezed)  # [1, T, K]
+                    logB_single = logB_t.squeeze(0)  # [T, K]
+                    
+                    # Get HMM parameters
+                    log_pi = torch.log(torch.clamp(hmm._Epi(), min=1e-30))
+                    ElogA = hmm._ElogA()
+                    
+                    # Extract single sequence and run Viterbi algorithm
+                    labels, _ = StickyHDPHMMVI.viterbi(log_pi, ElogA, logB_single)  # [T]
+                    labels = labels.cpu().numpy().astype(int)
+                    labels = labels[m]
+                    rasters.append(labels)
+                    lengths.append(len(labels))
+                    grabbed += 1
+                    
+                except torch.cuda.OutOfMemoryError:
+                    # If we still run out of memory on a single sequence, skip it
+                    print(f"Warning: Skipping sequence {b} due to memory constraints")
+                    continue
+                except Exception as e:
+                    print(f"Warning: Error processing sequence {b}: {e}")
+                    continue
         if grabbed >= max_sequences:
             break
     return rasters, lengths
