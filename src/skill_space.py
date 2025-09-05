@@ -739,6 +739,24 @@ class StickyHDPHMMVI(nn.Module):
         self.S_steps.fill_(0.0)
 
     # ---- ELBO component calculations ----------------------------------------
+    @staticmethod
+    def _hmm_local_free_energy_fixed_qh(r, xi, log_pi, ElogA, logB, eps=1e-12):
+        # r: [T,K], xi: [T-1,K,K], logB: [T,K], ElogA: [K,K]
+        init   = (r[0] * log_pi).sum()
+        trans  = (xi * ElogA).sum()
+        emit   = (r * logB).sum()
+        # Bethe entropy for a chain (exact)
+        H_pairs = -(xi.clamp_min(eps) * (xi.clamp_min(eps).log())).sum()
+        # sum over internal nodes only (2..T-1)
+        H_nodes = -(r[1:-1].clamp_min(eps) * r[1:-1].clamp_min(eps).log()).sum()
+        H_q = H_pairs - H_nodes
+        return {
+            'init': init.item(),
+            'trans': trans.item(),
+            'emit': emit.item(),
+            'entropy': H_q.item()
+        }
+    
     @torch.no_grad()
     def _calculate_dirichlet_term(
         self,
@@ -768,7 +786,7 @@ class StickyHDPHMMVI(nn.Module):
         
         # KL(q||p) = logC(φ) - logC(a) + (φ-a)ᵀ E[logΦ]
         # ELBO term is -KL, so we have logC(a) - logC(φ) + (a-φ)ᵀ E[logΦ]
-        dir_term = (self._dirichlet_logC(a) - self._dirichlet_logC(phi) + 
+        dir_term = (StickyHDPHMMVI._dirichlet_logC(a) - StickyHDPHMMVI._dirichlet_logC(phi) + 
                    ((a - phi) * ElogA).sum()).item()
         
         return dir_term
@@ -801,7 +819,9 @@ class StickyHDPHMMVI(nn.Module):
         Psi_hat: Optional[torch.Tensor] = None,        # [Kp1,D,D] - if None, uses self.niw.Psi
         nu_hat: Optional[torch.Tensor] = None,         # [Kp1] - if None, uses self.niw.nu
         phi: Optional[torch.Tensor] = None,            # [Kp1,Kp1] - if None, uses self.dir.phi
-        u_beta: Optional[torch.Tensor] = None          # [K] - if None, uses self.u_beta
+        u_beta: Optional[torch.Tensor] = None,         # [K] - if None, uses self.u_beta
+        rhat: Optional[torch.Tensor] = None,           # [B,T,Kp1] - if provided, skips FB
+        xihat: Optional[torch.Tensor] = None           # [B,T-1,Kp1,Kp1] - if provided, skips FB
     ) -> Dict[str, float]:
         """
         Calculate ELBO given statistics and parameters.
@@ -814,6 +834,7 @@ class StickyHDPHMMVI(nn.Module):
             mu_hat, k_hat, Psi_hat, nu_hat: NIW posterior parameters (optional, uses current if None)
             phi: Dirichlet posterior parameters (optional, uses current if None) 
             u_beta: Beta logits (optional, uses current if None)
+            rhat, xihat: Precomputed posteriors (optional, if provided skips FB)
             
         Returns:
             Dict containing ELBO and its components
@@ -847,10 +868,26 @@ class StickyHDPHMMVI(nn.Module):
         log_pi = torch.log(torch.clamp(pi_full, min=1e-30))
         
         # 1. Expected complete data log-likelihood (LL term)
-        ll = 0.0
+        init = 0.0
+        trans = 0.0
+        emit = 0.0
+        entropy = 0.0
         for b in range(B):
-            _, _, ll_b = StickyHDPHMMVI.forward_backward(log_pi, ElogA, logB[b])
-            ll += ll_b
+            if rhat is not None and xihat is not None:
+                r_b = rhat[b]
+                xi_b = xihat[b]
+            else:
+                r_b, xi_b, _ = StickyHDPHMMVI.forward_backward(log_pi, ElogA, logB[b])
+            if mask is not None:
+                m = mask[b]
+                pair_m = (m[:-1] * m[1:]).view(-1, 1, 1)  # [T-1,1,1]
+                r_b = r_b * m.view(-1, 1)  # [T,Kp1]
+                xi_b = xi_b * pair_m
+            stats = StickyHDPHMMVI._hmm_local_free_energy_fixed_qh(r_b, xi_b, log_pi, ElogA, logB[b])
+            init += stats['init']
+            trans += stats['trans']
+            emit += stats['emit']
+            entropy += stats['entropy']
         
         # 2. Dirichlet term: E_q[log p(Φ)] - E_q[log q(Φ)] = -KL(q(Φ)||p(Φ))
         dir_term = self._calculate_dirichlet_term(phi, pi_full, ElogA)
@@ -862,11 +899,14 @@ class StickyHDPHMMVI(nn.Module):
         niw_term = float(self._niw_elbo_term(mu_hat, k_hat, Psi_hat, nu_hat).item())
         
         # Complete ELBO
-        elbo = ll + dir_term + niw_term + logp_beta
+        elbo = init + trans + emit + entropy + dir_term + niw_term + logp_beta
         
         return {
             "elbo": elbo,
-            "ll": ll,
+            "init": init,
+            "trans": trans,
+            "emit": emit,
+            "entropy": entropy,
             "dir_term": dir_term,
             "niw_term": niw_term,
             "logp_beta": logp_beta
@@ -963,12 +1003,23 @@ class StickyHDPHMMVI(nn.Module):
             this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
             this_phi, this_u_beta
         )
-        ll_before_val = elbo_before_loop["ll"]
+        init_before_val = elbo_before_loop["init"]
+        trans_before_val = elbo_before_loop["trans"]
+        emit_before_val = elbo_before_loop["emit"]
+        entropy_before_val = elbo_before_loop["entropy"]
+        ll_before_val = init_before_val + trans_before_val + emit_before_val + entropy_before_val
         dir_before_val = elbo_before_loop["dir_term"]
         niw_before_val = elbo_before_loop["niw_term"]
         logp_beta_before_val = elbo_before_loop["logp_beta"]
         if logger is not None:
-            logger.debug(f"Initial ELBO: {elbo_before_loop['elbo']:.4f} (LL {ll_before_val:.4f}, Dir {dir_before_val:.4f}, NIW {niw_before_val:.4f}, Beta prior {logp_beta_before_val:.4f})")
+            logger.debug(f"Initial ELBO: {elbo_before_loop['elbo']:.4f}")
+            logger.debug(f"- Init {init_before_val:.4f}")
+            logger.debug(f"- Trans {trans_before_val:.4f}")
+            logger.debug(f"- Emit {emit_before_val:.4f}")
+            logger.debug(f"- Entropy {entropy_before_val:.4f}")
+            logger.debug(f"- Dir {dir_before_val:.4f}")
+            logger.debug(f"- NIW {niw_before_val:.4f}")
+            logger.debug(f"- Beta prior {logp_beta_before_val:.4f}")
 
         # ---- inner full loop ----------------------------------------------------
         for it in range(max(1, int(max_iters))):
@@ -986,8 +1037,8 @@ class StickyHDPHMMVI(nn.Module):
             this_acc_M1     = torch.zeros(Kp1, D, device=self.mu0.device, dtype=self.mu0.dtype)
             this_acc_M2     = torch.zeros(Kp1, D, D, device=self.mu0.device, dtype=self.mu0.dtype)
             this_r1_sum = torch.zeros(Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
-            this_r_sum = torch.zeros(T, Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
-            this_ll = 0.0
+            rhat_list = []
+            xihat_list = []
 
             for b in range(B):
                 rhat, xihat, ll = StickyHDPHMMVI.forward_backward(this_log_pi, this_ElogA, this_logB[b])
@@ -1008,10 +1059,21 @@ class StickyHDPHMMVI(nn.Module):
                     t0 = 0
                 this_acc_counts += xihat.sum(dim=0)
                 this_r1_sum += rhat[t0]
-                this_r_sum += rhat
                 last_out = {"rhat": rhat.detach(), "xihat": xihat.detach(), "loglik": torch.tensor(ll)}
-                this_ll += ll
-                
+                rhat_list.append(rhat)
+                xihat_list.append(xihat)
+            rhat_all = torch.stack(rhat_list, dim=0)       # [B,T,Kp1]
+            xihat_all = torch.stack(xihat_list, dim=0)     # [B,T-1,Kp1,Kp1]
+            elbo_after_fb_all = self.calculate_elbo(
+                mu_t, diag_var_t, F_t, mask,
+                this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
+                this_phi, this_u_beta, rhat_all, xihat_all
+            )
+            init_before_val = elbo_after_fb_all["init"]
+            trans_before_val = elbo_after_fb_all["trans"]
+            emit_before_val = elbo_after_fb_all["emit"]
+            entropy_before_val = elbo_after_fb_all["entropy"]
+            this_ll = init_before_val + trans_before_val + emit_before_val + entropy_before_val
             elbo_after_fb = this_ll + dir_before_val + niw_before_val + logp_beta_before_val
             if logger is not None:
                 logger.debug(f"Iter {it}: ELBO after FB: {elbo_after_fb:.4f} (LL {this_ll:.4f}, Δ={(this_ll - ll_before_val):.4f})")
@@ -1025,21 +1087,47 @@ class StickyHDPHMMVI(nn.Module):
             this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat = \
                 self._calc_NIW_posterior(this_S_Nk, this_S_M1, this_S_M2)
                 
-            niw_after = self._niw_elbo_term(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat).item()
+            elbo_after_niw_all = self.calculate_elbo(
+                mu_t, diag_var_t, F_t, mask,
+                this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
+                this_phi, this_u_beta, rhat_all, xihat_all
+            )
+            niw_after = elbo_after_niw_all["niw_term"]
+            emit_after = elbo_after_niw_all["emit"]
+            assert abs(init_before_val - elbo_after_niw_all["init"]) < 1e-4, "Initial term changed after NIW update!"
+            assert abs(trans_before_val - elbo_after_niw_all["trans"]) < 1e-4, "Transition term changed after NIW update!"
+            assert abs(entropy_before_val - elbo_after_niw_all["entropy"]) < 1e-4, "Entropy term changed after NIW update!"
+            assert abs(dir_before_val - elbo_after_niw_all["dir_term"]) < 1e-4, "Dirichlet term changed after NIW update!"
+            assert abs(logp_beta_before_val - elbo_after_niw_all["logp_beta"]) < 1e-4, "Beta prior term changed after NIW update!"
+            this_ll = this_ll - emit_before_val + emit_after
             elbo_after_niw = this_ll + dir_before_val + niw_after + logp_beta_before_val
             if logger is not None:
-                logger.debug(f"Iter {it}: ELBO after NIW update: {elbo_after_niw:.4f} (NIW term {niw_after:.4f}, Δ={(niw_after - niw_before_val):.4f})")
-
+                logger.debug(f"Iter {it}: ELBO after NIW update: {elbo_after_niw:.4f} (Emit LL {emit_after:.4f}, NIW term {niw_after:.4f}, Δ={(niw_after + emit_after - niw_before_val - emit_before_val):.4f})")
+            emit_before_val = emit_after
+            
             # (4) Update transitions from *blended* counts using helper
             #     Make a single "time-slice" that sums to S_counts so the helper
             #     sees exactly those counts.
             this_phi = self._calc_dir_posterior(this_S_counts, this_pi_full)
             this_ElogA = StickyHDPHMMVI._calc_ElogA(this_phi)  # [Kp1,Kp1]
             
-            dir_after = self._calculate_dirichlet_term(this_phi, this_pi_full, this_ElogA)
+            elbo_after_dir_all = self.calculate_elbo(
+                mu_t, diag_var_t, F_t, mask,
+                this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
+                this_phi, this_u_beta, rhat_all, xihat_all
+            )
+            dir_after = elbo_after_dir_all["dir_term"]
+            trans_after = elbo_after_dir_all["trans"]
+            assert abs(init_before_val - elbo_after_dir_all["init"]) < 1e-4, "Initial term changed after Dirichlet update!"
+            assert abs(emit_before_val - elbo_after_dir_all["emit"]) < 1e-4, "Emission term changed after Dirichlet update!"
+            assert abs(entropy_before_val - elbo_after_dir_all["entropy"]) < 1e-4, "Entropy term changed after Dirichlet update!"
+            assert abs(niw_after - elbo_after_dir_all["niw_term"]) < 1e-4, "NIW term changed after Dirichlet update!"
+            assert abs(logp_beta_before_val - elbo_after_dir_all["logp_beta"]) < 1e-4, "Beta prior term changed after Dirichlet update!"
+            this_ll = this_ll - trans_before_val + trans_after
             elbo_after_dir = this_ll + dir_after + niw_after + logp_beta_before_val
             if logger is not None:
-                logger.debug(f"Iter {it}: ELBO after Dirichlet update: {elbo_after_dir:.4f} (Dir term {dir_after:.4f}, Δ={(dir_after - dir_before_val):.4f})")
+                logger.debug(f"Iter {it}: ELBO after Dirichlet update: {elbo_after_dir:.4f} (Trans LL {trans_after:.4f}, Dir term {dir_after:.4f}, Δ={(dir_after + trans_after - dir_before_val - trans_before_val):.4f})")
+            trans_before_val = trans_after
 
             # (5) Optimize β/π from average r1 across sequences
             if optimize_pi and B > 0:
@@ -1050,10 +1138,23 @@ class StickyHDPHMMVI(nn.Module):
                     self.p.alpha, self.p.kappa, self.p.gamma, self.p.K,
                     steps=pi_steps, lr=pi_lr
                 )
-                logp_beta_after = self._calculate_beta_prior_term(this_u_beta)
+                elbo_after_beta_all = self.calculate_elbo(
+                    mu_t, diag_var_t, F_t, mask,
+                    this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
+                    this_phi, this_u_beta, rhat_all, xihat_all
+                )
+                logp_beta_after = elbo_after_beta_all["logp_beta"]
+                init_after = elbo_after_beta_all["init"]
+                assert abs(trans_before_val - elbo_after_beta_all["trans"]) < 1e-4, "Transitional term changed after β update!"
+                assert abs(emit_before_val - elbo_after_beta_all["emit"]) < 1e-4, "Emission term changed after β update!"
+                assert abs(entropy_before_val - elbo_after_beta_all["entropy"]) < 1e-4, "Entropy term changed after β update!"
+                assert abs(niw_after - elbo_after_beta_all["niw_term"]) < 1e-4, "NIW term changed after β update!"
+                assert abs(dir_after - elbo_after_beta_all["dir_term"]) < 1e-4, "Dirichlet term changed after β update!"
+                this_ll = this_ll - init_before_val + init_after
                 elbo_after_beta = this_ll + dir_after + niw_after + logp_beta_after
                 if logger is not None:
-                    logger.debug(f"Iter {it}: ELBO after β update: {elbo_after_beta:.4f} (logp(β) {logp_beta_after:.4f}, Δ={(logp_beta_after - logp_beta_before_val):.4f})")
+                    logger.debug(f"Iter {it}: ELBO after β update: {elbo_after_beta:.4f} (Init LL {init_after:.4f}, logp(β) {logp_beta_after:.4f}, Δ={(logp_beta_after + init_after - logp_beta_before_val - init_before_val):.4f})")
+                init_before_val = init_after
             else:
                 logp_beta_after = logp_beta_before_val
                 elbo_after_beta = elbo_after_dir
