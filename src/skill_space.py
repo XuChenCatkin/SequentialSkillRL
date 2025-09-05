@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import logging
 
 # ---------- helpers ----------------------------------------------------------
 
@@ -737,6 +738,94 @@ class StickyHDPHMMVI(nn.Module):
         self.S_Nk.zero_(); self.S_M1.zero_(); self.S_M2.zero_(); self.S_counts.zero_()
         self.S_steps.fill_(0.0)
 
+    # ---- ELBO calculation ---------------------------------------------------
+    @torch.no_grad()
+    def calculate_elbo(
+        self,
+        mu_t: torch.Tensor,                            # [T,D] or [B,T,D]
+        diag_var_t: Optional[torch.Tensor] = None,     # same shape as mu_t
+        F_t: Optional[torch.Tensor] = None,            # [T,D,R] or [B,T,D,R]
+        mask: Optional[torch.Tensor] = None,           # [T] or [B,T]
+        mu_hat: Optional[torch.Tensor] = None,         # [Kp1,D] - if None, uses self.niw.mu
+        k_hat: Optional[torch.Tensor] = None,          # [Kp1] - if None, uses self.niw.kappa
+        Psi_hat: Optional[torch.Tensor] = None,        # [Kp1,D,D] - if None, uses self.niw.Psi
+        nu_hat: Optional[torch.Tensor] = None,         # [Kp1] - if None, uses self.niw.nu
+        phi: Optional[torch.Tensor] = None,            # [Kp1,Kp1] - if None, uses self.dir.phi
+        u_beta: Optional[torch.Tensor] = None          # [K] - if None, uses self.u_beta
+    ) -> Dict[str, float]:
+        """
+        Calculate ELBO given statistics and parameters.
+        
+        ELBO = E[log p(data, states)] - E[log q(states, params)]
+             = LL + Dirichlet_term + NIW_term + Beta_prior_term
+        
+        Args:
+            mu_t, diag_var_t, F_t, mask: Data tensors
+            mu_hat, k_hat, Psi_hat, nu_hat: NIW posterior parameters (optional, uses current if None)
+            phi: Dirichlet posterior parameters (optional, uses current if None) 
+            u_beta: Beta logits (optional, uses current if None)
+            
+        Returns:
+            Dict containing ELBO and its components
+        """
+        # Use current parameters if not provided
+        if mu_hat is None: mu_hat = self.niw.mu
+        if k_hat is None: k_hat = self.niw.kappa
+        if Psi_hat is None: Psi_hat = self.niw.Psi
+        if nu_hat is None: nu_hat = self.niw.nu
+        if phi is None: phi = self.dir.phi
+        if u_beta is None: u_beta = self.u_beta
+        
+        # Ensure [B,T,D] shapes for uniform processing
+        if mu_t.dim() == 2:
+            mu_t = mu_t.unsqueeze(0)
+            if diag_var_t is not None: diag_var_t = diag_var_t.unsqueeze(0)
+            if F_t is not None: F_t = F_t.unsqueeze(0)
+            if mask is not None: mask = mask.unsqueeze(0)
+        
+        B, T, D = mu_t.shape
+        Kp1 = mu_hat.shape[0]
+        
+        # Calculate emission log-likelihoods
+        logB = StickyHDPHMMVI.expected_emission_loglik(
+            mu_hat, k_hat, Psi_hat, nu_hat,
+            mu_t, diag_var_t, F_t, mask)  # [B,T,Kp1]
+        
+        # Calculate transition and initial state parameters
+        ElogA = StickyHDPHMMVI._calc_ElogA(phi)  # [Kp1,Kp1]
+        pi_full = StickyHDPHMMVI._calc_Epi(u_beta)  # [Kp1]
+        log_pi = torch.log(torch.clamp(pi_full, min=1e-30))
+        
+        # 1. Expected complete data log-likelihood (LL term)
+        ll = 0.0
+        for b in range(B):
+            _, _, ll_b = StickyHDPHMMVI.forward_backward(log_pi, ElogA, logB[b])
+            ll += ll_b
+        
+        # 2. Dirichlet term: E_q[log p(Φ)] - E_q[log q(Φ)] = -KL(q(Φ)||p(Φ))
+        a = self.p.alpha * pi_full.unsqueeze(0) + self.p.kappa * torch.eye(Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
+        # KL(q||p) = logC(φ) - logC(a) + (φ-a)ᵀ E[logΦ]
+        # ELBO term is -KL, so we have logC(a) - logC(φ) + (a-φ)ᵀ E[logΦ]
+        dir_term = (self._dirichlet_logC(a) - self._dirichlet_logC(phi) + ((a - phi) * ElogA).sum()).item()
+        
+        # 3. Stick-breaking prior term for β: E_q[log p(β|γ)]
+        beta = torch.sigmoid(u_beta)
+        logp_beta = ((self.p.gamma - 1.0) * torch.log(torch.clamp(1.0 - beta, min=1e-30))).sum().item()
+        
+        # 4. NIW term: ∑_k [E log p(μ_k,Σ_k) - E log q(μ_k,Σ_k)]
+        niw_term = float(self._niw_elbo_term(mu_hat, k_hat, Psi_hat, nu_hat).item())
+        
+        # Complete ELBO
+        elbo = ll + dir_term + niw_term + logp_beta
+        
+        return {
+            "elbo": elbo,
+            "ll": ll,
+            "dir_term": dir_term,
+            "niw_term": niw_term,
+            "logp_beta": logp_beta
+        }
+    
     # ---- unified update (streaming & non-streaming) --------------------------
     @torch.no_grad()
     def update(
@@ -752,7 +841,8 @@ class StickyHDPHMMVI(nn.Module):
         optimize_pi: bool = True,                      # optimize π using mean r1
         pi_steps: int = 200,                           # π opt steps
         pi_lr: float = 0.05,                           # π opt learning rate
-        offline: bool = False                          # offline π opt (full data) if True
+        offline: bool = False,                         # offline π opt (full data) if True
+        logger: Optional[logging.Logger] = None        # for debug output
     ) -> Dict[str, torch.Tensor]:
         """
         Batch-global full inner loop:
@@ -870,8 +960,30 @@ class StickyHDPHMMVI(nn.Module):
 
             this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat = \
                 self._calc_NIW_posterior(this_S_Nk, this_S_M1, this_S_M2)
+                
+            elbo_after_niw = self.calculate_elbo(
+                mu_t, diag_var_t, F_t, mask,
+                this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
+                this_phi, this_u_beta
+            )["elbo"]
+            if logger is not None:
+                logger.debug(f"Iter {it}: ELBO after NIW update: {elbo_after_niw:.4f}")
 
-            # (4) Optimize β/π from average r1 across sequences
+            # (4) Update transitions from *blended* counts using helper
+            #     Make a single "time-slice" that sums to S_counts so the helper
+            #     sees exactly those counts.
+            this_phi = self._calc_dir_posterior(this_S_counts, this_pi_full)
+            this_ElogA = StickyHDPHMMVI._calc_ElogA(this_phi)  # [Kp1,Kp1]
+            
+            elbo_after_dir = self.calculate_elbo(
+                mu_t, diag_var_t, F_t, mask,
+                this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
+                this_phi, this_u_beta
+            )["elbo"]
+            if logger is not None:
+                logger.debug(f"Iter {it}: ELBO after Dirichlet update: {elbo_after_dir:.4f}")
+            
+            # (5) Optimize β/π from average r1 across sequences
             if optimize_pi and B > 0:
                 r1_mean = (this_r1_sum / B).clamp_min(1e-12)
                 r1_mean = r1_mean / r1_mean.sum()
@@ -881,53 +993,33 @@ class StickyHDPHMMVI(nn.Module):
                     steps=pi_steps, lr=pi_lr
                 )
                 this_pi_full = StickyHDPHMMVI._calc_Epi(this_u_beta)
-
-            # (5) Update transitions from *blended* counts using helper
-            #     Make a single "time-slice" that sums to S_counts so the helper
-            #     sees exactly those counts.
-            this_phi = self._calc_dir_posterior(this_S_counts, this_pi_full)
+                elbo_after_pi = self.calculate_elbo(
+                    mu_t, diag_var_t, F_t, mask,
+                    this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
+                    this_phi, this_u_beta
+                )["elbo"]
+                if logger is not None:
+                    logger.debug(f"Iter {it}: ELBO after π update: {elbo_after_pi:.4f}")
 
             # (6) Evaluate full inner ELBO with updated NIW/rows
-            #     We recompute logZ under current NIW/ElogA for a meaningful objective.
-            #     (Adds one extra FB pass per iteration; cheap and stable.)
-            logB_eval = StickyHDPHMMVI.expected_emission_loglik(
+            #     Use the new calculate_elbo method for cleaner code
+            elbo_result = self.calculate_elbo(
+                mu_t, diag_var_t, F_t, mask,
                 this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat,
-                mu_t, diag_var_t, F_t, mask)   # [B,T,Kp1]
-            ElogA_eval = StickyHDPHMMVI._calc_ElogA(this_phi)  # [Kp1,Kp1]
-            log_pi_eval = torch.log(torch.clamp(this_pi_full, min=1e-30))
+                this_phi, this_u_beta
+            )
             
-            # Compute expected complete data log-likelihood components with single FB call per batch
-            ll = 0.0
+            elbo = elbo_result["elbo"]
+            ll = elbo_result["ll"]
+            dir_term = elbo_result["dir_term"]
+            niw_term = elbo_result["niw_term"]
+            logp_beta = elbo_result["logp_beta"]
             
-            for b in range(B):
-                # Single forward-backward call per batch
-                _, _, ll_b = StickyHDPHMMVI.forward_backward(log_pi_eval, ElogA_eval, logB_eval[b])
-
-                ll += ll_b
-
-            # Dirichlet term: E_q[log p(Φ)] - E_q[log q(Φ)] = -KL(q(Φ)||p(Φ))
-            a = self.p.alpha * this_pi_full.unsqueeze(0) \
-            + self.p.kappa * torch.eye(Kp1, device=self.mu0.device, dtype=self.mu0.dtype)
-            # KL(q||p) = logC(φ) - logC(a) + (φ-a)ᵀ E[logΦ]
-            # ELBO term is -KL, so we have logC(a) - logC(φ) - (φ-a)ᵀ E[logΦ]
-            #            = logC(a) - logC(φ) + (a-φ)ᵀ E[logΦ]
-            dir_term = (self._dirichlet_logC(a) - self._dirichlet_logC(this_phi)
-                        + ((a - this_phi) * ElogA_eval).sum()).item()
-
-            # Stick-breaking prior term for β: E_q[log p(β|γ)]
-            beta = torch.sigmoid(this_u_beta)
-            logp_beta = ((self.p.gamma - 1.0) * torch.log(torch.clamp(1.0 - beta, min=1e-30))).sum()
-
-            # NIW term: ∑_k [E log p(μ_k,Σ_k) - E log q(μ_k,Σ_k)]
-            niw_term = float(self._niw_elbo_term(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat).item())
-
-            # Complete ELBO: expected complete data log-likelihood + priors - entropies
-            elbo = ll + dir_term + niw_term + logp_beta.item()
             elbo_history.append(elbo)
             total_ll_history.append(ll) 
             dir_term_history.append(dir_term)
             iw_term_history.append(niw_term)
-            logp_beta_history.append(float(logp_beta.item()))
+            logp_beta_history.append(logp_beta)
 
             # Improved Early stopping logic
             if len(elbo_history) == 1:

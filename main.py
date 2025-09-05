@@ -469,7 +469,8 @@ if __name__ == "__main__":
         # Set up logging
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger(__name__)
-        
+        logger.setLevel(logging.DEBUG)
+
         # Check for game-grouped data training mode and batch accumulation
         use_game_grouped = "game_grouped" in sys.argv[3:] if len(sys.argv) > 3 else False
         use_batch_accumulation = "batch_accumulation" in sys.argv[3:] if len(sys.argv) > 3 else False
@@ -616,7 +617,7 @@ if __name__ == "__main__":
                 niw_Psi0 = 30.0,
                 niw_nu0 = vae_config.latent_dim + 10,
                 offline = True,
-                streaming_rho = 0.7,
+                streaming_rho = 1.0,
                 max_iters = 10,
                 elbo_drop_tol = float("inf"),
                 optimize_pi_every_n_steps = 1,
