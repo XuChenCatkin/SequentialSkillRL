@@ -740,9 +740,10 @@ class StickyHDPHMMVI(nn.Module):
 
     # ---- ELBO component calculations ----------------------------------------
     @staticmethod
-    def _hmm_local_free_energy_fixed_qh(r, xi, log_pi, ElogA, logB, eps=1e-12):
+    def _hmm_local_free_energy_fixed_qh(r, xi, log_pi, ElogA, logB, eps=1e-12, t0_override=None) -> Dict[str, float]:
         # r: [T,K], xi: [T-1,K,K], logB: [T,K], ElogA: [K,K]
-        init   = (r[0] * log_pi).sum()
+        t0 = 0 if t0_override is None else t0_override
+        init   = (r[t0] * log_pi).sum()
         trans  = (xi * ElogA).sum()
         emit   = (r * logB).sum()
         # Bethe entropy for a chain (exact)
@@ -883,7 +884,10 @@ class StickyHDPHMMVI(nn.Module):
                 pair_m = (m[:-1] * m[1:]).view(-1, 1, 1)  # [T-1,1,1]
                 r_b = r_b * m.view(-1, 1)  # [T,Kp1]
                 xi_b = xi_b * pair_m
-            stats = StickyHDPHMMVI._hmm_local_free_energy_fixed_qh(r_b, xi_b, log_pi, ElogA, logB[b])
+                t0 = int(torch.nonzero(m, as_tuple=False)[0])
+            else:
+                t0 = 0
+            stats = StickyHDPHMMVI._hmm_local_free_energy_fixed_qh(r_b, xi_b, log_pi, ElogA, logB[b], t0_override=t0)
             init += stats['init']
             trans += stats['trans']
             emit += stats['emit']

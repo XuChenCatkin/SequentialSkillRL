@@ -1999,20 +1999,23 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
                     var_t_unsqueezed = var_t.unsqueeze(0)  # [1, T, latent_dim]
                     F_t_unsqueezed = None if F_t is None else F_t.unsqueeze(0)  # [1, T, ...]
                     valid_unsqueezed = valid.unsqueeze(0)  # [1, T]
+                    valid_idx = valid.nonzero(as_tuple=True)[0]
+                    if valid_idx.numel() == 0:
+                        continue
                     
                     logB_t = hmm.expected_emission_loglik(
                         hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu,
                         mu_t_unsqueezed, var_t_unsqueezed, F_t_unsqueezed, mask=valid_unsqueezed)  # [1, T, K]
                     logB_single = logB_t.squeeze(0)  # [T, K]
+                    logB_valid = logB_single[valid]  # [T_valid, K]
                     
                     # Get HMM parameters
                     log_pi = torch.log(torch.clamp(hmm._Epi(), min=1e-30))
                     ElogA = hmm._ElogA()
                     
                     # Extract single sequence and run Viterbi algorithm
-                    labels, _ = StickyHDPHMMVI.viterbi(log_pi, ElogA, logB_single)  # [T]
-                    labels = labels.cpu().numpy().astype(int)
-                    labels = labels[m]
+                    labels_valid, _ = StickyHDPHMMVI.viterbi(log_pi, ElogA, logB_valid)
+                    labels = labels_valid.cpu().numpy().astype(int)
                     rasters.append(labels)
                     lengths.append(len(labels))
                     grabbed += 1
@@ -2189,7 +2192,7 @@ def visualize_hmm_after_estep(
     # 3) figure: transition heatmap
     f2 = plt.figure(figsize=(6, 5))
     plt.imshow(A, origin="lower", aspect="auto", vmin=0., vmax=1., interpolation='nearest')
-    plt.colorbar(label="E[A_ij]")
+    plt.colorbar(label="E[$A_{ij}$]")
     plt.xlabel("Next state")
     plt.ylabel("Current state")
     diag_mean = float(np.mean(np.diag(A)))

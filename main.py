@@ -619,9 +619,9 @@ if __name__ == "__main__":
                 offline = True,
                 streaming_rho = 1.0,
                 max_iters = 10,
-                elbo_drop_tol = float("inf"),
+                elbo_drop_tol = 1000.0,
                 optimize_pi_every_n_steps = 1,
-                pi_iters = 200,
+                pi_iters = 50,
                 pi_lr = 5.0e-4,
 
                 # Game-grouped data options

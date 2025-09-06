@@ -620,13 +620,14 @@ def fit_sticky_hmm_with_game_grouped_data(
             hmm_out = hmm.update(
                 mu_bt, var_bt, F_bt, 
                 mask=valid, 
-                max_iters=1 if game_idx < 10 else max_iters, 
+                max_iters=1 if game_idx < 0 else max_iters, 
                 elbo_drop_tol=elbo_drop_tol, 
                 rho=streaming_rho, 
-                optimize_pi=(game_idx > 9 and (game_idx + 1) % optimize_pi_every_n_steps == 0), 
+                optimize_pi=(game_idx > -1 and (game_idx + 1) % optimize_pi_every_n_steps == 0), 
                 pi_steps=pi_iters, 
                 pi_lr=pi_lr, 
-                offline=offline
+                offline=offline,
+                logger=logger
             )
             
             # Extract ELBO from HMM update
