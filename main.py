@@ -469,7 +469,6 @@ if __name__ == "__main__":
         # Set up logging
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger(__name__)
-        logger.setLevel(logging.DEBUG)
 
         # Check for game-grouped data training mode and batch accumulation
         use_game_grouped = "game_grouped" in sys.argv[3:] if len(sys.argv) > 3 else False
