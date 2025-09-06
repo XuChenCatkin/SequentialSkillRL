@@ -602,7 +602,7 @@ if __name__ == "__main__":
                 
                 config=vae_config,  
                 batch_multiples=100,
-                init_niw_mu_with_kmean=False,
+                init_niw_mu_with_kmean=True,
                 # HMM parameters
                 alpha=50.0,
                 kappa=2.0,
