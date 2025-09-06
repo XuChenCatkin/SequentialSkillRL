@@ -469,6 +469,7 @@ if __name__ == "__main__":
         # Set up logging
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger(__name__)
+        logger.setLevel(logging.DEBUG)
 
         # Check for game-grouped data training mode and batch accumulation
         use_game_grouped = "game_grouped" in sys.argv[3:] if len(sys.argv) > 3 else False
@@ -594,13 +595,14 @@ if __name__ == "__main__":
             )
             model, hmm, training_info = train_vae_with_sticky_hmm_em(
                 # Load from HuggingFace
-                pretrained_hf_repo="CatkinChen/nethack-vae",
+                pretrained_hf_repo="CatkinChen/nethack-vae-hmm",
                 # Datasets
                 train_dataset=train_dataset, 
                 test_dataset=test_dataset,
                 
                 config=vae_config,  
                 batch_multiples=100,
+                init_niw_mu_with_kmean=False,
                 # HMM parameters
                 alpha=50.0,
                 kappa=2.0,
@@ -609,7 +611,7 @@ if __name__ == "__main__":
                 vae_only_with_hmm=vae_only_with_hmm if 'vae_only_with_hmm' in locals() else False,
                 pretrained_hmm_hf_repo=pretrained_hmm_repo if 'pretrained_hmm_repo' in locals() else None,
                 pretrained_hmm_round=pretrained_hmm_round if 'pretrained_hmm_round' in locals() else None,
-                em_rounds=1 if hmm_only else 3,
+                em_rounds=1 if hmm_only else 1,
                 m_epochs_per_round=1,
                 niw_mu0 = 0.0, 
                 niw_kappa0 = vae_config.latent_dim + 50, 

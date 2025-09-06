@@ -2322,7 +2322,9 @@ def train_vae_with_sticky_hmm_em(
                     "em/progress": (r + 1) / em_rounds
                 })
 
-            hmm.streaming_reset()
+            hmm.reset()
+            if init_niw_mu_with_kmean and not vae_only_with_hmm:
+                _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
             
             # E-step: Fit HMM posterior using current VAE representations
             if use_game_grouped_data:

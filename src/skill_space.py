@@ -131,6 +131,23 @@ class StickyHDPHMMVI(nn.Module):
         self._stream_allocated = False
         self.streaming_reset()
         
+    def reset(self):
+        """Reset model parameters to prior values."""
+        Kp1, D = self.niw.mu.shape[0], self.p.D
+        self.niw = NIWPosterior(
+            mu=torch.stack([self.mu0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
+            kappa=torch.full((Kp1,), self.kappa0, device=self.p.device, dtype=self.p.dtype),
+            Psi=torch.stack([self.Psi0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
+            nu=torch.full((Kp1,), self.nu0, device=self.p.device, dtype=self.p.dtype),
+        )
+        beta = torch.tensor([1.0 / (self.p.K + 2 - k) for k in range(1, Kp1)], device=self.p.device, dtype=self.p.dtype)
+        self.u_beta.data.copy_(torch.log(beta) - torch.log1p(-beta))
+        pi_full = self._Epi() * self.p.alpha + self.p.kappa * torch.eye(Kp1, device=self.p.device, dtype=self.p.dtype)
+        self.dir.phi.data.copy_(pi_full)
+        self._cache_fresh = False
+        self.streaming_reset()
+
+
     # --- ELBO terms ------------------------------------------
 
     @staticmethod
