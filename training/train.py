@@ -109,6 +109,7 @@ def fit_sticky_hmm_one_pass(
     streaming_rho: float = 1.0, 
     max_iters: int = 10,
     elbo_drop_tol: float = 10.0,
+    elbo_tol: float = 100.0,
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
@@ -128,6 +129,7 @@ def fit_sticky_hmm_one_pass(
         streaming_rho: Streaming parameter
         max_iters: Maximum iterations for HMM update
         elbo_drop_tol: ELBO drop tolerance
+        elbo_tol: ELBO convergence tolerance
         optimize_pi_every_n_steps: How often to optimize pi
         pi_iters: Number of pi iterations
         pi_lr: Learning rate for pi optimization
@@ -211,7 +213,7 @@ def fit_sticky_hmm_one_pass(
 
             # HMM update with combined batch
             hmm_out = hmm.update(mu_combined, var_combined, F_combined, mask=valid_combined, 
-                               max_iters=(1 if multi_batch_idx < 0 else max_iters), elbo_drop_tol=elbo_drop_tol, rho=streaming_rho, 
+                               max_iters=(1 if multi_batch_idx < 0 else max_iters), tol=elbo_tol, elbo_drop_tol=elbo_drop_tol, rho=streaming_rho, 
                                optimize_pi=(multi_batch_idx > -1 and (multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
                                pi_steps=pi_iters, pi_lr=pi_lr, offline=offline, logger=logger)
 
@@ -1289,8 +1291,8 @@ def train_multimodalhack_vae(
                             
                             # prior Gaussians
                             mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
-                            # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
-                            logdet_Sigma_k = -torch.logdet(E_Lambda + 1e-6*torch.eye(E_Lambda.size(-1), device=E_Lambda.device)).to(mu_bt.dtype)
+                            # log|Σ_k| = - log|Λ_k|
+                            logdet_Sigma_k = -ElogdetLambda
                             # flatten responsibilities to align with valid_screen
                             r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
                         # stash cache into batch so vae_loss can pick it up
@@ -1516,7 +1518,7 @@ def train_multimodalhack_vae(
                             # prior Gaussians
                             mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
                             # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
-                            logdet_Sigma_k = -torch.logdet(E_Lambda + 1e-6*torch.eye(E_Lambda.size(-1), device=E_Lambda.device)).to(mu_bt.dtype)
+                            logdet_Sigma_k = -ElogdetLambda
                             # flatten responsibilities to align with valid_screen
                             r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
                         # stash cache into batch so vae_loss can pick it up
@@ -1999,6 +2001,7 @@ def train_vae_with_sticky_hmm_em(
     streaming_rho: float = 1.0,
     max_iters: int = 10,
     elbo_drop_tol: float = 10.0,
+    elbo_tol: float = 100.0,
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
@@ -2063,6 +2066,7 @@ def train_vae_with_sticky_hmm_em(
         streaming_rho: rho used for streaming on statistics
         max_iters: max iterations in hmm update
         elbo_drop_tol: tolerance for ELBO drop
+        elbo_tol: tolerance for ELBO convergence
         optimize_pi_every_n_steps: how often to optimize pi
         pi_iters: number of iterations for pi optimization
         pi_lr: learning rate for pi optimization
@@ -2322,9 +2326,7 @@ def train_vae_with_sticky_hmm_em(
                     "em/progress": (r + 1) / em_rounds
                 })
 
-            hmm.reset()
-            if init_niw_mu_with_kmean and not vae_only_with_hmm:
-                _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
+            hmm.streaming_reset()
             
             # E-step: Fit HMM posterior using current VAE representations
             if use_game_grouped_data:
@@ -2355,7 +2357,7 @@ def train_vae_with_sticky_hmm_em(
                 # Use standard batched E-step
                 fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
                                         offline=offline, streaming_rho=streaming_rho, 
-                                        max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
+                                        max_iters=max_iters, elbo_drop_tol=elbo_drop_tol, elbo_tol=elbo_tol,
                                         optimize_pi_every_n_steps=optimize_pi_every_n_steps,
                                         pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
                                         logger=logger, use_wandb=use_wandb)

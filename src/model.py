@@ -2472,7 +2472,7 @@ def vae_loss(
         kl_mode = 'sticky_hdp_hmm'
         
     elif prior_mode == 'blend' and hmm is not None and prior_blend_alpha is not None:
-        # ------ Blended prior: alpha * standard + (1-alpha) * HMM ------
+        # ------ Blended prior: alpha * HMM + (1-alpha) * kl_standard ------
         alpha = prior_blend_alpha
 
         # Standard Normal prior component
