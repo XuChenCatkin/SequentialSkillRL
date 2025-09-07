@@ -1244,16 +1244,6 @@ class StickyHDPHMMVI(nn.Module):
                 
         if not early_stopping:
             # Use the best parameters from the last iteration
-            best_mu_hat = None
-            best_k_hat = None
-            best_Psi_hat = None
-            best_nu_hat = None
-            best_phi = None
-            best_u_beta = None
-            best_S_Nk = None
-            best_S_M1 = None
-            best_S_M2 = None
-            best_S_counts = None
             self._update_NIW(best_mu_hat if best_mu_hat is not None else this_mu_hat, 
                             best_k_hat if best_k_hat is not None else this_k_hat, 
                             best_Psi_hat if best_Psi_hat is not None else this_Psi_hat, 
