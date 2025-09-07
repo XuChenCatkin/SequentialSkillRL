@@ -612,7 +612,7 @@ if __name__ == "__main__":
                 test_dataset=test_dataset,
                 
                 config=vae_config,  
-                batch_multiples=10,
+                batch_multiples=100,
                 init_niw_mu_with_kmean=True,
                 # HMM parameters
                 alpha=150.0,
@@ -629,9 +629,9 @@ if __name__ == "__main__":
                 niw_Psi0 = 30.0,
                 niw_nu0 = vae_config.latent_dim + 10,
                 offline = True,
-                streaming_rho = 0.7,
+                streaming_rho = 1.0,
                 max_iters = 10,
-                elbo_drop_tol = 1000,
+                elbo_drop_tol = float("inf"),
                 optimize_pi_every_n_steps = 1,
                 pi_iters = 10,
                 pi_lr = 5.0e-4,

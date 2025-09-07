@@ -211,8 +211,8 @@ def fit_sticky_hmm_one_pass(
 
             # HMM update with combined batch
             hmm_out = hmm.update(mu_combined, var_combined, F_combined, mask=valid_combined, 
-                               max_iters=(1 if multi_batch_idx < 5 else max_iters), elbo_drop_tol=elbo_drop_tol, rho=streaming_rho, 
-                               optimize_pi=(multi_batch_idx > 4 and (multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
+                               max_iters=(1 if multi_batch_idx < 0 else max_iters), elbo_drop_tol=elbo_drop_tol, rho=streaming_rho, 
+                               optimize_pi=(multi_batch_idx > -1 and (multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
                                pi_steps=pi_iters, pi_lr=pi_lr, offline=offline, logger=logger)
 
             # Extract ELBO from HMM update
