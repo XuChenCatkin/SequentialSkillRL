@@ -466,10 +466,21 @@ if __name__ == "__main__":
             force_recollect=False
         )
         
-        # Set up logging
-        logging.basicConfig(level=logging.INFO)
+        # Set up logging with file output
+        os.makedirs("logs", exist_ok=True)  # Create logs directory
+        log_filename = f"logs/training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_filename),  # Save to file
+                logging.StreamHandler()  # Also show in console
+            ]
+        )
         logger = logging.getLogger(__name__)
         logger.setLevel(logging.DEBUG)
+        
+        print(f"📝 Logging to file: {log_filename}")
 
         # Check for game-grouped data training mode and batch accumulation
         use_game_grouped = "game_grouped" in sys.argv[3:] if len(sys.argv) > 3 else False
@@ -595,34 +606,34 @@ if __name__ == "__main__":
             )
             model, hmm, training_info = train_vae_with_sticky_hmm_em(
                 # Load from HuggingFace
-                pretrained_hf_repo="CatkinChen/nethack-vae-hmm",
+                pretrained_hf_repo="CatkinChen/nethack-vae",
                 # Datasets
                 train_dataset=train_dataset, 
                 test_dataset=test_dataset,
                 
                 config=vae_config,  
-                batch_multiples=100,
+                batch_multiples=10,
                 init_niw_mu_with_kmean=True,
                 # HMM parameters
-                alpha=50.0,
-                kappa=2.0,
+                alpha=150.0,
+                kappa=10.0,
                 gamma=10.0,
                 hmm_only=hmm_only,
                 vae_only_with_hmm=vae_only_with_hmm if 'vae_only_with_hmm' in locals() else False,
                 pretrained_hmm_hf_repo=pretrained_hmm_repo if 'pretrained_hmm_repo' in locals() else None,
                 pretrained_hmm_round=pretrained_hmm_round if 'pretrained_hmm_round' in locals() else None,
-                em_rounds=1 if hmm_only else 1,
+                em_rounds=1 if hmm_only else 3,
                 m_epochs_per_round=1,
                 niw_mu0 = 0.0, 
                 niw_kappa0 = vae_config.latent_dim + 50, 
                 niw_Psi0 = 30.0,
                 niw_nu0 = vae_config.latent_dim + 10,
                 offline = True,
-                streaming_rho = 1.0,
+                streaming_rho = 0.7,
                 max_iters = 10,
-                elbo_drop_tol = 1000.0,
+                elbo_drop_tol = 1000,
                 optimize_pi_every_n_steps = 1,
-                pi_iters = 50,
+                pi_iters = 10,
                 pi_lr = 5.0e-4,
 
                 # Game-grouped data options

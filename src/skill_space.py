@@ -178,9 +178,9 @@ class StickyHDPHMMVI(nn.Module):
         # multivariate gamma term
         i = torch.arange(1, D + 1, device=Psi.device, dtype=Psi.dtype).view(1, D)
         lgamma_sum = torch.sum(torch.lgamma((nu.view(Kp1, 1) + 1.0 - i) / 2.0), dim=1)  # [Kp1]
-        term = -(nu * D / 2.0) * torch.log(torch.tensor(2.0, device=Psi.device, dtype=Psi.dtype)) \
-            - (D * (D - 1) / 4.0) * torch.log(torch.tensor(torch.pi, device=Psi.device, dtype=Psi.dtype)) \
-            + 0.5 * nu * logdet_Psi - lgamma_sum
+        term = (nu * D / 2.0) * torch.log(torch.tensor(2.0, device=Psi.device, dtype=Psi.dtype)) \
+            + (D * (D - 1) / 4.0) * torch.log(torch.tensor(torch.pi, device=Psi.device, dtype=Psi.dtype)) \
+            - 0.5 * nu * logdet_Psi + lgamma_sum
         return term.sum()
 
     def _niw_elbo_term(self, mu_hat, k_hat, Psi_hat, nu_hat) -> torch.Tensor:
@@ -196,17 +196,17 @@ class StickyHDPHMMVI(nn.Module):
         E_Lambda, E_logdet_Lambda = StickyHDPHMMVI._calc_Lambda_expectations(Psi_hat, nu_hat)  # [Kp1,D,D]
 
         # --- IW part: -KL(q(Σ)||p(Σ)) ---
-        # log Z_IW(p) - log Z_IW(q)
+        # log Z_IW(q) - log Z_IW(p)
         logZ_p = StickyHDPHMMVI._logZ_invwishart(Psi0, torch.tensor(nu0, device=Psi_hat.device, dtype=Psi_hat.dtype))
         logZ_q = StickyHDPHMMVI._logZ_invwishart(Psi_hat, nu_hat)
-        logZ_term = logZ_p * Kp1 - logZ_q
+        logZ_term = logZ_q - logZ_p * Kp1
 
         # -0.5 * (ν_hat - ν₀) * E_q[log|Λ|]
         # Note: E_q[log|Σ|] = -E_q[log|Λ|]
         logdet_term = -0.5 * torch.sum((nu_hat - nu0) * E_logdet_Lambda)
 
         # +0.5 * Tr((Ψ_hat - Ψ₀) * E_q[Λ])
-        tr_term = 0.5 * torch.sum(torch.einsum('kdd,kdd->k', (Psi_hat - Psi0.unsqueeze(0)), E_Lambda))
+        tr_term = 0.5 * torch.einsum('kij,kji->', (Psi_hat - Psi0.unsqueeze(0)), E_Lambda)
         
         iw_term = logZ_term + logdet_term + tr_term
 
@@ -918,7 +918,7 @@ class StickyHDPHMMVI(nn.Module):
         
         # 4. NIW term: ∑_k [E log p(μ_k,Σ_k) - E log q(μ_k,Σ_k)]
         niw_term = float(self._niw_elbo_term(mu_hat, k_hat, Psi_hat, nu_hat).item())
-        
+
         # Complete ELBO
         elbo = init + trans + emit + entropy + dir_term + niw_term + logp_beta
         
@@ -1244,6 +1244,16 @@ class StickyHDPHMMVI(nn.Module):
                 
         if not early_stopping:
             # Use the best parameters from the last iteration
+            best_mu_hat = None
+            best_k_hat = None
+            best_Psi_hat = None
+            best_nu_hat = None
+            best_phi = None
+            best_u_beta = None
+            best_S_Nk = None
+            best_S_M1 = None
+            best_S_M2 = None
+            best_S_counts = None
             self._update_NIW(best_mu_hat if best_mu_hat is not None else this_mu_hat, 
                             best_k_hat if best_k_hat is not None else this_k_hat, 
                             best_Psi_hat if best_Psi_hat is not None else this_Psi_hat, 
