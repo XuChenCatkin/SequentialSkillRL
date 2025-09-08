@@ -108,8 +108,8 @@ def fit_sticky_hmm_one_pass(
     offline: bool = True,
     streaming_rho: float = 1.0, 
     max_iters: int = 10,
-    elbo_drop_tol: float = 10.0,
-    elbo_tol: float = 100.0,
+    elbo_drop_tol: float = 0.01,  # Relative ELBO drop tolerance (1%)
+    elbo_tol: float = 0.01,       # Relative ELBO gain tolerance (1%)
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
@@ -128,8 +128,8 @@ def fit_sticky_hmm_one_pass(
         offline: Whether to use offline mode
         streaming_rho: Streaming parameter
         max_iters: Maximum iterations for HMM update
-        elbo_drop_tol: ELBO drop tolerance
-        elbo_tol: ELBO convergence tolerance
+        elbo_drop_tol: Relative ELBO drop tolerance (fraction, e.g., 0.01 = 1%)
+        elbo_tol: Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
         optimize_pi_every_n_steps: How often to optimize pi
         pi_iters: Number of pi iterations
         pi_lr: Learning rate for pi optimization
@@ -505,7 +505,8 @@ def fit_sticky_hmm_with_game_grouped_data(
     offline: bool = True,
     streaming_rho: float = 1.0, 
     max_iters: int = 10,
-    elbo_drop_tol: float = 10.0,
+    elbo_tol: float = 0.01,       # Relative ELBO gain tolerance (1%)
+    elbo_drop_tol: float = 0.01,  # Relative ELBO drop tolerance (1%)
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
@@ -524,7 +525,8 @@ def fit_sticky_hmm_with_game_grouped_data(
         offline: Whether to use offline mode
         streaming_rho: Streaming parameter
         max_iters: Maximum iterations for HMM update
-        elbo_drop_tol: ELBO drop tolerance
+        elbo_tol: Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
+        elbo_drop_tol: Relative ELBO drop tolerance (fraction, e.g., 0.01 = 1%)
         optimize_pi_every_n_steps: How often to optimize pi
         pi_iters: Number of pi iterations
         pi_lr: Learning rate for pi optimization
@@ -623,6 +625,7 @@ def fit_sticky_hmm_with_game_grouped_data(
                 mu_bt, var_bt, F_bt, 
                 mask=valid, 
                 max_iters=1 if game_idx < 0 else max_iters, 
+                tol=elbo_tol,
                 elbo_drop_tol=elbo_drop_tol, 
                 rho=streaming_rho, 
                 optimize_pi=(game_idx > -1 and (game_idx + 1) % optimize_pi_every_n_steps == 0), 
@@ -2004,8 +2007,8 @@ def train_vae_with_sticky_hmm_em(
     offline: bool = True,
     streaming_rho: float = 1.0,
     max_iters: int = 10,
-    elbo_drop_tol: float = 10.0,
-    elbo_tol: float = 100.0,
+    elbo_drop_tol: float = 0.01,  # Relative ELBO drop tolerance (1%)
+    elbo_tol: float = 0.01,       # Relative ELBO gain tolerance (1%)
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
@@ -2069,8 +2072,8 @@ def train_vae_with_sticky_hmm_em(
         offline: Whether to use offline mode (no streaming)
         streaming_rho: rho used for streaming on statistics
         max_iters: max iterations in hmm update
-        elbo_drop_tol: tolerance for ELBO drop
-        elbo_tol: tolerance for ELBO convergence
+        elbo_drop_tol: Relative ELBO drop tolerance (fraction, e.g., 0.01 = 1%)
+        elbo_tol: Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
         optimize_pi_every_n_steps: how often to optimize pi
         pi_iters: number of iterations for pi optimization
         pi_lr: learning rate for pi optimization
@@ -2471,8 +2474,8 @@ def train_vae_with_sticky_hmm_em(
         
         # Define per-round parameter schedules
         if r == 0:  # First M-step (round 1)
-            m_step_config.initial_prior_blend_alpha = 0.1
-            m_step_config.final_prior_blend_alpha = 0.3
+            m_step_config.initial_prior_blend_alpha = 0.3
+            m_step_config.final_prior_blend_alpha = 0.4
             m_step_config.prior_blend_shape = "cosine"
             m_step_config.initial_mi_beta = 0.2
             m_step_config.final_mi_beta = 0.2 + (0.6 - 0.2) * (1/3)  # 0.333
@@ -2481,7 +2484,7 @@ def train_vae_with_sticky_hmm_em(
             m_step_config.initial_dw_beta = 0.5
             m_step_config.final_dw_beta = 0.5 + (1.0 - 0.5) * (1/3)  # 0.667
         elif r == 1:  # Second M-step (round 2)
-            m_step_config.initial_prior_blend_alpha = 0.3
+            m_step_config.initial_prior_blend_alpha = 0.4
             m_step_config.final_prior_blend_alpha = 0.6
             m_step_config.prior_blend_shape = "cosine"
             m_step_config.initial_mi_beta = 0.2 + (0.6 - 0.2) * (1/3)  # 0.333
@@ -2492,7 +2495,7 @@ def train_vae_with_sticky_hmm_em(
             m_step_config.final_dw_beta = 0.5 + (1.0 - 0.5) * (2/3)  # 0.833
         elif r == 2:  # Third M-step (round 3)
             m_step_config.initial_prior_blend_alpha = 0.6
-            m_step_config.final_prior_blend_alpha = 0.8
+            m_step_config.final_prior_blend_alpha = 1.0
             m_step_config.prior_blend_shape = "cosine"
             m_step_config.initial_mi_beta = 0.2 + (0.6 - 0.2) * (2/3)  # 0.467
             m_step_config.final_mi_beta = 0.6
@@ -2501,8 +2504,8 @@ def train_vae_with_sticky_hmm_em(
             m_step_config.initial_dw_beta = 0.5 + (1.0 - 0.5) * (2/3)  # 0.833
             m_step_config.final_dw_beta = 1.0
         else:  # Additional rounds beyond 3
-            m_step_config.initial_prior_blend_alpha = 0.8
-            m_step_config.final_prior_blend_alpha = 0.8
+            m_step_config.initial_prior_blend_alpha = 1.0
+            m_step_config.final_prior_blend_alpha = 1.0
             m_step_config.prior_blend_shape = "constant"
             m_step_config.initial_mi_beta = 0.6
             m_step_config.final_mi_beta = 0.6

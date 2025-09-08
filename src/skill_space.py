@@ -953,8 +953,8 @@ class StickyHDPHMMVI(nn.Module):
         F_t: Optional[torch.Tensor] = None,            # [T,D,R] or [B,T,D,R]
         mask: Optional[torch.Tensor] = None,           # [T] or [B,T]
         max_iters: int = 7,                            # inner full-loop limit
-        tol: float = 1e-4,                             # ELBO gain tolerance
-        elbo_drop_tol: float = 10.0,                   # ELBO drop tolerance for early stopping
+        tol: float = 0.01,                             # Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
+        elbo_drop_tol: float = 0.01,                   # Relative ELBO drop tolerance for early stopping (fraction, e.g., 0.01 = 1%)
         rho: Optional[float] = 1.0,                    # 1.0 => non-streaming; 0<rho<1 => EMA
         optimize_pi: bool = True,                      # optimize π using mean r1
         pi_steps: int = 200,                           # π opt steps
@@ -972,9 +972,13 @@ class StickyHDPHMMVI(nn.Module):
         (6) evaluate full inner ELBO; early stop if plateau or large drop
 
         Early stopping logic:
-        - If ELBO increases but change < tol: stop and use current parameters
-        - If ELBO drops by more than elbo_drop_tol: stop and use previous best parameters
+        - If ELBO increases but relative change < tol: stop and use current parameters
+        - If ELBO drops by more than elbo_drop_tol (relative): stop and use previous best parameters
         - Otherwise continue optimization
+
+        Args:
+            tol: Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
+            elbo_drop_tol: Relative ELBO drop tolerance (fraction, e.g., 0.01 = 1%)
 
         Returns diagnostics from the last pass.
         """
@@ -1045,6 +1049,8 @@ class StickyHDPHMMVI(nn.Module):
         logp_beta_before_val = elbo_before_loop["logp_beta"]
         if logger is not None:
             logger.debug(f"Initial ELBO: {elbo_before_loop['elbo']:.4f}")
+            logger.debug(f"Relative tol: {tol:.4f}")
+            logger.debug(f"Relative elbo_drop_tol: {elbo_drop_tol:.4f}")
             logger.debug(f"- Init {init_before_val:.4f}")
             logger.debug(f"- Trans {trans_before_val:.4f}")
             logger.debug(f"- Emit {emit_before_val:.4f}")
@@ -1234,23 +1240,27 @@ class StickyHDPHMMVI(nn.Module):
                     best_S_counts = this_S_counts.clone()
                     
                     # Check if improvement is small enough to stop
-                    if elbo_change < tol:
+                    if abs(elbo_change / prev_elbo) < tol:
                         early_stopping = True
                         # Use current (best) iteration parameters
                         self._update_NIW(this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat)
                         self._update_transitions(this_phi)
                         self._update_u_beta(this_u_beta)
                         self._update_moments(this_S_Nk, this_S_M1, this_S_M2, this_S_counts)
+                        if logger is not None:
+                            logger.debug(f"Early stopping: ELBO improvement {elbo_change:.4f} < tolerance")
                         break
                 else:
                     # ELBO decreased: check if drop is too large
-                    if abs(elbo_change) > elbo_drop_tol:
+                    if abs(elbo_change / prev_elbo) > elbo_drop_tol:
                         early_stopping = True
                         # Use previous (best) iteration parameters
                         self._update_NIW(best_mu_hat, best_k_hat, best_Psi_hat, best_nu_hat)
                         self._update_transitions(best_phi)
                         self._update_u_beta(best_u_beta)
                         self._update_moments(best_S_Nk, best_S_M1, best_S_M2, best_S_counts)
+                        if logger is not None:
+                            logger.debug(f"Early stopping: ELBO drop {abs(elbo_change):.4f} > tolerance, reverting to best parameters")
                         break
                 
         if not early_stopping:

@@ -1,7 +1,8 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import os
 import json
 import torch
+import numpy as np
 from datetime import datetime
 from huggingface_hub import HfApi, login, hf_hub_download, HfFileSystem
 from matplotlib import pyplot as plt
@@ -42,6 +43,178 @@ try:
 except ImportError:
     print("⚠️  scikit-learn not available. Install with: pip install scikit-learn")
     SKLEARN_AVAILABLE = False
+
+def compute_global_statistics(
+    model: MultiModalHackVAE, 
+    dataset: List[Dict], 
+    device: torch.device,
+    max_frames: int = 50000,
+    logger: Optional[object] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Evaluate a dataset with a VAE model to compute global mean and covariance statistics.
+    
+    Args:
+        model: Trained VAE model
+        dataset: Dataset in the standard format (list of batches)
+        device: Device to run evaluation on
+        max_frames: Maximum number of frames to process (to limit memory usage)
+        logger: Optional logger for progress reporting
+        
+    Returns:
+        Tuple of:
+            - global_mean: [D] - Global mean of latent representations
+            - global_cov: [D, D] - Global covariance matrix of latent representations
+            - global_var: [D] - Global variance (diagonal of covariance matrix)
+            - global_lowrank_mean: [D, R] or None - Global mean of low-rank factors (if present)
+    """
+    if logger:
+        logger.info(f"Computing global statistics from dataset with max_frames={max_frames}")
+    
+    model.eval()
+    
+    # Collect latent means, variances, and lowrank factors
+    mu_list = []
+    logvar_list = []
+    lowrank_list = []
+    collected_frames = 0
+    has_lowrank = False
+    
+    # Get batch and time dimensions from first batch
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty")
+    
+    # Try to get dimensions from different possible keys
+    B, T = None, None
+    for key in ['tty_chars', 'game_chars']:
+        if key in dataset[0]:
+            B, T = dataset[0][key].shape[:2]
+            break
+    
+    if B is None or T is None:
+        raise ValueError("Could not determine batch and time dimensions from dataset")
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataset):
+            # Move batch to device
+            batch_dev = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    x = v.to(device, non_blocking=True)
+                    # Reshape to [B*T, ...] for processing, except for special keys
+                    if x.dim() >= 3 and k not in ('original_batch_shape',):
+                        batch_dev[k] = x.view(B*T, *x.shape[2:])
+                    else:
+                        batch_dev[k] = x
+                else:
+                    batch_dev[k] = v
+            
+            # Forward pass through the model
+            try:
+                output = model(batch_dev)
+                mu_bt = output['mu']  # [B*T, D]
+                logvar_bt = output['logvar']  # [B*T, D]
+                lowrank_bt = output.get('lowrank_factors', None)  # [B*T, D, R] or None
+                
+                # Get valid frames mask
+                valid = batch_dev['valid_screen'].view(B*T).cpu().bool()  # [B*T]
+                
+                # Extract valid frames only
+                if valid.any():
+                    mu_valid = mu_bt[valid].detach().cpu()  # [N_valid, D]
+                    logvar_valid = logvar_bt[valid].detach().cpu()  # [N_valid, D]
+                    
+                    mu_list.append(mu_valid)
+                    logvar_list.append(logvar_valid)
+                    collected_frames += mu_valid.shape[0]
+                    
+                    # Handle lowrank factors if present
+                    if lowrank_bt is not None:
+                        lowrank_valid = lowrank_bt[valid].detach().cpu()  # [N_valid, D, R]
+                        lowrank_list.append(lowrank_valid)
+                        has_lowrank = True
+                    elif has_lowrank:
+                        # If we previously had lowrank factors but not in this batch,
+                        # create zero tensors to maintain consistency
+                        D, R = lowrank_list[0].shape[1], lowrank_list[0].shape[2]
+                        zero_lowrank = torch.zeros(mu_valid.shape[0], D, R)
+                        lowrank_list.append(zero_lowrank)
+                
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error processing batch {batch_idx}: {e}")
+                continue
+            
+            # Stop if we've collected enough frames
+            if collected_frames >= max_frames:
+                if logger:
+                    logger.info(f"Reached max_frames limit ({max_frames}), stopping collection")
+                break
+    
+    if not mu_list:
+        raise ValueError("No valid frames found in dataset")
+    
+    # Concatenate all collected data
+    all_mu = torch.cat(mu_list, dim=0)  # [N_total, D]
+    all_logvar = torch.cat(logvar_list, dim=0)  # [N_total, D]
+    all_lowrank = torch.cat(lowrank_list, dim=0) if has_lowrank else None  # [N_total, D, R] or None
+    
+    if logger:
+        logger.info(f"Collected {all_mu.shape[0]} valid frames from {len(dataset)} batches")
+        if has_lowrank:
+            logger.info(f"Low-rank factors shape: {all_lowrank.shape}")
+    
+    # Compute global statistics
+    # Global mean of the latent means
+    global_mean = torch.mean(all_mu, dim=0)  # [D]
+    
+    # For covariance, we use the sample covariance of the latent means
+    # Center the data
+    centered_mu = all_mu - global_mean.unsqueeze(0)  # [N_total, D]
+    
+    # Compute sample covariance matrix
+    N = all_mu.shape[0]
+    global_cov = torch.mm(centered_mu.t(), centered_mu) / (N - 1)  # [D, D]
+    
+    # Extract diagonal (variances)
+    global_var = torch.diag(global_cov)  # [D]
+    
+    # Compute global lowrank statistics if available
+    global_lowrank_mean = None
+    if has_lowrank and all_lowrank is not None:
+        # Global mean of lowrank factors across all samples
+        global_lowrank_mean = torch.mean(all_lowrank, dim=0)  # [D, R]
+        
+        if logger:
+            logger.info(f"Low-rank factor statistics:")
+            logger.info(f"  - Mean magnitude: {torch.norm(global_lowrank_mean):.4f}")
+            logger.info(f"  - Max factor magnitude: {torch.max(torch.abs(global_lowrank_mean)):.4f}")
+            # Compute rank statistics
+            U, S, Vt = torch.svd(global_lowrank_mean)
+            logger.info(f"  - Singular values: {S.tolist()[:5]}")  # Show first 5
+    
+    if logger:
+        logger.info(f"Global statistics computed:")
+        logger.info(f"  - Mean magnitude: {torch.norm(global_mean):.4f}")
+        logger.info(f"  - Mean variance: {torch.mean(global_var):.4f}")
+        logger.info(f"  - Trace of covariance: {torch.trace(global_cov):.4f}")
+        logger.info(f"  - Max eigenvalue: {torch.max(torch.linalg.eigvals(global_cov).real):.4f}")
+        logger.info(f"  - Min eigenvalue: {torch.min(torch.linalg.eigvals(global_cov).real):.4f}")
+        
+        # Report condition number
+        eigenvals = torch.linalg.eigvals(global_cov).real
+        condition_number = torch.max(eigenvals) / torch.max(torch.min(eigenvals), torch.tensor(1e-12))
+        logger.info(f"  - Condition number: {condition_number:.2e}")
+        
+        # Additional statistics for total covariance (diagonal + lowrank contribution)
+        if has_lowrank and all_lowrank is not None:
+            # Estimate the contribution of lowrank factors to the total covariance
+            # Cov_total = diag(logvar) + F @ F.T (where F are the lowrank factors)
+            lowrank_cov_contrib = torch.mean(torch.bmm(all_lowrank, all_lowrank.transpose(-2, -1)), dim=0)  # [D, D]
+            logger.info(f"  - Low-rank covariance contribution trace: {torch.trace(lowrank_cov_contrib):.4f}")
+            logger.info(f"  - Low-rank vs diagonal variance ratio: {torch.trace(lowrank_cov_contrib) / torch.trace(global_cov):.4f}")
+    
+    return global_mean, global_cov, global_var, global_lowrank_mean
 
 def save_checkpoint(
     model: MultiModalHackVAE,
