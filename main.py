@@ -622,7 +622,7 @@ if __name__ == "__main__":
                 vae_only_with_hmm=vae_only_with_hmm if 'vae_only_with_hmm' in locals() else False,
                 pretrained_hmm_hf_repo=pretrained_hmm_repo if 'pretrained_hmm_repo' in locals() else None,
                 pretrained_hmm_round=pretrained_hmm_round if 'pretrained_hmm_round' in locals() else None,
-                em_rounds=1 if hmm_only else 3,
+                em_rounds=1 if hmm_only else 4,
                 m_epochs_per_round=1,
                 niw_mu0 = 0.0, 
                 niw_kappa0 = 1.0, 
