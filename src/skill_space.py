@@ -344,37 +344,48 @@ class StickyHDPHMMVI(nn.Module):
         Returns rhat [T,Kp1], xihat [T-1,Kp1,Kp1], loglik (scalar).
         """
         T, Kp1 = logB.shape
-        # α
-        log_alpha = torch.full((T, Kp1), -float('inf'), device=logB.device, dtype=logB.dtype)
-        log_alpha[0] = log_pi + logB[0]
-        for t in range(1, T):
-            # logsumexp_i (log_alpha[t-1,i] + ElogA[i,k])
-            prev = log_alpha[t-1].unsqueeze(1) + ElogA  # [Kp1,Kp1]
-            log_alpha[t] = logB[t] + torch.logsumexp(prev, dim=0)
+        dev = logB.device
+        orig_dtype = logB.dtype
 
-        ll = torch.logsumexp(log_alpha[-1], dim=0)  # scalar
+        # Work in float64 for stability
+        log_pi = log_pi.to(torch.float64)
+        ElogA  = ElogA.to(torch.float64)
+        logB   = logB.to(torch.float64)
+        # α
+        log_alpha = torch.empty((T, Kp1), device=dev, dtype=torch.float64)
+        c = torch.empty(T, device=dev, dtype=torch.float64)
+
+        log_alpha[0] = log_pi + logB[0]
+        c[0] = torch.logsumexp(log_alpha[0], dim=-1)
+        log_alpha[0] -= c[0]
+
+        for t in range(1, T):
+            prev = log_alpha[t-1].unsqueeze(1) + ElogA          # [Kp1,Kp1]
+            log_alpha[t] = logB[t] + torch.logsumexp(prev, 0)   # [Kp1]
+            c[t] = torch.logsumexp(log_alpha[t], dim=-1)
+            log_alpha[t] -= c[t]
+
+        ll = float(c.sum().item())
 
         # β
-        log_beta = torch.zeros(T, Kp1, device=logB.device, dtype=logB.dtype)
-        for t in range(T - 2, -1, -1):
-            # logsumexp_k (ElogA[i,k] + logB[t+1,k] + log_beta[t+1,k])
-            tmp = ElogA + (logB[t + 1] + log_beta[t + 1]).unsqueeze(0)  # [Kp1,Kp1]
-            log_beta[t] = torch.logsumexp(tmp, dim=1)
+        log_beta = torch.zeros((T, Kp1), device=dev, dtype=torch.float64)
+        for t in range(T-2, -1, -1):
+            tmp = ElogA + (logB[t+1] + log_beta[t+1]).unsqueeze(0)  # [Kp1,Kp1]
+            log_beta[t] = torch.logsumexp(tmp, dim=1) - c[t+1]      # [Kp1]
 
         # posteriors
-        log_gamma = log_alpha + log_beta - ll
-        rhat = torch.softmax(log_gamma, dim=1)  # [T,Kp1]
+        log_gamma = log_alpha + log_beta                            # [T,Kp1]
+        den_g = torch.logsumexp(log_gamma, dim=1, keepdim=True)     # [T,1]
+        rhat = torch.exp(log_gamma - den_g).to(logB.dtype)          # sums to 1 per row
 
-        xihat = torch.zeros(T - 1, Kp1, Kp1, device=logB.device, dtype=logB.dtype)
-        for t in range(T - 1):
-            tmp = (
-                log_alpha[t].unsqueeze(1) + ElogA
-                + logB[t + 1].unsqueeze(0) + log_beta[t + 1].unsqueeze(0)
-                - ll
-            )  # [Kp1,Kp1]
-            xihat[t] = torch.softmax(tmp.view(-1), dim=0).view(Kp1, Kp1)
+        xihat = torch.empty((T-1, Kp1, Kp1), device=dev, dtype=logB.dtype)
+        for t in range(T-1):
+            tmp = (log_alpha[t].unsqueeze(1) + ElogA
+                + logB[t+1].unsqueeze(0) + log_beta[t+1].unsqueeze(0))   # [Kp1,Kp1]
+            den_xi = torch.logsumexp(tmp.view(-1), dim=0)
+            xihat[t] = torch.exp(tmp - den_xi)
 
-        return rhat, xihat, float(ll.item())
+        return rhat.to(orig_dtype), xihat.to(orig_dtype), ll
 
     @staticmethod
     @torch.no_grad()

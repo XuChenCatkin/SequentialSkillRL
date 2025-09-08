@@ -1290,9 +1290,11 @@ def train_multimodalhack_vae(
                             r_hat = torch.stack(r_hat_list, dim=0)  # [B,T,K]
                             
                             # prior Gaussians
-                            mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
+                            mu_k, E_Lambda, _ = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
                             # log|Σ_k| = - log|Λ_k|
-                            logdet_Sigma_k = -ElogdetLambda
+                            L = torch.linalg.cholesky(E_Lambda)                       # [Kp1,D,D]
+                            logdet_E_Lambda = 2.0 * torch.log(torch.diagonal(L,  dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
+                            logdet_Sigma_k = -logdet_E_Lambda                           # [Kp1]
                             # flatten responsibilities to align with valid_screen
                             r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
                         # stash cache into batch so vae_loss can pick it up
@@ -1516,9 +1518,11 @@ def train_multimodalhack_vae(
                             r_hat = torch.stack(r_hat_list, dim=0)  # [B,T,K]
                             
                             # prior Gaussians
-                            mu_k, E_Lambda, ElogdetLambda = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
+                            mu_k, E_Lambda, _ = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
                             # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
-                            logdet_Sigma_k = -ElogdetLambda
+                            L = torch.linalg.cholesky(E_Lambda)                       # [Kp1,D,D]
+                            logdet_E_Lambda = 2.0 * torch.log(torch.diagonal(L,  dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
+                            logdet_Sigma_k = -logdet_E_Lambda                         # [Kp1]
                             # flatten responsibilities to align with valid_screen
                             r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
                         # stash cache into batch so vae_loss can pick it up
@@ -2326,7 +2330,9 @@ def train_vae_with_sticky_hmm_em(
                     "em/progress": (r + 1) / em_rounds
                 })
 
-            hmm.streaming_reset()
+            hmm.reset()
+            if init_niw_mu_with_kmean and not vae_only_with_hmm:
+                _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
             
             # E-step: Fit HMM posterior using current VAE representations
             if use_game_grouped_data:
@@ -2465,8 +2471,8 @@ def train_vae_with_sticky_hmm_em(
         
         # Define per-round parameter schedules
         if r == 0:  # First M-step (round 1)
-            m_step_config.initial_prior_blend_alpha = 0.3
-            m_step_config.final_prior_blend_alpha = 0.4
+            m_step_config.initial_prior_blend_alpha = 0.1
+            m_step_config.final_prior_blend_alpha = 0.3
             m_step_config.prior_blend_shape = "cosine"
             m_step_config.initial_mi_beta = 0.2
             m_step_config.final_mi_beta = 0.2 + (0.6 - 0.2) * (1/3)  # 0.333
@@ -2475,7 +2481,7 @@ def train_vae_with_sticky_hmm_em(
             m_step_config.initial_dw_beta = 0.5
             m_step_config.final_dw_beta = 0.5 + (1.0 - 0.5) * (1/3)  # 0.667
         elif r == 1:  # Second M-step (round 2)
-            m_step_config.initial_prior_blend_alpha = 0.4
+            m_step_config.initial_prior_blend_alpha = 0.3
             m_step_config.final_prior_blend_alpha = 0.6
             m_step_config.prior_blend_shape = "cosine"
             m_step_config.initial_mi_beta = 0.2 + (0.6 - 0.2) * (1/3)  # 0.333
