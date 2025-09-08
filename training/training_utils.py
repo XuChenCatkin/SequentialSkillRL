@@ -66,7 +66,6 @@ def compute_global_statistics(
             - global_mean: [D] - Global mean of latent representations
             - global_cov: [D, D] - Global covariance matrix of latent representations
             - global_var: [D] - Global variance (diagonal of covariance matrix)
-            - global_lowrank_mean: [D, R] or None - Global mean of low-rank factors (if present)
     """
     if logger:
         logger.info(f"Computing global statistics from dataset with max_frames={max_frames}")
@@ -168,30 +167,43 @@ def compute_global_statistics(
     # Global mean of the latent means
     global_mean = torch.mean(all_mu, dim=0)  # [D]
     
-    # For covariance, we use the sample covariance of the latent means
-    # Center the data
-    centered_mu = all_mu - global_mean.unsqueeze(0)  # [N_total, D]
-    
-    # Compute sample covariance matrix
+    # Compute proper covariance: cov = 1/T∑_t(Σ_t + FF^T + μ_t μ_t^T) - μ̄ μ̄^T + εI
     N = all_mu.shape[0]
-    global_cov = torch.mm(centered_mu.t(), centered_mu) / (N - 1)  # [D, D]
+    D = all_mu.shape[1]
+    eps_reg = 1e-6  # Small regularization term
+    
+    # Convert logvar to diagonal covariance matrices Σ_t
+    all_var = torch.exp(all_logvar)  # [N_total, D] - diagonal elements of Σ_t
+    
+    # Compute 1/T∑_t(Σ_t + μ_t μ_t^T)
+    # Σ_t contribution: average of diagonal covariances
+    diag_cov_sum = torch.mean(all_var, dim=0)  # [D] - average diagonal
+    
+    # μ_t μ_t^T contribution: average of outer products
+    outer_products_sum = torch.mm(all_mu.t(), all_mu) / N  # [D, D] - (1/N)∑μ_t μ_t^T
+    
+    # Start building covariance matrix
+    global_cov = torch.diag(diag_cov_sum) + outer_products_sum  # [D, D]
+    
+    # Add FF^T contribution if low-rank factors are present
+    if has_lowrank and all_lowrank is not None:
+        # Compute 1/T∑_t(F_t F_t^T) where F_t is [D, R]
+        lowrank_cov_sum = torch.zeros(D, D, device=all_mu.device)
+        for t in range(N):
+            F_t = all_lowrank[t]  # [D, R]
+            lowrank_cov_sum += torch.mm(F_t, F_t.t())  # F_t F_t^T
+        lowrank_cov_sum = lowrank_cov_sum / N  # Average over time
+        global_cov += lowrank_cov_sum
+    
+    # Subtract μ̄ μ̄^T (global mean outer product)
+    global_mean_outer = torch.outer(global_mean, global_mean)  # [D, D]
+    global_cov = global_cov - global_mean_outer
+    
+    # Add regularization εI
+    global_cov = global_cov + eps_reg * torch.eye(D, device=all_mu.device)
     
     # Extract diagonal (variances)
     global_var = torch.diag(global_cov)  # [D]
-    
-    # Compute global lowrank statistics if available
-    global_lowrank_mean = None
-    if has_lowrank and all_lowrank is not None:
-        # Global mean of lowrank factors across all samples
-        global_lowrank_mean = torch.mean(all_lowrank, dim=0)  # [D, R]
-        
-        if logger:
-            logger.info(f"Low-rank factor statistics:")
-            logger.info(f"  - Mean magnitude: {torch.norm(global_lowrank_mean):.4f}")
-            logger.info(f"  - Max factor magnitude: {torch.max(torch.abs(global_lowrank_mean)):.4f}")
-            # Compute rank statistics
-            U, S, Vt = torch.svd(global_lowrank_mean)
-            logger.info(f"  - Singular values: {S.tolist()[:5]}")  # Show first 5
     
     if logger:
         logger.info(f"Global statistics computed:")
@@ -205,16 +217,25 @@ def compute_global_statistics(
         eigenvals = torch.linalg.eigvals(global_cov).real
         condition_number = torch.max(eigenvals) / torch.max(torch.min(eigenvals), torch.tensor(1e-12))
         logger.info(f"  - Condition number: {condition_number:.2e}")
+        logger.info(f"  - Regularization term (εI): {eps_reg}")
         
-        # Additional statistics for total covariance (diagonal + lowrank contribution)
+        # Additional statistics for covariance components
+        diag_trace = torch.sum(diag_cov_sum)
+        logger.info(f"  - Diagonal component trace: {diag_trace:.4f}")
+        logger.info(f"  - Mean outer product trace: {torch.trace(outer_products_sum):.4f}")
+        logger.info(f"  - Global mean outer product trace: {torch.trace(global_mean_outer):.4f}")
+        
         if has_lowrank and all_lowrank is not None:
-            # Estimate the contribution of lowrank factors to the total covariance
-            # Cov_total = diag(logvar) + F @ F.T (where F are the lowrank factors)
-            lowrank_cov_contrib = torch.mean(torch.bmm(all_lowrank, all_lowrank.transpose(-2, -1)), dim=0)  # [D, D]
-            logger.info(f"  - Low-rank covariance contribution trace: {torch.trace(lowrank_cov_contrib):.4f}")
-            logger.info(f"  - Low-rank vs diagonal variance ratio: {torch.trace(lowrank_cov_contrib) / torch.trace(global_cov):.4f}")
+            # The lowrank contribution is already computed in the main covariance
+            lowrank_trace = torch.trace(lowrank_cov_sum) if 'lowrank_cov_sum' in locals() else 0.0
+            logger.info(f"  - Low-rank component trace: {lowrank_trace:.4f}")
+            total_without_reg = diag_trace + torch.trace(outer_products_sum) - torch.trace(global_mean_outer) + lowrank_trace
+            logger.info(f"  - Total covariance trace (before regularization): {total_without_reg:.4f}")
+        else:
+            total_without_reg = diag_trace + torch.trace(outer_products_sum) - torch.trace(global_mean_outer)
+            logger.info(f"  - Total covariance trace (before regularization): {total_without_reg:.4f}")
     
-    return global_mean, global_cov, global_var, global_lowrank_mean
+    return global_mean, global_cov, global_var
 
 def save_checkpoint(
     model: MultiModalHackVAE,

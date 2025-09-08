@@ -624,19 +624,23 @@ if __name__ == "__main__":
                 pretrained_hmm_round=pretrained_hmm_round if 'pretrained_hmm_round' in locals() else None,
                 em_rounds=1 if hmm_only else 4,
                 m_epochs_per_round=1,
-                niw_mu0 = 0.0, 
+                set_niw_mu0_with_global_mean=True,
+                set_niw_Psi0_with_global_cov=True,
+                niw_mu0 = None,  # Set from data global mean
                 niw_kappa0 = 1.0, 
-                niw_Psi0 = 30.0,
+                niw_Psi0 = None,  # Set from data global covariance
                 niw_nu0 = vae_config.latent_dim + 10,
                 offline = True,
                 streaming_rho = 1.0,
                 max_iters = 10,
-                elbo_drop_tol = 0.01,  # 1% relative tolerance
-                elbo_tol = 0.01,       # 1% relative tolerance
+                elbo_drop_tol = 0.001,  # 0.1% relative tolerance
+                elbo_tol = 0.001,       # 0.1% relative tolerance
                 optimize_pi_every_n_steps = 100,
                 pi_iters = 10,
                 pi_lr = 5.0e-4,
-
+                reset_to_prior = True,
+                reset_low_count_states = False,
+                low_count_thresh = 0.01,  # States with <1% of total counts will be reset
                 # Game-grouped data options
                 use_game_grouped_data=use_game_grouped,
                 game_grouped_data_path=os.path.join(data_cache_dir, f"{train_file}_b{batch_size}_s{sequence_size}_m{max_training_batches}_group.pt") if use_game_grouped else None,

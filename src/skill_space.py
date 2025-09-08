@@ -146,7 +146,23 @@ class StickyHDPHMMVI(nn.Module):
         self.dir.phi.data.copy_(pi_full)
         self._cache_fresh = False
         self.streaming_reset()
-
+        
+    def reset_low_count_states(self, low_count_thresh, logger=None):
+        """Reset states with low occupancy to prior values."""
+        with torch.no_grad():
+            # Compute state occupancies from transition matrix
+            state_occupancies = self.S_Nk / self.S_Nk.sum()  # [Kp1]
+            low_count_states = state_occupancies < low_count_thresh
+            if low_count_states.any():
+                if logger:
+                    logger.info(f"   - Resetting {low_count_states.sum().item()} low-count states (occupancy < {low_count_thresh:.4f})")
+                    logger.info(f"     Low-count states: {torch.nonzero(low_count_states).squeeze(-1).cpu().numpy().tolist()}")
+                # Reset low-count states to prior values
+                self.niw.Psi[low_count_states] = self.Psi0.clone().to(device=self.Psi0.device, dtype=self.Psi0.dtype)
+                self.niw.nu[low_count_states] = self.nu0
+                self.niw.kappa[low_count_states] = self.kappa0
+        self._cache_fresh = False
+        self.streaming_reset()
 
     # --- ELBO terms ------------------------------------------
 
@@ -808,7 +824,7 @@ class StickyHDPHMMVI(nn.Module):
         
         if ElogA is None:
             ElogA = StickyHDPHMMVI._calc_ElogA(phi)
-        
+
         # Dirichlet prior parameters: a_k = α π + κ δ_k
         a = (self.p.alpha * pi_full.unsqueeze(0) + 
              self.p.kappa * torch.eye(Kp1, device=self.mu0.device, dtype=self.mu0.dtype))

@@ -58,7 +58,7 @@ import matplotlib.pyplot as plt
 import logging
 from src.data_collection import NetHackDataCollector, BLStatsAdapter
 from training.training_utils import save_checkpoint, save_model_to_huggingface, load_model_from_huggingface, \
-    upload_training_artifacts_to_huggingface, create_model_demo_notebook, load_model_from_local
+    upload_training_artifacts_to_huggingface, create_model_demo_notebook, load_model_from_local, compute_global_statistics
 
 # Import our utility functions
 from utils.analysis import compute_hmm_diagnostics, visualize_hmm_after_estep
@@ -1989,6 +1989,8 @@ def train_vae_with_sticky_hmm_em(
     kappa: float = 20.0, 
     gamma: float = 5.0,
     # NIW prior params
+    set_niw_mu0_with_global_mean: bool = True,
+    set_niw_Psi0_with_global_cov: bool = True,
     niw_mu0: float = 0.0, 
     niw_kappa0: float = 0.1, 
     niw_Psi0: float = 1.0,
@@ -2012,6 +2014,9 @@ def train_vae_with_sticky_hmm_em(
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    reset_to_prior: bool = False,
+    reset_low_count_states: bool = True,
+    low_count_thresh: float = 0.002,  # States with <0.2% occupancy will be reset
     # Game-grouped data options for E-step
     use_game_grouped_data: bool = False,
     game_grouped_data_path: str = None,
@@ -2053,10 +2058,12 @@ def train_vae_with_sticky_hmm_em(
         batch_multiples: Number of batches to combine for each training step
         alpha: DP concentration parameter for sticky-HDP-HMM
         kappa: Sticky parameter (self-transition bias)
-        gamma: Top-level DP concentration parameter  
+        gamma: Top-level DP concentration parameter
+        set_niw_mu0_with_global_mean: If True, sets NIW prior mean to global mean of VAE latents
+        set_niw_Psi0_with_global_cov: If True, sets NIW prior cov matrix to global covariance of VAE latents  
         niw_mu0: NIW prior mean parameter
         niw_kappa0: NIW prior concentration parameter
-        niw_Psi0: NIW prior scale matrix parameter
+        niw_Psi0: NIW prior cov matrix parameter
         niw_nu0: NIW prior degrees of freedom
         init_niw_mu_with_kmean: If True, initializes NIW mean with k-means
         hmm_only: If True, only fits HMM without VAE fine-tuning
@@ -2077,6 +2084,9 @@ def train_vae_with_sticky_hmm_em(
         optimize_pi_every_n_steps: how often to optimize pi
         pi_iters: number of iterations for pi optimization
         pi_lr: learning rate for pi optimization
+        reset_to_prior: If True, resets HMM to prior between E-steps
+        reset_low_count_states: If True, resets low-count states during E-step fitting
+        low_count_thresh: Threshold for low-count state reset (fraction of total counts, e.g., 0.002 = 0.2%)
         use_game_grouped_data: If True, use game-id grouped data for E-step instead of batched data
         game_grouped_data_path: Path to game-grouped data file (if None, will group from train_dataset)
         max_games_per_estep: Maximum number of games to process per E-step (None = all games)
@@ -2129,6 +2139,12 @@ def train_vae_with_sticky_hmm_em(
                 "D": config.latent_dim if config else 96
             },
             "niw_params": {
+                "reset_to_prior": reset_to_prior,
+                "set_niw_mu0_with_global_mean": set_niw_mu0_with_global_mean,
+                "set_niw_Psi0_with_global_cov": set_niw_Psi0_with_global_cov,
+                "init_niw_mu_with_kmean": init_niw_mu_with_kmean,
+                "reset_low_count_states": reset_low_count_states,
+                "low_count_thresh": low_count_thresh,
                 "mu0": niw_mu0,
                 "kappa0": niw_kappa0,
                 "Psi0": niw_Psi0,
@@ -2227,10 +2243,26 @@ def train_vae_with_sticky_hmm_em(
         # Initialize new HMM
         if logger: logger.info(f"�🧠 Initializing new Sticky-HDP-HMM: latent_dim={D}, skills={K}")
         
+        niw_mu0 = torch.full((D,), float(niw_mu0) if niw_mu0 is not None else 0.0, device=device)
+        niw_Psi0 = torch.eye(D, device=device) * (float(niw_Psi0) if niw_Psi0 is not None else 1.0)
+        
+        if set_niw_mu0_with_global_mean or set_niw_Psi0_with_global_cov:
+            global_mean, global_cov, global_var = compute_global_statistics(model, train_dataset, device, max_frames=100000, logger=logger)
+            if set_niw_mu0_with_global_mean:
+                niw_mu0 = global_mean
+                if logger: 
+                    logger.info("   - Set NIW mu0 with global mean of VAE latents")
+                    logger.info(f"     {global_mean}")
+            if set_niw_Psi0_with_global_cov:
+                niw_Psi0 = (niw_nu0 - D - 1) * global_cov
+                if logger: 
+                    logger.info("   - Set NIW Psi0 with global covariance of VAE latents")
+                    logger.info(f"     Cov diag: {global_var}")
+
         niw = NIWPrior(
-            mu0=torch.full((D,), niw_mu0, device=device), 
+            mu0=niw_mu0, 
             kappa0=niw_kappa0,
-            Psi0=torch.eye(D, device=device) * niw_Psi0,
+            Psi0=niw_Psi0,
             nu0=niw_nu0
         )
         hmm_params = StickyHDPHMMParams(
@@ -2303,9 +2335,9 @@ def train_vae_with_sticky_hmm_em(
             'D': D
         },
         'niw_params': {
-            'mu0': niw_mu0,
+            'mu0': niw_mu0.to('cpu').tolist() if isinstance(niw_mu0, torch.Tensor) else niw_mu0,
             'kappa0': niw_kappa0,
-            'Psi0': niw_Psi0,
+            'Psi0': niw_Psi0.to('cpu').tolist() if isinstance(niw_Psi0, torch.Tensor) else niw_Psi0,
             'nu0': niw_nu0
         },
         'hmm_paths': [],
@@ -2333,9 +2365,30 @@ def train_vae_with_sticky_hmm_em(
                     "em/progress": (r + 1) / em_rounds
                 })
 
-            hmm.reset()
-            if init_niw_mu_with_kmean and not vae_only_with_hmm:
-                _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
+            if r > 0:
+                if set_niw_mu0_with_global_mean or set_niw_Psi0_with_global_cov:
+                    global_mean, global_cov, global_var = compute_global_statistics(model, train_dataset, device, max_frames=100000, logger=logger)
+                    if set_niw_mu0_with_global_mean:
+                        hmm.mu0 = global_mean.to(device)
+                        if logger: 
+                            logger.info("   - Updated NIW mu0 with global mean of VAE latents")
+                            logger.info(f"     {global_mean}")
+                    if set_niw_Psi0_with_global_cov:
+                        hmm.Psi0 = ((hmm.nu0 - D - 1) * global_cov).to(device)
+                        if logger: 
+                            logger.info("   - Updated NIW Psi0 with global covariance of VAE latents")
+                            logger.info(f"     Cov diag: {global_var}")
+                if reset_to_prior:
+                    if logger: logger.info("   - Resetting HMM to prior")
+                    hmm.reset()
+                    if init_niw_mu_with_kmean and not vae_only_with_hmm:
+                        _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
+                elif reset_low_count_states:
+                    if logger: logger.info("   - Resetting NIW low-count states to prior")
+                    hmm.reset_low_count_states(low_count_thresh=low_count_thresh, logger=logger)
+                else:
+                    if logger: logger.info("   - Continuing HMM from previous round")
+                    hmm.streaming_reset()
             
             # E-step: Fit HMM posterior using current VAE representations
             if use_game_grouped_data:
