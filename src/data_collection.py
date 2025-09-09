@@ -938,6 +938,225 @@ class NetHackDataCollector:
             self.save_collected_data(collected_batches, save_path)
             return collected_batches
 
+    def group_sequences_by_game(self, collected_batches: List[Dict], save_path: str = None) -> Dict:
+        """
+        Group temporal sequences by game IDs from collected batches.
+        
+        This function takes the list of batches where each batch has shape [B, T, ...] and
+        groups the temporal sequences by game ID. It properly handles game transitions:
+        when a game ends (done=True), the next timestep in that batch position starts a new game.
+        
+        IMPORTANT: Game IDs can be reused across different episodes. All occurrences of the
+        same game ID are concatenated into a single sequence, regardless of when/where they
+        appear in the dataset. This means a game marked as 'complete' may still have
+        additional data from later episodes with the same ID.
+        
+        Args:
+            collected_batches: List of batch dictionaries from collect_data_batch
+            save_path: Optional path to save the grouped sequences
+            
+        Returns:
+            Dictionary mapping game_id -> Dict with grouped sequence data:
+            {
+                game_id: {
+                    'sequence_data': {key: tensor_with_shape_[total_T, ...]},
+                    'total_length': int,
+                    'is_complete': bool  # True if any episode ended with done=True
+                }
+            }
+        """
+        print(f"📊 Grouping sequences by game ID from {len(collected_batches)} batches...")
+        
+        if not collected_batches:
+            raise ValueError("No batches provided")
+        
+        # Get batch and time dimensions
+        first_batch = collected_batches[0]
+        B, T = first_batch['gameids'].shape[:2]
+        print(f"   📐 Batch dimensions: B={B}, T={T}")
+        
+        # Storage for all game sequences (using game_id as key)
+        game_sequences = {}
+        
+        # Track active games in each batch position [B] -> current_game_id
+        active_games = [None] * B
+        
+        # Process each batch in order
+        for batch_idx, batch in enumerate(collected_batches):
+            print(f"   🔄 Processing batch {batch_idx + 1}/{len(collected_batches)}...")
+            
+            gameids = batch['gameids']  # [B, T]
+            done_flags = batch['done']  # [B, T] - use 'done' key
+            
+            # Process each batch position (game slot)
+            for batch_pos in range(B):
+                game_id_sequence = gameids[batch_pos]  # [T]
+                done_sequence = done_flags[batch_pos]  # [T]
+                
+                t = 0
+                while t < T:
+                    current_game_id = int(game_id_sequence[t].item())
+                    
+                    # Start tracking this game if not already
+                    if current_game_id not in game_sequences:
+                        game_sequences[current_game_id] = {
+                            'sequence_data': {},
+                            'total_length': 0,
+                            'is_complete': False
+                        }
+                    
+                    game_info = game_sequences[current_game_id]
+                    
+                    # NOTE: Removed the "skip if complete" logic because game IDs can be reused
+                    # for different episodes. Each occurrence should be processed independently.
+                    
+                    # Find where this game segment ends in this batch using correct done semantics
+                    # done[k] = 1 means the game ended at timestep k-1, so timestep k is the start of a new game
+                    segment_end = t
+                    episode_complete = False
+                    
+                    while segment_end < T and game_id_sequence[segment_end] == current_game_id:
+                        segment_end += 1  # Include this timestep in current game
+                        
+                        # Check if next timestep indicates current game ended
+                        if segment_end < T and done_sequence[segment_end] == 1:
+                            # done[segment_end] = 1 means game ended at segment_end-1
+                            # So our current game ends at segment_end-1, which we've already included
+                            episode_complete = True
+                            break
+                    
+                    # Extract data for this game segment [t:segment_end]
+                    segment_length = segment_end - t
+                    
+                    if segment_length > 0:
+                        for key, value in batch.items():
+                            if isinstance(value, torch.Tensor):
+                                # Extract this game's segment: [segment_length, ...]
+                                game_segment = value[batch_pos, t:segment_end]
+                                
+                                if key not in game_info['sequence_data']:
+                                    # First segment for this game
+                                    game_info['sequence_data'][key] = game_segment
+                                else:
+                                    # Concatenate with previous segments
+                                    game_info['sequence_data'][key] = torch.cat([
+                                        game_info['sequence_data'][key], 
+                                        game_segment
+                                    ], dim=0)
+                            else:
+                                # Non-tensor data, store from first occurrence
+                                if key not in game_info['sequence_data']:
+                                    game_info['sequence_data'][key] = value
+                        
+                        # Update total length and completion status  
+                        game_info['total_length'] += segment_length
+                        if episode_complete:
+                            game_info['is_complete'] = True
+                        
+                        # Debug info for significant games
+                        if batch_idx < 3 and batch_pos < 3:  # First few batches and positions
+                            status = "COMPLETE" if game_info['is_complete'] else "continuing"
+                            print(f"     🎯 Game {current_game_id} (pos {batch_pos}): added {segment_length} timesteps, total={game_info['total_length']} ({status})")
+                    
+                    # Move to next segment
+                    t = segment_end
+        
+        # Clean up results and compute statistics
+        final_sequences = {}
+        total_complete = 0
+        total_timesteps = 0
+        
+        for game_id, game_info in game_sequences.items():
+            final_sequences[game_id] = {
+                'sequence_data': game_info['sequence_data'],
+                'total_length': game_info['total_length'],
+                'is_complete': game_info['is_complete']
+            }
+            
+            if game_info['is_complete']:
+                total_complete += 1
+            total_timesteps += game_info['total_length']
+        
+        print(f"✅ Sequence grouping completed!")
+        print(f"   📊 Total games: {len(final_sequences)}")
+        print(f"   ✅ Complete episodes: {total_complete}")
+        print(f"   🔄 Incomplete episodes: {len(final_sequences) - total_complete}")
+        print(f"   ⏱️  Total timesteps: {total_timesteps}")
+        print(f"   📈 Average sequence length: {total_timesteps / len(final_sequences):.1f}")
+        
+        # Save if requested
+        if save_path is not None:
+            print(f"💾 Saving grouped sequences to {save_path}...")
+            
+            # Create directory if it doesn't exist
+            import os
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            
+            save_data = {
+                'grouped_sequences': final_sequences,
+                'num_games': len(final_sequences),
+                'num_complete': total_complete,
+                'total_timesteps': total_timesteps,
+                'save_timestamp': time.time(),
+                'original_batch_info': {
+                    'num_batches': len(collected_batches),
+                    'batch_size': B,
+                    'seq_length': T
+                }
+            }
+            
+            if save_path.endswith('.pt'):
+                torch.save(save_data, save_path)
+            else:
+                import pickle
+                with open(save_path, 'wb') as f:
+                    pickle.dump(save_data, f)
+            
+            # Calculate file size
+            file_size = os.path.getsize(save_path) / (1024 * 1024)  # MB
+            print(f"✅ Grouped sequences saved!")
+            print(f"   📁 File: {save_path}")
+            print(f"   📊 Size: {file_size:.1f} MB")
+        
+        return final_sequences
+
+    def load_grouped_sequences(self, load_path: str) -> Dict:
+        """
+        Load previously saved grouped sequence data from disk.
+        
+        Args:
+            load_path: Path to the saved grouped sequences file
+            
+        Returns:
+            Dictionary mapping game_id -> sequence info
+        """
+        print(f"📁 Loading grouped sequences from {load_path}...")
+        
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"❌ File not found: {load_path}")
+        
+        # Load the data
+        if load_path.endswith('.pt'):
+            save_data = torch.load(load_path, map_location='cpu', weights_only=False)
+        else:
+            import pickle
+            with open(load_path, 'rb') as f:
+                save_data = pickle.load(f)
+        
+        grouped_sequences = save_data['grouped_sequences']
+        
+        # Calculate file size and print info
+        file_size = os.path.getsize(load_path) / (1024 * 1024)  # MB
+        print(f"✅ Grouped sequences loaded successfully!")
+        print(f"   📁 File: {load_path}")
+        print(f"   📊 Size: {file_size:.1f} MB")
+        print(f"   🎯 Games: {save_data['num_games']}")
+        print(f"   ✅ Complete episodes: {save_data['num_complete']}")
+        print(f"   ⏱️  Total timesteps: {save_data['total_timesteps']}")
+        print(f"   📈 Average length: {save_data['total_timesteps'] / save_data['num_games']:.1f}")
+        
+        return grouped_sequences
+
 class BLStatsAdapter:
     """
     Converts TTY data to MultiModalHackVAE expected format

@@ -65,7 +65,7 @@ from typing import Optional, List, Dict
 from enum import IntEnum
 from dataclasses import dataclass, field
 from nle import nethack
-from utils.math_utils import kl_gaussian_lowrank_q_p
+from utils.math_utils import kl_gaussian_lowrank_q_p, kl_gaussian_lowrank_to_fixed_gaussians
 
 # Import NetHackCategory from data_collection
 try:
@@ -447,7 +447,9 @@ class VAEConfig:
 
     # KL prior mode
     prior_mode: str = "standard"               # "standard" | "hmm" | "blend"
-    prior_blend_alpha: float = 0.5
+    initial_prior_blend_alpha: float = 0.3
+    final_prior_blend_alpha: float = 1.0
+    prior_blend_shape: str = 'linear'          # "linear" | "cosine" | "custom"
     
     focal_loss_alpha = 0.5
     focal_loss_gamma = 2.0
@@ -2034,7 +2036,9 @@ def vae_loss(
     config: VAEConfig,
     mi_beta: float = 1.0,
     tc_beta: float = 1.0,
-    dw_beta: float = 1.0
+    dw_beta: float = 1.0,
+    weight_override: Dict[str, float] | None = None,
+    prior_blend_alpha: float | None = None
     ):
     """
     VAE loss with separate embedding and raw reconstruction losses with free-bits KL and Gaussian TC proxy.
@@ -2400,48 +2404,137 @@ def vae_loss(
         metrics.update({f'metrics/inverse/{k}': v for k, v in inv_metrics.items()})
 
     # Sum raw reconstruction losses
-    total_raw_loss = sum(raw_losses[k] * config.raw_modality_weights.get(k, 1.0) for k in raw_losses)
+    # Total raw reconstruction loss (weighted, with optional per-head override)
+    weights = dict(config.raw_modality_weights)
+    if weight_override:
+        weights.update(weight_override)
+    total_raw_loss = sum(raw_losses[k] * weights.get(k, 1.0) for k in raw_losses)
 
-    # KL divergence
-    # Sigma_q = lowrank_factors @ lowrank_factors.T + torch.diag(torch.exp(logvar))
-    # KL divergence for low-rank approximation
+    # === KL term: either standard Normal prior or sticky‑HDP‑HMM prior ===
     eps = 1e-6
-    logvar = logvar.clamp(min=-10.0, max=10.0)  # Prevent extreme values
-    var = torch.exp(logvar).clamp_min(eps)  # [valid_B, LATENT_DIM]
-    mu2 = mu.square().sum(dim=1)  # mu^T * mu # [valid_B,]
+    logvar = logvar.clamp(min=-10.0, max=10.0)
+    var = torch.exp(logvar).clamp_min(eps)  # [valid_B, D]
     d = mu.size(1)
+    
     if lowrank_factors is not None:
-        r = lowrank_factors.size(2)
-        U = lowrank_factors.to(torch.float64)  # [valid_B, LATENT_DIM, LOW_RANK]
+        U = lowrank_factors.to(torch.float64)
         UUT_bar = torch.zeros(d, d, device=mu.device, dtype=torch.float64)  # [LATENT_DIM, LATENT_DIM]
         UUT_bar += torch.einsum('bik,bjk->ij', U, U) / valid_B # [LATENT_DIM, LATENT_DIM]
         diag_E_Sigma = var.mean(dim=0, dtype=torch.float64) + (U * U).mean(dim=(0,2))  # E[diag(Sigma_q)], [LATENT_DIM]
         Sigma_q_bar = UUT_bar + torch.diag(diag_E_Sigma) - torch.diag((U * U).mean(dim=(0,2)))  # [LATENT_DIM, LATENT_DIM]
         Sigma_q_bar.fill_diagonal_(0.0)
         Sigma_q_bar = Sigma_q_bar + torch.diag(diag_E_Sigma)  # [LATENT_DIM, LATENT_DIM]
-        tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))  # Trace of Sigma_q
-        Dinvu = U / var.unsqueeze(-1)  # [valid_B, LATENT_DIM, LOW_RANK]
-        I_plus = torch.bmm(U.transpose(1, 2), Dinvu)  # [valid_B, LOW_RANK, LOW_RANK]
-        eye_r = torch.eye(r, device=mu.device, dtype=torch.float64).unsqueeze(0)  # [1, LOW_RANK, LOW_RANK]
-        I_plus = I_plus + eye_r  # [valid_B, LOW_RANK, LOW_RANK]
-        sign2, logdet_small = torch.linalg.slogdet(I_plus)  # log(det(I + U^T * diag(1/var) * U))
-        if not torch.all(sign2 > 0):
-            raise ValueError("Matrix I + U^T * diag(1/var) * U is not positive definite.")
-        log_det_Sigma_q = logdet_small + logvar.sum(dim=1).to(torch.float64)  # log(det(Sigma_q)) [valid_B,]
-        log_det_Sigma_q = log_det_Sigma_q.to(mu.dtype)
     else:
-        # If no low-rank factors, just use diagonal covariance
+        U = None
         Sigma_q_bar = torch.diag(var.mean(dim=0, dtype=torch.float64))  # [LATENT_DIM, LATENT_DIM]
-        tr_Sigma_q = var.sum(dim=1)  # Trace of Sigma_q
-        log_det_Sigma_q = logvar.sum(dim=1)  # log(det(Sigma_q)) [valid_B,]
-    # KL divergence: D_KL(q(z|x) || p(z)) =
-    # 0.5 * (tr(Sigma_q) + mu^T * mu - d - log(det(Sigma_q)))
-    # where d is the dimensionality of the latent space (LATENT_DIM)
-    
-    kl_per_sample = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)  # [valid_B,]
-    kl_loss = kl_per_sample.mean()  # Average over batch
 
-    # Cov(mu) = E[mu * mu^T] - E[mu] * E[mu]^T
+    hmm = batch.get('sticky_hmm', None)   # injected by train loop during M‑step
+    
+    # Determine prior mode from config
+    prior_mode = getattr(config, 'prior_mode', 'standard')
+    
+    if prior_mode == 'standard' or (prior_mode == 'hmm' and hmm is None):
+        # ------ Standard Normal prior ------
+        mu2 = mu.square().sum(dim=1)
+        if lowrank_factors is not None:
+            r = lowrank_factors.size(2)
+            tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))
+            Dinvu = U / var.unsqueeze(-1)
+            I_plus = torch.bmm(U.transpose(1, 2), Dinvu)
+            I_plus = I_plus + torch.eye(r, device=mu.device, dtype=torch.float64).unsqueeze(0)
+            _, logdet_small = torch.linalg.slogdet(I_plus)
+            log_det_Sigma_q = (logdet_small + logvar.sum(dim=1).to(torch.float64)).to(mu.dtype)
+        else:
+            tr_Sigma_q = var.sum(dim=1)
+            log_det_Sigma_q = logvar.sum(dim=1)
+        kl_per_sample = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
+        kl_loss = kl_per_sample.mean()
+        kl_mode = 'standard'
+        
+    elif prior_mode == 'hmm' and hmm is not None:
+        # ------ Sticky‑HDP‑HMM prior ------
+        # We need responsibilities r_hat[t,k] for this batch and the prior Gaussians (mu_k, Sigma_k).
+        # The train loop passes 'hmm_cache' with: mu_k [K,D], E_Lambda [K,D,D], logdet_Sigma_k [K],
+        # and r_hat for the sequences in this batch (already aligned to valid_screen).
+        hmm_cache = batch['hmm_cache']   # dict created in train loop
+        mu_k = hmm_cache['mu_k']                     # [K,D]
+        E_Lambda = hmm_cache['E_Lambda']             # [K,D,D]
+        logdet_Sigma_k = hmm_cache['logdet_Sigma_k'] # [K]
+        r_hat = hmm_cache['r_hat_flat']              # [valid_B,K] responsibilities for valid positions
+
+        # KL(q(z_t)|p(z_t|h_t=k)) for all k, then expectation over r_hat
+        kl_bk = kl_gaussian_lowrank_to_fixed_gaussians(
+            mu_q=mu, diagvar_q=var, F_q=lowrank_factors,
+            mu_p=mu_k, Lambda_p=E_Lambda, logdet_Sigma_p=logdet_Sigma_k
+        )  # [valid_B,K]
+        kl_per_sample = (kl_bk * r_hat).sum(dim=1)   # [valid_B]
+        kl_loss = kl_per_sample.mean()
+        kl_mode = 'sticky_hdp_hmm'
+        
+    elif prior_mode == 'blend' and hmm is not None and prior_blend_alpha is not None:
+        # ------ Blended prior: alpha * HMM + (1-alpha) * kl_standard ------
+        alpha = prior_blend_alpha
+
+        # Standard Normal prior component
+        mu2 = mu.square().sum(dim=1)
+        if lowrank_factors is not None:
+            r = lowrank_factors.size(2)
+            tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))
+            Dinvu = U / var.unsqueeze(-1)
+            I_plus = torch.bmm(U.transpose(1, 2), Dinvu)
+            I_plus = I_plus + torch.eye(r, device=mu.device, dtype=torch.float64).unsqueeze(0)
+            _, logdet_small = torch.linalg.slogdet(I_plus)
+            log_det_Sigma_q = (logdet_small + logvar.sum(dim=1).to(torch.float64)).to(mu.dtype)
+        else:
+            tr_Sigma_q = var.sum(dim=1)
+            log_det_Sigma_q = logvar.sum(dim=1)
+        kl_standard = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
+        
+        # HMM prior component
+        hmm_cache = batch['hmm_cache']   # dict created in train loop
+        mu_k = hmm_cache['mu_k']                     # [K,D]
+        E_Lambda = hmm_cache['E_Lambda']             # [K,D,D]
+        logdet_Sigma_k = hmm_cache['logdet_Sigma_k'] # [K]
+        r_hat = hmm_cache['r_hat_flat']              # [valid_B,K] responsibilities for valid positions
+
+        # KL(q(z_t)|p(z_t|h_t=k)) for all k, then expectation over r_hat
+        kl_bk = kl_gaussian_lowrank_to_fixed_gaussians(
+            mu_q=mu, diagvar_q=var, F_q=lowrank_factors,
+            mu_p=mu_k, Lambda_p=E_Lambda, logdet_Sigma_p=logdet_Sigma_k
+        )  # [valid_B,K]
+        kl_hmm = (kl_bk * r_hat).sum(dim=1)   # [valid_B]
+        
+        # Blend the two KL losses
+        kl_per_sample = alpha * kl_hmm + (1.0 - alpha) * kl_standard
+        kl_loss = kl_per_sample.mean()
+        kl_mode = f'blend_alpha_{alpha:.2f}'
+        
+    elif prior_mode == 'blend' and hmm is None:
+        # Fallback to standard prior if blend is requested but no HMM available
+        print("Warning: prior_mode='blend' but no HMM provided. Falling back to standard Normal prior.")
+        mu2 = mu.square().sum(dim=1)
+        if lowrank_factors is not None:
+            r = lowrank_factors.size(2)
+            tr_Sigma_q = var.sum(dim=1) + (U * U).sum(dim=(1,2))
+            Dinvu = U / var.unsqueeze(-1)
+            I_plus = torch.bmm(U.transpose(1, 2), Dinvu)
+            I_plus = I_plus + torch.eye(r, device=mu.device, dtype=torch.float64).unsqueeze(0)
+            _, logdet_small = torch.linalg.slogdet(I_plus)
+            log_det_Sigma_q = (logdet_small + logvar.sum(dim=1).to(torch.float64)).to(mu.dtype)
+        else:
+            tr_Sigma_q = var.sum(dim=1)
+            log_det_Sigma_q = logvar.sum(dim=1)
+        kl_per_sample = 0.5 * (tr_Sigma_q + mu2 - d - log_det_Sigma_q)
+        kl_loss = kl_per_sample.mean()
+        kl_mode = 'standard_fallback'
+        
+    else:
+        raise ValueError(f"Unknown prior_mode: {prior_mode}. Must be 'standard', 'hmm', or 'blend'.")
+
+    # === Beta-VAE decomposition: depends on prior mode ===
+    eps = 1e-6
+    
+    # Posterior statistics (always computed the same way)
     mu64 = mu.to(torch.float64)
     mu_bar = mu64.mean(dim=0)  # Average mean vector over batch
     mu_c = mu64 - mu_bar
@@ -2452,28 +2545,109 @@ def vae_loss(
     total_S = (total_S + total_S.T) / 2 # [LATENT_DIM, LATENT_DIM]
     total_S = total_S + eps * torch.eye(d, device=mu.device, dtype=torch.float64)  # Numerical stability
     
-    # Dimension-wise KL divergence with free bits regularization
-    diag_S_bar = torch.diag(total_S).clamp_min(eps)  # Diagonal of the covariance matrix, [LATENT_DIM]
-    dwkl_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())  # [LATENT_DIM]
-    dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - config.free_bits, min=0)  # Free bits regularization
-    dwkl = dwkl_per_dim.sum().to(mu.dtype)  # Sum over dimensions
-    dwkl_fb = dwkl_fb_per_dim.sum().to(mu.dtype)  # Free bits regularization sum
-    
-    # total correlation term - use FP32 for linear algebra operations
-    with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for numerical stability
-        # Convert to FP32 for linear algebra operations
-        D_sqrt_inv = torch.diag(1.0 / torch.sqrt(diag_S_bar)).to(torch.float64) 
-        R = D_sqrt_inv @ total_S @ D_sqrt_inv  # R = inv_sqrt * total_S * inv_sqrt
-        R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=torch.float64)  # Ensure symmetry and positive definiteness
-        sign, logabsdet_R = torch.linalg.slogdet(R)  # log(det(R))
-        if not torch.all(sign > 0):
-            raise ValueError("Covariance matrix R is not positive definite.")
-        total_correlation = -0.5 * logabsdet_R  # Total correlation term
+    # Prior-dependent decomposition
+    if prior_mode == 'standard' or (prior_mode == 'hmm' and hmm is None) or (prior_mode == 'blend' and hmm is None):
+        # Standard decomposition: KL(q||N(0,I)) = MI + TC + DWKL
         
-        # Convert back to original dtype if needed
-        total_correlation = total_correlation.to(mu.dtype)
+        # Dimension-wise KL divergence with free bits regularization
+        diag_S_bar = torch.diag(total_S).clamp_min(eps)  # Diagonal of the covariance matrix, [LATENT_DIM]
+        dwkl_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())  # [LATENT_DIM]
+        dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - config.free_bits, min=0)  # Free bits regularization
+        dwkl = dwkl_per_dim.sum().to(mu.dtype)  # Sum over dimensions
+        dwkl_fb = dwkl_fb_per_dim.sum().to(mu.dtype)  # Free bits regularization sum
+        
+        # total correlation term - use FP32 for linear algebra operations
+        with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for numerical stability
+            # Convert to FP32 for linear algebra operations
+            D_sqrt_inv = torch.diag(1.0 / torch.sqrt(diag_S_bar)).to(torch.float64) 
+            R = D_sqrt_inv @ total_S @ D_sqrt_inv  # R = inv_sqrt * total_S * inv_sqrt
+            R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=torch.float64)  # Ensure symmetry and positive definiteness
+            sign, logabsdet_R = torch.linalg.slogdet(R)  # log(det(R))
+            if not torch.all(sign > 0):
+                raise ValueError("Covariance matrix R is not positive definite.")
+            total_correlation = -0.5 * logabsdet_R  # Total correlation term
+            
+            # Convert back to original dtype if needed
+            total_correlation = total_correlation.to(mu.dtype)
+        
+        mutual_information = kl_loss - total_correlation - dwkl  # Mutual information term
+        
+    elif prior_mode == 'hmm' and hmm is not None:
+        # HMM decomposition: approximate using skill-averaged statistics
+        # Note: This is a simplification - true HMM decomposition would be more complex
+        hmm_cache = batch['hmm_cache']
+        mu_k = hmm_cache['mu_k']  # [K,D]
+        r_hat = hmm_cache['r_hat_flat']  # [valid_B,K]
+        
+        # Skill-weighted prior statistics
+        mu_prior = (r_hat.unsqueeze(2) * mu_k.unsqueeze(0)).sum(dim=1)  # [valid_B,D] weighted skill means
+        mu_prior_bar = mu_prior.mean(dim=0).to(torch.float64)  # [D] average skill-weighted prior mean
+        
+        # Approximate DWKL using skill-weighted prior
+        diag_S_bar = torch.diag(total_S).clamp_min(eps)  # [LATENT_DIM]
+        dwkl_per_dim = 0.5 * (diag_S_bar + (mu_bar - mu_prior_bar).pow(2) - 1.0 - diag_S_bar.log())  # [LATENT_DIM]
+        dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - config.free_bits, min=0)  # Free bits regularization
+        dwkl = dwkl_per_dim.sum().to(mu.dtype)  # Sum over dimensions
+        dwkl_fb = dwkl_fb_per_dim.sum().to(mu.dtype)  # Free bits regularization sum
+        
+        # Approximate TC (same computation but relative to skill-weighted prior)
+        with torch.amp.autocast('cuda', enabled=False):
+            D_sqrt_inv = torch.diag(1.0 / torch.sqrt(diag_S_bar)).to(torch.float64) 
+            R = D_sqrt_inv @ total_S @ D_sqrt_inv
+            R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=torch.float64)
+            sign, logabsdet_R = torch.linalg.slogdet(R)
+            if not torch.all(sign > 0):
+                raise ValueError("Covariance matrix R is not positive definite.")
+            total_correlation = -0.5 * logabsdet_R
+            total_correlation = total_correlation.to(mu.dtype)
+        
+        mutual_information = kl_loss - total_correlation - dwkl
+        
+    elif prior_mode == 'blend' and hmm is not None and prior_blend_alpha is not None:
+        # Blend decomposition: weighted combination of standard and HMM decompositions
+        alpha = prior_blend_alpha
+
+        # Standard decomposition
+        diag_S_bar = torch.diag(total_S).clamp_min(eps)
+        dwkl_standard_per_dim = 0.5 * (diag_S_bar + mu_bar.pow(2) - 1.0 - diag_S_bar.log())
+        dwkl_standard = dwkl_standard_per_dim.sum().to(mu.dtype)
+        
+        with torch.amp.autocast('cuda', enabled=False):
+            D_sqrt_inv = torch.diag(1.0 / torch.sqrt(diag_S_bar)).to(torch.float64) 
+            R = D_sqrt_inv @ total_S @ D_sqrt_inv
+            R = 0.5 * (R + R.t()) + eps * torch.eye(d, device=mu.device, dtype=torch.float64)
+            sign, logabsdet_R = torch.linalg.slogdet(R)
+            if not torch.all(sign > 0):
+                raise ValueError("Covariance matrix R is not positive definite.")
+            tc_standard = -0.5 * logabsdet_R
+            tc_standard = tc_standard.to(mu.dtype)
+        
+        # HMM decomposition
+        hmm_cache = batch['hmm_cache']
+        mu_k = hmm_cache['mu_k']  # [K,D]
+        r_hat = hmm_cache['r_hat_flat']  # [valid_B,K]
+        mu_prior = (r_hat.unsqueeze(2) * mu_k.unsqueeze(0)).sum(dim=1)  # [valid_B,D]
+        mu_prior_bar = mu_prior.mean(dim=0).to(torch.float64)  # [D]
+        
+        dwkl_hmm_per_dim = 0.5 * (diag_S_bar + (mu_bar - mu_prior_bar).pow(2) - 1.0 - diag_S_bar.log())
+        dwkl_hmm = dwkl_hmm_per_dim.sum().to(mu.dtype)
+        
+        # For TC, we use the same computation (it's about posterior structure, not prior)
+        tc_hmm = tc_standard  # TC is primarily about posterior correlation structure
+        
+        # Blend the components
+        dwkl_per_dim = alpha * dwkl_standard_per_dim + (1.0 - alpha) * dwkl_hmm_per_dim
+        dwkl = alpha * dwkl_standard + (1.0 - alpha) * dwkl_hmm
+        total_correlation = tc_standard  # TC doesn't blend - it's about posterior structure
+        
+        # Apply free bits to blended DWKL
+        dwkl_fb_per_dim = torch.clamp(dwkl_per_dim - config.free_bits, min=0)
+        dwkl_fb = dwkl_fb_per_dim.sum().to(mu.dtype)
+        
+        mutual_information = kl_loss - total_correlation - dwkl
     
-    mutual_information = kl_loss - total_correlation - dwkl  # Mutual information term
+    else:
+        raise ValueError(f"Unknown prior_mode: {prior_mode}. Must be 'standard', 'hmm', or 'blend'.")
     
     with torch.no_grad():
         # Compute the eigenvalues and eigenvectors - use FP32 for numerical stability
@@ -2484,8 +2658,18 @@ def vae_loss(
             'total_correlation': float(total_correlation.item()),
             'dimension_wise_kl': dwkl_per_dim,
             'dimension_wise_kl_sum': float(dwkl.item()),
-            'eigenvalues': eigenvalues
+            'eigenvalues': eigenvalues,
+            'prior_mode': prior_mode,  # Add prior mode info
+            'decomposition_method': kl_mode  # Add decomposition method info
         }
+        
+        # Add blend-specific diagnostics
+        if prior_mode == 'blend' and hmm is not None and prior_blend_alpha is not None:
+            kl_diagnosis.update({
+                'blend_alpha': prior_blend_alpha,
+                'dwkl_standard_component': float(dwkl_standard.item()) if 'dwkl_standard' in locals() else None,
+                'dwkl_hmm_component': float(dwkl_hmm.item()) if 'dwkl_hmm' in locals() else None,
+            })
     
     # Total weighted loss
     total_loss = (total_raw_loss + 
@@ -2497,6 +2681,7 @@ def vae_loss(
         'total_loss': total_loss,
         'total_raw_loss': total_raw_loss,
         'kl_loss': kl_loss,
+        'kl_mode': kl_mode,  # Add kl_mode for monitoring
         'raw_losses': raw_losses,
         'kl_diagnosis': kl_diagnosis,
         'metrics': metrics

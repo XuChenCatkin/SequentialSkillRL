@@ -1,7 +1,8 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import os
 import json
 import torch
+import numpy as np
 from datetime import datetime
 from huggingface_hub import HfApi, login, hf_hub_download, HfFileSystem
 from matplotlib import pyplot as plt
@@ -42,6 +43,141 @@ try:
 except ImportError:
     print("⚠️  scikit-learn not available. Install with: pip install scikit-learn")
     SKLEARN_AVAILABLE = False
+
+def compute_global_statistics(
+    model: MultiModalHackVAE, 
+    dataset: List[Dict], 
+    device: torch.device,
+    max_frames: int = 50000,
+    logger: Optional[object] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Evaluate a dataset with a VAE model to compute global mean and covariance statistics.
+    
+    Args:
+        model: Trained VAE model
+        dataset: Dataset in the standard format (list of batches)
+        device: Device to run evaluation on
+        max_frames: Maximum number of frames to process (to limit memory usage)
+        logger: Optional logger for progress reporting
+        
+    Returns:
+        Tuple of:
+            - global_mean: [D] - Global mean of latent representations
+            - global_cov: [D, D] - Global covariance matrix of latent representations
+            - global_var: [D] - Global variance (diagonal of covariance matrix)
+    """
+    if logger:
+        logger.info(f"Computing global statistics from dataset with max_frames={max_frames}")
+    model.eval()
+
+    if not dataset:
+        raise ValueError("Dataset is empty")
+
+    # Infer [B, T]
+    B = T = None
+    for key in ('tty_chars', 'game_chars'):
+        if key in dataset[0]:
+            B, T = dataset[0][key].shape[:2]
+            break
+    if B is None or T is None:
+        raise ValueError("Could not determine batch and time dimensions")
+
+    # Streaming accumulators (avoid storing all frames)
+    sum_mu = None            # [D]
+    sum_outer = None         # [D,D]
+    sum_diag_var = None      # [D]
+    sum_lowrank = None       # [D,D]
+    N = 0
+    D = None
+    used_frames = 0
+    saw_lowrank = False
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataset):
+            # Move to device and flatten [B,T,...] -> [B*T,...] (except masks)
+            batch_dev = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    x = v.to(device, non_blocking=True)
+                    if x.dim() >= 3 and k != 'original_batch_shape':
+                        batch_dev[k] = x.view(B*T, *x.shape[2:])
+                    else:
+                        batch_dev[k] = x
+                else:
+                    batch_dev[k] = v
+
+            out = model(batch_dev)
+            mu_bt     = out['mu']                     # [B*T, D]
+            logvar_bt = out['logvar']                 # [B*T, D]
+            Fr_bt     = out.get('lowrank_factors')    # [B*T, D, R] or None
+
+            valid = batch_dev['valid_screen'].view(B*T).bool()
+            if not valid.any():
+                continue
+
+            mu = mu_bt[valid].detach().cpu()
+            var = logvar_bt[valid].detach().cpu().exp().clamp_min(1e-8)
+            if D is None:
+                D = mu.shape[-1]
+                sum_mu = torch.zeros(D, dtype=torch.float64)
+                sum_outer = torch.zeros(D, D, dtype=torch.float64)
+                sum_diag_var = torch.zeros(D, dtype=torch.float64)
+                sum_lowrank = torch.zeros(D, D, dtype=torch.float64)
+
+            # Cap to max_frames
+            take = min(max_frames - used_frames, mu.shape[0])
+            if take <= 0:
+                break
+            mu = mu[:take].to(torch.float64)
+            var = var[:take].to(torch.float64)
+
+            # Accumulate μ, μμᵀ, diag(Σ)
+            sum_mu += mu.sum(0)
+            sum_outer += mu.T @ mu           # (∑ μ μᵀ)
+            sum_diag_var += var.sum(0)
+            N += take
+            used_frames += take
+
+            # Low-rank accumulation
+            if Fr_bt is not None:
+                F = Fr_bt[valid][:take].detach().cpu().to(torch.float64)  # [take, D, R]
+                # einsum: sum_t F_t F_tᵀ = einsum('t d r, t e r -> d e')
+                sum_lowrank += torch.einsum('tdr,ter->de', F, F)
+                saw_lowrank = True
+            else:
+                # Explicitly add zeros so logic is consistent (no-op)
+                pass
+
+            if used_frames >= max_frames:
+                if logger: logger.info(f"Reached max_frames={max_frames}")
+                break
+
+    if N == 0:
+        raise ValueError("No valid frames found in dataset")
+
+    # Build covariance (in float64), then cast back to float32
+    mean = (sum_mu / N)
+    mean_outer = torch.outer(mean, mean)
+    diag_cov = (sum_diag_var / N).diag()
+    outer_mean = (sum_outer / N)
+    lowrank_cov = (sum_lowrank / N) if saw_lowrank else torch.zeros(D, D, dtype=torch.float64)
+
+    C = diag_cov + outer_mean + lowrank_cov - mean_outer
+    # Regularize, symmetrize
+    eps = 1e-6 * C.diag().mean().clamp_min(1e-6)
+    C = 0.5 * (C + C.T)
+    C = C + eps * torch.eye(D, dtype=torch.float64)
+
+    # Diagnostics (eigh for SPD)
+    if logger:
+        evals = torch.linalg.eigvalsh(C)
+        cond = (evals.max() / evals.clamp_min(1e-12).min()).item()
+        logger.info(f"Global stats: N={N}, mean|μ|={mean.norm().item():.4f}, "
+                    f"trace(C)={C.trace().item():.4f}, "
+                    f"λ_min={evals.min().item():.4f}, λ_max={evals.max().item():.4f}, cond={cond:.2e}")
+
+    return mean.to(torch.float32), C.to(torch.float32), C.diag().to(torch.float32)
 
 def save_checkpoint(
     model: MultiModalHackVAE,
@@ -815,4 +951,316 @@ def create_model_demo_notebook(repo_name: str, save_path: str = "demo_notebook.i
         json.dump(notebook_content, f, indent=2)
     
     print(f"📓 Demo notebook created: {save_path}")
+
+def save_hmm_to_huggingface(
+    hmm,  # StickyHDPHMMVI
+    hmm_params,  # StickyHDPHMMParams
+    niw_prior,  # NIWPrior
+    config: VAEConfig,
+    repo_name: str,
+    round_num: int,
+    total_rounds: int,
+    token: Optional[str] = None,
+    private: bool = True,
+    commit_message: str = None,
+    base_vae_repo: str = None
+) -> str:
+    """
+    Save Sticky-HDP-HMM model to HuggingFace Hub
+    
+    Args:
+        hmm: Trained StickyHDPHMMVI model
+        hmm_params: HMM parameters
+        niw_prior: NIW prior
+        config: VAEConfig from associated VAE
+        repo_name: HuggingFace repository name
+        round_num: Current EM round number
+        total_rounds: Total number of EM rounds
+        token: HuggingFace token
+        private: Whether to create private repository
+        commit_message: Commit message
+        base_vae_repo: Base VAE repository name
+        
+    Returns:
+        Repository URL on HuggingFace Hub
+    """
+    if not HF_AVAILABLE:
+        raise ImportError("HuggingFace Hub is required. Install with: pip install huggingface_hub")
+    
+    # Login if token is provided
+    if token:
+        login(token=token)
+    
+    api = HfApi()
+    
+    try:
+        # Check if repository exists, create if not
+        try:
+            repo_info = api.repo_info(repo_id=repo_name, repo_type="model")
+            print(f"📁 Repository {repo_name} already exists")
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower() or isinstance(e, RepositoryNotFoundError):
+                print(f"🆕 Creating new repository: {repo_name}")
+                api.create_repo(repo_id=repo_name, private=private, repo_type="model")
+            else:
+                raise e
+    
+        # Prepare HMM data
+        import tempfile
+        temp_hmm_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pt')
+        hmm_data = {
+            'hmm_posterior_params': hmm.get_posterior_params(),
+            'hmm_params': hmm_params,
+            'niw_prior': niw_prior,
+            'rho_emission': hmm.get_rho_emission().cpu(),
+            'rho_transition': hmm.get_rho_transition().cpu(),
+            'round': round_num,
+            'total_rounds': total_rounds,
+            'config': config,
+            'training_timestamp': datetime.now().isoformat(),
+        }
+        torch.save(hmm_data, temp_hmm_file.name)
+        temp_hmm_file.close()
+        
+        # Prepare model metadata
+        model_info = {
+            "model_type": "StickyHDPHMM",
+            "framework": "PyTorch",
+            "task": "latent-dynamics-modeling",
+            "round": round_num,
+            "total_rounds": total_rounds,
+            "latent_dim": config.latent_dim,
+            "num_skills": config.skill_num,
+            "hmm_parameters": {
+                "alpha": hmm_params.alpha,
+                "kappa": hmm_params.kappa,
+                "gamma": hmm_params.gamma,
+                "K": hmm_params.K,
+                "D": hmm_params.D
+            },
+            "base_vae_repo": base_vae_repo or "unknown"
+        }
+        
+        # Create model card
+        model_card_content = f"""---
+license: mit
+language: en
+tags:
+- nethack
+- reinforcement-learning
+- hmm
+- sticky-hdp-hmm
+- latent-dynamics
+- variational-inference
+pipeline_tag: other
+---
+
+# Sticky-HDP-HMM for NetHack (Round {round_num}/{total_rounds})
+
+A Sticky Hierarchical Dirichlet Process Hidden Markov Model trained on NetHack latent representations for learning skills and temporal dynamics.
+
+## Model Description
+
+This is a Sticky-HDP-HMM model that learns discrete skills and temporal transitions in the latent space of a NetHack VAE. The model uses:
+- Sticky self-transitions to encourage temporal persistence of skills
+- Hierarchical Dirichlet Process for automatic skill discovery
+- Normal-Inverse-Wishart priors for skill emission distributions
+
+## Model Details
+
+- **Model Type**: Sticky Hierarchical Dirichlet Process Hidden Markov Model
+- **Framework**: PyTorch with Variational Inference
+- **EM Round**: {round_num} of {total_rounds}
+- **Latent Dimensions**: {model_info.get('latent_dim', 'unknown')}
+- **Maximum Skills**: {model_info.get('num_skills', 'unknown')}
+- **Base VAE**: {base_vae_repo or 'local checkpoint'}
+
+## HMM Parameters
+
+- **Alpha (DP concentration)**: {hmm_params.alpha}
+- **Kappa (sticky parameter)**: {hmm_params.kappa}
+- **Gamma (top-level DP)**: {hmm_params.gamma}
+
+## Usage
+
+```python
+from train import load_hmm_from_huggingface
+import torch
+
+# Load the HMM
+hmm, config = load_hmm_from_huggingface("{repo_name}")
+
+# The HMM can be used with a VAE for skill-based generation
+```
+
+## Training
+
+This HMM was trained using Expectation-Maximization on VAE latent representations:
+- E-step: Variational inference for posterior skill assignments
+- M-step: VAE fine-tuning with HMM skill prior
+
+## Citation
+
+If you use this model, please consider citing:
+
+```bibtex
+@misc{{nethack-hmm,
+  title={{Sticky-HDP-HMM for NetHack Skill Learning}},
+  author={{Xu Chen}},
+  year={{2025}},
+  url={{https://huggingface.co/{repo_name}}}
+}}
+```
+"""
+        
+        # Save model card
+        model_card_path = "HMM_README.md"
+        with open(model_card_path, "w") as f:
+            f.write(model_card_content)
+        
+        # Save model config
+        config_path = "HMM_config.json"
+        with open(config_path, "w") as f:
+            json.dump(model_info, f, indent=2)
+        
+        # Upload files
+        print(f"📤 Uploading HMM to {repo_name}...")
+        
+        # Upload HMM file
+        api.upload_file(
+            path_or_fileobj=temp_hmm_file.name,
+            path_in_repo=f"hmm_round{round_num}.pt",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message=commit_message or f"Upload Sticky-HDP-HMM round {round_num}/{total_rounds}"
+        )
+        
+        # Upload model card
+        api.upload_file(
+            path_or_fileobj=model_card_path,
+            path_in_repo="README.md",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message="Add HMM model card"
+        )
+        
+        # Upload config
+        api.upload_file(
+            path_or_fileobj=config_path,
+            path_in_repo="config.json",
+            repo_id=repo_name,
+            repo_type="model",
+            commit_message="Add HMM config"
+        )
+        
+        # Clean up temporary files
+        os.unlink(temp_hmm_file.name)
+        os.remove(model_card_path)
+        os.remove(config_path)
+        
+        repo_url = f"https://huggingface.co/{repo_name}"
+        print(f"✅ HMM successfully uploaded to: {repo_url}")
+        return repo_url
+        
+    except Exception as e:
+        print(f"❌ Error uploading HMM to HuggingFace: {e}")
+        # Clean up temporary file on error
+        if 'temp_hmm_file' in locals() and os.path.exists(temp_hmm_file.name):
+            os.unlink(temp_hmm_file.name)
+        raise
+
+
+def load_hmm_from_huggingface(
+    repo_name: str,
+    round_num: int = None,
+    revision_name: Optional[str] = None,
+    token: Optional[str] = None,
+    device: str = "cpu"
+) -> tuple:
+    """
+    Load Sticky-HDP-HMM model from HuggingFace Hub
+    
+    Args:
+        repo_name: HuggingFace repository name
+        round_num: Specific round number to load (if None, loads latest)
+        revision_name: Specific revision to load
+        token: HuggingFace token
+        device: Device to load the model on
+        
+    Returns:
+        Tuple of (hmm, config, hmm_params, niw_prior, metadata)
+    """
+    if not HF_AVAILABLE:
+        raise ImportError("HuggingFace Hub is required. Install with: pip install huggingface_hub")
+    
+    # Login if token is provided
+    if token:
+        login(token=token)
+    
+    try:
+        # Download config first
+        print(f"📥 Downloading HMM config from {repo_name}...")
+        config_path = hf_hub_download(
+            repo_id=repo_name,
+            filename="config.json",
+            repo_type="model",
+            revision=revision_name
+        )
+        
+        with open(config_path, "r") as f:
+            config_data = json.load(f)
+        
+        # Determine which round to load
+        if round_num is None:
+            round_num = config_data.get('round', 1)
+        
+        # Download HMM file
+        hmm_filename = f"hmm_round{round_num}.pt"
+        print(f"📥 Downloading HMM weights from {repo_name}: {hmm_filename}...")
+        
+        hmm_path = hf_hub_download(
+            repo_id=repo_name,
+            filename=hmm_filename,
+            repo_type="model",
+            revision=revision_name
+        )
+        
+        # Load HMM data
+        hmm_checkpoint = torch.load(hmm_path, map_location=device, weights_only=False)
+        
+        # Extract components
+        config = hmm_checkpoint['config']
+        hmm_params = hmm_checkpoint['hmm_params'] 
+        niw_prior = hmm_checkpoint['niw_prior']
+        hmm_posterior_params = hmm_checkpoint['hmm_posterior_params']
+        rho_emission = hmm_checkpoint['rho_emission']
+        rho_transition = hmm_checkpoint['rho_transition']
+        
+        # Recreate HMM
+        from src.skill_space import StickyHDPHMMVI
+        hmm = StickyHDPHMMVI(
+            p=hmm_params,
+            niw_prior=niw_prior,
+            rho_emission=rho_emission,
+            rho_transition=rho_transition
+        )
+        
+        # Load posterior parameters instead of state_dict
+        hmm.load_posterior_params(hmm_posterior_params)
+        hmm = hmm.to(device)
+        
+        print(f"✅ HMM loaded successfully from HuggingFace: {repo_name}")
+        print(f"🎯 Round: {round_num}, Device: {device}")
+        
+        metadata = {
+            'round': hmm_checkpoint.get('round', round_num),
+            'total_rounds': hmm_checkpoint.get('total_rounds', 'unknown'),
+            'training_timestamp': hmm_checkpoint.get('training_timestamp', 'unknown')
+        }
+        
+        return hmm, config, hmm_params, niw_prior, metadata
+        
+    except Exception as e:
+        print(f"❌ Error loading HMM from HuggingFace: {e}")
+        raise
 

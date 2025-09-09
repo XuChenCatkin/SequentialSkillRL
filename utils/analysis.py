@@ -14,9 +14,12 @@ from collections import Counter
 from tqdm import tqdm
 from datetime import datetime
 import json
+import math
 
 from src.model import bag_presence_to_glyph_sets, make_pair_bag, MapDecoder
-from training.train import load_model_from_huggingface, load_model_from_local
+# Conditional import to avoid circular dependency
+# from training.train import load_model_from_huggingface, load_model_from_local
+from src.skill_space import StickyHDPHMMVI
 
 # Import NetHackCategory from data_collection
 try:
@@ -808,491 +811,353 @@ def visualize_reconstructions(
         }
     }
 
+def _mean_ekl_diag_or_lowrank(mu_np, logvar_np, lowrank_np=None):
+    """
+    Average per-sample KL(q(z|x) || N(0,I)).
+    Supports diag posterior (logvar) and optional low-rank factors F (B,D,R).
+    Uses matrix determinant lemma: det(Λ + FF^T) = det(Λ) * det(I + F^T Λ^{-1} F).
+    """
+    B, D = mu_np.shape
+    mu2_sum = (mu_np**2).sum(axis=1)                      # [B]
+    if lowrank_np is None:
+        # diag Σ = diag(exp(logvar))
+        s2 = np.exp(logvar_np)                            # [B,D]
+        tr_sum = s2.sum(axis=1)                           # [B]
+        logdet = logvar_np.sum(axis=1)                    # [B] (since det(Λ)=exp(sum logvar))
+        kl = 0.5 * (tr_sum + mu2_sum - D - logdet)
+        return float(kl.mean())
+    else:
+        # Σ = Λ + F F^T, Λ=diag(s2)
+        F = lowrank_np                                    # [B,D,R]
+        s2 = np.exp(logvar_np)                            # [B,D]
+        tr_sum = s2.sum(axis=1) + np.sum(F**2, axis=(1,2))
+        # logdet(Σ) = logdet(Λ) + logdet(I + F^T Λ^{-1} F)
+        logdet_L = logvar_np.sum(axis=1)                  # [B]
+        # build R x R matrix per-sample: I + F^T Λ^{-1} F
+        invL_F = F / np.maximum(s2[..., None], 1e-8)      # [B,D,R]
+        Bt = np.matmul(F.transpose(0,2,1), invL_F)        # [B,R,R]
+        # stable logdet via slogdet
+        sign, logdet_B = np.linalg.slogdet(np.eye(Bt.shape[1])[None,...] + Bt)
+        logdet_B = np.where(sign > 0, logdet_B, -1e9)     # guard
+        logdet = logdet_L + logdet_B
+        kl = 0.5 * (tr_sum + mu2_sum - D - logdet)
+        return float(kl.mean())
 
 def analyze_latent_space(
-    model, dataset, device, 
-    save_path="vae_analysis/latent_analysis.png", 
-    max_samples=100, 
-    dataset_labels=None
+    model,
+    dataset,
+    device,
+    save_path="vae_analysis/latent_analysis.png",
+    max_samples=100,
+    dataset_labels=None,
+    tsne_on_pca=True,
+    jitter_eps=1e-5,
 ):
     """
-    Enhanced version of analyze_latent_space with support for multiple datasets
-    Automatically balances samples between training and testing datasets
-    
-    Args:
-        model: Trained MultiModalHackVAE model
-        dataset: List of batches from multiple datasets
-        device: Device to run inference on
-        save_path: Path to save the analysis plots
-        max_samples: Maximum number of samples to analyze
-        dataset_labels: List of labels for each batch indicating which dataset it comes from
+    Balanced latent-space analysis with MI/TC/DW that includes posterior noise.
+    - Aggregated posterior covariance: Var_x[mu_x] + E_x[diag_var_x + F_x F_x^T]
+    - Safer t-SNE, covariance shrinkage, and numerically stable logdets.
     """
+    import os, random
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    import torch
+
     model.eval()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
+
     if dataset_labels is None:
-        dataset_labels = ['unknown'] * len(dataset)
-    
-    # Separate datasets by type
-    train_batches = []
-    test_batches = []
-    train_labels = []
-    test_labels = []
-    
-    for batch, label in zip(dataset, dataset_labels):
-        if label == 'train':
-            train_batches.append(batch)
-            train_labels.append(label)
-        elif label == 'test':
-            test_batches.append(batch)
-            test_labels.append(label)
-        else:
-            # Unknown labels go to train by default
-            train_batches.append(batch)
-            train_labels.append('train')
-    
-    print(f"📊 Dataset composition: {len(train_batches)} train batches, {len(test_batches)} test batches")
-    
-    # Determine sample allocation
-    if len(train_batches) > 0 and len(test_batches) > 0:
-        # Both datasets available - split samples evenly
-        train_samples_target = max_samples // 2
-        test_samples_target = max_samples - train_samples_target
-        print(f"🎯 Target samples: {train_samples_target} train, {test_samples_target} test")
-    elif len(train_batches) > 0:
-        # Only training data available
-        train_samples_target = max_samples
-        test_samples_target = 0
-        print(f"🎯 Only training data available, using {train_samples_target} samples")
-    elif len(test_batches) > 0:
-        # Only testing data available  
-        train_samples_target = 0
-        test_samples_target = max_samples
-        print(f"🎯 Only testing data available, using {test_samples_target} samples")
+        dataset_labels = ['train'] * len(dataset)  # default to train
+
+    # --- split batches by label
+    train_batches, test_batches = [], []
+    for b, lbl in zip(dataset, dataset_labels):
+        (train_batches if lbl == 'train' else test_batches).append(b)
+
+    # --- target allocation
+    if len(train_batches) and len(test_batches):
+        n_train = max_samples // 2
+        n_test  = max_samples - n_train
+    elif len(train_batches):
+        n_train, n_test = max_samples, 0
+    elif len(test_batches):
+        n_train, n_test = 0, max_samples
     else:
-        raise ValueError("No valid datasets provided")
-    
-    # Shuffle datasets for random sampling
-    if len(train_batches) > 0:
-        train_indices = list(range(len(train_batches)))
-        random.shuffle(train_indices)
-        train_batches = [train_batches[i] for i in train_indices]
-        train_labels = [train_labels[i] for i in train_indices]
-    
-    if len(test_batches) > 0:
-        test_indices = list(range(len(test_batches)))
-        random.shuffle(test_indices)
-        test_batches = [test_batches[i] for i in test_indices]
-        test_labels = [test_labels[i] for i in test_indices]
-    
-    latent_vectors = []
-    batch_indices = []
-    sample_info = []
-    
-    def extract_samples_from_batches(batches, labels, target_samples, dataset_type):
-        """Extract samples from a list of batches"""
-        local_latent_vectors = []
-        local_sample_info = []
-        sample_count = 0
-        
+        raise ValueError("No valid datasets provided.")
+
+    random.shuffle(train_batches)
+    random.shuffle(test_batches)
+
+    # containers
+    mu_list, logvar_list, lowrank_list, ds_list = [], [], [], []
+
+    def _pull_from_batches(batches, target, tag):
+        nonlocal mu_list, logvar_list, lowrank_list, ds_list
+        got = 0
         with torch.no_grad():
-            for batch_idx, (batch, label) in enumerate(zip(batches, labels)):
-                if sample_count >= target_samples:
+            for batch in batches:
+                if got >= target:
                     break
-                    
-                # Move batch to device and reshape like in training
-                batch_device = {}
-                for key, value in batch.items():
-                    if value is not None and isinstance(value, torch.Tensor):
-                        value_device = value.to(device)
-                        # Reshape tensors from [B, T, ...] to [B*T, ...]
-                        B, T = value_device.shape[:2]
-                        remaining_dims = value_device.shape[2:]
-                        batch_device[key] = value_device.view(B * T, *remaining_dims)
-                    else:
-                        batch_device[key] = value
-                        
-                if 'valid_screen' in batch_device:
-                    valid_screen = batch_device['valid_screen'].cpu()  # [B*T]
-                else:
-                    valid_screen = torch.ones(batch_device['game_chars'].shape[0], dtype=torch.bool)
-                
-                # Get model output (includes mu, logvar, lowrank_factors)
-                samples_to_process = min(max(0, target_samples - sample_count), valid_screen.sum().item())
-                if samples_to_process == 0:
+                # Move to device & flatten [B,T,...] -> [B*T,...]
+                flat = {}
+                BT = None
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        v = v.to(device)
+                        if v.ndim >= 2:
+                            B, T = v.shape[:2]
+                            v = v.view(B * T, *v.shape[2:])
+                            BT = B * T if BT is None else BT
+                        flat[k] = v
+                valid = flat.get('valid_screen')
+                if valid is None:
+                    # assume everything valid
+                    N = next(iter(flat.values())).shape[0]
+                    valid = torch.ones(N, dtype=torch.bool, device=device)
+
+                idx = torch.where(valid)[0]
+                if idx.numel() == 0:
                     continue
-                    
-                valid_indices = torch.where(valid_screen)[0]
-                
-                # Randomly shuffle valid indices for more diverse sampling
-                perm = torch.randperm(len(valid_indices))
-                valid_indices = valid_indices[perm][:samples_to_process]
-                
-                # Create batch structure for model forward pass
-                batch_for_model = {
-                    'game_chars': batch_device['game_chars'][valid_indices],
-                    'game_colors': batch_device['game_colors'][valid_indices],
-                    'blstats': batch_device['blstats'][valid_indices],
-                    'message_chars': batch_device['message_chars'][valid_indices],
-                    'hero_info': batch_device['hero_info'][valid_indices]
+                # shuffle valid positions, take up to what's left
+                need = int(min(target - got, idx.numel()))
+                if need <= 0:
+                    break
+                perm = torch.randperm(idx.numel(), device=device)[:need]
+                idx = idx[perm]
+
+                feed = {
+                    'game_chars':    flat['game_chars'][idx],
+                    'game_colors':   flat['game_colors'][idx],
+                    'blstats':       flat['blstats'][idx],
+                    'message_chars': flat['message_chars'][idx],
+                    'hero_info':     flat['hero_info'][idx],
                 }
-                
-                model_output = model(batch_for_model)
-                
-                mu = model_output['mu']  # [samples_to_process, latent_dim]
-                
-                # Store latent representations
-                local_latent_vectors.append(mu.cpu().numpy())
-                
-                # Store sample info with dataset labels
-                batch_size = mu.shape[0]
-                for i in range(batch_size):
-                    local_sample_info.append({
-                        'batch_idx': batch_idx,
-                        'sample_idx': i,
-                        'dataset': dataset_type,
-                        'valid_screen': True,
-                        'global_batch_idx': len(sample_info) + len(local_sample_info)
-                    })
-                
-                sample_count += batch_size
-                
-                if sample_count % 50 == 0 or sample_count >= target_samples:
-                    print(f"  📈 Extracted {sample_count}/{target_samples} {dataset_type} samples...")
-        
-        return local_latent_vectors, local_sample_info
-    
-    # Extract samples from training dataset
-    if train_samples_target > 0:
-        print(f"🔄 Extracting samples from training dataset...")
-        train_latent_vectors, train_sample_info = extract_samples_from_batches(
-            train_batches, train_labels, train_samples_target, 'train'
-        )
-        latent_vectors.extend(train_latent_vectors)
-        sample_info.extend(train_sample_info)
-        print(f"✅ Extracted {len(train_sample_info)} training samples")
-    
-    # Extract samples from testing dataset
-    if test_samples_target > 0:
-        print(f"🔄 Extracting samples from testing dataset...")
-        test_latent_vectors, test_sample_info = extract_samples_from_batches(
-            test_batches, test_labels, test_samples_target, 'test'
-        )
-        latent_vectors.extend(test_latent_vectors)
-        sample_info.extend(test_sample_info)
-        print(f"✅ Extracted {len(test_sample_info)} testing samples")
-    
-    # Combine all latent vectors
-    if len(latent_vectors) == 0:
-        raise ValueError("No samples could be extracted from the datasets")
-    
-    latent_vectors = np.vstack(latent_vectors)
-    
-    # Create batch indices for backward compatibility
-    batch_indices = [info['global_batch_idx'] for info in sample_info]
-    
-    # Final shuffle for more uniform distribution in visualizations
-    sample_indices = list(range(len(latent_vectors)))
-    random.shuffle(sample_indices)
-    latent_vectors = latent_vectors[sample_indices]
-    sample_info = [sample_info[i] for i in sample_indices]
-    batch_indices = [batch_indices[i] for i in sample_indices]
-    
-    # Create dataset color mapping
-    unique_datasets = list(set([info['dataset'] for info in sample_info]))
-    dataset_colors = {}
-    colors = ['turquoise', 'lightcoral', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
-    for i, dataset in enumerate(unique_datasets):
-        dataset_colors[dataset] = colors[i % len(colors)]
-    
-    dataset_color_values = [dataset_colors[info['dataset']] for info in sample_info]
-    
-    print(f"📊 Enhanced Latent Space Analysis (Balanced Sampling):")
-    print(f"  - Total samples analyzed: {len(latent_vectors)}")
-    print(f"  - Datasets: {unique_datasets}")
-    
-    # Count samples per dataset after balancing
-    actual_counts = {}
-    for dataset in unique_datasets:
-        count = sum(1 for info in sample_info if info['dataset'] == dataset)
-        actual_counts[dataset] = count
-        print(f"  - {dataset} samples: {count}")
-    
-    print(f"  - Latent dimensionality: {latent_vectors.shape[1]}")
-    print(f"  - Latent mean: {np.mean(latent_vectors, axis=0)[:5]}...")
-    print(f"  - Latent std: {np.std(latent_vectors, axis=0)[:5]}...")
-    
-    # Compute PCA and t-SNE first for use in multiple plots
-    pca = PCA(n_components=min(10, latent_vectors.shape[1]))
-    latent_pca = pca.fit_transform(latent_vectors)
-    pca_explained_variance = pca.explained_variance_ratio_
-        
-    print("🔄 Computing t-SNE embedding (this may take a moment)...")
-    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(latent_vectors)//4))
-    latent_tsne = tsne.fit_transform(latent_vectors)
-    
-    # Compute statistics for plots
-    latent_vars = np.var(latent_vectors, axis=0)
-    latent_means = np.mean(latent_vectors, axis=0)
-    
-    # Create comprehensive visualization
-    fig, axes = plt.subplots(3, 3, figsize=(18, 18))
-    
-    # 1. PCA of latent space colored by dataset (moved to first position)
-    for dataset in unique_datasets:
-        mask = [info['dataset'] == dataset for info in sample_info]
-        if any(mask):
-            dataset_pca = latent_pca[mask]
-            axes[0, 0].scatter(dataset_pca[:, 0], dataset_pca[:, 1], 
-                                c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
-    
-    axes[0, 0].set_xlabel(f'PC1 ({pca_explained_variance[0]:.2%} variance)')
-    axes[0, 0].set_ylabel(f'PC2 ({pca_explained_variance[1]:.2%} variance)')
-    axes[0, 0].set_title('PCA of Latent Space (colored by dataset)')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # 2. t-SNE of latent space colored by dataset
-    if latent_tsne is not None:
-        for dataset in unique_datasets:
-            mask = [info['dataset'] == dataset for info in sample_info]
-            if any(mask):
-                dataset_tsne = latent_tsne[mask]
-                axes[0, 1].scatter(dataset_tsne[:, 0], dataset_tsne[:, 1], 
-                                    c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
-        
-        axes[0, 1].set_xlabel('t-SNE Dimension 1')
-        axes[0, 1].set_ylabel('t-SNE Dimension 2')
-        axes[0, 1].set_title('t-SNE of Latent Space (colored by dataset)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
+                out = model(feed)
+                mu      = out['mu']                        # [n,D]
+                logvar  = out.get('logvar', None)          # [n,D]
+                lowrank = out.get('lowrank_factors', None) # [n,D,R] or None
+
+                mu_list.append(mu.detach().cpu().numpy())
+                if logvar is not None:
+                    logvar_list.append(logvar.detach().cpu().numpy())
+                if lowrank is not None:
+                    lowrank_list.append(lowrank.detach().cpu().numpy())
+                ds_list.extend([tag] * mu.shape[0])
+                got += mu.shape[0]
+        return got
+
+    got_train = _pull_from_batches(train_batches, n_train, 'train') if n_train else 0
+    got_test  = _pull_from_batches(test_batches,  n_test,  'test')  if n_test  else 0
+    total = got_train + got_test
+    if total == 0:
+        raise RuntimeError("No valid samples collected. Check valid_screen and inputs.")
+
+    # --- stack
+    mu_all = np.vstack(mu_list)                            # [N,D]
+    D = mu_all.shape[1]
+    logvar_all  = np.vstack(logvar_list) if logvar_list else None
+    lowrank_all = np.vstack(lowrank_list) if lowrank_list else None  # shape: [N,D,R] collapsed ok
+
+    # --- compute aggregated posterior covariance: Var[mu] + E[diag(var)] + E[FF^T]
+    mu_mean = mu_all.mean(axis=0)                          # [D]
+    mu_centered = mu_all - mu_mean
+    cov_between = (mu_centered.T @ mu_centered) / (mu_all.shape[0] - 1 + 1e-6)  # Var_x[mu_x]  [D,D]
+
+    if logvar_all is not None:
+        E_diag = np.exp(logvar_all).mean(axis=0)           # [D]
     else:
-        # Fallback: show first two latent dimensions
-        for dataset in unique_datasets:
-            mask = [info['dataset'] == dataset for info in sample_info]
-            if any(mask):
-                dataset_latents = latent_vectors[mask]
-                axes[0, 1].scatter(dataset_latents[:, 0], dataset_latents[:, 1], 
-                                  c=dataset_colors[dataset], label=dataset, alpha=0.6, s=20)
-        
-        axes[0, 1].set_xlabel('Latent Dimension 0')
-        axes[0, 1].set_ylabel('Latent Dimension 1')
-        axes[0, 1].set_title('Raw Latent Space (t-SNE unavailable)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-    
-    # 3. Variance per latent dimension
-    axes[0, 2].bar(range(len(latent_vars)), latent_vars)
-    axes[0, 2].set_xlabel('Latent Dimension')
-    axes[0, 2].set_ylabel('Variance')
-    axes[0, 2].set_title('Variance per Latent Dimension')
-    axes[0, 2].grid(True, alpha=0.3)
-    
-    # 4. Mean per latent dimension
-    axes[1, 0].bar(range(len(latent_means)), latent_means)
-    axes[1, 0].set_xlabel('Latent Dimension')
-    axes[1, 0].set_ylabel('Mean')
-    axes[1, 0].set_title('Mean per Latent Dimension')
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # 5. PC1 distribution by dataset (instead of first latent dimension)
-    dataset_pc1_values = []
-    for dataset in unique_datasets:
-        mask = [info['dataset'] == dataset for info in sample_info]
-        if any(mask):
-            dataset_pc1 = latent_pca[mask, 0]  # Get PC1 values for this dataset
-            dataset_pc1_values.append(dataset_pc1)
-        else:
-            dataset_pc1_values.append(np.array([]))  # Empty array if no samples
-    
-    # Only plot non-empty datasets
-    non_empty_datasets = [ds for ds, vals in zip(unique_datasets, dataset_pc1_values) if len(vals) > 0]
-    non_empty_values = [vals for vals in dataset_pc1_values if len(vals) > 0]
-    
-    if non_empty_values:
-        axes[1, 1].hist(non_empty_values, bins=30, alpha=0.7, label=non_empty_datasets, density=True)
-    
-    axes[1, 1].axvline(0, color='black', linestyle='--', alpha=0.7, label='Zero mean')
-    axes[1, 1].set_xlabel(f'PC1 Value ({pca_explained_variance[0]:.2%} variance)')
-    axes[1, 1].set_ylabel('Density')
-    axes[1, 1].set_title('PC1 Distribution by Dataset')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    # 6. Correlation matrix of first 10 raw latent dimensions
-    n_dims_to_show = min(10, latent_vectors.shape[1])
-    corr_matrix = np.corrcoef(latent_vectors[:, :n_dims_to_show].T)
-    im = axes[1, 2].imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
-    axes[1, 2].set_xlabel('Latent Dimension')
-    axes[1, 2].set_ylabel('Latent Dimension')
-    axes[1, 2].set_title(f'Raw Latent Correlation Matrix (first {n_dims_to_show} dims)')
-    
-    # Add correlation colorbar
-    cbar = plt.colorbar(im, ax=axes[1, 2])
-    cbar.set_label('Correlation')
-    
-    # 7. Per-dimension KL divergence histogram
-    # Compute per-dimension KL divergence: KL(q(z_i) || p(z_i)) for each dimension
-    # Assuming standard normal prior: KL = 0.5 * (var + mean^2 - 1 - log(var))
-    per_dim_kl = 0.5 * (latent_vars + latent_means**2 - 1 - np.log(np.maximum(latent_vars, 1e-8)))
-    
-    axes[2, 0].bar(range(len(per_dim_kl)), per_dim_kl)
-    axes[2, 0].axhline(0.05, color='red', linestyle='--', alpha=0.7, label='Threshold (0.05 nats)')
-    axes[2, 0].set_xlabel('Latent Dimension')
-    axes[2, 0].set_ylabel('KL Divergence (nats)')
-    axes[2, 0].set_title('Per-Dimension KL Divergence')
-    axes[2, 0].legend()
-    axes[2, 0].grid(True, alpha=0.3)
-    
-    # 8. Eigenvalues of posterior covariance matrix
-    posterior_cov = np.cov(latent_vectors.T)
-    eigenvalues = np.linalg.eigvals(posterior_cov)
-    eigenvalues = np.sort(eigenvalues)[::-1]  # Sort in descending order
-    
-    axes[2, 1].bar(range(len(eigenvalues)), eigenvalues)
-    axes[2, 1].axhline(1.0, color='red', linestyle='--', alpha=0.7, label='Unit variance threshold')
-    axes[2, 1].set_xlabel('Eigenvalue Index (sorted)')
-    axes[2, 1].set_ylabel('Eigenvalue')
-    axes[2, 1].set_title('Posterior Covariance Eigenvalues')
-    axes[2, 1].legend()
-    axes[2, 1].grid(True, alpha=0.3)
-    axes[2, 1].set_yscale('log')  # Log scale for better visualization
-    
-    # 9. Mutual Information and Total Correlation
-    # Use proper β-VAE decomposition: KL = MI + TC + DW-KL
-    
-    # First compute overall KL divergence KL(q(z) || p(z))
-    kl_total = 0.5 * (np.trace(posterior_cov) + np.sum(latent_means**2) - 
-                      latent_vectors.shape[1] - np.linalg.slogdet(posterior_cov)[1])
-    
-    # Dimension-wise KL: sum of KL(q(z_i) || p(z_i)) for each dimension
-    dimension_wise_kl = np.sum(per_dim_kl)
-    
-    # Total Correlation: -0.5 * log(det(R)) where R is normalized covariance
-    diag_vars = np.maximum(np.diag(posterior_cov), 1e-8)
-    D_sqrt_inv = np.diag(1.0 / np.sqrt(diag_vars))
-    R = D_sqrt_inv @ posterior_cov @ D_sqrt_inv  # Normalized covariance
-    R = 0.5 * (R + R.T) + 1e-8 * np.eye(R.shape[0])  # Ensure symmetry and stability
-    total_correlation = -0.5 * np.linalg.slogdet(R)[1]
-    
-    # Mutual Information: residual from the decomposition
-    mutual_info = kl_total - total_correlation - dimension_wise_kl
-    
-    metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL\n(sum)']
-    values = [mutual_info, total_correlation, dimension_wise_kl, kl_total]
-    colors = ['skyblue', 'lightcoral', 'lightgreen', 'gold']
-    
-    bars = axes[2, 2].bar(metrics, values, color=colors, alpha=0.7)
-    axes[2, 2].set_ylabel('Nats')
-    axes[2, 2].set_title('β-VAE KL Decomposition: KL = MI + TC + DW-KL')
-    axes[2, 2].grid(True, alpha=0.3)
-    
-    # Add value labels on bars
-    for bar, value in zip(bars, values):
-        height = bar.get_height()
-        axes[2, 2].text(bar.get_x() + bar.get_width()/2., height + 0.01*max(values),
-                       f'{value:.3f}', ha='center', va='bottom', fontsize=9)
-    
-    pca_explained_variance = pca.explained_variance_ratio_
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-    
-    # Generate TTY visualization grid using PCA components
-    print(f"\n🎮 Generating TTY visualization grid using PCA space...")
-    # Use first 2 PCA components for the grid
-    W = pca.components_[:2]  # [2, latent_dim] - first 2 principal components
+        E_diag = np.zeros(D, dtype=np.float64)
+
+    if lowrank_all is not None:
+        # lowrank_all: [N, D, R] -> average FF^T over samples (R is small, so this is cheap for ~100 samples)
+        N, D_, R = lowrank_all.shape
+        assert D_ == D
+        E_FFt = np.zeros((D, D), dtype=np.float64)
+        for i in range(N):
+            F = lowrank_all[i]                             # [D,R]
+            E_FFt += F @ F.T
+        E_FFt /= N
+    else:
+        E_FFt = np.zeros((D, D), dtype=np.float64)
+
+    Sigma_agg = cov_between + np.diag(E_diag) + E_FFt      # [D,D]
+    # numerical shrinkage
+    Sigma_agg = 0.5 * (Sigma_agg + Sigma_agg.T)
+    Sigma_agg += jitter_eps * np.eye(D)
+
+    # --- per-dim stats for plots
+    var_total = np.diag(Sigma_agg)                         # Var(z_i)
+    mean_total = mu_mean                                   # E[z_i]
+
+    # --- PCA (for plots & grid)
+    pca = PCA(n_components=min(10, D), svd_solver='auto', random_state=42)
+    latent_pca = pca.fit_transform(mu_all)                 # PCA of means for viz
+    pca_expl = pca.explained_variance_ratio_
+
+    # --- TSNE (on PCA-10 for stability / speed)
+    n = mu_all.shape[0]
+    if tsne_on_pca:
+        tsne_input = latent_pca
+    else:
+        tsne_input = mu_all
+    # clamp perplexity
+    perpl = max(5, min(30, n - 1, n // 4 if n >= 24 else 5))
+    try:
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perpl, init='pca', learning_rate='auto')
+        latent_tsne = tsne.fit_transform(tsne_input)
+    except Exception as e:
+        print(f"[t-SNE warning] {e} — falling back to first two PCs.")
+        latent_tsne = None
+
+    # --- KL decomposition (Gaussian assumption): KL(q(z)||N(0,I)) = MI + TC + DW
+    # Total KL with full Σ_agg and mean_total
+    ekl = _mean_ekl_diag_or_lowrank(mu_all, logvar_all, lowrank_all)  # E_x KL(q(z|x)||N(0,I))
+
+    # Dimension-wise KL: sum_i KL(q(z_i)||N(0,1)) with Var(z_i)=var_total_i, mean=mean_total_i
+    dw_kl = 0.5 * np.sum(var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
+
+    # Total correlation: -0.5 * log det( R ),  R = D^{-1/2} Σ D^{-1/2}
+    Dinv2 = np.diag(1.0 / np.sqrt(np.clip(var_total, jitter_eps, None)))
+    R = Dinv2 @ Sigma_agg @ Dinv2
+    R = 0.5 * (R + R.T) + jitter_eps * np.eye(D)
+    _, logdetR = np.linalg.slogdet(R)
+    tc = -0.5 * logdetR
+
+    mi = float(ekl - tc - dw_kl)
+
+    # --- Visualization
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(3, 3, figsize=(18, 18))
+
+    # dataset palette (avoid shadowing)
+    palette = ['turquoise', 'lightcoral', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
+    ds_unique = sorted(set(ds_list))
+    ds_to_color = {ds: palette[i % len(palette)] for i, ds in enumerate(ds_unique)}
+    ds_mask = {ds: np.array([d == ds for d in ds_list]) for ds in ds_unique}
+
+    # (0,0) PCA scatter
+    for ds in ds_unique:
+        m = ds_mask[ds]
+        axes[0,0].scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+    axes[0,0].set_title('PCA of Latent Means (by dataset)')
+    axes[0,0].set_xlabel(f'PC1 ({pca_expl[0]:.1%})'); axes[0,0].set_ylabel(f'PC2 ({pca_expl[1]:.1%})'); axes[0,0].legend(); axes[0,0].grid(alpha=0.3)
+
+    # (0,1) t-SNE
+    if latent_tsne is not None:
+        for ds in ds_unique:
+            m = ds_mask[ds]
+            axes[0,1].scatter(latent_tsne[m,0], latent_tsne[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+        axes[0,1].set_title(f't-SNE (perplexity={perpl})'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
+    else:
+        for ds in ds_unique:
+            m = ds_mask[ds]
+            axes[0,1].scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+        axes[0,1].set_title('Fallback: PC1 vs PC2'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
+
+    # (0,2) per-dim variance (from Σ_agg diagonal)
+    axes[0,2].bar(range(D), var_total)
+    axes[0,2].set_title('Variance per Latent (Σ_agg diag)'); axes[0,2].set_xlabel('dim'); axes[0,2].grid(alpha=0.3)
+
+    # (1,0) per-dim mean
+    axes[1,0].bar(range(D), mean_total)
+    axes[1,0].set_title('Mean per Latent'); axes[1,0].set_xlabel('dim'); axes[1,0].grid(alpha=0.3)
+
+    # (1,1) PC1 distribution by dataset
+    for ds in ds_unique:
+        m = ds_mask[ds]
+        if m.any():
+            axes[1,1].hist(latent_pca[m,0], bins=30, alpha=0.6, density=True, label=ds, color=ds_to_color[ds])
+    axes[1,1].axvline(0, color='k', ls='--', alpha=0.7)
+    axes[1,1].set_title('PC1 Distribution'); axes[1,1].legend(); axes[1,1].grid(alpha=0.3)
+
+    # (1,2) correlation of first 10 raw dims using Σ_agg
+    k = min(10, D)
+    Sigma_k = Sigma_agg[:k,:k]
+    d = np.sqrt(np.clip(np.diag(Sigma_k), jitter_eps, None))
+    Rk = (Sigma_k / d[:,None]) / d[None,:]
+    im = axes[1,2].imshow(Rk, vmin=-1, vmax=1, cmap='RdBu_r')
+    axes[1,2].set_title('Correlation (first 10 dims)'); fig.colorbar(im, ax=axes[1,2], label='corr')
+
+    # (2,0) per-dim KL
+    per_dim_kl = 0.5 * (var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
+    axes[2,0].bar(range(D), per_dim_kl)
+    axes[2,0].axhline(0.05, color='r', ls='--', alpha=0.7, label='0.05 nats'); axes[2,0].legend()
+    axes[2,0].set_title('Per-dim KL'); axes[2,0].grid(alpha=0.3)
+
+    # (2,1) eigen-spectrum
+    evals = np.linalg.eigvalsh(Sigma_agg)
+    evals = np.clip(evals, jitter_eps, None)
+    axes[2,1].bar(range(D), np.sort(evals)[::-1])
+    axes[2,1].set_yscale('log'); axes[2,1].set_title('Eigenvalues of Σ_agg (log)'); axes[2,1].grid(alpha=0.3)
+
+    # (2,2) KL decomposition
+    metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL']
+    vals = [mi, tc, dw_kl, ekl]
+    bars = axes[2,2].bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
+    axes[2,2].set_ylabel('nats'); axes[2,2].set_title('KL = MI + TC + DW')
+    for b, v in zip(bars, vals):
+        axes[2,2].text(b.get_x() + b.get_width()/2., v * 1.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+    plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.show()
+
+    # --- PCA grid decode
+    print("\n🎮 Generating TTY visualization grid using PCA space...")
+    W = pca.components_[:2]                   # [2,D]
     num_per_axis = 5
-    points = torch.distributions.Normal(0,1).icdf(torch.linspace(0.01, 0.99, num_per_axis))
-    XX, YY = torch.meshgrid(points, points, indexing='ij')
-    XXYY = torch.stack((XX, YY)).reshape(2, -1).T  # [25, 2]
-    
-    # Transform from PCA space back to latent space
-    pca_grid = XXYY.numpy()  # [25, 2] in PCA space
-    # To go from PCA space to latent space: latent = pca_coords @ components + mean
-    latent_grid = pca_grid @ W + latent_means[np.newaxis, :]  # [25, latent_dim]
-    latent_grid = torch.tensor(latent_grid, dtype=torch.float32)
-    
+    q = torch.distributions.Normal(0,1).icdf(torch.linspace(0.01, 0.99, num_per_axis))
+    XX, YY = torch.meshgrid(q, q, indexing='ij')
+    grid_2d = torch.stack((XX, YY)).reshape(2, -1).T.numpy()     # [25,2]
+    latent_grid = grid_2d @ W + pca.mean_[None, :]               # [25,D]
+    latent_grid = torch.tensor(latent_grid, dtype=torch.float32, device=device)
+
     with torch.no_grad():
-        decode_output = model.sample(z=latent_grid.to(device))
-        # Use ego data instead of full map chars/colors
-        if 'ego_chars' in decode_output and 'ego_colors' in decode_output:
-            chars = decode_output['ego_chars'].cpu()
-            colors = decode_output['ego_colors'].cpu()
+        dec = model.sample(z=latent_grid)
+        if 'ego_chars' in dec and 'ego_colors' in dec:
+            ego_chars = dec['ego_chars'].detach().cpu()
+            ego_colors = dec['ego_colors'].detach().cpu()
         else:
-            print("⚠️ No ego_chars/ego_colors in decode output, creating dummy data")
-            chars = torch.full((latent_grid.shape[0], 8, 8), 32)  # 8x8 grid of spaces
-            colors = torch.zeros((latent_grid.shape[0], 8, 8))   # Black colors
+            print("⚠️ sample() lacks ego chars/colors; using placeholders.")
+            ego_chars  = torch.full((latent_grid.shape[0], 8, 8), 32)
+            ego_colors = torch.zeros_like(ego_chars)
 
-    # Create TTY grid visualization
-    tty_fig, tty_axes = plt.subplots(num_per_axis, num_per_axis, figsize=(20, 20))
-    tty_fig.suptitle('Generated NetHack Ego-Centric Views from PCA Latent Space Grid (5x5)', fontsize=16, y=0.98)
-
-    print(f"🎨 Rendering {num_per_axis * num_per_axis} NetHack ego-centric views...")
-    n = min(len(chars), num_per_axis * num_per_axis)
+    fig2, axs = plt.subplots(num_per_axis, num_per_axis, figsize=(20, 20))
+    fig2.suptitle('Generated Ego Views from PCA Grid (5x5)', fontsize=16, y=0.98)
+    import numpy as np
     imgs = [
-        _render_map_image(chars[i], colors[i],
+        _render_map_image(ego_chars[i], ego_colors[i],
                           font_path="DejaVuSansMono.ttf", font_size=12, bg=(0,0,0))
-        for i in range(n)
+        for i in range(min(len(ego_chars), num_per_axis**2))
     ]
-    tty_axes = tty_axes.ravel()
-    for i, ax in enumerate(tty_axes):
+    axs = axs.ravel()
+    for i, ax in enumerate(axs):
         ax.axis("off")
-        if i < n:
+        if i < len(imgs):
             ax.imshow(imgs[i], interpolation="nearest")
     plt.tight_layout()
-    
     tty_save_path = save_path.replace('.png', '_tty_grid.png')
-    plt.figure(tty_fig.number)
-    plt.savefig(tty_save_path, dpi=200, bbox_inches='tight')
-    plt.show()
-    
-    print(f"Enhanced latent space analysis saved to {save_path}")
-    print(f"TTY grid visualization saved to {tty_save_path}")
-    
-    # Enhanced statistics with PCA focus
-    print(f"\n📈 Enhanced Statistics (PCA-Focused Analysis):")
-    print(f"  - Effective dimensionality (dims with var > 0.01): {np.sum(latent_vars > 0.01)}")
-    print(f"  - High variance dimensions (var > 0.1): {np.sum(latent_vars > 0.1)}")
-    print(f"  - Dimensions close to N(0,1): {np.sum((np.abs(latent_means) < 0.1) & (np.abs(latent_vars - 1.0) < 0.2))}")
-    print(f"  - PCA components computed: {len(pca_explained_variance)}")
-    print(f"  - PCA explained variance (first 5 components): {pca_explained_variance[:5]}")
-    print(f"  - PCA cumulative variance (first 5): {np.cumsum(pca_explained_variance[:5])}")
-    print(f"  - t-SNE computation: successful")
-    
-    print(f"\n🎯 Dataset Balance Analysis:")
-    for dataset in unique_datasets:
-        mask = [info['dataset'] == dataset for info in sample_info]
-        dataset_latents = latent_vectors[mask]
-        if len(dataset_latents) > 0:
-            # Analyze in both raw latent space and PCA space
-            dataset_pca = latent_pca[mask]
-            dataset_mean_norm = np.linalg.norm(dataset_latents.mean(axis=0))
-            dataset_std_norm = np.linalg.norm(dataset_latents.std(axis=0))
-            dataset_pc1_mean = dataset_pca[:, 0].mean()
-            dataset_pc1_std = dataset_pca[:, 0].std()
-            print(f"  - {dataset} dataset:")
-            print(f"    * Samples: {len(dataset_latents)}")
-            print(f"    * Raw latent mean norm: {dataset_mean_norm:.3f}")
-            print(f"    * Raw latent std norm: {dataset_std_norm:.3f}")
-            print(f"    * PC1 mean: {dataset_pc1_mean:.3f}, PC1 std: {dataset_pc1_std:.3f}")
-            print(f"    * Latent range: [{dataset_latents.min():.3f}, {dataset_latents.max():.3f}]")
-            print(f"    * PC1 range: [{dataset_pca[:, 0].min():.3f}, {dataset_pca[:, 0].max():.3f}]")
-    
+    plt.figure(fig2.number); plt.savefig(tty_save_path, dpi=200, bbox_inches='tight'); plt.show()
+
+    # --- reporting
+    print(f"\n📊 Enhanced Latent Space Analysis")
+    print(f"  - Samples: {total} ({got_train} train, {got_test} test), D={D}")
+    print(f"  - KL total={ekl:.3f}, MI={mi:.3f}, TC={tc:.3f}, DW={dw_kl:.3f}")
+    print(f"  - PCA first 5 explained: {pca_expl[:5]} (cum {np.cumsum(pca_expl[:5])})")
+
     return {
-        'latent_vectors': latent_vectors,
-        'batch_indices': batch_indices, 
-        'sample_info': sample_info,
-        'latent_means': latent_means,
-        'latent_vars': latent_vars,
+        'mu': mu_all,
+        'Sigma_agg': Sigma_agg,
+        'mean': mu_mean,
+        'var_diag': var_total,
         'pca_components': latent_pca,
-        'pca_explained_variance': pca_explained_variance,
-        'pca_model': pca,  # Include the fitted PCA model
+        'pca_model': pca,
         'tsne_components': latent_tsne,
-        'dataset_labels': unique_datasets,
-        'tty_grid_path': tty_save_path
+        'metrics': {'kl_total': float(ekl), 'mi': float(mi), 'tc': float(tc), 'dw_kl': float(dw_kl)},
+        'dataset_labels': ds_list,
+        'plot_path': save_path,
+        'tty_grid_path': tty_save_path,
     }
+
 
 
 def create_visualization_demo(
@@ -1401,6 +1266,8 @@ def create_visualization_demo(
     model = None
     
     try:
+        # Import here to avoid circular dependency
+        from training.train import load_model_from_huggingface
         model = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
     except Exception as e:
         print(f"⚠️  Failed to load from HuggingFace: {e}")
@@ -1436,6 +1303,8 @@ def create_visualization_demo(
         
         if local_checkpoint_path is not None:
             try:
+                # Import here to avoid circular dependency
+                from training.train import load_model_from_local
                 model = load_model_from_local(local_checkpoint_path, device=device)
                 print(f"✅ Successfully loaded model from local checkpoint")
             except Exception as local_e:
@@ -2003,3 +1872,511 @@ def plot_glyph_char_color_pairs_from_saved(
     }
     
     return results
+
+
+@torch.no_grad()
+def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_sequences: int = 6, max_batches: int = 4, random_seed: int = 42, batch_multiples: int = 1):
+    """
+    Collect a few sequences' Viterbi paths for raster plots.
+    Uses Viterbi algorithm to find the most likely state sequence, rather than argmax per timestep.
+    
+    Args:
+        model: VAE model for encoding
+        dataset: Dataset to sample from
+        device: Device to run on
+        hmm: HMM model
+        max_sequences: Maximum number of sequences to collect
+        max_batches: Maximum number of batches to process
+        random_seed: Random seed for reproducible sampling
+        batch_multiples: Number of batches to concatenate along time dimension for each processing group
+        
+    Returns: 
+        (rasters: List[np.ndarray], lengths: List[int])
+    """
+    import random
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
+    rasters, lengths = [], []
+    grabbed = 0
+    
+    # Get batch dimensions and shuffle B indices once
+    B, T = dataset[0]['tty_chars'].shape[:2] if 'tty_chars' in dataset[0] else dataset[0]['game_chars'].shape[:2]
+    B_indices = list(range(B))
+    random.shuffle(B_indices)
+    
+    # Process in groups of batch_multiples consecutive batches
+    for group_idx in range(max_batches):
+        if grabbed >= max_sequences:
+            break
+            
+        start_batch_idx = group_idx * batch_multiples
+        
+        # Collect batch_multiples consecutive batches for concatenation
+        group_batches = []
+        for i in range(batch_multiples):
+            batch_idx = start_batch_idx + i
+            if batch_idx >= len(dataset):
+                break
+            batch = dataset[batch_idx]
+            group_batches.append(batch)
+        
+        if not group_batches:
+            continue
+            
+        # Concatenate batches along time dimension with B shuffling
+        concatenated_batch = {}
+        
+        for k in group_batches[0].keys():
+            if isinstance(group_batches[0][k], torch.Tensor):
+                # Apply B shuffling to each batch, then concatenate along time dimension (dim=1)
+                tensors_to_cat = []
+                for batch in group_batches:
+                    if k in batch:
+                        tensor = batch[k]
+                        if tensor.dim() >= 2:
+                            tensor = tensor[B_indices]  # Shuffle along batch dimension
+                        tensors_to_cat.append(tensor)
+                if tensors_to_cat:
+                    concatenated_batch[k] = torch.cat(tensors_to_cat, dim=1)
+            else:
+                # For non-tensor data, just use the first batch's value
+                concatenated_batch[k] = group_batches[0][k]
+        
+        # Move to device and keep [B,T*batch_multiples,...] shapes
+        batch_dev = {}
+        for k, v in concatenated_batch.items():
+            if isinstance(v, torch.Tensor):
+                batch_dev[k] = v.to(device, non_blocking=True)
+            else:
+                batch_dev[k] = v
+        
+        if 'game_chars' not in batch_dev: 
+            continue
+            
+        B, extended_T = batch_dev['game_chars'].shape[:2]  # extended_T = T * batch_multiples
+        
+        # Since we already shuffled B indices, just take sequences in order
+        seq_indices = list(range(B))
+        
+        with torch.no_grad():
+            # Process each sequence separately to avoid memory issues
+            for b in seq_indices:
+                if grabbed >= max_sequences: break
+                
+                # Extract single sequence data
+                seq_data = {}
+                for k, v in batch_dev.items():
+                    if isinstance(v, torch.Tensor) and v.dim() >= 2 and k not in ('original_batch_shape',):
+                        seq_data[k] = v[b:b+1]  # Keep batch dimension [1, T, ...]
+                    else:
+                        seq_data[k] = v
+                
+                # Flatten sequence for model forward: [1, T, ...] -> [T, ...]
+                flat = {}
+                for k, v in seq_data.items():
+                    if isinstance(v, torch.Tensor) and v.dim() >= 3 and k not in ('original_batch_shape',):
+                        flat[k] = v.view(extended_T, *v.shape[2:])  # [T, ...]
+                    else:
+                        flat[k] = v
+                
+                # Forward pass for single sequence
+                try:
+                    out = model(flat)
+                    mu_t = out['mu'].view(extended_T, -1)  # [T, latent_dim]
+                    var_t = out['logvar'].exp().clamp_min(1e-6).view(extended_T, -1)  # [T, latent_dim]
+                    F_tr = out.get('lowrank_factors', None)
+                    F_t = None if F_tr is None else F_tr.view(extended_T, F_tr.size(-2), F_tr.size(-1))
+                    valid = flat['valid_screen'].view(extended_T).bool()
+                    
+                    # Check if sequence has any valid frames
+                    m = valid.cpu().numpy().astype(bool)
+                    if m.sum() == 0: 
+                        continue
+                    
+                    # Compute emission log-likelihoods for this sequence
+                    mu_t_unsqueezed = mu_t.unsqueeze(0)  # [1, T, latent_dim]
+                    var_t_unsqueezed = var_t.unsqueeze(0)  # [1, T, latent_dim]
+                    F_t_unsqueezed = None if F_t is None else F_t.unsqueeze(0)  # [1, T, ...]
+                    valid_unsqueezed = valid.unsqueeze(0)  # [1, T]
+                    valid_idx = valid.nonzero(as_tuple=True)[0]
+                    if valid_idx.numel() == 0:
+                        continue
+                    
+                    logB_t = hmm.expected_emission_loglik(
+                        hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu,
+                        mu_t_unsqueezed, var_t_unsqueezed, F_t_unsqueezed, mask=valid_unsqueezed)  # [1, T, K]
+                    logB_single = logB_t.squeeze(0)  # [T, K]
+                    logB_valid = logB_single[valid]  # [T_valid, K]
+                    
+                    # Get HMM parameters
+                    log_pi = torch.log(torch.clamp(hmm._Epi(), min=1e-30))
+                    ElogA = hmm._ElogA()
+                    
+                    # Extract single sequence and run Viterbi algorithm
+                    labels_valid, _ = StickyHDPHMMVI.viterbi(log_pi, ElogA, logB_valid)
+                    labels = labels_valid.cpu().numpy().astype(int)
+                    rasters.append(labels)
+                    lengths.append(len(labels))
+                    grabbed += 1
+                    
+                except torch.cuda.OutOfMemoryError:
+                    # If we still run out of memory on a single sequence, skip it
+                    print(f"Warning: Skipping sequence {b} due to memory constraints")
+                    continue
+                except Exception as e:
+                    print(f"Warning: Error processing sequence {b}: {e}")
+                    continue
+        if grabbed >= max_sequences:
+            break
+    return rasters, lengths
+
+@torch.no_grad()
+def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_batches: int = 5, logger=None, random_seed: int = 42, batch_multiples: int = 1):
+    """
+    Compute HMM diagnostics on a subset of the dataset
+    
+    Args:
+        model: VAE model for encoding
+        dataset: Dataset to sample from
+        device: Device to run on
+        hmm: HMM model
+        max_batches: Maximum number of batches to process
+        logger: Optional logger
+        random_seed: Random seed for reproducible sampling
+        batch_multiples: Number of batches to concatenate along time dimension for each diagnostic computation
+    """
+    import random
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
+    model.eval()
+    total_batches_needed = max_batches * batch_multiples
+    n_batches = min(len(dataset), total_batches_needed)
+    B, T = dataset[0]['tty_chars'].shape[:2]
+    
+    # Shuffle B indices once and apply to all batches to maintain temporal continuity
+    B_indices = list(range(B))
+    random.shuffle(B_indices)
+    
+    all_mu = []
+    all_var = []
+    all_F = []
+    all_mask = []
+    
+    # Collect VAE outputs for diagnostics
+    with torch.no_grad():
+        # Process in groups of batch_multiples consecutive batches
+        for group_idx in range(max_batches):
+            start_batch_idx = group_idx * batch_multiples
+            
+            # Collect batch_multiples consecutive batches for concatenation
+            group_mu = []
+            group_var = []
+            group_F = []
+            group_mask = []
+            
+            # Process batch_multiples consecutive batches
+            for i in range(batch_multiples):
+                batch_idx = start_batch_idx + i
+                if batch_idx >= len(dataset):
+                    break
+                    
+                batch = dataset[batch_idx]
+                
+                batch_dev = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        x = v.to(device, non_blocking=True)
+                        # Apply B shuffling here
+                        if x.dim() >= 2:
+                            x = x[B_indices]  # Shuffle along batch dimension
+                        if x.dim() >= 3 and k not in ('original_batch_shape',):
+                            batch_dev[k] = x.view(B*T, *x.shape[2:])
+                        else:
+                            batch_dev[k] = x
+                    else:
+                        batch_dev[k] = v
+                
+                # Forward encode only
+                out = model(batch_dev)
+                mu = out['mu']
+                logvar = out['logvar']
+                F = out.get('lowrank_factors', None)
+                
+                valid = batch_dev['valid_screen'].view(B, T)
+                
+                # Reshape to [B,T,...]
+                mu_bt = mu.view(B, T, -1)
+                var_bt = logvar.exp().clamp_min(1e-6).view(B, T, -1)
+                F_bt = None if F is None else F.view(B, T, F.size(-2), F.size(-1))
+                
+                group_mu.append(mu_bt)
+                group_var.append(var_bt)
+                if F_bt is not None:
+                    group_F.append(F_bt)
+                group_mask.append(valid)
+            
+            # Concatenate along time dimension for this group
+            if group_mu:
+                group_mu_concat = torch.cat(group_mu, dim=1)  # [B, T*batch_multiples, D]
+                group_var_concat = torch.cat(group_var, dim=1)  # [B, T*batch_multiples, D]
+                group_F_concat = torch.cat(group_F, dim=1) if group_F else None  # [B, T*batch_multiples, ...]
+                group_mask_concat = torch.cat(group_mask, dim=1)  # [B, T*batch_multiples]
+                
+                all_mu.append(group_mu_concat)
+                all_var.append(group_var_concat)
+                if group_F_concat is not None:
+                    all_F.append(group_F_concat)
+                all_mask.append(group_mask_concat)
+    
+    # Concatenate all data
+    mu_concat = torch.cat(all_mu, dim=0)  # [total_B, T, D]
+    var_concat = torch.cat(all_var, dim=0)
+    F_concat = torch.cat(all_F, dim=0) if all_F else None
+    mask_concat = torch.cat(all_mask, dim=0)
+    
+    # Compute diagnostics using HMM's built-in function
+    diagnostics = hmm.diagnostics(
+        mu_t=mu_concat,
+        diag_var_t=var_concat, 
+        F_t=F_concat,
+        mask=mask_concat
+    )
+    
+    return diagnostics
+
+@torch.no_grad()
+def visualize_hmm_after_estep(
+    model, dataset, device, hmm: StickyHDPHMMVI, save_dir: str, round_idx: int,
+    logger=None, max_diags_batches: int = 5, max_raster_sequences: int = 6, random_seed: int = 42, batch_multiples: int = 1
+):
+    """
+    Produce a small set of plots summarizing the HMM after the E-step.
+    Saves figures under {save_dir}/round_{round_idx:02d}/ and returns a dict of paths.
+    
+    Args:
+        model: VAE model for encoding
+        dataset: Dataset to sample from
+        device: Device to run on
+        hmm: HMM model
+        save_dir: Directory to save results
+        round_idx: Round index for naming
+        logger: Optional logger
+        max_diags_batches: Maximum number of batches for diagnostics
+        max_raster_sequences: Maximum number of sequences for raster plots
+        random_seed: Random seed for reproducible sampling
+        batch_multiples: Number of batches to concatenate along time dimension for each processing group
+    """
+    round_dir = os.path.join(save_dir, f"round_{round_idx:02d}")
+    os.makedirs(round_dir, exist_ok=True)
+
+    # 1) quick diagnostics and basic tensors
+    diags = compute_hmm_diagnostics(model, dataset, device, hmm, max_batches=max_diags_batches, logger=logger, random_seed=random_seed, batch_multiples=batch_multiples)
+    pi_hat = diags["occupancy_pi_hat"].cpu().numpy()
+    A = hmm._EA().cpu().numpy()  # E[A]
+    mu_k, E_Lambda, _ = hmm.get_emission_expectations()        # [K,D], [K,D,D], [K]
+    mu_k = mu_k.cpu().numpy()
+
+    # 2) figure: occupancy bar
+    f1 = plt.figure(figsize=(8, 3))
+    xs = np.arange(len(pi_hat))
+    plt.bar(xs, pi_hat)
+    plt.xlabel("Skill k")
+    plt.ylabel("Occupancy $\hat{\\pi}_k$")
+    plt.title(f"Round {round_idx}: Skill occupancy (effK={diags['effective_K']:.2f})")
+    plt.tight_layout()
+    path_pi = os.path.join(round_dir, f"round{round_idx:02d}_pi_bar.png")
+    f1.savefig(path_pi, dpi=160); plt.close(f1)
+
+    # 3) figure: transition heatmap
+    f2 = plt.figure(figsize=(6, 5))
+    plt.imshow(A, origin="lower", aspect="auto", vmin=0., vmax=1., interpolation='nearest')
+    plt.colorbar(label="E[$A_{ij}$]")
+    plt.xlabel("Next state")
+    plt.ylabel("Current state")
+    diag_mean = float(np.mean(np.diag(A)))
+    plt.title(f"Round {round_idx}: Transition matrix (diag mean={diag_mean:.3f})")
+    plt.tight_layout()
+    path_A = os.path.join(round_dir, f"round{round_idx:02d}_A_heatmap.png")
+    f2.savefig(path_A, dpi=160); plt.close(f2)
+
+    # 4) figure: t-SNE of mu_k (+ optional ellipses from E[Lambda]^{-1})
+    try:
+        from sklearn.manifold import TSNE
+        from sklearn.decomposition import PCA
+        
+        # Use t-SNE for better cluster visualization, but fallback to PCA if needed
+        if mu_k.shape[0] > 3 and mu_k.shape[1] > 2:  # Need enough points and dimensions for t-SNE
+            try:
+                # Preprocess with PCA if dimensionality is very high
+                if mu_k.shape[1] > 128:
+                    pca_prep = PCA(n_components=50).fit(mu_k)
+                    mu_prep = pca_prep.transform(mu_k)
+                else:
+                    mu_prep = mu_k
+                
+                tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, mu_k.shape[0]-1))
+                xy = tsne.fit_transform(mu_prep)
+                method_name = "t-SNE"
+            except Exception:
+                # Fallback to PCA if t-SNE fails
+                comps = min(2, mu_k.shape[1])
+                pca = PCA(n_components=comps).fit(mu_k)
+                xy = pca.transform(mu_k)
+                method_name = "PCA"
+        else:
+            # Use PCA for small datasets
+            comps = min(2, mu_k.shape[1])
+            pca = PCA(n_components=comps).fit(mu_k)
+            xy = pca.transform(mu_k)
+            method_name = "PCA"
+            
+        f3 = plt.figure(figsize=(6, 5))
+        plt.scatter(xy[:,0], xy[:,1], s=50*(pi_hat / (pi_hat.max()+1e-8) + 0.2), alpha=0.7)
+        
+        # Add skill labels for clarity
+        for i in range(mu_k.shape[0]):
+            plt.annotate(f'{i}', (xy[i,0], xy[i,1]), xytext=(3, 3), 
+                        textcoords='offset points', fontsize=8, alpha=0.8)
+        
+        # Only add ellipses for PCA (they don't make sense for t-SNE transformed space)
+        if method_name == "PCA":
+            for i in range(mu_k.shape[0]):
+                try:
+                    cov = np.linalg.inv(E_Lambda[i].cpu().numpy())
+                    cov = 0.5*(cov + cov.T)
+                    w, V = np.linalg.eigh(cov)
+                    w = np.clip(w, 1e-8, None)
+                    angle = math.degrees(math.atan2(V[1, -1], V[0, -1]))
+                    r1, r2 = np.sqrt(w[-1]), np.sqrt(w[-2]) if len(w) > 1 else np.sqrt(w[-1])
+                    from matplotlib.patches import Ellipse
+                    e = Ellipse(xy[i], 2*r1, 2*r2, angle=angle, fill=False, alpha=0.4)
+                    ax = plt.gca(); ax.add_patch(e)
+                except Exception:
+                    pass
+                    
+        plt.xlabel(f"{method_name} 1"); plt.ylabel(f"{method_name} 2")
+        plt.title(f"Round {round_idx}: {method_name} of emission means (size ∝ $\\hat\\pi_k$)")
+        plt.tight_layout()
+        path_pca = os.path.join(round_dir, f"round{round_idx:02d}_mu_{method_name.lower()}.png")
+        f3.savefig(path_pca, dpi=160); plt.close(f3)
+    except Exception as e:
+        path_pca = None
+
+    # 5) figure: skill rasters on a few sequences
+    rasters, lengths = _collect_sample_rasters(model, dataset, device, hmm, max_sequences=max_raster_sequences, random_seed=random_seed, batch_multiples=batch_multiples)
+    if len(rasters) > 0:
+        maxT = max(lengths)
+        canvas = np.full((len(rasters), maxT), fill_value=-1, dtype=np.int32)
+        for i, lab in enumerate(rasters):
+            canvas[i, :len(lab)] = lab
+        f4 = plt.figure(figsize=(10, 1.2 + 0.35*len(rasters)))
+        plt.imshow(canvas, interpolation="nearest", aspect="auto", origin="lower", cmap="tab20")
+        plt.colorbar(label="Skill id", fraction=0.025, pad=0.02)
+        plt.xlabel("t (valid frames)"); plt.ylabel("sequence #")
+        plt.title(f"Round {round_idx}: Skill raster (Viterbi optimal paths)")
+        plt.tight_layout()
+        path_raster = os.path.join(round_dir, f"round{round_idx:02d}_skill_raster.png")
+        f4.savefig(path_raster, dpi=160); plt.close(f4)
+    else:
+        path_raster = None
+
+    # 6) figure: Top 5 empirical dwell-time PMFs with geometric overlay
+    try:
+        if "all_lengths" in diags and "p_stay" in diags and "top5_idx" in diags:
+            all_lengths = diags["all_lengths"]
+            p_stay = diags["p_stay"].cpu().numpy()
+            top5_idx = diags["top5_idx"].cpu().numpy()
+            
+            # Create subplot grid: 2x3 (will use 5 subplots)
+            f5, axes = plt.subplots(2, 3, figsize=(15, 8))
+            axes = axes.flatten()
+            
+            max_bins = 50  # Maximum number of bins to show
+            
+            for i, state_idx in enumerate(top5_idx[:5]):  # Top 5 states
+                ax = axes[i]
+                state_idx = int(state_idx)
+                
+                # Get empirical dwell lengths for this state
+                empirical_lengths = all_lengths[state_idx]
+                
+                if len(empirical_lengths) > 0:
+                    # Create histogram of empirical lengths
+                    max_len = min(max(empirical_lengths), max_bins)
+                    bins = np.arange(1, max_len + 2) - 0.5  # Bins centered on integers
+                    counts, _ = np.histogram(empirical_lengths, bins=bins)
+                    pmf_empirical = counts / counts.sum()
+                    
+                    # Plot empirical PMF
+                    x_vals = np.arange(1, max_len + 1)
+                    ax.bar(x_vals, pmf_empirical, alpha=0.7, label='Empirical', color='steelblue')
+                    
+                    # Compute and overlay geometric PMF
+                    p_stay_state = p_stay[state_idx]
+                    if p_stay_state < 0.999:  # Avoid division by zero
+                        p_exit = 1.0 - p_stay_state
+                        # Geometric PMF: P(L=k) = (1-p)^(k-1) * p for k=1,2,3,...
+                        geometric_pmf = [(p_stay_state**(k-1)) * p_exit for k in x_vals]
+                        ax.plot(x_vals, geometric_pmf, 'r-', linewidth=2, label='Geometric', alpha=0.8)
+                    
+                    # Formatting
+                    ax.set_xlabel('Dwell length')
+                    ax.set_ylabel('Probability')
+                    ax.set_title(f'State {state_idx} (π̂={pi_hat[state_idx]:.3f})')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Set reasonable axis limits
+                    ax.set_xlim(0.5, min(max_len + 0.5, max_bins + 0.5))
+                    
+                else:
+                    # No data for this state
+                    ax.text(0.5, 0.5, f'State {state_idx}\\nNo dwell data', 
+                           transform=ax.transAxes, ha='center', va='center', fontsize=12)
+                    ax.set_xlabel('Dwell length')
+                    ax.set_ylabel('Probability')
+                    ax.set_title(f'State {state_idx} (π̂={pi_hat[state_idx]:.3f})')
+            
+            # Hide the last subplot if we have only 5 states
+            if len(top5_idx) < 6:
+                axes[5].set_visible(False)
+            
+            plt.suptitle(f'Round {round_idx}: Top 5 States - Empirical vs Geometric Dwell-time PMFs', fontsize=14)
+            plt.tight_layout()
+            
+            path_dwell = os.path.join(round_dir, f"round{round_idx:02d}_dwell_pmfs.png")
+            f5.savefig(path_dwell, dpi=160, bbox_inches='tight')
+            plt.close(f5)
+        else:
+            path_dwell = None
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to create dwell-time PMF plot: {e}")
+        path_dwell = None
+
+    # Save a small JSON snapshot for quick diffing
+    snap = {
+        "round": round_idx,
+        "avg_loglik_per_step": float(diags["avg_loglik_per_step"]),
+        "state_entropy": float(diags["state_entropy"]),
+        "effective_K": float(diags["effective_K"]),
+        "stickiness_diag_mean": float(diags["stickiness_diag_mean"]),
+        "expected_dwell_length_per_state": [float(x) for x in diags["expected_dwell_length_per_state"]],
+        "top5_pi": [float(x) for x in diags["top5_pi"]],
+        "top5_idx": [int(x) for x in diags["top5_idx"]],
+    }
+    json_path = os.path.join(round_dir, f"round{round_idx:02d}_diags.json")
+    with open(json_path, "w") as f:
+        json.dump(snap, f, indent=2)
+
+    return {
+        "dir": round_dir,
+        "pi_bar": path_pi,
+        "A_heatmap": path_A,
+        "mu_pca": path_pca,
+        "skill_raster": path_raster,
+        "dwell_pmfs": path_dwell,
+        "diags_json": json_path,
+    }
