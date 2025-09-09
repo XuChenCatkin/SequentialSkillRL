@@ -1424,3 +1424,131 @@ class StickyHDPHMMVI(nn.Module):
             "empirical_dwell_length_per_state": emp_mean,
             "all_lengths": all_lens
         }
+
+    # -----------------------------------------------------------------------
+    #                       C A U S A L   F I L T E R
+    # -----------------------------------------------------------------------
+    @dataclass
+    class FilterState:
+        """Minimal per‑sequence filter state."""
+        log_alpha: torch.Tensor  # [Kp1] normalized (log) filtering marginals
+        loglik: float = 0.0      # cumulative log-likelihood
+
+    @torch.no_grad()
+    def emission_logB_one(
+        self,
+        mu_t: torch.Tensor,                       # [D] or [1,D]
+        diag_var_t: Optional[torch.Tensor] = None,# [D] or [1,D]
+        F_t: Optional[torch.Tensor] = None        # [D,R] or [1,D,R]
+    ) -> torch.Tensor:
+        """
+        Convenience: compute log B_t[k] = E_q[log p(z_t | h_t=k)] for a single time step.
+        Returns [Kp1] tensor.
+        """
+        if mu_t.dim() == 1:        # [D] -> [1,D]
+            mu_t = mu_t.unsqueeze(0)
+        if diag_var_t is not None and diag_var_t.dim() == 1:
+            diag_var_t = diag_var_t.unsqueeze(0)
+        if F_t is not None and F_t.dim() == 2:
+            F_t = F_t.unsqueeze(0)
+        logB = StickyHDPHMMVI.expected_emission_loglik(
+            self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
+            mu_t, diag_var_t, F_t, mask=None
+        )  # [1,Kp1]
+        return logB.squeeze(0)  # [Kp1]
+
+    @torch.no_grad()
+    def filter_init_from_logB(self, logB0: torch.Tensor) -> "StickyHDPHMMVI.FilterState":
+        """
+        Initialise causal filter with the first observation.
+        logB0: [Kp1] emission log-likelihoods for t=0.
+        """
+        log_pi = torch.log(torch.clamp(self._Epi(), min=1e-30)).to(torch.float64)  # [Kp1]
+        log_alpha0 = (log_pi + logB0.to(torch.float64))
+        c0 = torch.logsumexp(log_alpha0, dim=-1)
+        return StickyHDPHMMVI.FilterState(log_alpha=log_alpha0 - c0, loglik=float(c0.item()))
+
+    @torch.no_grad()
+    def filter_step(
+        self,
+        state: "StickyHDPHMMVI.FilterState",
+        logB_t: torch.Tensor,               # [Kp1]
+        ElogA: Optional[torch.Tensor] = None
+    ) -> Tuple["StickyHDPHMMVI.FilterState",
+               torch.Tensor,                # alpha_t probs [Kp1]
+               torch.Tensor,                # xi_{t-1}(i,j) [Kp1,Kp1]
+               float,                       # boundary_prob_t = 1 - sum_i xi_ii
+               float]:                      # skill_entropy_t = H(alpha_t)
+        """
+        One causal filtering update:
+          α_{t|t-1}(j) ∝ ∑_i α_{t-1}(i) A_{ij}
+          α_t(j) ∝ B_t(j) * α_{t|t-1}(j)
+          ξ_{t-1,t}(i,j) ∝ α_{t-1}(i) * A_{ij} * B_t(j)
+        Works entirely in log-domain for stability.
+        """
+        if ElogA is None:
+            ElogA = self._ElogA()  # [Kp1,Kp1]
+        # log predictive prior: log ∑_i exp(log_alpha_{t-1}(i) + ElogA(i,j))
+        log_pred = torch.logsumexp(state.log_alpha.unsqueeze(1).to(torch.float64) + ElogA.to(torch.float64),
+                                   dim=0)  # [Kp1]
+        # new α
+        log_alpha_t_un = log_pred + logB_t.to(torch.float64)         # [Kp1]
+        c_t = torch.logsumexp(log_alpha_t_un, dim=-1)
+        log_alpha_t = log_alpha_t_un - c_t
+        alpha_t = torch.exp(log_alpha_t.to(torch.float32))           # [Kp1]
+
+        # pair posterior ξ_{t-1,t}(i,j) given z_{1:t}
+        log_xi_num = (state.log_alpha.unsqueeze(1).to(torch.float64)
+                      + ElogA.to(torch.float64)
+                      + logB_t.view(1, -1).to(torch.float64))        # [Kp1,Kp1]
+        logZ = torch.logsumexp(log_xi_num.view(-1), dim=0)
+        xi_t = torch.exp((log_xi_num - logZ).to(torch.float32))      # [Kp1,Kp1]
+
+        # boundary prob and entropy on this step
+        p_same = torch.diagonal(xi_t, 0).sum().item()
+        boundary_prob = float(max(0.0, min(1.0, 1.0 - p_same)))
+        # entropy H(α_t)
+        eps = 1e-12
+        skill_entropy = float((-(alpha_t.clamp_min(eps) * alpha_t.clamp_min(eps).log()).sum()).item())
+
+        new_state = StickyHDPHMMVI.FilterState(log_alpha=log_alpha_t, loglik=state.loglik + float(c_t.item()))
+        return new_state, alpha_t, xi_t, boundary_prob, skill_entropy
+
+    @torch.no_grad()
+    def filter_sequence(
+        self,
+        logB: torch.Tensor,                 # [T,Kp1]
+        ElogA: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Run causal filter over a whole sequence (useful for evaluation).
+        Returns:
+          alpha: [T,Kp1],  xi: [T-1,Kp1,Kp1],
+          boundary_prob: [T] (first step set to NaN),
+          skill_entropy: [T],
+          loglik: scalar
+        """
+        T, Kp1 = logB.shape
+        if ElogA is None:
+            ElogA = self._ElogA()
+        # t=0
+        st = self.filter_init_from_logB(logB[0])
+        alpha_list = [torch.exp(st.log_alpha.to(torch.float32)).view(1, -1)]
+        boundary_list = [torch.tensor(float('nan'), device=logB.device)]
+        entropy_list = [-(alpha_list[0].clamp_min(1e-12).log() * alpha_list[0]).sum()]
+        xi_all = []
+        # t>=1
+        for t in range(1, T):
+            st, a_t, xi_t, p_change, H = self.filter_step(st, logB[t], ElogA)
+            alpha_list.append(a_t.view(1, -1))
+            xi_all.append(xi_t.unsqueeze(0))
+            boundary_list.append(torch.tensor(p_change, device=logB.device))
+            entropy_list.append(torch.tensor(H, device=logB.device))
+        out = {
+            "alpha": torch.cat(alpha_list, dim=0),               # [T,Kp1]
+            "xi": torch.cat(xi_all, dim=0) if len(xi_all) else torch.zeros(0, Kp1, Kp1, device=logB.device),
+            "boundary_prob": torch.stack(boundary_list),         # [T]
+            "skill_entropy": torch.stack(entropy_list),          # [T]
+            "loglik": torch.tensor(st.loglik, device=logB.device)
+        }
+        return out
