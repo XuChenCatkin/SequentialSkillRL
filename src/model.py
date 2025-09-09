@@ -1358,6 +1358,38 @@ class MultiModalHackVAE(nn.Module):
         self.world_model = WorldModel(config)
         self.inverse_dynamics = InverseDynamics(config)
         
+    @torch.no_grad()
+    def world_model_step(self, s_t: torch.Tensor, z_t: torch.Tensor,
+                         action_onehot: torch.Tensor,
+                         skill_onehot_or_soft: Optional[torch.Tensor] = None):
+        """
+        One-step prior p(z_{t+1}|s_t, a_t, h_t) using the internal world model.
+        Shapes:
+          s_t:                [B, S]
+          z_t:                [B, D]
+          action_onehot:      [B, A]
+          skill_onehot_or_soft: [B, K] or None
+        Returns:
+          s_tp1, mu_p, logvar_p, F_p (or None)
+        """
+        if not self.world_model.enabled:
+            raise RuntimeError("World model disabled in config.")
+        wm = self.world_model
+        if skill_onehot_or_soft is not None and skill_onehot_or_soft.dim() == 1:
+            skill_onehot_or_soft = F.one_hot(skill_onehot_or_soft.long(), num_classes=wm.skill_num).float()
+        a_pack = torch.cat([action_onehot, skill_onehot_or_soft], dim=-1) if wm.skill_num > 0 and skill_onehot_or_soft is not None else action_onehot
+        x_in = torch.cat([z_t.detach(), a_pack], dim=-1)
+        x_in = wm.in_norm(x_in)
+        s_tp1 = wm.gru(x_in, s_t)
+        s_tp1 = wm.out_norm(s_tp1)
+        mu_p = wm.prior_mu(s_tp1)
+        logvar_p = wm.prior_logvar(s_tp1)
+        F_p = wm.prior_lowrank(s_tp1) if wm.prior_lowrank is not None else None
+        if F_p is not None:
+            R = F_p.shape[-1] // mu_p.shape[-1]
+            F_p = F_p.view(mu_p.shape[0], mu_p.shape[1], -1) if F_p.dim()==3 else F_p
+            F_p = F_p.view(mu_p.shape[0], -1, R)
+        return s_tp1, mu_p, logvar_p, F_p
 
     def encode(self, glyph_chars, glyph_colors, blstats, msg_tokens, hero_info):
         """
