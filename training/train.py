@@ -57,6 +57,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import logging
 from src.data_collection import NetHackDataCollector, BLStatsAdapter
+import json
 from training.training_utils import save_checkpoint, save_model_to_huggingface, load_model_from_huggingface, \
     upload_training_artifacts_to_huggingface, create_model_demo_notebook, load_model_from_local, compute_global_statistics
 
@@ -2238,10 +2239,25 @@ def train_vae_with_sticky_hmm_em(
             raise ValueError(f"HMM latent dimension ({hmm.p.D}) does not match VAE config ({D})")
         if hmm.p.K + 1 != K:
             if logger: logger.warning(f"⚠️  HMM skill count ({hmm.p.K + 1}) does not match VAE config ({K}). Continuing...")
+        
+        # For pre-trained HMM, create compact representation from loaded parameters
+        niw_mu0_compact = f"pretrained(norm={torch.norm(niw.mu0):.4f})"
+        niw_Psi0_compact = f"pretrained(trace={torch.trace(niw.Psi0):.4f}, det={torch.det(niw.Psi0):.6f})"
     
     else:
         # Initialize new HMM
-        if logger: logger.info(f"�🧠 Initializing new Sticky-HDP-HMM: latent_dim={D}, skills={K}")
+        if logger: logger.info(f"🧠 Initializing new Sticky-HDP-HMM: latent_dim={D}, skills={K}")
+        
+        # Create compact NIW parameters representation before tensor conversion
+        if set_niw_mu0_with_global_mean:
+            niw_mu0_compact = "global_mean"  # Will be updated after global statistics
+        else:
+            niw_mu0_compact = float(niw_mu0) if niw_mu0 is not None else 0.0
+        
+        if set_niw_Psi0_with_global_cov:
+            niw_Psi0_compact = "global_cov"  # Will be updated after global statistics
+        else:
+            niw_Psi0_compact = float(niw_Psi0) if niw_Psi0 is not None else 1.0
         
         niw_mu0 = torch.full((D,), float(niw_mu0) if niw_mu0 is not None else 0.0, device=device)
         niw_Psi0 = torch.eye(D, device=device) * (float(niw_Psi0) if niw_Psi0 is not None else 1.0)
@@ -2250,11 +2266,13 @@ def train_vae_with_sticky_hmm_em(
             global_mean, global_cov, global_var = compute_global_statistics(model, train_dataset, device, max_frames=100000, logger=logger)
             if set_niw_mu0_with_global_mean:
                 niw_mu0 = global_mean
+                niw_mu0_compact = f"global_mean(norm={torch.norm(global_mean):.4f})"
                 if logger: 
                     logger.info("   - Set NIW mu0 with global mean of VAE latents")
                     logger.info(f"     {global_mean}")
             if set_niw_Psi0_with_global_cov:
                 niw_Psi0 = (niw_nu0 - D - 1) * global_cov
+                niw_Psi0_compact = f"global_cov(trace={torch.trace(niw_Psi0):.4f}, det={torch.det(niw_Psi0):.6f})"
                 if logger: 
                     logger.info("   - Set NIW Psi0 with global covariance of VAE latents")
                     logger.info(f"     Cov diag: {global_var}")
@@ -2335,10 +2353,12 @@ def train_vae_with_sticky_hmm_em(
             'D': D
         },
         'niw_params': {
-            'mu0': niw_mu0.to('cpu').tolist() if isinstance(niw_mu0, torch.Tensor) else niw_mu0,
+            'mu0': niw_mu0_compact,
             'kappa0': niw_kappa0,
-            'Psi0': niw_Psi0.to('cpu').tolist() if isinstance(niw_Psi0, torch.Tensor) else niw_Psi0,
-            'nu0': niw_nu0
+            'Psi0': niw_Psi0_compact,
+            'nu0': niw_nu0,
+            'set_mu0_with_global_mean': set_niw_mu0_with_global_mean,
+            'set_Psi0_with_global_cov': set_niw_Psi0_with_global_cov
         },
         'hmm_paths': [],
         'vae_hmm_paths': [],
@@ -2726,6 +2746,16 @@ def train_vae_with_sticky_hmm_em(
             if logger: logger.info(f"    * HMM: https://huggingface.co/{hub_repo_id_hmm}")
         if hub_repo_id_vae_hmm and not hmm_only:
             if logger: logger.info(f"    * VAE+HMM: https://huggingface.co/{hub_repo_id_vae_hmm}")
+    
+    # Log detailed training info
+    if logger: 
+        logger.info(f"📊 Training Configuration:")
+        logger.info(f"  - Mode: {'HMM-only' if training_info['hmm_only'] else 'VAE-only w/ HMM' if training_info['vae_only_with_hmm'] else 'EM'}")
+        logger.info(f"  - HMM params: α={training_info['hmm_params']['alpha']}, κ={training_info['hmm_params']['kappa']}, γ={training_info['hmm_params']['gamma']}, K={training_info['hmm_params']['K']}, D={training_info['hmm_params']['D']}")
+        logger.info(f"  - NIW params: μ₀={training_info['niw_params']['mu0']}, κ₀={training_info['niw_params']['kappa0']}, Ψ₀={training_info['niw_params']['Psi0']}, ν₀={training_info['niw_params']['nu0']}")
+        logger.info(f"  - Checkpoints: HMM={len(training_info['hmm_paths'])}, VAE+HMM={len(training_info['vae_hmm_paths'])}")
+        if training_info['hf_repos']['hmm'] or training_info['hf_repos']['vae_hmm']:
+            logger.info(f"  - HF repos: HMM={training_info['hf_repos']['hmm']}, VAE+HMM={training_info['hf_repos']['vae_hmm']}")
 
     # Final wandb logging and cleanup
     if use_wandb and WANDB_AVAILABLE:

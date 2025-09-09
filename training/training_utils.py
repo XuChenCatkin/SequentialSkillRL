@@ -50,7 +50,7 @@ def compute_global_statistics(
     device: torch.device,
     max_frames: int = 50000,
     logger: Optional[object] = None
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Evaluate a dataset with a VAE model to compute global mean and covariance statistics.
     
@@ -69,173 +69,115 @@ def compute_global_statistics(
     """
     if logger:
         logger.info(f"Computing global statistics from dataset with max_frames={max_frames}")
-    
     model.eval()
-    
-    # Collect latent means, variances, and lowrank factors
-    mu_list = []
-    logvar_list = []
-    lowrank_list = []
-    collected_frames = 0
-    has_lowrank = False
-    
-    # Get batch and time dimensions from first batch
-    if len(dataset) == 0:
+
+    if not dataset:
         raise ValueError("Dataset is empty")
-    
-    # Try to get dimensions from different possible keys
-    B, T = None, None
-    for key in ['tty_chars', 'game_chars']:
+
+    # Infer [B, T]
+    B = T = None
+    for key in ('tty_chars', 'game_chars'):
         if key in dataset[0]:
             B, T = dataset[0][key].shape[:2]
             break
-    
     if B is None or T is None:
-        raise ValueError("Could not determine batch and time dimensions from dataset")
-    
+        raise ValueError("Could not determine batch and time dimensions")
+
+    # Streaming accumulators (avoid storing all frames)
+    sum_mu = None            # [D]
+    sum_outer = None         # [D,D]
+    sum_diag_var = None      # [D]
+    sum_lowrank = None       # [D,D]
+    N = 0
+    D = None
+    used_frames = 0
+    saw_lowrank = False
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataset):
-            # Move batch to device
+            # Move to device and flatten [B,T,...] -> [B*T,...] (except masks)
             batch_dev = {}
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     x = v.to(device, non_blocking=True)
-                    # Reshape to [B*T, ...] for processing, except for special keys
-                    if x.dim() >= 3 and k not in ('original_batch_shape',):
+                    if x.dim() >= 3 and k != 'original_batch_shape':
                         batch_dev[k] = x.view(B*T, *x.shape[2:])
                     else:
                         batch_dev[k] = x
                 else:
                     batch_dev[k] = v
-            
-            # Forward pass through the model
-            try:
-                output = model(batch_dev)
-                mu_bt = output['mu']  # [B*T, D]
-                logvar_bt = output['logvar']  # [B*T, D]
-                lowrank_bt = output.get('lowrank_factors', None)  # [B*T, D, R] or None
-                
-                # Get valid frames mask
-                valid = batch_dev['valid_screen'].view(B*T).cpu().bool()  # [B*T]
-                
-                # Extract valid frames only
-                if valid.any():
-                    mu_valid = mu_bt[valid].detach().cpu()  # [N_valid, D]
-                    logvar_valid = logvar_bt[valid].detach().cpu()  # [N_valid, D]
-                    
-                    mu_list.append(mu_valid)
-                    logvar_list.append(logvar_valid)
-                    collected_frames += mu_valid.shape[0]
-                    
-                    # Handle lowrank factors if present
-                    if lowrank_bt is not None:
-                        lowrank_valid = lowrank_bt[valid].detach().cpu()  # [N_valid, D, R]
-                        lowrank_list.append(lowrank_valid)
-                        has_lowrank = True
-                    elif has_lowrank:
-                        # If we previously had lowrank factors but not in this batch,
-                        # create zero tensors to maintain consistency
-                        D, R = lowrank_list[0].shape[1], lowrank_list[0].shape[2]
-                        zero_lowrank = torch.zeros(mu_valid.shape[0], D, R)
-                        lowrank_list.append(zero_lowrank)
-                
-            except Exception as e:
-                if logger:
-                    logger.warning(f"Error processing batch {batch_idx}: {e}")
+
+            out = model(batch_dev)
+            mu_bt     = out['mu']                     # [B*T, D]
+            logvar_bt = out['logvar']                 # [B*T, D]
+            Fr_bt     = out.get('lowrank_factors')    # [B*T, D, R] or None
+
+            valid = batch_dev['valid_screen'].view(B*T).bool()
+            if not valid.any():
                 continue
-            
-            # Stop if we've collected enough frames
-            if collected_frames >= max_frames:
-                if logger:
-                    logger.info(f"Reached max_frames limit ({max_frames}), stopping collection")
+
+            mu = mu_bt[valid].detach().cpu()
+            var = logvar_bt[valid].detach().cpu().exp().clamp_min(1e-8)
+            if D is None:
+                D = mu.shape[-1]
+                sum_mu = torch.zeros(D, dtype=torch.float64)
+                sum_outer = torch.zeros(D, D, dtype=torch.float64)
+                sum_diag_var = torch.zeros(D, dtype=torch.float64)
+                sum_lowrank = torch.zeros(D, D, dtype=torch.float64)
+
+            # Cap to max_frames
+            take = min(max_frames - used_frames, mu.shape[0])
+            if take <= 0:
                 break
-    
-    if not mu_list:
+            mu = mu[:take].to(torch.float64)
+            var = var[:take].to(torch.float64)
+
+            # Accumulate μ, μμᵀ, diag(Σ)
+            sum_mu += mu.sum(0)
+            sum_outer += mu.T @ mu           # (∑ μ μᵀ)
+            sum_diag_var += var.sum(0)
+            N += take
+            used_frames += take
+
+            # Low-rank accumulation
+            if Fr_bt is not None:
+                F = Fr_bt[valid][:take].detach().cpu().to(torch.float64)  # [take, D, R]
+                # einsum: sum_t F_t F_tᵀ = einsum('t d r, t e r -> d e')
+                sum_lowrank += torch.einsum('tdr,ter->de', F, F)
+                saw_lowrank = True
+            else:
+                # Explicitly add zeros so logic is consistent (no-op)
+                pass
+
+            if used_frames >= max_frames:
+                if logger: logger.info(f"Reached max_frames={max_frames}")
+                break
+
+    if N == 0:
         raise ValueError("No valid frames found in dataset")
-    
-    # Concatenate all collected data
-    all_mu = torch.cat(mu_list, dim=0)  # [N_total, D]
-    all_logvar = torch.cat(logvar_list, dim=0)  # [N_total, D]
-    all_lowrank = torch.cat(lowrank_list, dim=0) if has_lowrank else None  # [N_total, D, R] or None
-    
+
+    # Build covariance (in float64), then cast back to float32
+    mean = (sum_mu / N)
+    mean_outer = torch.outer(mean, mean)
+    diag_cov = (sum_diag_var / N).diag()
+    outer_mean = (sum_outer / N)
+    lowrank_cov = (sum_lowrank / N) if saw_lowrank else torch.zeros(D, D, dtype=torch.float64)
+
+    C = diag_cov + outer_mean + lowrank_cov - mean_outer
+    # Regularize, symmetrize
+    eps = 1e-6 * C.diag().mean().clamp_min(1e-6)
+    C = 0.5 * (C + C.T)
+    C = C + eps * torch.eye(D, dtype=torch.float64)
+
+    # Diagnostics (eigh for SPD)
     if logger:
-        logger.info(f"Collected {all_mu.shape[0]} valid frames from {len(dataset)} batches")
-        if has_lowrank:
-            logger.info(f"Low-rank factors shape: {all_lowrank.shape}")
-    
-    # Compute global statistics
-    # Global mean of the latent means
-    global_mean = torch.mean(all_mu, dim=0)  # [D]
-    
-    # Compute proper covariance: cov = 1/T∑_t(Σ_t + FF^T + μ_t μ_t^T) - μ̄ μ̄^T + εI
-    N = all_mu.shape[0]
-    D = all_mu.shape[1]
-    eps_reg = 1e-6  # Small regularization term
-    
-    # Convert logvar to diagonal covariance matrices Σ_t
-    all_var = torch.exp(all_logvar)  # [N_total, D] - diagonal elements of Σ_t
-    
-    # Compute 1/T∑_t(Σ_t + μ_t μ_t^T)
-    # Σ_t contribution: average of diagonal covariances
-    diag_cov_sum = torch.mean(all_var, dim=0)  # [D] - average diagonal
-    
-    # μ_t μ_t^T contribution: average of outer products
-    outer_products_sum = torch.mm(all_mu.t(), all_mu) / N  # [D, D] - (1/N)∑μ_t μ_t^T
-    
-    # Start building covariance matrix
-    global_cov = torch.diag(diag_cov_sum) + outer_products_sum  # [D, D]
-    
-    # Add FF^T contribution if low-rank factors are present
-    if has_lowrank and all_lowrank is not None:
-        # Compute 1/T∑_t(F_t F_t^T) where F_t is [D, R]
-        lowrank_cov_sum = torch.zeros(D, D, device=all_mu.device)
-        for t in range(N):
-            F_t = all_lowrank[t]  # [D, R]
-            lowrank_cov_sum += torch.mm(F_t, F_t.t())  # F_t F_t^T
-        lowrank_cov_sum = lowrank_cov_sum / N  # Average over time
-        global_cov += lowrank_cov_sum
-    
-    # Subtract μ̄ μ̄^T (global mean outer product)
-    global_mean_outer = torch.outer(global_mean, global_mean)  # [D, D]
-    global_cov = global_cov - global_mean_outer
-    
-    # Add regularization εI
-    global_cov = global_cov + eps_reg * torch.eye(D, device=all_mu.device)
-    
-    # Extract diagonal (variances)
-    global_var = torch.diag(global_cov)  # [D]
-    
-    if logger:
-        logger.info(f"Global statistics computed:")
-        logger.info(f"  - Mean magnitude: {torch.norm(global_mean):.4f}")
-        logger.info(f"  - Mean variance: {torch.mean(global_var):.4f}")
-        logger.info(f"  - Trace of covariance: {torch.trace(global_cov):.4f}")
-        logger.info(f"  - Max eigenvalue: {torch.max(torch.linalg.eigvals(global_cov).real):.4f}")
-        logger.info(f"  - Min eigenvalue: {torch.min(torch.linalg.eigvals(global_cov).real):.4f}")
-        
-        # Report condition number
-        eigenvals = torch.linalg.eigvals(global_cov).real
-        condition_number = torch.max(eigenvals) / torch.max(torch.min(eigenvals), torch.tensor(1e-12))
-        logger.info(f"  - Condition number: {condition_number:.2e}")
-        logger.info(f"  - Regularization term (εI): {eps_reg}")
-        
-        # Additional statistics for covariance components
-        diag_trace = torch.sum(diag_cov_sum)
-        logger.info(f"  - Diagonal component trace: {diag_trace:.4f}")
-        logger.info(f"  - Mean outer product trace: {torch.trace(outer_products_sum):.4f}")
-        logger.info(f"  - Global mean outer product trace: {torch.trace(global_mean_outer):.4f}")
-        
-        if has_lowrank and all_lowrank is not None:
-            # The lowrank contribution is already computed in the main covariance
-            lowrank_trace = torch.trace(lowrank_cov_sum) if 'lowrank_cov_sum' in locals() else 0.0
-            logger.info(f"  - Low-rank component trace: {lowrank_trace:.4f}")
-            total_without_reg = diag_trace + torch.trace(outer_products_sum) - torch.trace(global_mean_outer) + lowrank_trace
-            logger.info(f"  - Total covariance trace (before regularization): {total_without_reg:.4f}")
-        else:
-            total_without_reg = diag_trace + torch.trace(outer_products_sum) - torch.trace(global_mean_outer)
-            logger.info(f"  - Total covariance trace (before regularization): {total_without_reg:.4f}")
-    
-    return global_mean, global_cov, global_var
+        evals = torch.linalg.eigvalsh(C)
+        cond = (evals.max() / evals.clamp_min(1e-12).min()).item()
+        logger.info(f"Global stats: N={N}, mean|μ|={mean.norm().item():.4f}, "
+                    f"trace(C)={C.trace().item():.4f}, "
+                    f"λ_min={evals.min().item():.4f}, λ_max={evals.max().item():.4f}, cond={cond:.2e}")
+
+    return mean.to(torch.float32), C.to(torch.float32), C.diag().to(torch.float32)
 
 def save_checkpoint(
     model: MultiModalHackVAE,
