@@ -429,6 +429,10 @@ class PPOTrainer:
         self.last_hmm_refresh = 0
         os.makedirs(run_cfg.log_dir, exist_ok=True)
         self._log_file = os.path.join(run_cfg.log_dir, "metrics.jsonl")
+        # --- HMM filtering state (per-env) and cached E[log A] ---
+        self._filt_state = [None for _ in range(ppo_cfg.num_envs)]  # StickyHDPHMMVI.FilterState or None per env
+        # cache ElogA; refresh whenever HMM is updated
+        self._ElogA = self.hmm._ElogA()
 
     # --------------------------- rollout -------------------------------------
 
@@ -452,9 +456,48 @@ class PPOTrainer:
 
         for t in range(self.ppo_cfg.rollout_len):
             enc = self._encode_obs(obs)
-            z = enc["z"]
-            # optionally attach last rhat approx to policy input (we don't recompute full FB online, we feed zeros here; skill feats are filled later for PPO updates)
+            z = enc["z"]  # [B,D]
+
+            # ---- Causal skill filtering (per-env, current frame) ----
             skill_feat = None
+            if self.ppo_cfg.policy_uses_skill:
+                B = z.size(0)
+                Kp1 = int(self.hmm.niw.mu.size(0))  # includes remainder
+                skill_list = []
+                for b in range(B):
+                    mu_b = enc["mu"][b]                      # [D]
+                    dv_b = enc["logvar"][b].exp()           # [D]
+                    # logB_t[k] = E_q[log p(z_t | h_t=k)]
+                    if hasattr(self.hmm, "emission_logB_one"):
+                        logB_b = self.hmm.emission_logB_one(mu_b, dv_b, None)  # [Kp1]
+                    else:
+                        # Fallback: compute via expected_emission_loglik on a 1-step batch
+                        logB_b = StickyHDPHMMVI.expected_emission_loglik(
+                            self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
+                            mu_b.unsqueeze(0), dv_b.unsqueeze(0), None, mask=None
+                        ).squeeze(0)  # [Kp1]
+
+                    st = self._filt_state[b]
+                    if st is None:
+                        # initialise at episode start
+                        if hasattr(self.hmm, "filter_init_from_logB"):
+                            st = self.hmm.filter_init_from_logB(logB_b)
+                            alpha_b = torch.exp(st.log_alpha.to(torch.float32))  # [Kp1]
+                        else:
+                            # Very old HMM class fallback: α₀ ∝ π ⊙ B₀
+                            log_pi = torch.log(torch.clamp(self.hmm._Epi(), min=1e-30))
+                            la = (log_pi + logB_b)
+                            la = la - torch.logsumexp(la, dim=-1, keepdim=False)
+                            alpha_b = torch.exp(la.to(torch.float32))
+                    else:
+                        # one causal update (uses cached ElogA)
+                        st, alpha_b, _xi, _bound, _sent = self.hmm.filter_step(st, logB_b, self._ElogA)
+                    self._filt_state[b] = st
+                    # drop the remainder state for policy features
+                    skill_list.append(alpha_b[:Kp1-1])
+
+                skill_feat = torch.stack(skill_list, dim=0)  # [B, K]
+
             logits, value = self.actor_critic(z, skill_feat)
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample()
@@ -464,10 +507,18 @@ class PPOTrainer:
             next_obs, rew, terminated, truncated, info = self.envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             # store
-            self.buf.add(z=z, mu=enc["mu"], logvar=enc["logvar"], actions=torch.as_tensor(action, device=self.device),
+            self.buf.add(z=z, mu=enc["mu"], logvar=enc["logvar"],
+                         actions=torch.as_tensor(action, device=self.device),
                          rews_e=torch.as_tensor(rew, dtype=torch.float32, device=self.device),
                          dones=torch.as_tensor(done, dtype=torch.bool, device=self.device),
-                         val=value, logp=logp)
+                         val=value, logp=logp,
+                         skill=skill_feat if (self.buf.skill is not None) else None)
+            # reset filter state for envs that terminated; next loop will re-init on new obs
+            if self.ppo_cfg.policy_uses_skill:
+                for b, d in enumerate(done):
+                    if d:
+                        self._filt_state[b] = None
+
             obs = next_obs
             self.global_steps += self.ppo_cfg.num_envs
         self._obs = obs
@@ -547,6 +598,8 @@ class PPOTrainer:
             max_iters=self.hmm_cfg.hmm_max_iters, tol=self.hmm_cfg.hmm_tol, elbo_drop_tol=self.hmm_cfg.hmm_elbo_drop_tol,
             rho=self.hmm_cfg.rho_emission, optimize_pi=self.hmm_cfg.optimise_pi, offline=False
         )
+        # refresh cached ElogA used by the online filter
+        self._ElogA = self.hmm._ElogA()
         if self.hmm_cfg.reset_low_count_states is not None:
             self.hmm.reset_low_count_states(self.hmm_cfg.reset_low_count_states)
         self.last_hmm_refresh = self.global_steps
@@ -564,8 +617,8 @@ class PPOTrainer:
         while self.global_steps < self.ppo_cfg.total_updates * self.ppo_cfg.rollout_len * self.ppo_cfg.num_envs:
             self.collect_rollout()
             bonuses = self._compute_intrinsic_for_buffer()
-            # skills for policy (concat to z) at update time (optional)
-            skills_for_policy = bonuses["rhat_skill"].transpose(0,1) if self.ppo_cfg.policy_uses_skill else None  # [T,B,K]
+            # skills for policy (concat to z) during PPO update: use the SAME features we acted with
+            skills_for_policy = self.buf.skill.transpose(0,1) if (self.ppo_cfg.policy_uses_skill and self.buf.skill is not None) else None  # [T,B,K]
             # total reward
             intrinsic = bonuses["dyn"] + bonuses["hdp"] + bonuses["rnd"]
             ext = self.buf.rews_e
@@ -618,14 +671,37 @@ class PPOTrainer:
         total = []
         for _ in range(episodes):
             o, _ = env.reset()
+            # local filter state for single env evaluation
+            fstate = None
             done = False; ret = 0.0
             while not done:
                 enc = self._encode_obs(o)
-                logits, value = self.actor_critic(enc["z"], None)
+                skill_feat = None
+                if self.ppo_cfg.policy_uses_skill:
+                    mu = enc["mu"].squeeze(0)             # [D]
+                    dv = enc["logvar"].squeeze(0).exp()   # [D]
+                    if hasattr(self.hmm, "emission_logB_one"):
+                        logB = self.hmm.emission_logB_one(mu, dv, None)
+                    else:
+                        logB = StickyHDPHMMVI.expected_emission_loglik(
+                            self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
+                            mu.unsqueeze(0), dv.unsqueeze(0), None, mask=None
+                        ).squeeze(0)
+                    if fstate is None:
+                        fstate = self.hmm.filter_init_from_logB(logB) if hasattr(self.hmm, "filter_init_from_logB") else None
+                        alpha = torch.exp(fstate.log_alpha.to(torch.float32)) if fstate is not None else torch.softmax(logB, dim=-1)
+                    else:
+                        fstate, alpha, _xi, _bound, _sent = self.hmm.filter_step(fstate, logB, self._ElogA)
+                    # drop remainder state
+                    skill_feat = alpha[: self.hmm.niw.mu.size(0)-1].unsqueeze(0)
+
+                logits, value = self.actor_critic(enc["z"], skill_feat)
                 a = torch.argmax(logits, dim=-1) if self.ppo_cfg.deterministic_eval else torch.distributions.Categorical(logits=logits).sample()
                 o, r, term, trunc, _ = env.step(int(a.item()))
                 done = term or trunc
                 ret += r
+                if done:
+                    fstate = None
             total.append(ret)
         self._log_scalar({"eval/return_mean": float(np.mean(total)), "eval/return_std": float(np.std(total))})
 
