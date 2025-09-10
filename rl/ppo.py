@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 # MiniHack / Gym
 import gymnasium as gym
-from minihack import MiniHackNavigation, MiniHackSkill, MiniHackRoom
+from minihack import MiniHackNavigation, MiniHackSkill, MiniHack
 from nle import nethack  # action id space (615)
 
 # --- your code ---
