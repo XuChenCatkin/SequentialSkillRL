@@ -127,7 +127,54 @@ results = train_online_ppo_with_pretrained_models(
     env_id="MiniHack-Room-5x5-v0",
     total_env_steps=100000,
     use_wandb=True,
-    wandb_project="my-ppo-experiment"
+    wandb_project="my-ppo-experiment",
+    upload_to_hf=True,
+    hf_repo_name="your-username/ppo-agent",
+    device="cuda"
+)
+print(f"Training completed! Best return: {results['best_eval_return']}")
+```
+
+### Quick Test Mode
+```python
+# Quick test with minimal steps
+results = train_online_ppo_with_pretrained_models(
+    vae_repo_name="your-username/nethack-vae",
+    hmm_repo_name="your-username/nethack-hmm",
+    test_mode=True,
+    test_steps=1000,
+    use_wandb=False,
+    upload_to_hf=False
+)
+```
+
+### Custom Configurations
+```python
+from rl.ppo import PPOConfig, CuriosityConfig
+
+# Custom PPO configuration
+ppo_config = PPOConfig(
+    num_envs=16,
+    rollout_len=256,
+    learning_rate=1e-4,
+    clip_coef=0.1
+)
+
+# Custom curiosity configuration
+curiosity_config = CuriosityConfig(
+    use_dyn_kl=True,
+    use_skill_entropy=True,
+    use_rnd=False,
+    eta0_dyn=0.5,
+    tau_dyn=1e6
+)
+
+results = train_online_ppo_with_pretrained_models(
+    vae_repo_name="your-username/nethack-vae",
+    hmm_repo_name="your-username/nethack-hmm",
+    ppo_config=ppo_config,
+    curiosity_config=curiosity_config,
+    total_env_steps=1000000
 )
 ```
 
@@ -136,11 +183,8 @@ results = train_online_ppo_with_pretrained_models(
 # Check MiniHack installation
 poetry run python training/online_rl.py minihack_check
 
-# Run system tests
+# Run system tests  
 poetry run python training/online_rl.py test
-
-# Show usage examples
-poetry run python training/online_rl.py example
 ```
 
 ## Project Structure
