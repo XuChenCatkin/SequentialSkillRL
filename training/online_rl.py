@@ -31,12 +31,8 @@ if project_root not in sys.path:
 
 # Import PPO components - we'll handle import errors gracefully
 try:
-    # Try to add the minihack path and import
-    import sys
-    if '/workspace/SequentialSkillRL' not in sys.path:
-        sys.path.insert(0, '/workspace/SequentialSkillRL')
-    
-    # Import minihack first to register environments
+    # Import NLE and MiniHack (now properly installed via Poetry wheel)
+    import nle
     import minihack
     
     # Now try to import PPO components
@@ -47,6 +43,7 @@ try:
     # PPOTrainer import will be handled separately
     PPO_AVAILABLE = True
     MINIHACK_AVAILABLE = True
+    print("✅ NLE and MiniHack imported successfully - no sys.path workarounds needed!")
 except ImportError as e:
     print(f"⚠️  PPO components not available: {e}")
     PPO_AVAILABLE = False
@@ -904,23 +901,27 @@ def create_training_environment(env_id: str, device: str = "cpu", logger: Option
 def check_minihack_installation():
     """
     Check MiniHack installation status and list available environments.
-    Based on MiniHack documentation.
+    Now works with proper Poetry wheel installation - no sys.path workarounds needed!
     """
     print("🧪 Checking MiniHack Installation")
     
     try:
         import gymnasium as gym
-        import sys
         
-        # Add project root to path
-        if '/workspace/SequentialSkillRL' not in sys.path:
-            sys.path.insert(0, '/workspace/SequentialSkillRL')
+        print("📦 Importing NLE...")
+        try:
+            import nle
+            print("✅ NLE module imported successfully")
+        except Exception as e:
+            print(f"❌ NLE import failed: {e}")
+            return False
         
         print("📦 Importing MiniHack...")
         try:
             import minihack
             print("✅ MiniHack module imported successfully")
             print(f"   MiniHack location: {minihack.__file__ if hasattr(minihack, '__file__') else 'namespace package'}")
+            print(f"   Version: {getattr(minihack, '__version__', 'Unknown')}")
         except Exception as e:
             print(f"❌ MiniHack import failed: {e}")
             return False
@@ -945,7 +946,8 @@ def check_minihack_installation():
         
         # Try to create a simple environment
         if minihack_envs:
-            test_env = minihack_envs[0] if "Room-5x5" not in minihack_envs else "MiniHack-Room-5x5-v0"
+            # Use a known working environment
+            test_env = "MiniHack-Room-5x5-v0" if "MiniHack-Room-5x5-v0" in minihack_envs else minihack_envs[0]
             print(f"🧪 Testing environment creation: {test_env}")
             try:
                 env = gym.make(test_env)

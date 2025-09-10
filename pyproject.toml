@@ -18,18 +18,21 @@ dependencies = [
     "scikit-learn (>=1.7.1,<2.0.0)",
     "huggingface-hub (>=0.34.3,<0.35.0)",
     "wandb (>=0.21.0,<0.22.0)",
-    "pytest (>=8.4.1,<9.0.0)"
+    "pytest (>=5.3,<9.0.0)",
+    # NLE installed as editable from local directory
+    "nle @ file:///workspace/SequentialSkillRL/nle",
+    "minihack @ file:///workspace/SequentialSkillRL/minihack/dist/minihack-1.0.2%2B95b11cc-py3-none-any.whl",
 ]
 
 [tool.poetry]
 package-mode = false
 
 [tool.poetry.group.dev.dependencies]
-minihack = {path = "minihack", develop = true}
 cmake="^3.26"
 cython="^0.29"
 pybind11 = {version = "^2.10", optional = true}
-nle = {path = "nle", develop = true}
+# Additional dev tools for our project
+pre-commit = "^2.0.1"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
