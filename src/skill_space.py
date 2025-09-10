@@ -126,28 +126,40 @@ class StickyHDPHMMVI(nn.Module):
         self.nu0 = float(niw_prior.nu0)
 
         # Streaming defaults + lazy buffers
-        self.stream_rho = float(rho_emission)
+        self.stream_rho_niw = float(rho_emission)
         self.stream_rho_trans = float(rho_transition) if rho_transition is not None else None
         self._stream_allocated = False
+        self._no_stats = True
         self.streaming_reset()
         
-    def reset(self):
+        self.init_kmeans = None
+        
+    def reset(self, reset_streaming: bool = True, keep_mu: bool = False):
         """Reset model parameters to prior values."""
         Kp1, D = self.niw.mu.shape[0], self.p.D
-        self.niw = NIWPosterior(
-            mu=torch.stack([self.mu0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
-            kappa=torch.full((Kp1,), self.kappa0, device=self.p.device, dtype=self.p.dtype),
-            Psi=torch.stack([self.Psi0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
-            nu=torch.full((Kp1,), self.nu0, device=self.p.device, dtype=self.p.dtype),
-        )
+        if keep_mu:
+            self.niw = NIWPosterior(
+                mu=self.init_kmeans.clone() if self.init_kmeans is not None else self.niw.mu.clone(),
+                kappa=torch.full((Kp1,), self.kappa0, device=self.p.device, dtype=self.p.dtype),
+                Psi=torch.stack([self.Psi0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
+                nu=torch.full((Kp1,), self.nu0, device=self.p.device, dtype=self.p.dtype),
+            )
+        else:
+            self.niw = NIWPosterior(
+                mu=torch.stack([self.mu0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
+                kappa=torch.full((Kp1,), self.kappa0, device=self.p.device, dtype=self.p.dtype),
+                Psi=torch.stack([self.Psi0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
+                nu=torch.full((Kp1,), self.nu0, device=self.p.device, dtype=self.p.dtype),
+            )
         beta = torch.tensor([1.0 / (self.p.K + 2 - k) for k in range(1, Kp1)], device=self.p.device, dtype=self.p.dtype)
         self.u_beta.data.copy_(torch.log(beta) - torch.log1p(-beta))
         pi_full = self._Epi() * self.p.alpha + self.p.kappa * torch.eye(Kp1, device=self.p.device, dtype=self.p.dtype)
         self.dir.phi.data.copy_(pi_full)
         self._cache_fresh = False
-        self.streaming_reset()
+        if reset_streaming:
+            self.streaming_reset()
         
-    def reset_low_count_states(self, low_count_thresh, logger=None):
+    def reset_low_count_states(self, low_count_thresh, reset_streaming: bool=True, logger=None):
         """Reset states with low occupancy to prior values."""
         with torch.no_grad():
             # Compute state occupancies from transition matrix
@@ -162,7 +174,8 @@ class StickyHDPHMMVI(nn.Module):
                 self.niw.nu[low_count_states] = self.nu0
                 self.niw.kappa[low_count_states] = self.kappa0
         self._cache_fresh = False
-        self.streaming_reset()
+        if reset_streaming:
+            self.streaming_reset()
 
     # --- ELBO terms ------------------------------------------
 
@@ -576,6 +589,7 @@ class StickyHDPHMMVI(nn.Module):
         self.S_M1 = M1
         self.S_M2 = M2
         self.S_counts = xi_counts
+        self._no_stats = False
 
     @torch.no_grad()
     def _calc_NIW_posterior(self, Nk, M1, M2) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -781,6 +795,7 @@ class StickyHDPHMMVI(nn.Module):
         self._alloc_stream_buffers()
         self.S_Nk.zero_(); self.S_M1.zero_(); self.S_M2.zero_(); self.S_counts.zero_()
         self.S_steps.fill_(0.0)
+        self._no_stats = True
 
     # ---- ELBO component calculations ----------------------------------------
     @staticmethod
@@ -971,11 +986,9 @@ class StickyHDPHMMVI(nn.Module):
         max_iters: int = 7,                            # inner full-loop limit
         tol: float = 0.01,                             # Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
         elbo_drop_tol: float = 0.01,                   # Relative ELBO drop tolerance for early stopping (fraction, e.g., 0.01 = 1%)
-        rho: Optional[float] = 1.0,                    # 1.0 => non-streaming; 0<rho<1 => EMA
         optimize_pi: bool = True,                      # optimize π using mean r1
         pi_steps: int = 200,                           # π opt steps
         pi_lr: float = 0.05,                           # π opt learning rate
-        offline: bool = False,                         # offline π opt (full data) if True
         logger: Optional[logging.Logger] = None        # for debug output
     ) -> Dict[str, torch.Tensor]:
         """
@@ -1010,13 +1023,8 @@ class StickyHDPHMMVI(nn.Module):
         B, T, D = mu_t.shape
         Kp1 = self.niw.mu.shape[0]
 
-        # Resolve streaming coefficients
-        if rho is None:
-            rho_eff = self.stream_rho
-        else:
-            rho_eff = float(max(0.0, min(1.0, rho)))
-        rho_tr = self.stream_rho_trans if self.stream_rho_trans is not None else rho_eff
-        rho_tr = float(max(0.0, min(1.0, rho_tr)))
+        rho_niw = self.stream_rho_niw
+        rho_tr = self.stream_rho_trans if self.stream_rho_trans is not None else rho_niw
 
         # ELBO trackers
         elbo_history = []
@@ -1133,10 +1141,18 @@ class StickyHDPHMMVI(nn.Module):
                 logger.debug(f"Iter {it}: ELBO after FB: {elbo_after_fb:.4f} (LL {this_ll:.4f}, Δ={(this_ll - ll_before_val):.4f})")
 
             # (3) Blend stats (EMA or full replace) and update NIW
-            this_S_Nk     = (1.0 if offline else (1.0 - rho_eff)) * self.S_Nk     + rho_eff * this_acc_Nk
-            this_S_M1     = (1.0 if offline else (1.0 - rho_eff)) * self.S_M1     + rho_eff * this_acc_M1
-            this_S_M2     = (1.0 if offline else (1.0 - rho_eff)) * self.S_M2     + rho_eff * this_acc_M2
-            this_S_counts = (1.0 if offline else (1.0 - rho_tr)) * self.S_counts + rho_tr  * this_acc_counts
+            if self._no_stats:  # first pass after reset
+                if logger: logger.debug(f"First pass after reset, using full stats.")
+                this_S_Nk     = this_acc_Nk
+                this_S_M1     = this_acc_M1
+                this_S_M2     = this_acc_M2
+                this_S_counts = this_acc_counts
+            else:
+                if logger: logger.debug(f"Blending stats with ρ_niw={rho_niw:.4f}, ρ_tr={rho_tr:.4f}.")
+                this_S_Nk     = (1.0 - rho_niw) * self.S_Nk     + rho_niw * this_acc_Nk
+                this_S_M1     = (1.0 - rho_niw) * self.S_M1     + rho_niw * this_acc_M1
+                this_S_M2     = (1.0 - rho_niw) * self.S_M2     + rho_niw * this_acc_M2
+                this_S_counts = (1.0 - rho_tr) * self.S_counts + rho_tr  * this_acc_counts
 
             this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat = \
                 self._calc_NIW_posterior(this_S_Nk, this_S_M1, this_S_M2)
@@ -1332,7 +1348,7 @@ class StickyHDPHMMVI(nn.Module):
     @torch.no_grad()
     def get_rho_emission(self) -> torch.Tensor:
         """Alias for streaming rho used in code paths that expect get_rho_emission()."""
-        return torch.tensor(float(self.stream_rho), device=self.mu0.device, dtype=self.mu0.dtype)
+        return torch.tensor(float(self.stream_rho_niw), device=self.mu0.device, dtype=self.mu0.dtype)
 
     @torch.no_grad()
     def get_rho_transition(self) -> torch.Tensor:

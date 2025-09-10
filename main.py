@@ -630,8 +630,8 @@ if __name__ == "__main__":
                 niw_kappa0 = 1.0, 
                 niw_Psi0 = 30.0,
                 niw_nu0 = vae_config.latent_dim + 10,
-                offline = True,
-                streaming_rho = 1.0,
+                streaming_rho_niw = 1.0,
+                streaming_rho_trans = 1.0,
                 max_iters = 10,
                 elbo_drop_tol = 0.01,  # 1% relative tolerance
                 elbo_tol = 0.01,       # 1% relative tolerance
@@ -639,6 +639,7 @@ if __name__ == "__main__":
                 pi_iters = 10,
                 pi_lr = 5.0e-4,
                 reset_to_prior = True,
+                reset_streaming = True,
                 reset_low_count_states = False,
                 low_count_thresh = 0.01,  # States with <1% of total counts will be reset
                 # Game-grouped data options
