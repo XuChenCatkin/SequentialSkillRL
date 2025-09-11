@@ -2163,7 +2163,7 @@ def train_vae_with_sticky_hmm_em(
     # 1) Load the pretrained VAE from HuggingFace or local checkpoint
     if pretrained_hf_repo:
         if logger: logger.info(f"🤗 Loading pretrained VAE from HuggingFace: {pretrained_hf_repo}")
-        model = load_model_from_huggingface(
+        model, _ = load_model_from_huggingface(
             repo_name=pretrained_hf_repo,
             token=hf_token,
             device=device

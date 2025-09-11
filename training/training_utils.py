@@ -438,7 +438,7 @@ from train import load_model_from_huggingface
 import torch
 
 # Load the model
-model = load_model_from_huggingface("{repo_name}")
+model, config = load_model_from_huggingface("{repo_name}")
 
 # Example usage with synthetic data
 batch_size = 1
@@ -634,7 +634,7 @@ def load_model_from_huggingface(
     token: Optional[str] = None,
     device: str = "cpu",
     **model_kwargs
-) -> MultiModalHackVAE:
+) -> tuple[MultiModalHackVAE, VAEConfig]:
     """
     Load MultiModalHackVAE model from HuggingFace Hub
     
@@ -647,6 +647,7 @@ def load_model_from_huggingface(
         
     Returns:
         Loaded MultiModalHackVAE model
+        VAEConfig used for initialization
     """
     if not HF_AVAILABLE:
         raise ImportError("HuggingFace Hub is required. Install with: pip install huggingface_hub")
@@ -728,7 +729,7 @@ def load_model_from_huggingface(
         print(f"🎯 Model on device: {device}")
         print(f"🎯 Model in evaluation mode")
         
-        return model
+        return model, vae_config
         
     except Exception as e:
         print(f"❌ Error loading from HuggingFace: {e}")
@@ -888,7 +889,7 @@ def create_model_demo_notebook(repo_name: str, save_path: str = "demo_notebook.i
                 "source": [
                     "# Load the model (you'll need to import your model class)\n",
                     "# from your_package import MultiModalHackVAE\n",
-                    "# model = load_model_from_huggingface('{repo_name}')\n",
+                    "# model, _ = load_model_from_huggingface('{repo_name}')\n",
                     "\n",
                     "# Example synthetic data\n",
                     "batch_size = 1\n",

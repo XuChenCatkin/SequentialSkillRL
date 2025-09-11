@@ -46,6 +46,7 @@ from datetime import datetime
 from src.data_collection import NetHackDataCollector, BLStatsAdapter
 from training.train import train_multimodalhack_vae, VAEConfig, load_datasets, train_vae_with_sticky_hmm_em
 from utils.analysis import create_visualization_demo, analyze_glyph_char_color_pairs, plot_glyph_char_color_pairs_from_saved
+from training.online_rl import train_online_ppo_with_pretrained_models
 
 if __name__ == "__main__":
     
@@ -349,12 +350,12 @@ if __name__ == "__main__":
             vae_repo = repo_name.replace('-hmm', '-vae')  # e.g., nethack-hmm -> nethack-vae
             try:
                 from training.train import load_model_from_huggingface
-                model = load_model_from_huggingface(vae_repo, device=str(device))
+                model, _ = load_model_from_huggingface(vae_repo, device=str(device))
                 print(f"✅ VAE loaded from {vae_repo}")
             except Exception as e:
                 print(f"⚠️  Could not load VAE from {vae_repo}: {e}")
                 print(f"🔄 Trying fallback VAE repo...")
-                model = load_model_from_huggingface("CatkinChen/nethack-vae", device=str(device))
+                model, _ = load_model_from_huggingface("CatkinChen/nethack-vae", device=str(device))
                 print(f"✅ VAE loaded from fallback repo")
             
             # Set up analysis directory
@@ -682,3 +683,38 @@ if __name__ == "__main__":
             print(f"✅ Training completed!")
             print(f"📊 HMM checkpoints: {len(training_info['hmm_paths'])}")
             print(f"📊 VAE+HMM checkpoints: {len(training_info['vae_hmm_paths'])}")
+            
+    elif len(sys.argv) > 1 and sys.argv[1] == "rl":
+        print(f"🎮 Reinforcement Learning mode activated")
+        
+        # Set up logging with file output
+        os.makedirs("logs", exist_ok=True)  # Create logs directory
+        log_filename = f"logs/rl_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_filename),  # Save to file
+                logging.StreamHandler()  # Also show in console
+            ]
+        )
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.DEBUG)
+        
+        print(f"📝 Logging to file: {log_filename}")
+        
+        results = train_online_ppo_with_pretrained_models(
+            env_name='MiniHack-Room-5x5-v0',
+            vae_repo_id="CatkinChen/nethack-vae-hmm",
+            hmm_repo_id="CatkinChen/nethack-hmm",
+            total_timesteps=100000,
+            learning_rate=3e-4,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            use_wandb=False,
+            wandb_project="SequentialSkillRL",
+            wandb_run_name=f"online_ppo_{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+            push_to_hub=False,
+            hub_repo_id="CatkinChen/nethack-ppo-with-vae-hmm",
+            hf_upload_artifacts=True,
+            logger=logger,
+        )

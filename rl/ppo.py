@@ -16,6 +16,7 @@ from nle import nethack  # action id space (615)
 # --- your code ---
 from src.model import MultiModalHackVAE, VAEConfig
 from src.skill_space import StickyHDPHMMVI, StickyHDPHMMParams, NIWPrior
+from src.data_collection import NetHackDataCollector
 
 # KL helper already used by your VAE loss
 from utils.math_utils import kl_gaussian_lowrank_q_p
@@ -122,17 +123,18 @@ def one_hot(indices: torch.Tensor, num_classes: int) -> torch.Tensor:
     y = torch.zeros(*indices.shape, num_classes, device=indices.device)
     return y.scatter_(-1, indices.long().unsqueeze(-1), 1.0)
 
-def obs_to_device(obs: dict, device):
+def obs_to_device(obs: dict, device, hero_info):
     # NLE/MiniHack observation keys; robust to dict/np/tensors
     def to_t(x):
         t = torch.as_tensor(x)
-        return t.to(device)
+        return t.to(device, dtype=torch.long)
+    
     out = {
         "game_chars": to_t(obs.get("chars") if "chars" in obs else obs["glyphs_char"]),
         "game_colors": to_t(obs.get("colors") if "colors" in obs else obs["glyphs_color"]),
         "blstats": to_t(obs["blstats"]),
         "message_chars": to_t(obs.get("message", np.zeros((obs["blstats"].shape[0], 256), np.int64))),
-        "hero_info": to_t(obs.get("inv_strs", np.zeros((obs["blstats"].shape[0], 4), np.int64))) # fallback zeros
+        "hero_info": to_t(hero_info)
     }
     # ensure batch dimension for vectorized envs
     for k, v in out.items():
@@ -144,6 +146,18 @@ def obs_to_device(obs: dict, device):
         elif v.dim() == 1 and k in ["message_chars", "hero_info"]:
             out[k] = v.unsqueeze(0)
     return out
+
+def message_ascii_to_string(message_chars: np.ndarray) -> str:
+    """Convert ASCII codes from message observation to string."""
+    # Handle different input types
+    if hasattr(message_chars, 'cpu'):  # torch tensor
+        message_chars = message_chars.cpu().numpy()
+    elif hasattr(message_chars, 'numpy'):  # numpy array
+        message_chars = message_chars
+    
+    # Filter out padding (0) and convert to characters
+    valid_chars = message_chars[message_chars > 0]
+    return ''.join(chr(code) for code in valid_chars if 32 <= code <= 126)
 
 # --------------------------------------------------------------------------------------
 # Policy & RND
@@ -433,16 +447,70 @@ class PPOTrainer:
         self._filt_state = [None for _ in range(ppo_cfg.num_envs)]  # StickyHDPHMMVI.FilterState or None per env
         # cache ElogA; refresh whenever HMM is updated
         self._ElogA = self.hmm._ElogA()
+        
+        # --- Hero info tracking for each environment ---
+        self.data_collector = NetHackDataCollector()
+        self._hero_info = [None for _ in range(ppo_cfg.num_envs)]  # Current hero info per env [role, race, gender, alignment]
+        self._episode_start = [True for _ in range(ppo_cfg.num_envs)]  # Track if we need to parse hero info
 
     # --------------------------- rollout -------------------------------------
 
     @torch.no_grad()
     def _encode_obs(self, obs_dict: dict) -> Dict[str, torch.Tensor]:
-        b = obs_to_device(obs_dict, self.device)
+        # Stack current hero info for all environments
+        hero_info_batch = torch.stack([
+            hero_info if hero_info is not None else torch.zeros(4, dtype=torch.int32)
+            for hero_info in self._hero_info
+        ], dim=0)  # [num_envs, 4]
+        
+        b = obs_to_device(obs_dict, self.device, hero_info=hero_info_batch)
         enc = self.vae.encode(b["game_chars"], b["game_colors"], b["blstats"], b["message_chars"], b["hero_info"])
         mu = enc["mu"]; logvar = enc["logvar"]; F = enc["lowrank_factors"]  # tensors [B,D], [B,D], [B,D,R] or None
         z  = mu  # use mean latent for policy input
         return {"z": z, "mu": mu, "logvar": logvar, "F": F}
+
+    def _update_hero_info_from_obs(self, obs_dict: dict):
+        """Extract hero info from the first observation of each new episode."""
+        for env_idx in range(self.ppo_cfg.num_envs):
+            if self._episode_start[env_idx]:
+                try:
+                    # Extract message from observation for this environment
+                    message_key = "message" if "message" in obs_dict else None
+                    if message_key and hasattr(obs_dict[message_key], 'shape') and len(obs_dict[message_key].shape) > 1:
+                        # Vectorized env case: obs_dict[message_key] is [num_envs, 256]
+                        message_ascii = obs_dict[message_key][env_idx]
+                    elif message_key and env_idx == 0:
+                        # Single env case: obs_dict[message_key] is [256]
+                        message_ascii = obs_dict[message_key]
+                    else:
+                        # No message found
+                        continue
+                    
+                    # Convert ASCII codes to string
+                    message_str = message_ascii_to_string(message_ascii)
+                    
+                    # Parse hero info using data collector
+                    # Use a unique game_id per environment (could be improved with actual game tracking)
+                    game_id = env_idx  # Simple approach: use env index as game_id
+                    hero_info = self.data_collector.parse_hero_info_from_message(game_id, message_str)
+                    
+                    if hero_info is not None:
+                        self._hero_info[env_idx] = hero_info
+                        print(f"✅ Environment {env_idx}: Parsed hero info {hero_info.tolist()} from message: '{message_str[:100]}...'")
+                    else:
+                        # Keep previous hero info or use zeros as fallback
+                        if self._hero_info[env_idx] is None:
+                            self._hero_info[env_idx] = torch.zeros(4, dtype=torch.int32)
+                            print(f"⚠️ Environment {env_idx}: Could not parse hero info from message: '{message_str[:100]}...'")
+                    
+                except Exception as e:
+                    # Fallback to zeros if anything goes wrong
+                    if self._hero_info[env_idx] is None:
+                        self._hero_info[env_idx] = torch.zeros(4, dtype=torch.int32)
+                    print(f"⚠️ Environment {env_idx}: Error parsing hero info: {e}")
+                
+                # Mark that we've processed the episode start
+                self._episode_start[env_idx] = False
 
     @torch.no_grad()
     def collect_rollout(self):
@@ -465,30 +533,20 @@ class PPOTrainer:
                 Kp1 = int(self.hmm.niw.mu.size(0))  # includes remainder
                 skill_list = []
                 for b in range(B):
-                    mu_b = enc["mu"][b]                      # [D]
-                    dv_b = enc["logvar"][b].exp()           # [D]
+                    mu_b = enc["mu"][b]                                     # [D]
+                    dv_b = enc["logvar"][b].exp().clamp_min(1e-6)           # [D]
+                    F    = enc.get('lowrank_factors', None)                 # [D,R] or None
                     # logB_t[k] = E_q[log p(z_t | h_t=k)]
-                    if hasattr(self.hmm, "emission_logB_one"):
-                        logB_b = self.hmm.emission_logB_one(mu_b, dv_b, None)  # [Kp1]
-                    else:
-                        # Fallback: compute via expected_emission_loglik on a 1-step batch
-                        logB_b = StickyHDPHMMVI.expected_emission_loglik(
-                            self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                            mu_b.unsqueeze(0), dv_b.unsqueeze(0), None, mask=None
-                        ).squeeze(0)  # [Kp1]
+                    logB_b = StickyHDPHMMVI.expected_emission_loglik(
+                        self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
+                        mu_b.unsqueeze(0), dv_b.unsqueeze(0), F.unsqueeze(0), mask=None
+                    ).squeeze(0)  # [Kp1]
 
                     st = self._filt_state[b]
                     if st is None:
                         # initialise at episode start
-                        if hasattr(self.hmm, "filter_init_from_logB"):
-                            st = self.hmm.filter_init_from_logB(logB_b)
-                            alpha_b = torch.exp(st.log_alpha.to(torch.float32))  # [Kp1]
-                        else:
-                            # Very old HMM class fallback: α₀ ∝ π ⊙ B₀
-                            log_pi = torch.log(torch.clamp(self.hmm._Epi(), min=1e-30))
-                            la = (log_pi + logB_b)
-                            la = la - torch.logsumexp(la, dim=-1, keepdim=False)
-                            alpha_b = torch.exp(la.to(torch.float32))
+                        st = self.hmm.filter_init_from_logB(logB_b)
+                        alpha_b = torch.exp(st.log_alpha.to(torch.float32))  # [Kp1]
                     else:
                         # one causal update (uses cached ElogA)
                         st, alpha_b, _xi, _bound, _sent = self.hmm.filter_step(st, logB_b, self._ElogA)
@@ -518,8 +576,17 @@ class PPOTrainer:
                 for b, d in enumerate(done):
                     if d:
                         self._filt_state[b] = None
+            
+            # Mark episode start for environments that terminated (for hero info parsing)
+            for b, d in enumerate(done):
+                if d:
+                    self._episode_start[b] = True
 
             obs = next_obs
+            
+            # Update hero info for any new episodes that started
+            self._update_hero_info_from_obs(obs)
+            
             self.global_steps += self.ppo_cfg.num_envs
         self._obs = obs
 
@@ -539,20 +606,80 @@ class PPOTrainer:
         return bonuses
 
     @torch.no_grad()
+    def _compute_skill_features(self, enc):
+        """Helper to compute skill features for a single batch of observations."""
+        if not self.ppo_cfg.policy_uses_skill:
+            return None
+            
+        B = enc["z"].size(0)
+        Kp1 = self.hmm.niw.mu.size(0)
+        skill_list = []
+        
+        for b in range(B):
+            mu_b = enc["mu"][b]
+            dv_b = enc["logvar"][b].exp()
+            
+            if hasattr(self.hmm, "emission_logB_one"):
+                logB_b = self.hmm.emission_logB_one(mu_b, dv_b, None)
+            else:
+                logB_b = StickyHDPHMMVI.expected_emission_loglik(
+                    self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
+                    mu_b.unsqueeze(0), dv_b.unsqueeze(0), None, mask=None
+                ).squeeze(0)
+            
+            st = self._filt_state[b]
+            if st is None:
+                if hasattr(self.hmm, "filter_init_from_logB"):
+                    st = self.hmm.filter_init_from_logB(logB_b)
+                    alpha_b = torch.exp(st.log_alpha.to(torch.float32))
+                else:
+                    # Fallback for older HMM classes
+                    alpha_b = torch.softmax(logB_b, dim=-1)
+            else:
+                st, alpha_b, _, _, _ = self.hmm.filter_step(st, logB_b, self._ElogA)
+            
+            self._filt_state[b] = st
+            skill_list.append(alpha_b[:Kp1-1])  # Drop remainder state
+        
+        return torch.stack(skill_list, dim=0)
+
+    @torch.no_grad()
     def _advantages(self, rews_total: torch.Tensor, values: torch.Tensor, dones: torch.Tensor):
-        # all [T,B]
+        """
+        Compute GAE advantages with proper episode boundary handling.
+        
+        Args:
+            rews_total: [T,B] total rewards (extrinsic + intrinsic)
+            values: [T,B] value estimates for each timestep
+            dones: [T,B] episode termination flags
+        """
         T, B = rews_total.size()
-        adv = torch.zeros_like(rews_total)
-        lastgaelam = torch.zeros(B, device=rews_total.device)
-        next_value = torch.zeros(B, device=rews_total.device)
+        
+        # Get bootstrap values (value of observation after rollout)
+        enc = self._encode_obs(self._obs)
+        skill_feat = self._compute_skill_features(enc)
+        _, bootstrap_values = self.actor_critic(enc["z"], skill_feat)
+        
+        # Extend values with bootstrap
+        extended_values = torch.cat([values, bootstrap_values.unsqueeze(0)], dim=0)  # [T+1, B]
+        
+        # Compute advantages
+        advantages = torch.zeros_like(rews_total)
+        gae = torch.zeros(B, device=self.device)
+        
         for t in reversed(range(T)):
-            notdone = (~dones[t]).float()
-            delta = rews_total[t] + self.ppo_cfg.gamma * next_value * notdone - values[t]
-            lastgaelam = delta + self.ppo_cfg.gamma * self.ppo_cfg.gae_lambda * notdone * lastgaelam
-            adv[t] = lastgaelam
-            next_value = values[t]
-        ret = adv + values
-        return adv, ret
+            # Episode continues if current step is not done
+            nextnonterminal = (~dones[t]).float()
+            
+            # TD error
+            delta = rews_total[t] + self.ppo_cfg.gamma * extended_values[t + 1] * nextnonterminal - values[t]
+            
+            # GAE (resets to delta when episode ends)
+            gae = delta + self.ppo_cfg.gamma * self.ppo_cfg.gae_lambda * nextnonterminal * gae
+            advantages[t] = gae
+        
+        returns = advantages + values
+        return advantages, returns
 
     def _ppo_update(self, advantages, returns, skills_for_policy):
         data = self.buf.get()
@@ -609,6 +736,11 @@ class PPOTrainer:
     def train(self):
         set_seed(self.run_cfg.seed)
         obs, _ = self.envs.reset(seed=self.run_cfg.seed)
+        
+        # Parse hero info from initial observations (episode start)
+        self._episode_start = [True for _ in range(self.ppo_cfg.num_envs)]
+        self._update_hero_info_from_obs(obs)
+        
         self._obs = obs
 
         # maintain a growing replay window of latents for HMM refresh

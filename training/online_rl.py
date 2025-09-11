@@ -58,10 +58,9 @@ warnings.filterwarnings('ignore')
 
 
 def train_online_ppo_with_pretrained_models(
-    env_name: str = "MiniHack-Quest-Hard-v0",
-    repo_id: str = "catid/SequentialSkillRL",
-    vae_filename: str = "nethack-vae.pth",
-    hmm_filename: str = "hmm_round3.pt",
+    env_name: str = "MiniHack-Room-5x5-v0",
+    vae_repo_id: str = "CatkinChen/nethack-vae-hmm",
+    hmm_repo_id: str = "CatkinChen/nethack-hmm",
     total_timesteps: int = 50000,
     learning_rate: float = 5e-4,
     batch_size: int = 32,
@@ -79,26 +78,33 @@ def train_online_ppo_with_pretrained_models(
     rnd_coef: float = 0.1,
     test_mode: bool = False,
     test_episodes: int = 10,
-    project_name: str = "SequentialSkillRL",
-    run_name: Optional[str] = None,
     save_freq: int = 1000,
     log_freq: int = 100,
-    device: str = "auto",
+    device: torch.device = torch.device('cuda'),
     seed: Optional[int] = None,
     debug_mode: bool = False,
-    upload_to_huggingface: bool = False,
-    use_wandb: bool = True,
-    upload_model_to_hf: bool = False,
-    hf_model_name: Optional[str] = None
+    # Weights & Biases monitoring parameters
+    use_wandb: bool = False,
+    wandb_project: str = "SequentialSkillRL",
+    wandb_entity: str = None,
+    wandb_run_name: str = None,
+    wandb_tags: List[str] = None,
+    wandb_notes: str = None,
+    # HuggingFace integration
+    push_to_hub: bool = False,
+    hub_repo_id: str | None = None,
+    hf_token: str | None = None,
+    hf_private: bool = True,
+    hf_upload_artifacts: bool = True,
+    logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """
     Train online PPO agent with pretrained VAE and HMM models.
     
     Args:
         env_name: MiniHack environment name
-        repo_id: HuggingFace repository ID for pretrained models
-        vae_filename: VAE model filename
-        hmm_filename: HMM model filename
+        vae_repo_id: HuggingFace repository ID for VAE model
+        hmm_repo_id: HuggingFace repository ID for HMM model
         total_timesteps: Total training timesteps
         learning_rate: PPO learning rate
         batch_size: Training batch size
@@ -116,8 +122,6 @@ def train_online_ppo_with_pretrained_models(
         rnd_coef: RND coefficient
         test_mode: Run in test mode (no training)
         test_episodes: Number of test episodes
-        project_name: W&B project name
-        run_name: W&B run name
         save_freq: Model save frequency
         log_freq: Logging frequency
         device: Device to use ('auto', 'cuda', 'cpu')
@@ -131,52 +135,42 @@ def train_online_ppo_with_pretrained_models(
     Returns:
         Dictionary with training results and final metrics
     """
-    # Set up logging
-    logging.basicConfig(
-        level=logging.DEBUG if debug_mode else logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-    logger = logging.getLogger(__name__)
-    
-    logger.info("=" * 80)
-    logger.info(f"Starting Online PPO Training with Pretrained Models")
-    logger.info(f"Environment: {env_name}")
-    logger.info(f"Repository: {repo_id}")
-    logger.info(f"VAE Model: {vae_filename}")
-    logger.info(f"HMM Model: {hmm_filename}")
-    logger.info(f"Total Timesteps: {total_timesteps:,}")
-    logger.info(f"Test Mode: {test_mode}")
-    logger.info("=" * 80)
+    if logger:
+        logger.info("=" * 80)
+        logger.info(f"Starting Online PPO Training with Pretrained Models")
+        logger.info(f"Environment: {env_name}")
+        logger.info(f"VAE Repository: {vae_repo_id}")
+        logger.info(f"HMM Repository: {hmm_repo_id}")
+        logger.info(f"Total Timesteps: {total_timesteps:,}")
+        logger.info(f"Test Mode: {test_mode}")
+        logger.info("=" * 80)
     
     # Set random seed
     if seed is not None:
         set_seed(seed)
-        logger.info(f"🌱 Random seed set to: {seed}")
+        if logger: logger.info(f"🌱 Random seed set to: {seed}")
     
     # Device setup
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
-    logger.info(f"🔧 Using device: {device}")
+    if logger: logger.info(f"🔧 Using device: {device}")
     
     # Create run name if not provided
-    if run_name is None:
+    if wandb_run_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         mode_str = "test" if test_mode else "train"
-        run_name = f"online_ppo_{env_name}_{mode_str}_{timestamp}"
-    
+        wandb_run_name = f"online_ppo_{env_name}_{mode_str}_{timestamp}"
+
     # Initialize W&B
     wandb_run = None
     if WANDB_AVAILABLE and use_wandb and not test_mode:
         try:
             wandb_run = wandb.init(
-                project=project_name,
-                name=run_name,
+                project=wandb_project,
+                name=wandb_run_name,
                 config={
                     "env_name": env_name,
-                    "repo_id": repo_id,
-                    "vae_filename": vae_filename,
-                    "hmm_filename": hmm_filename,
+                    "vae_repo_id": vae_repo_id,
+                    "hmm_repo_id": hmm_repo_id,
                     "total_timesteps": total_timesteps,
                     "learning_rate": learning_rate,
                     "batch_size": batch_size,
@@ -196,104 +190,119 @@ def train_online_ppo_with_pretrained_models(
                     "seed": seed
                 }
             )
-            logger.info(f"📊 W&B initialized with run name: {run_name}")
+            if logger: logger.info(f"📊 W&B initialized with run name: {wandb_run_name}")
         except Exception as e:
-            logger.warning(f"⚠️  W&B initialization failed: {e}")
+            if logger: logger.warning(f"⚠️  W&B initialization failed: {e}")
             wandb_run = None
     
     try:
         # Load pretrained VAE
-        logger.info("🔄 Loading pretrained VAE model...")
-        vae_model, vae_config = load_model_from_huggingface(
-            repo_id=repo_id,
-            filename=vae_filename,
-            device=device
+        if logger: logger.info("🔄 Loading pretrained VAE model...")
+        vae_model, config = load_model_from_huggingface(
+            repo_name=vae_repo_id,
+            token=hf_token,
+            device=str(device)
         )
-        logger.info(f"✅ VAE model loaded successfully")
-        logger.info(f"   - Latent dimension: {vae_config.latent_dim}")
-        logger.info(f"   - Architecture: {vae_config.architecture}")
-        
+        if logger: logger.info(f"✅ VAE model loaded successfully")
+        if logger: logger.info(f"   - Latent dimension: {config.latent_dim}")
+        if logger: logger.info(f"   - Skills: {config.skill_num}")
+
         # Load pretrained HMM
-        logger.info("🔄 Loading pretrained HMM model...")
-        hmm_model = load_hmm_from_huggingface(
-            repo_id=repo_id,
-            filename=hmm_filename,
-            device=device
+        if logger: logger.info("🔄 Loading pretrained HMM model...")
+        hmm_model, loaded_config, hmm_params, niw, metadata = load_hmm_from_huggingface(
+            repo_name=hmm_repo_id,
+            round_num=None,  # None means latest
+            device=str(device)
         )
-        logger.info(f"✅ HMM model loaded successfully")
-        
+        if logger: logger.info(f"✅ HMM model loaded successfully")
+        if metadata:
+            if logger: logger.info(f"   🏷️  HMM Round: {metadata.get('round', 'unknown')}")
+            if logger: logger.info(f"   📅 Created: {metadata.get('created', 'unknown')}")
+            
         # Create environment
-        logger.info(f"🎮 Creating environment: {env_name}")
+        if logger: logger.info(f"🎮 Creating environment: {env_name}")
         env = gym.make(env_name)
         
         # Log environment info
-        logger.info(f"   - Observation space: {env.observation_space}")
-        logger.info(f"   - Action space: {env.action_space}")
+        if logger: logger.info(f"   - Observation space: {env.observation_space}")
+        if logger: logger.info(f"   - Action space: {env.action_space}")
         
         # Configure training
         train_config = TrainConfig(
-            total_timesteps=total_timesteps,
-            batch_size=batch_size,
-            n_epochs=n_epochs,
-            save_freq=save_freq,
-            log_freq=log_freq
+            env_id=env_name,
+            seed=seed if seed is not None else 42,
+            device=str(device),
+            log_dir=f"./ppo/{wandb_run_name}",
+            save_every=save_freq,
+            eval_every=save_freq,
+            eval_episodes=test_episodes
         )
         
         ppo_config = PPOConfig(
-            lr=learning_rate,
+            learning_rate=learning_rate,
             gamma=gamma,
             vf_coef=vf_coef,
             ent_coef=ent_coef,
-            max_grad_norm=max_grad_norm
+            max_grad_norm=max_grad_norm,
+            epochs_per_update=n_epochs,
+            minibatch_size=batch_size
         )
         
         # Configure curiosity if enabled
-        curiosity_config = None
         if use_curiosity:
             curiosity_config = CuriosityConfig(
-                lr=curiosity_lr,
-                forward_coef=curiosity_forward_coef,
-                inverse_coef=curiosity_inverse_coef
+                use_dyn_kl=True,
+                use_skill_entropy=True,
+                use_rnd=False,
+                eta0_dyn=curiosity_forward_coef,
+                eta0_hdp=curiosity_inverse_coef
             )
-            logger.info(f"🧠 Curiosity enabled: forward_coef={curiosity_forward_coef}, inverse_coef={curiosity_inverse_coef}")
+            if logger: logger.info(f"🧠 Curiosity enabled: eta0_dyn={curiosity_forward_coef}, eta0_hdp={curiosity_inverse_coef}")
+        else:
+            # Disabled curiosity config
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,
+                use_skill_entropy=False,
+                use_rnd=False
+            )
         
         # Configure RND if enabled
-        rnd_config = None
         if use_rnd:
             rnd_config = RNDConfig(
-                lr=rnd_lr,
-                coef=rnd_coef
+                lr=rnd_lr
             )
-            logger.info(f"🔍 RND enabled: coef={rnd_coef}")
+            if logger: logger.info(f"🔍 RND enabled: lr={rnd_lr}")
+        else:
+            # Default RND config (will be ignored if not used)
+            rnd_config = RNDConfig()
         
         # Configure HMM integration
         hmm_config = HMMOnlineConfig(
-            use_hmm_reward=True,
-            hmm_reward_scale=0.1,
-            update_frequency=100
+            hmm_update_every=10000,
+            rho_emission=0.1
         )
         
         # Create PPO trainer
-        logger.info("🚀 Initializing PPO trainer...")
+        if logger: logger.info("🚀 Initializing PPO trainer...")
         trainer = PPOTrainer(
-            env=env,
-            vae_model=vae_model,
-            hmm_model=hmm_model,
-            ppo_config=ppo_config,
-            curiosity_config=curiosity_config,
-            rnd_config=rnd_config,
-            hmm_config=hmm_config,
-            device=device
+            env_id=env_name,
+            ppo_cfg=ppo_config,
+            cur_cfg=curiosity_config,
+            hmm_cfg=hmm_config,
+            rnd_cfg=rnd_config,
+            run_cfg=train_config,
+            vae=vae_model,
+            hmm=hmm_model
         )
-        logger.info("✅ PPO trainer initialized successfully")
+        if logger: logger.info("✅ PPO trainer initialized successfully")
         
         # Test mode: run evaluation episodes
         if test_mode:
-            logger.info(f"🧪 Running {test_episodes} test episodes...")
+            if logger: logger.info(f"🧪 Running {test_episodes} test episodes...")
             test_results = []
             
             for episode in range(test_episodes):
-                logger.info(f"Episode {episode + 1}/{test_episodes}")
+                if logger: logger.info(f"Episode {episode + 1}/{test_episodes}")
                 
                 obs, _ = env.reset()
                 done = False
@@ -316,7 +325,7 @@ def train_online_ppo_with_pretrained_models(
                     'length': episode_length
                 })
                 
-                logger.info(f"   Reward: {episode_reward}, Length: {episode_length}")
+                if logger: logger.info(f"   Reward: {episode_reward}, Length: {episode_length}")
             
             # Calculate test statistics
             rewards = [r['reward'] for r in test_results]
@@ -331,32 +340,28 @@ def train_online_ppo_with_pretrained_models(
                 'std_length': np.std(lengths)
             }
             
-            logger.info("📈 Test Results:")
-            logger.info(f"   Mean Reward: {test_stats['mean_reward']:.2f} ± {test_stats['std_reward']:.2f}")
-            logger.info(f"   Min/Max Reward: {test_stats['min_reward']:.2f} / {test_stats['max_reward']:.2f}")
-            logger.info(f"   Mean Length: {test_stats['mean_length']:.1f} ± {test_stats['std_length']:.1f}")
+            if logger: logger.info("📈 Test Results:")
+            if logger: logger.info(f"   Mean Reward: {test_stats['mean_reward']:.2f} ± {test_stats['std_reward']:.2f}")
+            if logger: logger.info(f"   Min/Max Reward: {test_stats['min_reward']:.2f} / {test_stats['max_reward']:.2f}")
+            if logger: logger.info(f"   Mean Length: {test_stats['mean_length']:.1f} ± {test_stats['std_length']:.1f}")
             
             return {
                 'test_results': test_results,
                 'test_stats': test_stats,
-                'run_name': run_name
+                'run_name': wandb_run_name
             }
         
         # Training mode
-        logger.info("🏋️  Starting PPO training...")
+        if logger: logger.info("🏋️  Starting PPO training...")
         start_time = time.time()
-        
-        training_results = trainer.train(
-            config=train_config,
-            wandb_run=wandb_run,
-            run_name=run_name
-        )
+
+        trainer.train()
         
         training_time = time.time() - start_time
-        logger.info(f"⏱️  Training completed in {training_time:.2f} seconds")
+        if logger: logger.info(f"⏱️  Training completed in {training_time:.2f} seconds")
         
         # Save final checkpoint
-        checkpoint_dir = Path("checkpoints") / run_name
+        checkpoint_dir = Path("checkpoints") / wandb_run_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         final_checkpoint_path = save_checkpoint(
@@ -365,58 +370,332 @@ def train_online_ppo_with_pretrained_models(
             step=total_timesteps,
             is_final=True
         )
-        logger.info(f"💾 Final checkpoint saved: {final_checkpoint_path}")
+        if logger: logger.info(f"💾 Final checkpoint saved: {final_checkpoint_path}")
         
-        # Upload to HuggingFace if enabled
-        if upload_to_huggingface and HF_AVAILABLE:
+        # Collect training results from log file or trainer state for artifact upload
+        training_results = {
+            'total_timesteps': total_timesteps,
+            'training_time': training_time,
+            'final_checkpoint_path': str(final_checkpoint_path),
+            'global_steps': getattr(trainer, 'global_steps', total_timesteps),
+            'config': {
+                'env_name': env_name,
+                'learning_rate': learning_rate,
+                'batch_size': batch_size,
+                'n_epochs': n_epochs,
+                'gamma': gamma,
+                'vf_coef': vf_coef,
+                'ent_coef': ent_coef,
+                'max_grad_norm': max_grad_norm,
+                'use_curiosity': use_curiosity,
+                'use_rnd': use_rnd
+            }
+        }
+        
+        # Try to read training logs if available
+        if hasattr(trainer, '_log_file') and os.path.exists(trainer._log_file):
             try:
-                logger.info("☁️  Uploading checkpoint to HuggingFace...")
+                training_logs = []
+                with open(trainer._log_file, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            training_logs.append(json.loads(line.strip()))
+                training_results['training_logs'] = training_logs
+                if logger: logger.info(f"📊 Collected {len(training_logs)} training log entries")
+            except Exception as e:
+                if logger: logger.warning(f"⚠️  Could not read training logs: {e}")
+                training_results['training_logs'] = []
+        
+        # Upload to HuggingFace if enabled (upload all components to one repository)
+        if push_to_hub and HF_AVAILABLE:
+            try:
+                if logger: logger.info("☁️  Uploading all model components to HuggingFace...")
+                
+                # Determine the target repository for all components
+                target_repo = hub_repo_id or f"{wandb_project}-{wandb_run_name}"
                 
                 # Create repository if it doesn't exist
                 api = HfApi()
                 try:
-                    create_repo(repo_id, private=False, exist_ok=True)
+                    create_repo(target_repo, private=hf_private, exist_ok=True, token=hf_token)
+                    if logger: logger.info(f"📦 Created/verified repository: {target_repo}")
                 except Exception as e:
-                    logger.warning(f"Repository creation warning: {e}")
+                    if logger: logger.warning(f"Repository creation warning: {e}")
                 
-                # Upload checkpoint
+                # Upload PPO checkpoint (main training result)
+                if logger: logger.info("📤 Uploading PPO policy checkpoint...")
                 upload_file(
                     path_or_fileobj=str(final_checkpoint_path),
-                    path_in_repo=f"checkpoints/{run_name}_final.pth",
-                    repo_id=repo_id,
-                    commit_message=f"Upload final checkpoint for {run_name}"
+                    path_in_repo=f"ppo_policy.pth",
+                    repo_id=target_repo,
+                    token=hf_token,
+                    commit_message=f"Upload PPO policy for {wandb_run_name}"
                 )
-                logger.info("✅ Checkpoint uploaded to HuggingFace successfully")
                 
-            except Exception as e:
-                logger.error(f"❌ HuggingFace upload failed: {e}")
-        
-        # Upload final model to HuggingFace Hub if enabled
-        if upload_model_to_hf and HF_AVAILABLE:
-            try:
-                logger.info("☁️  Uploading final model to HuggingFace Hub...")
-                
-                hf_repo_name = hf_model_name or f"{project_name}-{run_name}"
-                
-                # Create model repository
-                api = HfApi()
+                # Upload VAE model (copy from original repo to unified repo)
+                if logger: logger.info("📤 Uploading VAE model...")
                 try:
-                    create_repo(hf_repo_name, private=False, exist_ok=True)
+                    # Save VAE model locally first
+                    vae_save_path = checkpoint_dir / "vae_model.pth"
+                    torch.save({
+                        'model_state_dict': vae_model.state_dict(),
+                        'config': config.__dict__,
+                        'model_class': vae_model.__class__.__name__
+                    }, vae_save_path)
+                    
+                    upload_file(
+                        path_or_fileobj=str(vae_save_path),
+                        path_in_repo="vae_model.pth",
+                        repo_id=target_repo,
+                        token=hf_token,
+                        commit_message=f"Upload VAE model for {wandb_run_name}"
+                    )
+                    if logger: logger.info("✅ VAE model uploaded successfully")
                 except Exception as e:
-                    logger.warning(f"Model repository creation warning: {e}")
+                    if logger: logger.warning(f"⚠️  VAE upload failed: {e}")
                 
-                # Upload final model
-                upload_file(
-                    path_or_fileobj=str(final_checkpoint_path),
-                    path_in_repo="pytorch_model.bin",
-                    repo_id=hf_repo_name,
-                    commit_message=f"Upload final model for {run_name}"
-                )
+                # Upload HMM model (copy from original repo to unified repo)
+                if logger: logger.info("📤 Uploading HMM model...")
+                try:
+                    # Save HMM model locally first
+                    hmm_save_path = checkpoint_dir / "hmm_model.pth"
+                    torch.save({
+                        'model_state_dict': hmm_model.state_dict() if hasattr(hmm_model, 'state_dict') else hmm_model,
+                        'model_class': hmm_model.__class__.__name__
+                    }, hmm_save_path)
+                    
+                    upload_file(
+                        path_or_fileobj=str(hmm_save_path),
+                        path_in_repo="hmm_model.pth",
+                        repo_id=target_repo,
+                        token=hf_token,
+                        commit_message=f"Upload HMM model for {wandb_run_name}"
+                    )
+                    if logger: logger.info("✅ HMM model uploaded successfully")
+                except Exception as e:
+                    if logger: logger.warning(f"⚠️  HMM upload failed: {e}")
                 
-                logger.info(f"✅ Final model uploaded to HuggingFace: {hf_repo_name}")
+                # Create and upload model card with information about all components
+                if logger: logger.info("📝 Creating model card...")
+                try:
+                    model_card_content = f"""---
+library_name: pytorch
+pipeline_tag: reinforcement-learning
+tags:
+- nethack
+- ppo
+- vae
+- hmm
+- minihack
+- sequential-skills
+
+---
+
+# {target_repo}
+
+This repository contains a complete Sequential Skill RL model trained on NetHack/MiniHack environments.
+
+## Model Components
+
+### 1. PPO Policy (`ppo_policy.pth`)
+- **Type**: Proximal Policy Optimization agent
+- **Environment**: {env_name}
+- **Training Steps**: {total_timesteps:,}
+- **Features**: 
+  - Curiosity-driven exploration: {use_curiosity}
+  - Random Network Distillation: {use_rnd}
+
+### 2. VAE Model (`vae_model.pth`)
+- **Type**: Variational Autoencoder
+- **Purpose**: Encodes NetHack observations into latent skill representations
+- **Latent Dimension**: {getattr(config, 'latent_dim', 'Unknown')}
+- **Architecture**: {getattr(config, 'architecture', 'Unknown')}
+
+### 3. HMM Model (`hmm_model.pth`)
+- **Type**: Hidden Markov Model (Sticky HDP-HMM)
+- **Purpose**: Models sequential skill transitions and dynamics
+- **Integration**: Used for intrinsic reward computation
+
+## Usage
+
+```python
+import torch
+from training.online_rl import train_online_ppo_with_pretrained_models
+
+# Load the complete model
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load individual components
+ppo_checkpoint = torch.load('ppo_policy.pth', map_location=device)
+vae_data = torch.load('vae_model.pth', map_location=device)
+hmm_data = torch.load('hmm_model.pth', map_location=device)
+
+# Use for inference or continued training
+results = train_online_ppo_with_pretrained_models(
+    env_name="{env_name}",
+    vae_repo_id="{vae_repo_id}",
+    hmm_repo_id="{hmm_repo_id}",
+    test_mode=True
+)
+```
+
+## Training Configuration
+
+- **Environment**: {env_name}
+- **Learning Rate**: {learning_rate}
+- **Batch Size**: {batch_size}
+- **Training Time**: {training_time:.2f} seconds
+- **Device**: {device}
+- **Seed**: {seed}
+
+## Performance
+
+Training completed successfully with the following configuration:
+- Curiosity-driven exploration: {use_curiosity}
+- Random Network Distillation: {use_rnd}
+
+Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+                    
+                    model_card_path = checkpoint_dir / "README.md"
+                    with open(model_card_path, 'w') as f:
+                        f.write(model_card_content)
+                    
+                    upload_file(
+                        path_or_fileobj=str(model_card_path),
+                        path_in_repo="README.md",
+                        repo_id=target_repo,
+                        token=hf_token,
+                        commit_message=f"Add model card for {wandb_run_name}"
+                    )
+                    if logger: logger.info("✅ Model card uploaded successfully")
+                except Exception as e:
+                    if logger: logger.warning(f"⚠️  Model card upload failed: {e}")
+                
+                # Upload training configuration
+                if logger: logger.info("📄 Uploading training configuration...")
+                try:
+                    config_data = {
+                        'training_config': {
+                            'env_name': env_name,
+                            'total_timesteps': total_timesteps,
+                            'learning_rate': learning_rate,
+                            'batch_size': batch_size,
+                            'n_epochs': n_epochs,
+                            'gamma': gamma,
+                            'vf_coef': vf_coef,
+                            'ent_coef': ent_coef,
+                            'max_grad_norm': max_grad_norm,
+                            'use_curiosity': use_curiosity,
+                            'curiosity_lr': curiosity_lr,
+                            'curiosity_forward_coef': curiosity_forward_coef,
+                            'curiosity_inverse_coef': curiosity_inverse_coef,
+                            'use_rnd': use_rnd,
+                            'rnd_lr': rnd_lr,
+                            'rnd_coef': rnd_coef,
+                            'device': str(device),
+                            'seed': seed,
+                            'training_time': training_time
+                        },
+                        'model_sources': {
+                            'vae_repo_id': vae_repo_id,
+                            'hmm_repo_id': hmm_repo_id
+                        },
+                        'timestamp': datetime.now().isoformat(),
+                        'run_name': wandb_run_name
+                    }
+                    
+                    config_path = checkpoint_dir / "training_config.json"
+                    with open(config_path, 'w') as f:
+                        json.dump(config_data, f, indent=2)
+                    
+                    upload_file(
+                        path_or_fileobj=str(config_path),
+                        path_in_repo="training_config.json",
+                        repo_id=target_repo,
+                        token=hf_token,
+                        commit_message=f"Add training configuration for {wandb_run_name}"
+                    )
+                    if logger: logger.info("✅ Training configuration uploaded successfully")
+                except Exception as e:
+                    if logger: logger.warning(f"⚠️  Configuration upload failed: {e}")
+                
+                if logger: logger.info(f"🎉 All model components uploaded to: https://huggingface.co/{target_repo}")
+                
+                # Upload training artifacts if requested
+                if hf_upload_artifacts:
+                    try:
+                        if logger: logger.info("📈 Uploading training artifacts...")
+                        from .training_utils import upload_training_artifacts_to_huggingface
+                        
+                        # Extract training metrics from logs for artifact upload
+                        train_losses = []
+                        eval_returns = []
+                        steps = []
+                        
+                        if 'training_logs' in training_results:
+                            for log_entry in training_results['training_logs']:
+                                if 'steps' in log_entry:
+                                    steps.append(log_entry['steps'])
+                                if 'return/mean_ext' in log_entry:
+                                    train_losses.append(-log_entry['return/mean_ext'])  # Convert reward to loss-like metric
+                                if 'eval/return_mean' in log_entry:
+                                    eval_returns.append(log_entry['eval/return_mean'])
+                        
+                        # Create artifact data structure similar to VAE training
+                        artifact_config = {
+                            'training_type': 'online_ppo',
+                            'environment': env_name,
+                            'total_timesteps': total_timesteps,
+                            'training_time': training_time,
+                            'device': str(device),
+                            'ppo_config': {
+                                'learning_rate': learning_rate,
+                                'batch_size': batch_size,
+                                'n_epochs': n_epochs,
+                                'gamma': gamma,
+                                'vf_coef': vf_coef,
+                                'ent_coef': ent_coef,
+                                'max_grad_norm': max_grad_norm
+                            },
+                            'exploration_config': {
+                                'use_curiosity': use_curiosity,
+                                'curiosity_lr': curiosity_lr if use_curiosity else None,
+                                'curiosity_forward_coef': curiosity_forward_coef if use_curiosity else None,
+                                'curiosity_inverse_coef': curiosity_inverse_coef if use_curiosity else None,
+                                'use_rnd': use_rnd,
+                                'rnd_lr': rnd_lr if use_rnd else None,
+                                'rnd_coef': rnd_coef if use_rnd else None
+                            },
+                            'model_sources': {
+                                'vae_repo_id': vae_repo_id,
+                                'hmm_repo_id': hmm_repo_id
+                            }
+                        }
+                        
+                        # Use eval returns as "test losses" and negative mean rewards as "train losses"
+                        upload_training_artifacts_to_huggingface(
+                            repo_name=target_repo,
+                            train_losses=train_losses if train_losses else [0.0],  # Fallback if no data
+                            test_losses=[-r for r in eval_returns] if eval_returns else [0.0],  # Convert rewards to loss-like
+                            training_config=artifact_config,
+                            token=hf_token,
+                            plots_dir="training_artifacts"
+                        )
+                        
+                        if logger: logger.info("✅ Training artifacts uploaded successfully")
+                        
+                    except Exception as e:
+                        if logger: logger.warning(f"⚠️  Training artifacts upload failed: {e}")
+                        if debug_mode:
+                            import traceback
+                            if logger: logger.error(traceback.format_exc())
                 
             except Exception as e:
-                logger.warning(f"⚠️  Failed to upload final model: {e}")
+                if logger: logger.error(f"❌ HuggingFace upload failed: {e}")
+                if debug_mode:
+                    import traceback
+                    if logger: logger.error(traceback.format_exc())
         
         # Close W&B run
         if use_wandb:
@@ -425,11 +704,13 @@ def train_online_ppo_with_pretrained_models(
         # Prepare final results
         results = {
             'training_results': training_results,
-            'run_name': run_name,
+            'run_name': wandb_run_name,
             'training_time': training_time,
             'final_checkpoint': str(final_checkpoint_path),
             'config': {
                 'env_name': env_name,
+                'vae_repo_id': vae_repo_id,
+                'hmm_repo_id': hmm_repo_id,
                 'total_timesteps': total_timesteps,
                 'learning_rate': learning_rate,
                 'use_curiosity': use_curiosity,
@@ -437,14 +718,14 @@ def train_online_ppo_with_pretrained_models(
             }
         }
         
-        logger.info("🎉 Training completed successfully!")
+        if logger: logger.info("🎉 Training completed successfully!")
         return results
         
     except Exception as e:
-        logger.error(f"❌ Training failed: {e}")
+        if logger: logger.error(f"❌ Training failed: {e}")
         if debug_mode:
             import traceback
-            logger.error(traceback.format_exc())
+            if logger: logger.error(traceback.format_exc())
         if use_wandb and wandb_run is not None:
             wandb_run.finish()
         raise
@@ -453,63 +734,3 @@ def train_online_ppo_with_pretrained_models(
         # Cleanup
         if 'env' in locals():
             env.close()
-
-
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Online PPO Training with Pretrained Models")
-    parser.add_argument("--env_name", type=str, default="MiniHack-Quest-Hard-v0",
-                       help="MiniHack environment name")
-    parser.add_argument("--repo_id", type=str, default="catid/SequentialSkillRL",
-                       help="HuggingFace repository ID")
-    parser.add_argument("--vae_filename", type=str, default="nethack-vae.pth",
-                       help="VAE model filename")
-    parser.add_argument("--hmm_filename", type=str, default="hmm_round3.pt",
-                       help="HMM model filename")
-    parser.add_argument("--total_timesteps", type=int, default=50000,
-                       help="Total training timesteps")
-    parser.add_argument("--learning_rate", type=float, default=5e-4,
-                       help="Learning rate")
-    parser.add_argument("--test_mode", action="store_true",
-                       help="Run in test mode")
-    parser.add_argument("--test_episodes", type=int, default=10,
-                       help="Number of test episodes")
-    parser.add_argument("--debug", action="store_true",
-                       help="Enable debug mode")
-    parser.add_argument("--upload_to_huggingface", action="store_true",
-                       help="Upload checkpoints to HuggingFace")
-    parser.add_argument("--seed", type=int, default=None,
-                       help="Random seed")
-    
-    args = parser.parse_args()
-    
-    # Run training
-    try:
-        results = train_online_ppo_with_pretrained_models(
-            env_name=args.env_name,
-            repo_id=args.repo_id,
-            vae_filename=args.vae_filename,
-            hmm_filename=args.hmm_filename,
-            total_timesteps=args.total_timesteps,
-            learning_rate=args.learning_rate,
-            test_mode=args.test_mode,
-            test_episodes=args.test_episodes,
-            debug_mode=args.debug,
-            upload_to_huggingface=args.upload_to_huggingface,
-            seed=args.seed
-        )
-        
-        print("\n🎉 Training completed!")
-        print(f"Run name: {results['run_name']}")
-        if 'training_time' in results:
-            print(f"Training time: {results['training_time']:.2f} seconds")
-        if 'test_stats' in results:
-            print(f"Test mean reward: {results['test_stats']['mean_reward']:.2f}")
-            
-    except KeyboardInterrupt:
-        print("\n⚠️  Training interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Training failed: {e}")
-        sys.exit(1)

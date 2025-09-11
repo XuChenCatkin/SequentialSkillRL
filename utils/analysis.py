@@ -17,8 +17,6 @@ import json
 import math
 
 from src.model import bag_presence_to_glyph_sets, make_pair_bag, MapDecoder
-# Conditional import to avoid circular dependency
-# from training.train import load_model_from_huggingface, load_model_from_local
 from src.skill_space import StickyHDPHMMVI
 
 # Import NetHackCategory from data_collection
@@ -1268,7 +1266,7 @@ def create_visualization_demo(
     try:
         # Import here to avoid circular dependency
         from training.train import load_model_from_huggingface
-        model = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
+        model, _ = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
     except Exception as e:
         print(f"⚠️  Failed to load from HuggingFace: {e}")
         print(f"🔄 Attempting to load from local checkpoints...")

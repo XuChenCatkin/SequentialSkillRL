@@ -122,29 +122,29 @@ from training.online_rl import train_online_ppo_with_pretrained_models
 
 # Train PPO with pre-trained VAE and HMM models
 results = train_online_ppo_with_pretrained_models(
-    vae_repo_name="your-username/nethack-vae",
-    hmm_repo_name="your-username/nethack-hmm", 
-    env_id="MiniHack-Room-5x5-v0",
-    total_env_steps=100000,
+    vae_repo_id="CatkinChen/nethack-vae-hmm",
+    hmm_repo_id="CatkinChen/nethack-hmm", 
+    env_name="MiniHack-Room-5x5-v0",
+    total_timesteps=50000,
     use_wandb=True,
-    wandb_project="my-ppo-experiment",
-    upload_to_hf=True,
-    hf_repo_name="your-username/ppo-agent",
+    wandb_project="SequentialSkillRL",
+    push_to_hub=True,  # Upload all components to unified repo
+    hub_repo_id_vae_hmm="your-username/nethack-complete-model",
     device="cuda"
 )
-print(f"Training completed! Best return: {results['best_eval_return']}")
+print(f"Training completed! Run: {results['run_name']}")
 ```
 
 ### Quick Test Mode
 ```python
 # Quick test with minimal steps
 results = train_online_ppo_with_pretrained_models(
-    vae_repo_name="your-username/nethack-vae",
-    hmm_repo_name="your-username/nethack-hmm",
+    vae_repo_id="CatkinChen/nethack-vae-hmm",
+    hmm_repo_id="CatkinChen/nethack-hmm",
     test_mode=True,
-    test_steps=1000,
+    test_episodes=10,
     use_wandb=False,
-    upload_to_hf=False
+    push_to_hub=False
 )
 ```
 
@@ -180,11 +180,38 @@ results = train_online_ppo_with_pretrained_models(
 
 ### Command Line Usage
 ```bash
-# Check MiniHack installation
-poetry run python training/online_rl.py minihack_check
+# Basic training with separate model repositories
+python training/online_rl.py \
+  --vae_repo_id CatkinChen/nethack-vae-hmm \
+  --hmm_repo_id CatkinChen/nethack-hmm \
+  --env_name MiniHack-Room-5x5-v0 \
+  --total_timesteps 50000
 
-# Run system tests  
-poetry run python training/online_rl.py test
+# Training with unified model upload to HuggingFace
+python training/online_rl.py \
+  --vae_repo_id CatkinChen/nethack-vae-hmm \
+  --hmm_repo_id CatkinChen/nethack-hmm \
+  --env_name MiniHack-Quest-Hard-v0 \
+  --total_timesteps 100000 \
+  --push_to_hub \
+  --hub_repo_id your-username/nethack-complete-model \
+  --hf_upload_artifacts \
+  --use_wandb \
+  --wandb_project SequentialSkillRL
+
+# Test mode with evaluation only
+python training/online_rl.py \
+  --test_mode \
+  --test_episodes 20 \
+  --vae_repo_id CatkinChen/nethack-vae-hmm \
+  --hmm_repo_id CatkinChen/nethack-hmm
+
+# Test mode with evaluation episodes
+python training/online_rl.py \
+  --vae_repo_id CatkinChen/nethack-vae-hmm \
+  --hmm_repo_id CatkinChen/nethack-hmm \
+  --test_mode \
+  --test_episodes 10
 ```
 
 ## Project Structure
@@ -221,6 +248,30 @@ SequentialSkillRL/
 - **Environment**: MiniHack-based NetHack environments
 - **Policy**: Uses skill-aware policy networks
 - **Intrinsic Rewards**: Dynamic KL divergence, skill entropy, RND
+
+### 3. HuggingFace Integration
+- **Model Upload**: Automatically uploads trained models (PPO policy, VAE, HMM) to unified repositories
+- **Training Artifacts**: Uploads training curves, logs, and configuration files
+- **Model Cards**: Generates comprehensive model documentation
+- **Separate Repositories**: Supports loading VAE and HMM from different repositories
+
+#### Training Artifacts Include:
+- **Training Curves**: Reward progression and performance metrics over time
+- **Configuration Files**: Complete training hyperparameters and settings
+- **Model Cards**: Detailed documentation with usage examples
+- **Training Logs**: Step-by-step training metrics and evaluation results
+
+#### Usage Example:
+```bash
+# Upload complete model with training artifacts
+python training/online_rl.py \
+  --vae_repo_id CatkinChen/nethack-vae-hmm \
+  --hmm_repo_id CatkinChen/nethack-hmm \
+  --push_to_hub \
+  --hub_repo_id your-username/nethack-ppo-complete \
+  --hf_upload_artifacts \
+  --hf_token your_hf_token
+```
 - **Tracking**: Real-time metrics and model uploading
 
 ### 3. Experiment Management

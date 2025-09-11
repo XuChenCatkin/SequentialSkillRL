@@ -1451,29 +1451,6 @@ class StickyHDPHMMVI(nn.Module):
         loglik: float = 0.0      # cumulative log-likelihood
 
     @torch.no_grad()
-    def emission_logB_one(
-        self,
-        mu_t: torch.Tensor,                       # [D] or [1,D]
-        diag_var_t: Optional[torch.Tensor] = None,# [D] or [1,D]
-        F_t: Optional[torch.Tensor] = None        # [D,R] or [1,D,R]
-    ) -> torch.Tensor:
-        """
-        Convenience: compute log B_t[k] = E_q[log p(z_t | h_t=k)] for a single time step.
-        Returns [Kp1] tensor.
-        """
-        if mu_t.dim() == 1:        # [D] -> [1,D]
-            mu_t = mu_t.unsqueeze(0)
-        if diag_var_t is not None and diag_var_t.dim() == 1:
-            diag_var_t = diag_var_t.unsqueeze(0)
-        if F_t is not None and F_t.dim() == 2:
-            F_t = F_t.unsqueeze(0)
-        logB = StickyHDPHMMVI.expected_emission_loglik(
-            self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
-            mu_t, diag_var_t, F_t, mask=None
-        )  # [1,Kp1]
-        return logB.squeeze(0)  # [Kp1]
-
-    @torch.no_grad()
     def filter_init_from_logB(self, logB0: torch.Tensor) -> "StickyHDPHMMVI.FilterState":
         """
         Initialise causal filter with the first observation.
