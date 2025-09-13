@@ -787,15 +787,51 @@ class StickyHDPHMMVI(nn.Module):
         self.register_buffer("S_M1",     torch.zeros(Kp1, D,    device=dev, dtype=dt))
         self.register_buffer("S_M2",     torch.zeros(Kp1, D, D, device=dev, dtype=dt))
         self.register_buffer("S_counts", torch.zeros(Kp1, Kp1,  device=dev, dtype=dt))
-        self.register_buffer("S_steps",  torch.tensor(0.0,      device=dev, dtype=dt))
         self._stream_allocated = True
 
     @torch.no_grad()
     def streaming_reset(self):
         self._alloc_stream_buffers()
         self.S_Nk.zero_(); self.S_M1.zero_(); self.S_M2.zero_(); self.S_counts.zero_()
-        self.S_steps.fill_(0.0)
         self._no_stats = True
+
+    @torch.no_grad()
+    def seed_streaming_from_posterior(self):
+        """
+        Initialise streaming sufficient statistics (S_*) from current posterior
+        (mu_hat, kappa_hat, Psi_hat, nu_hat, phi). This preserves pre-trained
+        information as pseudo-counts for subsequent EMA blending.
+        """
+        self._alloc_stream_buffers()
+        Kp1, D = self.niw.mu.shape
+        mu_hat = self.niw.mu                  # [Kp1,D]
+        k_hat  = self.niw.kappa               # [Kp1]
+        Psi_hat= self.niw.Psi                 # [Kp1,D,D]
+        nu_hat = self.niw.nu                  # [Kp1]
+        mu0, k0, Psi0, nu0 = self.mu0, self.kappa0, self.Psi0, self.nu0
+
+        # NIW equivalent counts
+        Nk_kappa = (k_hat - k0).clamp_min(0.0)
+        Nk_nu    = (nu_hat - nu0).clamp_min(0.0)
+        Nk = torch.minimum(Nk_kappa, Nk_nu)   # be robust to small numeric mismatch
+
+        # First and second moments
+        S1 = (k_hat.view(Kp1,1) * mu_hat) - (k0 * mu0.view(1, D))
+        outer_mu0 = (mu0.view(D,1) @ mu0.view(1,D))       # [D,D]
+        outer_muh = torch.einsum('ki,kj->kij', mu_hat, mu_hat)  # [Kp1,D,D]
+        S2 = Psi_hat - Psi0.unsqueeze(0) - (k0 * outer_mu0).unsqueeze(0) + k_hat.view(Kp1,1,1) * outer_muh
+
+        # Dirichlet row pseudo-counts from posterior φ: counts = φ - (α π + κ I)
+        pi_full = self._Epi()                              # [Kp1]
+        a = (self.p.alpha * pi_full.unsqueeze(0) +
+             self.p.kappa * torch.eye(Kp1, device=mu_hat.device, dtype=mu_hat.dtype))  # [Kp1,Kp1]
+        counts = (self.dir.phi - a).clamp_min(0.0)
+
+        # Install
+        self.S_Nk.copy_(Nk)
+        self.S_M1.copy_(S1)
+        self.S_M2.copy_(S2)
+        self.S_counts.copy_(counts)
 
     # ---- ELBO component calculations ----------------------------------------
     @staticmethod

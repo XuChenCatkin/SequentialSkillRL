@@ -1248,6 +1248,7 @@ def load_hmm_from_huggingface(
         
         # Load posterior parameters instead of state_dict
         hmm.load_posterior_params(hmm_posterior_params)
+        hmm.seed_streaming_from_posterior()
         hmm = hmm.to(device)
         
         print(f"✅ HMM loaded successfully from HuggingFace: {repo_name}")

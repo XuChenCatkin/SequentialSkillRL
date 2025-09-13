@@ -29,7 +29,7 @@ import minihack
 
 # Now try to import PPO components
 from rl.ppo import (
-    PPOConfig, CuriosityConfig, HMMOnlineConfig, RNDConfig, TrainConfig, PPOTrainer,
+    PPOConfig, CuriosityConfig, HMMOnlineConfig, VAEOnlineConfig, RNDConfig, TrainConfig, PPOTrainer,
     set_seed
 )
 
@@ -61,6 +61,14 @@ def train_online_ppo_with_pretrained_models(
     env_name: str = "MiniHack-Room-5x5-v0",
     vae_repo_id: str = "CatkinChen/nethack-vae-hmm",
     hmm_repo_id: str = "CatkinChen/nethack-hmm",
+    # Configuration objects - provide full control over training
+    ppo_config: Optional[PPOConfig] = None,
+    curiosity_config: Optional[CuriosityConfig] = None,
+    hmm_config: Optional[HMMOnlineConfig] = None,
+    vae_config: Optional[VAEOnlineConfig] = None,
+    rnd_config: Optional[RNDConfig] = None,
+    train_config: Optional[TrainConfig] = None,
+    # Legacy parameters for backwards compatibility
     total_timesteps: int = 50000,
     learning_rate: float = 5e-4,
     batch_size: int = 32,
@@ -105,6 +113,16 @@ def train_online_ppo_with_pretrained_models(
         env_name: MiniHack environment name
         vae_repo_id: HuggingFace repository ID for VAE model
         hmm_repo_id: HuggingFace repository ID for HMM model
+        
+        # Configuration objects (recommended approach)
+        ppo_config: PPO training configuration. If None, uses legacy parameters.
+        curiosity_config: Curiosity-driven exploration configuration. If None, uses legacy parameters.
+        hmm_config: HMM online learning configuration. If None, uses defaults.
+        vae_config: VAE online learning configuration. If None, uses defaults.
+        rnd_config: Random Network Distillation configuration. If None, uses defaults.
+        train_config: General training configuration. If None, uses legacy parameters.
+        
+        # Legacy parameters (for backwards compatibility)
         total_timesteps: Total training timesteps
         learning_rate: PPO learning rate
         batch_size: Training batch size
@@ -127,10 +145,20 @@ def train_online_ppo_with_pretrained_models(
         device: Device to use ('auto', 'cuda', 'cpu')
         seed: Random seed
         debug_mode: Enable debug logging
-        upload_to_huggingface: Upload checkpoints to HuggingFace
+        
+        # Monitoring and uploading
         use_wandb: Enable Weights & Biases logging
-        upload_model_to_hf: Upload final model to HuggingFace
-        hf_model_name: Custom HuggingFace model name
+        wandb_project: W&B project name
+        wandb_entity: W&B entity/team name
+        wandb_run_name: Custom run name
+        wandb_tags: List of tags for the run
+        wandb_notes: Notes for the run
+        push_to_hub: Upload checkpoints to HuggingFace
+        hub_repo_id: Target HuggingFace repository ID
+        hf_token: HuggingFace authentication token
+        hf_private: Make repository private
+        hf_upload_artifacts: Upload training artifacts
+        logger: Optional logger instance
     
     Returns:
         Dictionary with training results and final metrics
@@ -164,13 +192,80 @@ def train_online_ppo_with_pretrained_models(
     wandb_run = None
     if WANDB_AVAILABLE and use_wandb and not test_mode:
         try:
-            wandb_run = wandb.init(
-                project=wandb_project,
-                name=wandb_run_name,
-                config={
-                    "env_name": env_name,
-                    "vae_repo_id": vae_repo_id,
-                    "hmm_repo_id": hmm_repo_id,
+            # Create comprehensive config for W&B logging
+            wandb_config = {
+                "env_name": env_name,
+                "vae_repo_id": vae_repo_id,
+                "hmm_repo_id": hmm_repo_id,
+                "device": str(device),
+                "seed": seed,
+                # PPO Configuration
+                "ppo": {
+                    "num_envs": ppo_config.num_envs,
+                    "rollout_len": ppo_config.rollout_len,
+                    "total_updates": ppo_config.total_updates,
+                    "minibatch_size": ppo_config.minibatch_size,
+                    "epochs_per_update": ppo_config.epochs_per_update,
+                    "gamma": ppo_config.gamma,
+                    "gae_lambda": ppo_config.gae_lambda,
+                    "clip_coef": ppo_config.clip_coef,
+                    "ent_coef": ppo_config.ent_coef,
+                    "vf_coef": ppo_config.vf_coef,
+                    "max_grad_norm": ppo_config.max_grad_norm,
+                    "learning_rate": ppo_config.learning_rate,
+                    "policy_uses_skill": ppo_config.policy_uses_skill,
+                    "deterministic_eval": ppo_config.deterministic_eval
+                },
+                # Curiosity Configuration
+                "curiosity": {
+                    "use_dyn_kl": curiosity_config.use_dyn_kl,
+                    "use_skill_entropy": curiosity_config.use_skill_entropy,
+                    "use_skill_transition_novelty": curiosity_config.use_skill_transition_novelty,
+                    "use_rnd": curiosity_config.use_rnd,
+                    "eta0_dyn": curiosity_config.eta0_dyn,
+                    "tau_dyn": curiosity_config.tau_dyn,
+                    "eta0_hdp": curiosity_config.eta0_hdp,
+                    "tau_hdp": curiosity_config.tau_hdp,
+                    "eta0_rnd": curiosity_config.eta0_rnd,
+                    "tau_rnd": curiosity_config.tau_rnd,
+                    "use_skill_boundary_gate": curiosity_config.use_skill_boundary_gate,
+                    "gate_delta_eps": curiosity_config.gate_delta_eps,
+                    "eta0_stn": curiosity_config.eta0_stn,
+                    "tau_stn": curiosity_config.tau_stn,
+                    "ema_beta": curiosity_config.ema_beta,
+                    "eps": curiosity_config.eps
+                },
+                # HMM Configuration
+                "hmm": {
+                    "hmm_update_every": hmm_config.hmm_update_every,
+                    "hmm_fit_window": hmm_config.hmm_fit_window,
+                    "hmm_max_iters": hmm_config.hmm_max_iters,
+                    "hmm_tol": hmm_config.hmm_tol,
+                    "hmm_elbo_drop_tol": hmm_config.hmm_elbo_drop_tol,
+                    "rho_emission": hmm_config.rho_emission,
+                    "rho_transition": hmm_config.rho_transition,
+                    "optimise_pi": hmm_config.optimise_pi,
+                    "reset_low_count_states": hmm_config.reset_low_count_states
+                },
+                # RND Configuration
+                "rnd": {
+                    "proj_dim": rnd_config.proj_dim,
+                    "hidden": rnd_config.hidden,
+                    "lr": rnd_config.lr,
+                    "update_per_rollout": rnd_config.update_per_rollout
+                },
+                # Training Configuration
+                "training": {
+                    "env_id": train_config.env_id,
+                    "seed": train_config.seed,
+                    "device": train_config.device,
+                    "log_dir": train_config.log_dir,
+                    "save_every": train_config.save_every,
+                    "eval_every": train_config.eval_every,
+                    "eval_episodes": train_config.eval_episodes
+                },
+                # Legacy parameters for compatibility
+                "legacy": {
                     "total_timesteps": total_timesteps,
                     "learning_rate": learning_rate,
                     "batch_size": batch_size,
@@ -185,10 +280,17 @@ def train_online_ppo_with_pretrained_models(
                     "curiosity_inverse_coef": curiosity_inverse_coef,
                     "use_rnd": use_rnd,
                     "rnd_lr": rnd_lr,
-                    "rnd_coef": rnd_coef,
-                    "device": str(device),
-                    "seed": seed
+                    "rnd_coef": rnd_coef
                 }
+            }
+            
+            wandb_run = wandb.init(
+                project=wandb_project,
+                name=wandb_run_name,
+                config=wandb_config,
+                entity=wandb_entity,
+                tags=wandb_tags,
+                notes=wandb_notes
             )
             if logger: logger.info(f"📊 W&B initialized with run name: {wandb_run_name}")
         except Exception as e:
@@ -227,60 +329,89 @@ def train_online_ppo_with_pretrained_models(
         if logger: logger.info(f"   - Observation space: {env.observation_space}")
         if logger: logger.info(f"   - Action space: {env.action_space}")
         
-        # Configure training
-        train_config = TrainConfig(
-            env_id=env_name,
-            seed=seed if seed is not None else 42,
-            device=str(device),
-            log_dir=f"./ppo/{wandb_run_name}",
-            save_every=save_freq,
-            eval_every=save_freq,
-            eval_episodes=test_episodes
-        )
-        
-        ppo_config = PPOConfig(
-            learning_rate=learning_rate,
-            gamma=gamma,
-            vf_coef=vf_coef,
-            ent_coef=ent_coef,
-            max_grad_norm=max_grad_norm,
-            epochs_per_update=n_epochs,
-            minibatch_size=batch_size
-        )
-        
-        # Configure curiosity if enabled
-        if use_curiosity:
-            curiosity_config = CuriosityConfig(
-                use_dyn_kl=True,
-                use_skill_entropy=True,
-                use_rnd=False,
-                eta0_dyn=curiosity_forward_coef,
-                eta0_hdp=curiosity_inverse_coef
+        # Configure training - use provided configs or create from legacy parameters
+        if train_config is None:
+            train_config = TrainConfig(
+                env_id=env_name,
+                seed=seed if seed is not None else 42,
+                device=str(device),
+                log_dir=f"./ppo/{wandb_run_name}",
+                save_every=save_freq,
+                eval_every=save_freq,
+                eval_episodes=test_episodes
             )
-            if logger: logger.info(f"🧠 Curiosity enabled: eta0_dyn={curiosity_forward_coef}, eta0_hdp={curiosity_inverse_coef}")
         else:
-            # Disabled curiosity config
-            curiosity_config = CuriosityConfig(
-                use_dyn_kl=False,
-                use_skill_entropy=False,
-                use_rnd=False
+            # Override specific fields if they differ from config
+            if train_config.env_id != env_name:
+                train_config.env_id = env_name
+            if save_freq != 1000:  # Only override if non-default
+                train_config.save_every = save_freq
+                train_config.eval_every = save_freq
+            if test_episodes != 10:  # Only override if non-default
+                train_config.eval_episodes = test_episodes
+        
+        if ppo_config is None:
+            ppo_config = PPOConfig(
+                learning_rate=learning_rate,
+                gamma=gamma,
+                vf_coef=vf_coef,
+                ent_coef=ent_coef,
+                max_grad_norm=max_grad_norm,
+                epochs_per_update=n_epochs,
+                minibatch_size=batch_size
             )
         
-        # Configure RND if enabled
-        if use_rnd:
-            rnd_config = RNDConfig(
-                lr=rnd_lr
-            )
-            if logger: logger.info(f"🔍 RND enabled: lr={rnd_lr}")
+        # Configure curiosity if enabled or if config provided
+        if curiosity_config is None:
+            if use_curiosity:
+                curiosity_config = CuriosityConfig(
+                    use_dyn_kl=True,
+                    use_skill_entropy=True,
+                    use_rnd=False,
+                    eta0_dyn=curiosity_forward_coef,
+                    eta0_hdp=curiosity_inverse_coef
+                )
+                if logger: logger.info(f"🧠 Curiosity enabled: eta0_dyn={curiosity_forward_coef}, eta0_hdp={curiosity_inverse_coef}")
+            else:
+                # Disabled curiosity config
+                curiosity_config = CuriosityConfig(
+                    use_dyn_kl=False,
+                    use_skill_entropy=False,
+                    use_rnd=False
+                )
         else:
-            # Default RND config (will be ignored if not used)
-            rnd_config = RNDConfig()
+            if logger: logger.info(f"🧠 Using provided curiosity config")
+        
+        # Configure RND if enabled or if config provided
+        if rnd_config is None:
+            if use_rnd:
+                rnd_config = RNDConfig(
+                    lr=rnd_lr
+                )
+                if logger: logger.info(f"🔍 RND enabled: lr={rnd_lr}")
+            else:
+                # Default RND config (will be ignored if not used)
+                rnd_config = RNDConfig()
+        else:
+            if logger: logger.info(f"🔍 Using provided RND config")
         
         # Configure HMM integration
-        hmm_config = HMMOnlineConfig(
-            hmm_update_every=10000,
-            rho_emission=0.1
-        )
+        if hmm_config is None:
+            hmm_config = HMMOnlineConfig(
+                hmm_update_every=10000,
+                rho_emission=0.1
+            )
+        
+        # Configure VAE online learning
+        if vae_config is None:
+            vae_config = VAEOnlineConfig(
+                update_every=20_480,
+                vae_lr=1e-4,
+                blend_alpha=1.0
+            )
+            if logger: logger.info(f"🔄 Using default VAE config: update_every={vae_config.update_every}")
+        else:
+            if logger: logger.info(f"🔄 Using provided VAE config")
         
         # Create PPO trainer
         if logger: logger.info("🚀 Initializing PPO trainer...")
@@ -289,10 +420,12 @@ def train_online_ppo_with_pretrained_models(
             ppo_cfg=ppo_config,
             cur_cfg=curiosity_config,
             hmm_cfg=hmm_config,
+            vae_cfg=vae_config,
             rnd_cfg=rnd_config,
             run_cfg=train_config,
             vae=vae_model,
-            hmm=hmm_model
+            hmm=hmm_model,
+            wandb_run=wandb_run
         )
         if logger: logger.info("✅ PPO trainer initialized successfully")
         

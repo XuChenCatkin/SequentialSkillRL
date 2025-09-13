@@ -2668,8 +2668,8 @@ def vae_loss(
         tc_hmm = tc_standard  # TC is primarily about posterior correlation structure
         
         # Blend the components
-        dwkl_per_dim = alpha * dwkl_standard_per_dim + (1.0 - alpha) * dwkl_hmm_per_dim
-        dwkl = alpha * dwkl_standard + (1.0 - alpha) * dwkl_hmm
+        dwkl_per_dim = (1.0 - alpha) * dwkl_standard_per_dim + alpha * dwkl_hmm_per_dim
+        dwkl = (1.0 - alpha) * dwkl_standard + alpha * dwkl_hmm
         total_correlation = tc_standard  # TC doesn't blend - it's about posterior structure
         
         # Apply free bits to blended DWKL

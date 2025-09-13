@@ -23,6 +23,13 @@ Commands:
         Batch accumulation: Additional pass that freezes HMM, accumulates statistics, then batch updates
         VAE-only with HMM: Skip E-step HMM training, load pre-trained HMM, only train VAE with HMM prior
     
+    rl                             - Train online PPO agent with pretrained VAE+HMM models
+                                    Uses configuration objects for fine-grained control over:
+                                    - PPO hyperparameters (learning rate, rollout length, etc.)
+                                    - Curiosity-driven exploration (dynamics surprise, skill entropy, transition novelty)
+                                    - HMM online learning (update frequency, fitting window)
+                                    - Training setup (environment, device, logging, checkpointing)
+    
     vae_analysis <repo_name>       - Run VAE analysis and visualization
     bin_count_analysis [top_k]     - Analyze glyph character/color distributions  
     hmm_analysis <repo_name>       - Run HMM analysis and visualization
@@ -37,6 +44,7 @@ Examples:
     python main.py train vae_hmm game_grouped
     python main.py train vae_only_with_hmm CatkinChen/nethack-hmm
     python main.py train vae_only_with_hmm CatkinChen/nethack-hmm 2
+    python main.py rl
 """
 import logging
 import os
@@ -47,6 +55,7 @@ from src.data_collection import NetHackDataCollector, BLStatsAdapter
 from training.train import train_multimodalhack_vae, VAEConfig, load_datasets, train_vae_with_sticky_hmm_em
 from utils.analysis import create_visualization_demo, analyze_glyph_char_color_pairs, plot_glyph_char_color_pairs_from_saved
 from training.online_rl import train_online_ppo_with_pretrained_models
+from rl.ppo import PPOConfig, CuriosityConfig, HMMOnlineConfig, VAEOnlineConfig, RNDConfig, TrainConfig
 
 if __name__ == "__main__":
     
@@ -703,16 +712,121 @@ if __name__ == "__main__":
         
         print(f"📝 Logging to file: {log_filename}")
         
+        # Example of using config objects for fine-grained control
+        # You can customize any aspect of training by modifying these configs
+        
+        # PPO Configuration
+        ppo_config = PPOConfig(
+            num_envs=8,
+            rollout_len=128,
+            total_updates=1000,  # Reduced for demo
+            minibatch_size=512,
+            epochs_per_update=4,
+            gamma=0.999,
+            gae_lambda=0.95,
+            clip_coef=0.2,
+            ent_coef=0.01,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            learning_rate=3e-4,
+            vf_learning_rate=None,  # Use same as learning_rate
+            policy_uses_skill=True,
+            deterministic_eval=True
+        )
+        
+        # Curiosity Configuration - Enable all intrinsic rewards
+        curiosity_config = CuriosityConfig(
+            use_dyn_kl=True,           # Dynamics surprise
+            use_skill_entropy=True,    # Skill entropy with boundary gating
+            use_skill_transition_novelty=True,  # Skill transition novelty
+            use_rnd=False,             # Disable RND for this demo
+            
+            # Annealing parameters
+            eta0_dyn=1.0,
+            tau_dyn=3e6,
+            eta0_hdp=1.0,
+            tau_hdp=3e6,
+            eta0_stn=1.0,
+            tau_stn=3e6,
+            
+            # Skill boundary gating
+            use_skill_boundary_gate=True,
+            gate_delta_eps=1e-3,
+            
+            # EMA normalization
+            ema_beta=0.99,
+            eps=1e-8
+        )
+        
+        # HMM Online Learning Configuration
+        hmm_config = HMMOnlineConfig(
+            hmm_update_every=50_000,   # Update HMM every 50k steps
+            hmm_update_growth=1.30,    # New: growth factor for update interval
+            hmm_update_every_cap=60_000, # New: cap for update interval
+            hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
+            hmm_max_iters=7,
+            hmm_tol=1e-2,
+            hmm_elbo_drop_tol=1e-2,
+            rho_emission=0.05,         # Streaming blend rate
+            rho_transition=None,       # Use same as emission
+            optimise_pi=True,
+            reset_low_count_states=5e-4
+        )
+        
+        # VAE Online Configuration
+        vae_config = VAEOnlineConfig(
+            update_every=20_480,       # Update VAE every ~20 rollouts
+            vae_lr=1e-4,              # Learning rate for VAE updates
+            blend_alpha=1.0           # Blending factor for VAE updates
+        )
+        
+        # RND Configuration (not used in this demo, but shown for completeness)
+        rnd_config = RNDConfig(
+            proj_dim=128,
+            hidden=256,
+            lr=1e-3,
+            update_per_rollout=2
+        )
+        
+        # Training Configuration
+        run_name = f"online_ppo_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        train_config = TrainConfig(
+            env_id='MiniHack-Room-5x5-v0',
+            seed=42,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            log_dir=f"./runs/{run_name}",
+            save_every=25_000,
+            eval_every=25_000,
+            eval_episodes=10
+        )
+        
+        print(f"🔧 Training Configuration:")
+        print(f"   Environment: {train_config.env_id}")
+        print(f"   Device: {train_config.device}")
+        print(f"   Total Steps: {ppo_config.num_envs * ppo_config.rollout_len * ppo_config.total_updates:,}")
+        print(f"   PPO Updates: {ppo_config.total_updates:,}")
+        print(f"   Curiosity: Dynamics={curiosity_config.use_dyn_kl}, Entropy={curiosity_config.use_skill_entropy}, Transition={curiosity_config.use_skill_transition_novelty}")
+        print(f"   HMM Updates: Every {hmm_config.hmm_update_every:,} steps (growth={hmm_config.hmm_update_growth}, cap={hmm_config.hmm_update_every_cap:,})")
+        print(f"   VAE Updates: Every {vae_config.update_every:,} steps (lr={vae_config.vae_lr}, blend_alpha={vae_config.blend_alpha})")
+        
+        # Train with config objects (recommended approach)
         results = train_online_ppo_with_pretrained_models(
-            env_name='MiniHack-Room-5x5-v0',
+            env_name=train_config.env_id,
             vae_repo_id="CatkinChen/nethack-vae-hmm",
             hmm_repo_id="CatkinChen/nethack-hmm",
-            total_timesteps=100000,
-            learning_rate=3e-4,
-            device='cuda' if torch.cuda.is_available() else 'cpu',
+            
+            # Use config objects for full control
+            ppo_config=ppo_config,
+            curiosity_config=curiosity_config,
+            hmm_config=hmm_config,
+            vae_config=vae_config,
+            rnd_config=rnd_config,
+            train_config=train_config,
+            
+            # Monitoring and uploading
             use_wandb=False,
             wandb_project="SequentialSkillRL",
-            wandb_run_name=f"online_ppo_{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+            wandb_run_name=run_name,
             push_to_hub=False,
             hub_repo_id="CatkinChen/nethack-ppo-with-vae-hmm",
             hf_upload_artifacts=True,
