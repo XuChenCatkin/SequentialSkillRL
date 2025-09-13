@@ -43,23 +43,21 @@ cd ..
 
 ### 5. Install Dependencies
 ```bash
-# Install Poetry dependencies (this will automatically install NLE and MiniHack)
-poetry install
+# Option 1: Use the provided installation script (recommended)
+./install_minihack.sh
 
-# If poetry command is not found, use the full path:
-/root/.local/bin/poetry install
+# Option 2: Manual installation
+# Install MiniHack wheel directly with pip (bypasses Poetry hash issues)
+pip install minihack/dist/minihack-1.0.2+95b11cc-py3-none-any.whl --force-reinstall
+
+# Install remaining Poetry dependencies
+poetry install --only-root
+
+# Option 3: If you prefer to use poetry install, you may need to update the lock file first
+poetry lock && poetry install
 ```
 
-### 6. Install Dependencies
-```bash
-# Install Poetry dependencies (this will automatically install NLE and MiniHack)
-poetry install
-
-# If poetry command is not found, use the full path:
-/root/.local/bin/poetry install
-```
-
-### 7. Verify Installation
+### 6. Verify Installation
 ```bash
 # Test that MiniHack environments are properly registered
 poetry run python -c "
@@ -72,7 +70,7 @@ print('✅ Installation successful!')
 "
 ```
 
-### 8. Environment Activation (Optional)
+### 7. Environment Activation (Optional)
 ```bash
 # Change to the project directory first
 cd /workspace/SequentialSkillRL
@@ -80,7 +78,7 @@ cd /workspace/SequentialSkillRL
 source $(poetry env info --path)/bin/activate
 ```
 
-### 9. Login to External Services
+### 8. Login to External Services
 ```bash
 # Login to Weights & Biases for experiment tracking
 wandb login
@@ -105,8 +103,19 @@ poetry run python training/online_rl.py test
 ### MiniHack Environments Not Found
 If you see "0 MiniHack environments found", ensure you:
 1. Built the MiniHack wheel: `cd minihack && python setup.py bdist_wheel`
-2. Reinstalled dependencies: `poetry install --no-cache`
+2. Installed with pip: `pip install minihack/dist/minihack-1.0.2+95b11cc-py3-none-any.whl --force-reinstall`
 3. Updated submodules: `git submodule update --init --recursive`
+
+### Poetry Installation Issues
+If Poetry fails to install MiniHack due to hash mismatches:
+```bash
+# Option 1: Use pip directly (recommended)
+pip install minihack/dist/minihack-1.0.2+95b11cc-py3-none-any.whl --force-reinstall
+poetry install --only-root
+
+# Option 2: Update Poetry lock file
+poetry lock && poetry install
+```
 
 ### CMake Issues
 If you encounter cmake-related errors during NLE compilation:

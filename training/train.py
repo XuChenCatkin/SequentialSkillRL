@@ -2279,7 +2279,7 @@ def train_vae_with_sticky_hmm_em(
             alpha=alpha, 
             kappa=kappa, 
             gamma=gamma,
-            K=K-1, # exclude the remainder
+            K=K, # exclude the remainder
             D=D,
             device=device
         )

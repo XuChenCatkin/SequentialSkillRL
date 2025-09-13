@@ -17,6 +17,7 @@ from nle import nethack  # action id space (615)
 from src.model import MultiModalHackVAE, VAEConfig
 from src.skill_space import StickyHDPHMMVI, StickyHDPHMMParams, NIWPrior
 from src.data_collection import NetHackDataCollector
+from utils.action_utils import ACTION_DIM, KEYPRESS_INDEX_MAPPING
 
 # KL helper already used by your VAE loss
 from utils.math_utils import kl_gaussian_lowrank_q_p
@@ -277,10 +278,10 @@ class CuriosityComputer:
         """
         device = mu.device
         B, T, D = mu.shape
-        A = nethack.NUM_ACTIONS
+        A = ACTION_DIM
 
         # ---- HMM responsibilities rhat and (B) skill entropy ----
-        rhat = self.compute_skill_rhat(mu, logvar.exp(), F, mask)  # [B,T,Kp1]
+        rhat = self.compute_skill_rhat(mu, logvar.exp().clamp_min(1e-6), F, mask)  # [B,T,Kp1]
         Kp1 = rhat.shape[-1]
         # Entropy H[q(h_t)] only for valid steps
         with torch.no_grad():
@@ -370,24 +371,42 @@ class CuriosityComputer:
 
 class RolloutBuffer:
     def __init__(self, num_envs, T, z_dim, skill_dim, device):
-        self.num_envs = num_envs; self.T = T; self.device = device
+        self.num_envs = num_envs; self.T = T; self.device = device; self.z_dim = z_dim
         self.ptr = 0
         self.z      = torch.zeros(T, num_envs, z_dim, device=device)
         self.mu     = torch.zeros(T, num_envs, z_dim, device=device)
         self.logvar = torch.zeros(T, num_envs, z_dim, device=device)
-        self.F      = None  # low-rank optional
+        self.lowrank_factors = None  # low-rank optional - allocated dynamically when first F is added
         self.actions= torch.zeros(T, num_envs, dtype=torch.long, device=device)
         self.rews_e = torch.zeros(T, num_envs, device=device)  # extrinsic
         self.dones  = torch.zeros(T, num_envs, dtype=torch.bool, device=device)
         self.val    = torch.zeros(T, num_envs, device=device)
         self.logp   = torch.zeros(T, num_envs, device=device)
         self.skill  = torch.zeros(T, num_envs, skill_dim, device=device) if skill_dim>0 else None
+
+    def _maybe_allocate_lowrank_factors(self, lowrank_factors_tensor):
+        """Allocate lowrank_factors buffer when first lowrank_factors tensor is provided."""
+        if self.lowrank_factors is None and lowrank_factors_tensor is not None:
+            # Get dimensions from the provided tensor
+            D, R = lowrank_factors_tensor.shape[-2], lowrank_factors_tensor.shape[-1]
+            self.lowrank_factors = torch.zeros(self.T, self.num_envs, D, R, device=self.device)
+            return True
+        return False
+        
     def add(self, **kw):
         t = self.ptr
+
+        # Special handling for lowrank_factors - allocate buffer if needed
+        if 'lowrank_factors' in kw and kw['lowrank_factors'] is not None:
+            self._maybe_allocate_lowrank_factors(kw['lowrank_factors'])
+
         for k,v in kw.items():
-            if getattr(self, k) is None: continue
-            getattr(self, k)[t].copy_(v)
+            buffer = getattr(self, k)
+            if buffer is None: 
+                continue
+            buffer[t].copy_(v)
         self.ptr += 1
+        
     def full(self): return self.ptr >= self.T
     def reset(self): self.ptr = 0
     def get(self):
@@ -395,7 +414,8 @@ class RolloutBuffer:
         T,B = self.T, self.num_envs
         data = { "mu": self.mu, "logvar": self.logvar, "actions": self.actions, "extrinsic": self.rews_e, "dones": self.dones, "values": self.val, "logp": self.logp }
         if self.skill is not None: data["skill"] = self.skill
-        for k in ["mu","logvar","actions","extrinsic","dones","values","logp","skill"]:
+        if self.lowrank_factors is not None: data["lowrank_factors"] = self.lowrank_factors
+        for k in ["mu","logvar","actions","extrinsic","dones","values","logp","skill","lowrank_factors"]:
             if k in data: data[k] = data[k].reshape(T*B, *data[k].shape[2:])
         return data
 
@@ -419,8 +439,10 @@ class PPOTrainer:
             return gym.make(env_id)
         self.envs = gym.vector.SyncVectorEnv([make_env for _ in range(ppo_cfg.num_envs)])
         obs_space = self.envs.single_observation_space
-        act_space = self.envs.single_action_space
-        self.n_actions = int(act_space.n)  # should be 615 in NLE
+        # Use the FULL NLE action set so one policy transfers across MiniHack tasks
+        self.n_actions = ACTION_DIM
+        # Build per-env mask and global->local index mapping
+        self._init_action_adapter()
 
         # Models
         self.vae = vae.to(self.device).eval()  # encoder used in no-grad mode during rollouts
@@ -512,6 +534,41 @@ class PPOTrainer:
                 # Mark that we've processed the episode start
                 self._episode_start[env_idx] = False
 
+    def _init_action_adapter(self):
+        """
+        Build (a) valid-action mask over the global NLE action space and
+        (b) a mapping from global action id -> local env index expected by each env.
+        Assumes all vectorized envs are the same MiniHack task (usual case).
+        """
+        G = ACTION_DIM
+        # Grab allowed actions list from the first underlying env
+        base_env = self.envs.envs[0]
+        allowed = getattr(base_env.unwrapped, "actions", None)
+        if allowed is None:
+            allowed = list(range(G))  # full action set
+        allowed = [int(a) for a in allowed]
+
+        # mask over global ids
+        mask = torch.zeros(G, dtype=torch.bool, device=self.device)
+        allowed_indices = [KEYPRESS_INDEX_MAPPING[k] for k in allowed]
+        mask[allowed_indices] = True
+        # global->local index (for stepping env)
+        g2l = torch.full((G,), -1, dtype=torch.long, device=self.device)
+        for li, gid in enumerate(allowed_indices):
+            g2l[gid] = li
+        # Broadcast to all env slots
+        B = self.ppo_cfg.num_envs
+        self.action_mask = mask.view(1, G).expand(B, G).contiguous()      # [B,G] bool
+        self.global2local = g2l.view(1, G).expand(B, G).contiguous()      # [B,G] long
+
+    def _masked_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the per-env action mask to logits.
+        logits: [B,G]
+        """
+        # Extremely negative for invalid actions to remove them from Categorical
+        return logits.masked_fill(~self.action_mask, -1e9)
+
     @torch.no_grad()
     def collect_rollout(self):
         self.buf.reset()
@@ -539,7 +596,7 @@ class PPOTrainer:
                     # logB_t[k] = E_q[log p(z_t | h_t=k)]
                     logB_b = StickyHDPHMMVI.expected_emission_loglik(
                         self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                        mu_b.unsqueeze(0), dv_b.unsqueeze(0), F.unsqueeze(0), mask=None
+                        mu_b.unsqueeze(0), dv_b.unsqueeze(0), F.unsqueeze(0) if F is not None else None, mask=None
                     ).squeeze(0)  # [Kp1]
 
                     st = self._filt_state[b]
@@ -556,17 +613,23 @@ class PPOTrainer:
 
                 skill_feat = torch.stack(skill_list, dim=0)  # [B, K]
 
-            logits, value = self.actor_critic(z, skill_feat)
-            dist = torch.distributions.Categorical(logits=logits)
-            action = dist.sample()
-            logp = dist.log_prob(action)
+            logits, value = self.actor_critic(z, skill_feat)        # logits: [B,G]
+            masked = self._masked_logits(logits)
+            dist = torch.distributions.Categorical(logits=masked)
+            a_global = dist.sample()               # [B] global ids in NLE space
+            logp = dist.log_prob(a_global)
+
+            # Map to per-env local indices for stepping vectorized env
+            a_local = self.global2local.gather(1, a_global.view(-1,1)).squeeze(1)  # [B]
+            # Safety: if something is -1 (shouldn't happen with mask), map to 0
+            a_local = torch.where(a_local < 0, torch.zeros_like(a_local), a_local)
 
             # step
-            next_obs, rew, terminated, truncated, info = self.envs.step(action.cpu().numpy())
+            next_obs, rew, terminated, truncated, info = self.envs.step(a_local.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             # store
-            self.buf.add(z=z, mu=enc["mu"], logvar=enc["logvar"],
-                         actions=torch.as_tensor(action, device=self.device),
+            self.buf.add(z=z, mu=enc["mu"], logvar=enc["logvar"], lowrank_factors=enc.get('lowrank_factors', None),
+                         actions=torch.as_tensor(a_global, device=self.device),
                          rews_e=torch.as_tensor(rew, dtype=torch.float32, device=self.device),
                          dones=torch.as_tensor(done, dtype=torch.bool, device=self.device),
                          val=value, logp=logp,
@@ -597,11 +660,11 @@ class PPOTrainer:
         T, B = self.ppo_cfg.rollout_len, self.ppo_cfg.num_envs
         mu     = self.buf.mu.transpose(0,1)      # [B,T,D]
         logvar = self.buf.logvar.transpose(0,1)  # [B,T,D]
-        F = None
+        lowrank_factors = self.buf.lowrank_factors.transpose(0,1) if self.buf.lowrank_factors is not None else None  # [B,T,D,R] or None
         actions= self.buf.actions.transpose(0,1) # [B,T]
         mask   = (~self.buf.dones).transpose(0,1).float() # [B,T], 1 for valid
         # curvature: last step after done is invalid; mask handled
-        bonuses = self.curiosity.compute_intrinsic(mu, logvar, F, actions, mask)
+        bonuses = self.curiosity.compute_intrinsic(mu, logvar, lowrank_factors, actions, mask)
         self.curiosity.global_step = self.global_steps
         return bonuses
 
@@ -691,8 +754,10 @@ class PPOTrainer:
                 idx = inds[start:start+mb]
                 mu = data["mu"][idx]
                 skill = None if skills_for_policy is None else skills_for_policy.reshape(-1, skills_for_policy.shape[-1])[idx]
-                logits, value = self.actor_critic(mu, skill)
-                dist = torch.distributions.Categorical(logits=logits)
+                logits, value = self.actor_critic(mu, skill) # [N,G]
+                # Same env for all samples -> same mask row; broadcast to batch
+                masked = logits.masked_fill(~self.action_mask[0].unsqueeze(0), -1e9)
+                dist = torch.distributions.Categorical(logits=masked)
                 logp = dist.log_prob(data["actions"][idx])
                 ratio = torch.exp(logp - data["logp"][idx])
                 adv = advantages.reshape(-1)[idx]
