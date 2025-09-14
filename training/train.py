@@ -2451,7 +2451,7 @@ def train_vae_with_sticky_hmm_em(
             else:
                 # Use standard batched E-step
                 fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
-                                        max_iters=max_iters, elbo_drop_tol=elbo_drop_tol, elbo_tol=elbo_tol,
+                                        max_iters=(max_iters if r == (em_rounds - 1) else 1), elbo_drop_tol=elbo_drop_tol, elbo_tol=elbo_tol,
                                         optimize_pi_every_n_steps=optimize_pi_every_n_steps,
                                         pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
                                         logger=logger, use_wandb=use_wandb)
