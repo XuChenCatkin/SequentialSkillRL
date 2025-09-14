@@ -1349,6 +1349,8 @@ class PPOTrainer:
             self.maybe_refresh_vae(replay_mu, replay_logvar, replay_actions, replay_mask)
 
             # logging
+            intrinsic_mean = intrinsic.mean()
+            cur_eff = float((ext.mean() / (intrinsic_mean + 1e-8)).item())
             self._log_scalar({
                 "steps": self.global_steps,
                 "return/mean_ext": float(ext.mean().item()),
@@ -1356,6 +1358,7 @@ class PPOTrainer:
                 "int/hdp_mean": float(bonuses["hdp"].mean().item()),
                 "int/trans_mean": float(bonuses["trans"].mean().item()),
                 "int/rnd_mean": float(bonuses["rnd"].mean().item()),
+                "curiosity/efficiency": cur_eff
             })
             if (self.global_steps % self.run_cfg.eval_every) < (self.ppo_cfg.num_envs * self.ppo_cfg.rollout_len):
                 self.evaluate(self.run_cfg.eval_episodes)
@@ -1364,40 +1367,113 @@ class PPOTrainer:
 
     @torch.no_grad()
     def evaluate(self, episodes: int):
+        """
+        Evaluation with richer diagnostics to support:
+          (1) VAE+HMM+PPO vs VAE+PPO (task returns, success, sample-efficiency)
+          (2) Curiosity vs RND (decomposition & exploration proxies)
+        """
         env = gym.make(self.env_id)
-        total = []
+        ret_list, len_list, succ_list = [], [], []
+        cover_list = []    # unique (x,y) cells visited per episode (if blstats available)
+        # HMM‑centric diagnostics
+        bound_mass_list, bound_bool_list, ent_list = [], [], []
+        used_skills_list, effK_list = [], []
+
         for _ in range(episodes):
             o, _ = env.reset()
-            # local filter state for single env evaluation
-            fstate = None
-            done = False; ret = 0.0
-            while not done:
-                enc = self._encode_obs(o)
-                skill_feat = None
-                if self.ppo_cfg.policy_uses_skill:
-                    mu = enc["mu"].squeeze(0)             # [D]
-                    dv = enc["logvar"].squeeze(0).exp()   # [D]
-                    logB = StickyHDPHMMVI.expected_emission_loglik(
-                        self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                        mu.unsqueeze(0), dv.unsqueeze(0), None, mask=None
-                    ).squeeze(0)
-                    if fstate is None:
-                        fstate = self.hmm.filter_init_from_logB(logB) if hasattr(self.hmm, "filter_init_from_logB") else None
-                        alpha = torch.exp(fstate.log_alpha.to(torch.float32)) if fstate is not None else torch.softmax(logB, dim=-1)
-                    else:
-                        fstate, alpha, _xi, _bound, _sent = self.hmm.filter_step(fstate, logB, self._ElogA)
-                    # drop remainder state
-                    skill_feat = alpha[: self.hmm.niw.mu.size(0)-1].unsqueeze(0)
+            done = False; ret = 0.0; ep_len = 0
+            # buffers to run HMM causal filter post‑episode
+            mu_seq, logvar_seq = [], []
+            visited = set()
 
-                logits, value = self.actor_critic(enc["z"], skill_feat)
-                a = torch.argmax(logits, dim=-1) if self.ppo_cfg.deterministic_eval else torch.distributions.Categorical(logits=logits).sample()
+            while not done:
+                # coverage proxy from blstats (x,y)
+                if isinstance(o, dict) and "blstats" in o:
+                    bl = o["blstats"]
+                    if getattr(bl, "ndim", 0) == 1:
+                        x, y = int(bl[0]), int(bl[1])
+                    else:
+                        x, y = int(bl[0][0]), int(bl[0][1])  # [B,dim]
+                    visited.add((x, y))
+
+                enc = self._encode_obs(o)
+                mu_seq.append(enc["mu"].squeeze(0).cpu())
+                logvar_seq.append(enc["logvar"].squeeze(0).cpu())
+
+                logits, value = self.actor_critic(enc["z"], None)
+                a = (torch.argmax(logits, dim=-1)
+                     if self.ppo_cfg.deterministic_eval
+                     else torch.distributions.Categorical(logits=logits).sample())
                 o, r, term, trunc, _ = env.step(int(a.item()))
                 done = term or trunc
-                ret += r
-                if done:
-                    fstate = None
-            total.append(ret)
-        self._log_scalar({"eval/return_mean": float(np.mean(total)), "eval/return_std": float(np.std(total))})
+                ret += float(r); ep_len += 1
+
+            # episode‑level tallies
+            ret_list.append(ret); len_list.append(ep_len)
+            succ_list.append(1.0 if ret > 0.0 else 0.0)
+            cover_list.append(len(visited))
+
+            # ---------- HMM filter over the episode ----------
+            try:
+                mu_t = torch.stack(mu_seq, dim=0).to(self.device)           # [T,D]
+                logvar_t = torch.stack(logvar_seq, dim=0).to(self.device)   # [T,D]
+                diag_var_t = torch.exp(logvar_t)
+
+                # Emission potentials and causal filter
+                logB = StickyHDPHMMVI.expected_emission_loglik(
+                    self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
+                    mu_t.unsqueeze(0), diag_var_t.unsqueeze(0), None, None
+                ).squeeze(0)                                                # [T,Kp1]
+
+                if hasattr(self.hmm, "filter_sequence"):
+                    fs = self.hmm.filter_sequence(logB)                     # dict with alpha, xi, boundary_prob, skill_entropy
+                    alpha = fs["alpha"]                                     # [T,Kp1]
+                    boundary_prob = fs["boundary_prob"]                     # [T]
+                    skill_entropy = fs["skill_entropy"]                     # [T]
+
+                    # boolean gate 1[ΔH_t > 0]
+                    dH = torch.nan_to_num(skill_entropy[1:] - skill_entropy[:-1])
+                    gate_bool = (dH > 0).float()
+                    bound_bool_rate = float(gate_bool.mean().item()) if gate_bool.numel() > 0 else 0.0
+                    bound_mass_rate = float(torch.nan_to_num(boundary_prob[1:]).mean().item()) if boundary_prob.numel() > 1 else 0.0
+                    ent_mean = float(torch.nan_to_num(skill_entropy).mean().item())
+
+                    # used skills (exclude remainder state = last index)
+                    if alpha.numel() > 0:
+                        Kp1 = alpha.size(-1)
+                        alpha_no_rest = alpha[:, :Kp1-1]
+                        used = torch.unique(torch.argmax(alpha_no_rest, dim=-1)).numel()
+                        occ = alpha_no_rest.sum(dim=0); occ = occ / (occ.sum() + 1e-12)
+                        effK = float(torch.exp(-(occ.clamp_min(1e-12) * occ.clamp_min(1e-12).log()).sum()).item())
+                    else:
+                        used, effK = 0, 0.0
+
+                    bound_mass_list.append(bound_mass_rate)
+                    bound_bool_list.append(bound_bool_rate)
+                    ent_list.append(ent_mean)
+                    used_skills_list.append(int(used))
+                    effK_list.append(effK)
+            except Exception:
+                # Robustness in case HMM diagnostics fail on early runs
+                pass
+
+        # Aggregate & log
+        log_dict = {
+            "eval/return_mean": float(np.mean(ret_list) if len(ret_list) else 0.0),
+            "eval/return_std": float(np.std(ret_list) if len(ret_list) else 0.0),
+            "eval/success_rate": float(np.mean(succ_list) if len(succ_list) else 0.0),
+            "eval/ep_len_mean": float(np.mean(len_list) if len(len_list) else 0.0),
+            "eval/coverage_pos_mean": float(np.mean(cover_list) if len(cover_list) else 0.0),
+        }
+        if bound_mass_list:
+            log_dict.update({
+                "eval/skill_boundary_mass_rate": float(np.mean(bound_mass_list)),
+                "eval/skill_boundary_bool_rate": float(np.mean(bound_bool_list)),
+                "eval/skill_entropy_mean": float(np.mean(ent_list)),
+                "eval/used_skills_mean": float(np.mean(used_skills_list)),
+                "eval/effective_K_mean": float(np.mean(effK_list)),
+            })
+        self._log_scalar(log_dict)
 
     def _log_scalar(self, d: Dict[str, float]):
         # Always log to JSON file
