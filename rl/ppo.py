@@ -4,6 +4,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, Dict, List
 
 import numpy as np
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,17 +86,19 @@ class HMMOnlineConfig:
 
 @dataclass
 class VAEOnlineConfig:
-    # Full VAE online update
-    update_every: int = 20_480         # every ~20 rollouts by default
-    vae_lr: float = 1e-4              # learning rate for full VAE update
-    vae_steps_per_call: int = 4       # small number of mini-updates
-    span_len: int = 64                # random short spans for stability/memory
-    mini_batch_B: int = 32            # number of random spans per step
+    # Full VAE online update - synchronized with HMM updates
+    vae_update_every: int = 10_240          # env steps between VAE refreshes (same as HMM)
+    vae_update_growth: float = 1.30         # after each refresh: interval *= growth (same as HMM)
+    vae_update_every_cap: int = 60_000      # cap interval to avoid going too sparse (same as HMM)
+    vae_lr: float = 1e-4                    # learning rate for full VAE update
+    vae_steps_per_call: int = 8             # More mini-updates per call for better adaptation
+    span_len: int = 64                      # random short spans for stability/memory
+    mini_batch_B: int = 32                  # number of random spans per step
     # VAE loss coefficients for online training (lighter than offline)
-    mi_beta: float = 0.1              # Mutual information beta (lighter online)
-    tc_beta: float = 0.1              # Total correlation beta
-    dw_beta: float = 0.1              # Dimension-wise KL beta
-    blend_alpha: float = 1.0          # Use HMM prior blending during online training (100% HMM)
+    mi_beta: float = 0.1                    # Mutual information beta (lighter online)
+    tc_beta: float = 0.1                    # Total correlation beta
+    dw_beta: float = 0.1                    # Dimension-wise KL beta
+    blend_alpha: float = 1.0                # Use HMM prior blending during online training (100% HMM)
 
 @dataclass
 class RNDConfig:
@@ -322,6 +325,16 @@ class CuriosityComputer:
                     mask=None
                 ).squeeze(0)
                 
+                # Diagnostic: Check for extreme logB_t values that might cause uniform posterior
+                if t % 100 == 0 and b == 0:  # Log occasionally
+                    logB_range = logB_t.max() - logB_t.min()
+                    unused_skills = (self.hmm.niw.nu <= 106.1).float().sum().item()  # Count near-prior skills
+                    used_skills = (self.hmm.niw.nu > 106.1).float().sum().item()
+                    print(f"🔍 logB_t at t={t}: range={logB_range:.2f}, "
+                          f"unused_skills={unused_skills}, used_skills={used_skills}")
+                    print(f"   logB_t[unused] ≈ {logB_t[self.hmm.niw.nu <= 106.1].mean():.2f}, "
+                          f"logB_t[used] ≈ {logB_t[self.hmm.niw.nu > 106.1].mean():.2f}")
+                
                 if not prev_valid or st is None:
                     # Initialize new HMM chain (start of episode or after invalid step)
                     st = self.hmm.filter_init_from_logB(logB_t)
@@ -347,7 +360,10 @@ class CuriosityComputer:
         mu: torch.Tensor, logvar: torch.Tensor, F: Optional[torch.Tensor],       # [B,T,D], [B,T,D], [B,T,D,R] or None
         actions: torch.Tensor,                                                   # [B,T] (nle codes)
         mask: torch.Tensor,                                                      # [B,T]
-        dones: Optional[torch.Tensor] = None                                     # [B,T] episode termination flags
+        dones: Optional[torch.Tensor] = None,                                    # [B,T] episode termination flags
+        next_obs_mu: Optional[torch.Tensor] = None,                              # [B,D] next observation mu for final timestep dynamics
+        next_obs_logvar: Optional[torch.Tensor] = None,                          # [B,D] next observation logvar for final timestep dynamics
+        next_obs_F: Optional[torch.Tensor] = None                                # [B,D,R] next observation F for final timestep dynamics
     ) -> Dict[str, torch.Tensor]:
         """
         Returns dict with per-step intrinsic bonuses (aligned to timesteps), and per-term summaries.
@@ -425,26 +441,50 @@ class CuriosityComputer:
             # initial world state zero for each batch element
             s = self.vae.world_model.initial_state(B, device=device)
             mu_p_list, logvar_p_list, Fp_list = [], [], []
-            for t in range(T-1):
+            
+            # Compute predictions for t=0 to t=T-1 (need T predictions for T timesteps)
+            num_predictions = T if (next_obs_mu is not None) else T-1
+            for t in range(num_predictions):
                 s, mu_p, logvar_p, F_p = self.vae.world_model_step(
                     s, mu[:,t,:], a_onehot[:,t,:], skill_soft[:,t,:]
                 )
                 mu_p_list.append(mu_p)
                 logvar_p_list.append(logvar_p)
                 Fp_list.append(F_p)
-            # pad last step with zeros (no next obs)
-            mu_p = torch.stack(mu_p_list, dim=1)                     # [B,T-1,D]
-            logvar_p = torch.stack(logvar_p_list, dim=1)             # [B,T-1,D]
-            F_p = torch.stack(Fp_list, dim=1) if Fp_list[0] is not None else None  # [B,T-1,D,R] or None
+            
+            mu_p = torch.stack(mu_p_list, dim=1)                     # [B,num_predictions,D]
+            logvar_p = torch.stack(logvar_p_list, dim=1)             # [B,num_predictions,D]
+            F_p = torch.stack(Fp_list, dim=1) if Fp_list[0] is not None else None  # [B,num_predictions,D,R] or None
 
-            # KL at t+1 between q(z_{t+1}|x_{t+1}) and p(z_{t+1}|s_t,a_t,h_t)
-            mu_q = mu[:,1:,:]; logvar_q = logvar[:,1:,:]
-            F_q = F[:,1:,:,:] if F is not None else None
+            # Prepare actual next observations for KL computation
+            if next_obs_mu is not None:
+                # Include final timestep using provided next observation
+                mu_q = torch.cat([mu[:,1:,:], next_obs_mu.unsqueeze(1)], dim=1)     # [B,T,D]
+                logvar_q = torch.cat([logvar[:,1:,:], next_obs_logvar.unsqueeze(1)], dim=1)  # [B,T,D]
+                if F is not None and next_obs_F is not None:
+                    F_q = torch.cat([F[:,1:,:,:], next_obs_F.unsqueeze(1)], dim=1)  # [B,T,D,R]
+                else:
+                    F_q = None
+                kl_timesteps = T  # All timesteps have dynamics reward
+            else:
+                # Original behavior - only t=1 to t=T-1
+                mu_q = mu[:,1:,:]; logvar_q = logvar[:,1:,:]
+                F_q = F[:,1:,:,:] if F is not None else None
+                kl_timesteps = T-1  # Only T-1 timesteps have dynamics reward
+            
+            # Compute KL divergences
             kl = kl_gaussian_lowrank_q_p(
-                mu_q=mu_q.reshape(-1, D), logvar_q=logvar_q.reshape(-1, D), F_q=None if F_q is None else F_q.reshape(-1, D, F_q.size(-1)),
-                mu_p=mu_p.reshape(-1, D), logvar_p=logvar_p.reshape(-1, D), F_p=None if F_p is None else F_p.reshape(-1, D, F_p.size(-1))
-            ).view(B, T-1)
-            dyn[:,:-1] = kl
+                mu_q=mu_q.reshape(-1, D), logvar_q=logvar_q.reshape(-1, D), 
+                F_q=None if F_q is None else F_q.reshape(-1, D, F_q.size(-1)),
+                mu_p=mu_p.reshape(-1, D), logvar_p=logvar_p.reshape(-1, D), 
+                F_p=None if F_p is None else F_p.reshape(-1, D, F_p.size(-1))
+            ).view(B, kl_timesteps)
+            
+            # Assign KL values to appropriate timesteps
+            if next_obs_mu is not None:
+                dyn = kl  # [B, T] - all timesteps covered
+            else:
+                dyn[:,:-1] = kl  # [B, T-1] - last timestep remains zero
             dyn = dyn * mask
 
         # ---- RND novelty on z_t ----
@@ -731,9 +771,10 @@ class PPOTrainer:
         self.global_steps = 0
         self.last_hmm_refresh = 0
         self._hmm_interval = self.hmm_cfg.hmm_update_every
-        # Online VAE full training
+        # Online VAE full training - synchronized with HMM updates
         self.vae_online = VAEOnlineConfig()
         self.last_vae_refresh = 0
+        self._vae_interval = self.vae_online.vae_update_every  # Track VAE update interval
         self.vae_opt = None
         # Enable full VAE training instead of just world model
         if self.vae is not None:
@@ -960,6 +1001,12 @@ class PPOTrainer:
     def _compute_intrinsic_for_buffer(self) -> Dict[str, torch.Tensor]:
         T, B = self.ppo_cfg.rollout_len, self.ppo_cfg.num_envs
         
+        # Encode next observation for final timestep dynamics calculation
+        next_obs_enc = self._encode_obs(self._obs)
+        next_obs_mu = next_obs_enc["mu"]
+        next_obs_logvar = next_obs_enc["logvar"]  
+        next_obs_F = next_obs_enc.get("F", None)
+        
         # Get extended data that includes previous rollout's last timestep
         extended_data = self.buf.get_extended_data_for_transitions()
         
@@ -983,13 +1030,14 @@ class PPOTrainer:
             
             # Compute intrinsic rewards using extended data for transition computations
             bonuses = self.curiosity.compute_intrinsic(
-                mu_ext, logvar_ext, lowrank_factors_ext, actions_ext, mask_ext, dones_ext
+                mu_ext, logvar_ext, lowrank_factors_ext, actions_ext, mask_ext, dones_ext,
+                next_obs_mu=next_obs_mu, next_obs_logvar=next_obs_logvar, next_obs_F=next_obs_F
             )
             
             # Extract rewards for current rollout timesteps only (skip the prepended previous timestep)
             result_bonuses = {}
             for key, value in bonuses.items():
-                if value.dim() > 2:
+                if value.dim() > 1:
                     # Per-timestep outputs (rewards, skill probabilities, etc.) - extract current rollout portion
                     result_bonuses[key] = value[:, 1:]  # [B, T, ...] - skip first timestep which is from prev rollout
                 else:
@@ -1006,7 +1054,8 @@ class PPOTrainer:
             mask_curr = self.buf.mask.transpose(0,1)    # [B,T]
             
             result_bonuses = self.curiosity.compute_intrinsic(
-                mu_curr, logvar_curr, lowrank_factors_curr, actions_curr, mask_curr, dones_curr
+                mu_curr, logvar_curr, lowrank_factors_curr, actions_curr, mask_curr, dones_curr,
+                next_obs_mu=next_obs_mu, next_obs_logvar=next_obs_logvar, next_obs_F=next_obs_F
             )
         
         self.curiosity.global_step = self.global_steps
@@ -1120,11 +1169,33 @@ class PPOTrainer:
 
     # --------------------------- HMM / VAE refresh ---------------------------
 
+    def maybe_refresh_models(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, 
+                            replay_actions: torch.Tensor, replay_mask: torch.Tensor):
+        """
+        Synchronized HMM and VAE updates. Updates happen together when either interval is reached.
+        This ensures coordinated learning between the skill discovery (HMM) and representation (VAE).
+        """
+        hmm_ready = (self.global_steps - self.last_hmm_refresh) >= self._hmm_interval
+        vae_ready = (self.global_steps - self.last_vae_refresh) >= self._vae_interval and self.vae_opt is not None
+        
+        # Update both models if either is ready (synchronized updates)
+        if hmm_ready or vae_ready:
+            print(f"🔄 Synchronized model update at step {self.global_steps:,}")
+            print(f"   HMM interval: {self._hmm_interval:,}, VAE interval: {self._vae_interval:,}")
+            
+            # Always update HMM when synchronized update occurs
+            if hmm_ready:
+                self._refresh_hmm(replay_mu, replay_logvar, replay_mask)
+                print(f"   ✅ HMM updated (next in {self._hmm_interval:,} steps)")
+            
+            # Always update VAE when synchronized update occurs  
+            if vae_ready:
+                self._refresh_vae(replay_mu, replay_logvar, replay_actions, replay_mask)
+                print(f"   ✅ VAE updated (next in {self._vae_interval:,} steps)")
+
     @torch.no_grad()
-    def maybe_refresh_hmm(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, replay_mask: torch.Tensor):
-        # adaptive cadence: early frequent refresh; relax over time
-        if (self.global_steps - self.last_hmm_refresh) < self._hmm_interval:
-            return
+    def _refresh_hmm(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, replay_mask: torch.Tensor):
+        """Internal HMM update method."""
         B,T,D = replay_mu.shape
         # run full VI update on the window
         out = self.hmm.update(
@@ -1139,18 +1210,11 @@ class PPOTrainer:
         self.last_hmm_refresh = self.global_steps
         # relax cadence
         self._hmm_interval = min(int(self._hmm_interval * self.hmm_cfg.hmm_update_growth),
-                                    self.hmm_cfg.hmm_update_every_cap)
+                                self.hmm_cfg.hmm_update_every_cap)
 
-    def maybe_refresh_vae(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, 
-                          replay_actions: torch.Tensor, replay_mask: torch.Tensor):
-        """
-        Full VAE online update using reconstructions + all VAE losses on random short spans.
-        Uses raw observations stored during rollouts for complete VAE training.
-        """
-        if (self.vae_opt is None) or ((self.global_steps - self.last_vae_refresh) < self.vae_online.update_every):
-            return
-        self.last_vae_refresh = self.global_steps
-
+    def _refresh_vae(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, 
+                     replay_actions: torch.Tensor, replay_mask: torch.Tensor):
+        """Internal VAE update method."""
         # Check if we have stored observations
         if self.buf.obs_chars is None:
             print("⚠️ No observations stored for full VAE training, skipping...")
@@ -1173,33 +1237,20 @@ class PPOTrainer:
             # Gather observation spans and create batches
             batch_list = []
             for bi, t in zip(b_idx.tolist(), t0.tolist()):
-                t1 = t + span
-                m = replay_mask[bi, t:t1]  # [span]
-                if m.sum() < 2:  # too short valid chain
-                    continue
-                    
-                # Get observation data for this span
-                obs_chars = self.buf.obs_chars[t:t1, bi]    # [span, H, W]
-                obs_colors = self.buf.obs_colors[t:t1, bi]  # [span, H, W]
-                obs_blstats = self.buf.obs_blstats[t:t1, bi]  # [span, blstats_dim]
-                obs_message = self.buf.obs_message[t:t1, bi]  # [span, 256]
-                obs_hero_info = self.buf.obs_hero_info[t:t1, bi]  # [span, 4]
+                if t + span > T or not self.buf.mask[t:t+span, bi].all():
+                    continue  # Skip invalid spans
                 
-                # Create batch for this span
-                span_batch = {
-                    'game_chars': obs_chars,
-                    'game_colors': obs_colors,
-                    'blstats': obs_blstats,
-                    'message_chars': obs_message,
-                    'hero_info': obs_hero_info,
-                    'valid_screen': m,  # Use mask as validity indicator
-                    'batch_size': 1,  # Single trajectory
-                    'original_batch_shape': (1, span)
-                }
-                batch_list.append(span_batch)
+                batch_list.append({
+                    'game_chars': self.buf.obs_chars[t:t+span, bi],      # [span, 21, 79]
+                    'game_colors': self.buf.obs_colors[t:t+span, bi],    # [span, 21, 79]
+                    'blstats': self.buf.obs_blstats[t:t+span, bi],       # [span, blstats_dim]
+                    'message_chars': self.buf.obs_message[t:t+span, bi], # [span, 256]
+                    'hero_info': self.buf.obs_hero_info[t:t+span, bi],   # [span, 4]
+                    'valid_screen': torch.ones(span, dtype=torch.bool, device=device)
+                })
             
             if not batch_list:
-                continue
+                continue  # No valid spans found
                 
             # Concatenate all spans into a single batch
             # Reshape from [num_spans, span_len, ...] to [num_spans * span_len, ...]
@@ -1228,23 +1279,19 @@ class PPOTrainer:
                 
                 # Encode the batch to get latent representations
                 with torch.no_grad():
-                    temp_enc = self.vae.encode(all_chars, all_colors, all_blstats, all_message, all_hero_info)
-                    temp_mu = temp_enc["mu"]  # [total_samples, D]
-                    temp_logvar = temp_enc["logvar"]  # [total_samples, D]
-                    temp_diagvar = temp_logvar.exp().clamp_min(1e-6)
-                    temp_F = temp_enc.get("lowrank_factors", None)
+                    enc_output = self.vae.encode(
+                        combined_batch['game_chars'], combined_batch['game_colors'], 
+                        combined_batch['blstats'], combined_batch['message_chars'], 
+                        combined_batch['hero_info']
+                    )
+                    mu_encoded = enc_output['mu']  # [total_samples, D]
                 
-                # Compute HMM responsibilities for this batch
-                logB = StickyHDPHMMVI.expected_emission_loglik(
-                    self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                    temp_mu, temp_diagvar, temp_F, mask=all_valid.unsqueeze(-1)
-                )  # [total_samples, Kp1]
+                # Get HMM responsibilities for these latents  
+                # Use diagonal covariance approximation for efficiency
+                diagvar_encoded = enc_output['logvar'].exp().clamp_min(1e-6)
+                r_hat = self.hmm.predict_posterior(mu_encoded.unsqueeze(0), diagvar_encoded.unsqueeze(0), None, 
+                                                 torch.ones(1, mu_encoded.size(0), device=device)).squeeze(0)  # [total_samples, Kp1]
                 
-                # Convert to responsibilities (softmax over states)
-                r_hat = torch.softmax(logB, dim=-1)  # [total_samples, Kp1]
-                
-                # Add HMM cache to batch
-                combined_batch['sticky_hmm'] = self.hmm  # Pass HMM object
                 combined_batch['hmm_cache'] = {
                     'mu_k': self.hmm.niw.mu,  # [Kp1, D] 
                     'E_Lambda': self.hmm._get_E_Lambda(),  # [Kp1, D, D]
@@ -1267,7 +1314,6 @@ class PPOTrainer:
                     dw_beta=self.vae_online.dw_beta,
                     prior_blend_alpha=self.vae_online.blend_alpha
                 )
-                
                 loss = vae_loss_dict['total_loss']
             
             # Backward pass
@@ -1283,8 +1329,15 @@ class PPOTrainer:
                     "vae/mi_beta": self.vae_online.mi_beta,
                     "vae/tc_beta": self.vae_online.tc_beta,
                     "vae/dw_beta": self.vae_online.dw_beta,
+                    "vae/training_triggered": 1.0,  # Flag that VAE training occurred
+                    "vae/spans_processed": float(len(batch_list)),
                     "steps": self.global_steps
                 })
+        
+        self.last_vae_refresh = self.global_steps
+        # Relax VAE update cadence (same as HMM)
+        self._vae_interval = min(int(self._vae_interval * self.vae_online.vae_update_growth),
+                                 self.vae_online.vae_update_every_cap)
         
         # Set VAE back to eval mode for inference
         self.vae.eval()
@@ -1306,7 +1359,32 @@ class PPOTrainer:
         # maintain a growing replay window of latents for HMM refresh
         replay_mu, replay_logvar, replay_mask, replay_actions = None, None, None, None
 
-        while self.global_steps < self.ppo_cfg.total_updates * self.ppo_cfg.rollout_len * self.ppo_cfg.num_envs:
+        # Calculate total training parameters for progress tracking
+        total_env_steps = self.ppo_cfg.total_updates * self.ppo_cfg.rollout_len * self.ppo_cfg.num_envs
+        steps_per_update = self.ppo_cfg.rollout_len * self.ppo_cfg.num_envs
+        
+        print(f"🚀 Starting PPO Training")
+        print(f"   Total updates: {self.ppo_cfg.total_updates}")
+        print(f"   Steps per update: {steps_per_update}")
+        print(f"   Total environment steps: {total_env_steps:,}")
+        print(f"   Environment: {self.env_id}")
+        print(f"   Seed: {self.run_cfg.seed}")
+        print()
+        
+        # Create progress bar for training updates
+        pbar = tqdm(
+            total=self.ppo_cfg.total_updates, 
+            desc="Training Progress",
+            unit="update",
+            bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}"
+        )
+        
+        update_count = 0
+        start_time = time.time()
+        
+        while self.global_steps < total_env_steps:
+            update_start_time = time.time()
+            
             self.collect_rollout()
             bonuses = self._compute_intrinsic_for_buffer()
             # skills for policy (concat to z) during PPO update: use the SAME features we acted with
@@ -1345,12 +1423,31 @@ class PPOTrainer:
                         replay_mask = replay_mask[:, s:]
                         replay_actions = replay_actions[:, s:]
 
-            self.maybe_refresh_hmm(replay_mu, replay_logvar, replay_mask)
-            self.maybe_refresh_vae(replay_mu, replay_logvar, replay_actions, replay_mask)
+            # Use synchronized model updates for coordinated learning
+            self.maybe_refresh_models(replay_mu, replay_logvar, replay_actions, replay_mask)
 
             # logging
             intrinsic_mean = intrinsic.mean()
             cur_eff = float((ext.mean() / (intrinsic_mean + 1e-8)).item())
+            
+            # Update progress bar and add metrics
+            update_count += 1
+            update_time = time.time() - update_start_time
+            elapsed_time = time.time() - start_time
+            updates_per_sec = update_count / elapsed_time if elapsed_time > 0 else 0
+            eta_seconds = (self.ppo_cfg.total_updates - update_count) / updates_per_sec if updates_per_sec > 0 else 0
+            eta_str = f"{eta_seconds/3600:.1f}h" if eta_seconds > 3600 else f"{eta_seconds/60:.1f}m"
+            
+            # Update progress bar with rich information
+            pbar.set_postfix({
+                'Steps': f"{self.global_steps:,}",
+                'ExtRet': f"{ext.mean().item():.2f}",
+                'CurEff': f"{cur_eff:.2f}",
+                'UPS': f"{updates_per_sec:.1f}",
+                'ETA': eta_str
+            })
+            pbar.update(1)
+            
             self._log_scalar({
                 "steps": self.global_steps,
                 "return/mean_ext": float(ext.mean().item()),
@@ -1358,12 +1455,52 @@ class PPOTrainer:
                 "int/hdp_mean": float(bonuses["hdp"].mean().item()),
                 "int/trans_mean": float(bonuses["trans"].mean().item()),
                 "int/rnd_mean": float(bonuses["rnd"].mean().item()),
-                "curiosity/efficiency": cur_eff
+                "curiosity/efficiency": cur_eff,
+                # Add raw (always positive) vs normalized comparisons
+                "int/dyn_raw_mean": float(bonuses["dyn_raw"].mean().item()),
+                "int/hdp_raw_mean": float(bonuses["hdp_raw"].mean().item()),
+                "int/trans_raw_mean": float(bonuses["trans_raw"].mean().item()),
+                "int/rnd_raw_mean": float(bonuses["rnd_raw"].mean().item()),
+                # Track negative ratio to monitor normalization impact
+                "int/negative_ratio": float((intrinsic < 0).float().mean().item()),
+                "int/total_mean": float(intrinsic.mean().item()),
+                "int/total_std": float(intrinsic.std().item()),
+                # HMM health diagnostics - detect uniform posterior issue
+                "hmm/hdp_raw_std": float(bonuses["hdp_raw"].std().item()),
+                "hmm/hdp_raw_min": float(bonuses["hdp_raw"].min().item()),
+                "hmm/hdp_raw_max": float(bonuses["hdp_raw"].max().item()),
+                "hmm/skill_posterior_entropy_var": float(bonuses["hdp_raw"].var().item()),
+                "hmm/constant_entropy_ratio": float((torch.abs(bonuses["hdp_raw"] - bonuses["hdp_raw"].mean()) < 0.01).float().mean().item()),
+                # Skill usage diagnostics
+                "hmm/unused_skills": float((self.hmm.niw.nu <= 106.1).float().sum().item()),
+                "hmm/used_skills": float((self.hmm.niw.nu > 106.1).float().sum().item()),
+                "hmm/max_nu": float(self.hmm.niw.nu.max().item()),
+                "hmm/mean_nu": float(self.hmm.niw.nu.mean().item()),
+                # Natural learning cycle diagnostics to validate your hypothesis
+                "learning_cycle/unused_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, self.hmm.niw.nu <= 106.1].sum().item()),
+                "learning_cycle/used_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, self.hmm.niw.nu > 106.1].sum().item()),
+                # Synchronized model training diagnostics
+                "learning_cycle/hmm_training_gap": float(self.global_steps - self.last_hmm_refresh),
+                "learning_cycle/vae_training_gap": float(self.global_steps - self.last_vae_refresh),
+                "learning_cycle/hmm_interval": float(self._hmm_interval),
+                "learning_cycle/vae_interval": float(self._vae_interval)
             })
             if (self.global_steps % self.run_cfg.eval_every) < (self.ppo_cfg.num_envs * self.ppo_cfg.rollout_len):
+                pbar.write(f"🧪 Running evaluation at step {self.global_steps:,}...")
                 self.evaluate(self.run_cfg.eval_episodes)
             if (self.global_steps % self.run_cfg.save_every) < (self.ppo_cfg.num_envs * self.ppo_cfg.rollout_len):
+                pbar.write(f"💾 Saving checkpoint at step {self.global_steps:,}...")
                 self._save_ckpt()
+        
+        # Training completed
+        pbar.close()
+        final_time = time.time() - start_time
+        print(f"\n✅ Training completed!")
+        print(f"   Total time: {final_time/3600:.2f} hours")
+        print(f"   Final steps: {self.global_steps:,}")
+        print(f"   Updates completed: {update_count}")
+        print(f"   Average updates/sec: {update_count/final_time:.2f}")
+        print()
 
     @torch.no_grad()
     def evaluate(self, episodes: int):
@@ -1372,6 +1509,9 @@ class PPOTrainer:
           (1) VAE+HMM+PPO vs VAE+PPO (task returns, success, sample-efficiency)
           (2) Curiosity vs RND (decomposition & exploration proxies)
         """
+        print(f"🧪 Starting evaluation with {episodes} episodes...")
+        start_time = time.time()
+        
         env = gym.make(self.env_id)
         ret_list, len_list, succ_list = [], [], []
         cover_list = []    # unique (x,y) cells visited per episode (if blstats available)
@@ -1379,7 +1519,17 @@ class PPOTrainer:
         bound_mass_list, bound_bool_list, ent_list = [], [], []
         used_skills_list, effK_list = [], []
 
-        for _ in range(episodes):
+        # Create progress bar for evaluation episodes
+        eval_pbar = tqdm(
+            range(episodes), 
+            desc="Evaluation", 
+            unit="ep",
+            leave=False,
+            bar_format="{l_bar}{bar:20}{r_bar}"
+        )
+
+        for ep_idx in eval_pbar:
+            ep_start_time = time.time()
             o, _ = env.reset()
             done = False; ret = 0.0; ep_len = 0
             # buffers to run HMM causal filter post‑episode
@@ -1412,6 +1562,19 @@ class PPOTrainer:
             ret_list.append(ret); len_list.append(ep_len)
             succ_list.append(1.0 if ret > 0.0 else 0.0)
             cover_list.append(len(visited))
+            
+            # Update progress bar with episode stats
+            ep_time = time.time() - ep_start_time
+            current_avg_ret = np.mean(ret_list) if ret_list else 0.0
+            current_success_rate = np.mean(succ_list) if succ_list else 0.0
+            
+            eval_pbar.set_postfix({
+                'Ret': f"{ret:.1f}",
+                'AvgRet': f"{current_avg_ret:.2f}",
+                'Success': f"{current_success_rate:.1%}",
+                'Len': f"{ep_len}",
+                'Time': f"{ep_time:.1f}s"
+            })
 
             # ---------- HMM filter over the episode ----------
             try:
@@ -1457,13 +1620,36 @@ class PPOTrainer:
                 # Robustness in case HMM diagnostics fail on early runs
                 pass
 
+        eval_pbar.close()
+        env.close()
+        
+        # Calculate evaluation summary
+        eval_time = time.time() - start_time
+        final_avg_ret = np.mean(ret_list) if ret_list else 0.0
+        final_success_rate = np.mean(succ_list) if succ_list else 0.0
+        final_avg_len = np.mean(len_list) if len_list else 0.0
+        final_avg_coverage = np.mean(cover_list) if cover_list else 0.0
+        
+        print(f"📊 Evaluation Results:")
+        print(f"   Episodes: {episodes}")
+        print(f"   Time: {eval_time:.1f}s ({eval_time/episodes:.1f}s/ep)")
+        print(f"   Average Return: {final_avg_ret:.3f} ± {np.std(ret_list):.3f}")
+        print(f"   Success Rate: {final_success_rate:.1%}")
+        print(f"   Average Length: {final_avg_len:.1f}")
+        print(f"   Average Coverage: {final_avg_coverage:.1f} positions")
+        if bound_mass_list:
+            print(f"   Skill Entropy: {np.mean(ent_list):.3f}")
+            print(f"   Used Skills: {np.mean(used_skills_list):.1f}")
+            print(f"   Effective K: {np.mean(effK_list):.2f}")
+        print()
+
         # Aggregate & log
         log_dict = {
-            "eval/return_mean": float(np.mean(ret_list) if len(ret_list) else 0.0),
+            "eval/return_mean": float(final_avg_ret),
             "eval/return_std": float(np.std(ret_list) if len(ret_list) else 0.0),
-            "eval/success_rate": float(np.mean(succ_list) if len(succ_list) else 0.0),
-            "eval/ep_len_mean": float(np.mean(len_list) if len(len_list) else 0.0),
-            "eval/coverage_pos_mean": float(np.mean(cover_list) if len(cover_list) else 0.0),
+            "eval/success_rate": float(final_success_rate),
+            "eval/ep_len_mean": float(final_avg_len),
+            "eval/coverage_pos_mean": float(final_avg_coverage),
         }
         if bound_mass_list:
             log_dict.update({

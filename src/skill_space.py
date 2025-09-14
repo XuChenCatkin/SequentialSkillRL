@@ -674,51 +674,8 @@ class StickyHDPHMMVI(nn.Module):
         Update row-wise Dirichlet params with sticky prior and counts.
         """
         self.dir.phi = phihat
-
-    def _optimize_pi_from_r1(self, r1: torch.Tensor, steps: int = 200, lr: float = 0.05) -> torch.Tensor:
-        """
-        Optimize global sticks β (via logits u_beta) using a β-restricted ELBO:
-            L(β) = E_q[log p(Φ | π)] + E_q[log p(h1 | π)] + log p(β),
-        with π = concat(SB(σ(u_beta)), remainder).
-        Args:
-            r1: average initial-state responsibilities (Kp1,)
-        Returns:
-            π* (detached, shape [Kp1])
-        """
-        K = self.p.K
-        alpha, kappa, gamma = self.p.alpha, self.p.kappa, self.p.gamma
-        ElogA = self._ElogA().detach()
-        r1 = r1.detach()
-
-        opt = torch.optim.Adam([self.u_beta], lr=lr)
-        for _ in range(steps):
-            opt.zero_grad(set_to_none=True)
-            beta = torch.sigmoid(self.u_beta)          # [K]
-            piK, rest = stick_breaking(beta)           # [K], scalar
-            pi = torch.cat([piK, rest.view(1)], dim=0) # [Kp1]
-            # Dirichlet prior rows a_k = α π + κ δ_k, with π sum=1
-            a = alpha * pi.unsqueeze(0) + kappa * torch.eye(K + 1, device=pi.device, dtype=pi.dtype)  # [Kp1,Kp1]
-            a = a.clamp(min=1e-8)  # avoid NaNs
-            # E_q[log p(Φ | π)] under q(Φ) with row-wise Dirichlet φ
-            const = (K + 1) * torch.lgamma(torch.tensor(alpha + kappa, device=pi.device, dtype=pi.dtype))
-            L1 = ((a - 1.0) * ElogA).sum() - torch.lgamma(a).sum() + const
-            # E_q[log p(h1 | π)]
-            L2 = torch.sum(r1 * torch.log(torch.clamp(pi, min=1e-30)))
-            # log p(β) with Beta(1,γ) sticks: ∑ (γ-1) log(1-β_k)
-            L3 = (gamma - 1.0) * torch.sum(torch.log(torch.clamp(1.0 - beta, min=1e-30)))
-            loss = -(L1 + L2 + L3)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_([self.u_beta], max_norm=10.0)
-            opt.step()
-            with torch.no_grad():
-                self.u_beta.clamp_(-10.0, 10.0)
-
-        with torch.no_grad():
-            beta = torch.sigmoid(self.u_beta)
-            piK, rest = stick_breaking(beta)
-            pi = torch.cat([piK, rest.view(1)], dim=0)
-        return pi.detach()
     
+    # ---- optimize u_beta -----------------------------------------------------
     @staticmethod
     def _optimize_u_beta(
         u_beta: torch.Tensor,
@@ -729,7 +686,9 @@ class StickyHDPHMMVI(nn.Module):
         gamma: float,
         K: int,
         steps: int = 200,
-        lr: float = 0.05
+        lr: float = 0.05,
+        early_stopping_patience: int = 10,
+        early_stopping_min_delta: float = 1e-5
     ) -> torch.Tensor:
         """
         Optimize global sticks β (via logits u_beta) using a β-restricted ELBO:
@@ -743,6 +702,8 @@ class StickyHDPHMMVI(nn.Module):
             K: number of explicit states
             steps: optimization steps
             lr: learning rate
+            early_stopping_patience: number of steps to wait for improvement before stopping
+            early_stopping_min_delta: minimum change in loss to be considered as improvement
         Returns:
             optimized u_beta (detached, shape [K])
         """
@@ -751,8 +712,13 @@ class StickyHDPHMMVI(nn.Module):
 
         u_beta_opt = u_beta.clone().requires_grad_(True)
         opt = torch.optim.Adam([u_beta_opt], lr=lr)
+        
+        # Early stopping variables
+        best_loss = float('inf')
+        patience_counter = 0
+        
         with torch.enable_grad():
-            for _ in range(steps):
+            for step in range(steps):
                 opt.zero_grad(set_to_none=True)
                 beta = torch.sigmoid(u_beta_opt)          # [K]
                 piK, rest = stick_breaking(beta)           # [K], scalar
@@ -768,6 +734,19 @@ class StickyHDPHMMVI(nn.Module):
                 # log p(β) with Beta(1,γ) sticks: ∑ (γ-1) log(1-β_k)
                 L3 = (gamma - 1.0) * torch.sum(torch.log(torch.clamp(1.0 - beta, min=1e-30)))
                 loss = -(L1 + L2 + L3)
+                
+                # Early stopping check
+                current_loss = loss.item()
+                if current_loss < best_loss - early_stopping_min_delta:
+                    best_loss = current_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= early_stopping_patience:
+                    # Early stopping triggered
+                    break
+                
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_([u_beta_opt], max_norm=10.0)
                 opt.step()
@@ -1025,6 +1004,8 @@ class StickyHDPHMMVI(nn.Module):
         optimize_pi: bool = True,                      # optimize π using mean r1
         pi_steps: int = 200,                           # π opt steps
         pi_lr: float = 0.05,                           # π opt learning rate
+        pi_early_stopping_patience: int = 10,         # early stopping patience for π optimization
+        pi_early_stopping_min_delta: float = 1e-5,    # early stopping min delta for π optimization
         logger: Optional[logging.Logger] = None        # for debug output
     ) -> Dict[str, torch.Tensor]:
         """
@@ -1243,7 +1224,9 @@ class StickyHDPHMMVI(nn.Module):
                 this_u_beta = StickyHDPHMMVI._optimize_u_beta(
                     this_u_beta, r1_mean, this_ElogA,
                     self.p.alpha, self.p.kappa, self.p.gamma, self.p.K,
-                    steps=pi_steps, lr=pi_lr
+                    steps=pi_steps, lr=pi_lr,
+                    early_stopping_patience=pi_early_stopping_patience, 
+                    early_stopping_min_delta=pi_early_stopping_min_delta
                 )
                 elbo_after_beta_all = self.calculate_elbo(
                     mu_t, diag_var_t, F_t, mask,

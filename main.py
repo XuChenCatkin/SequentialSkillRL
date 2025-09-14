@@ -376,7 +376,7 @@ if __name__ == "__main__":
             print(f"   📐 Latent dim: {hmm.p.D}")
             if metadata:
                 print(f"   🏷️  Round: {metadata.get('round', 'unknown')}")
-                print(f"   📅 Created: {metadata.get('created', 'unknown')}")
+                print(f"   📅 Created: {metadata.get('training_timestamp', 'unknown')}")
             
             # Load VAE model for encoding data
             print(f"🎨 Loading VAE model for data encoding...")
@@ -640,6 +640,12 @@ if __name__ == "__main__":
                 final_prior_blend_alpha=0.6,
                 prior_blend_shape='cosine'
             )
+            
+            # HMM Training Schedule:
+            # - EM Rounds 1-3: Only 1 HMM iteration per round (quick updates)
+            # - EM Round 4 (last): Up to 10 HMM iterations with pi optimization every iteration
+            # This allows fast initial learning followed by fine-grained optimization
+            
             model, hmm, training_info = train_vae_with_sticky_hmm_em(
                 # Load from HuggingFace
                 pretrained_hf_repo="CatkinChen/nethack-vae",
@@ -668,12 +674,14 @@ if __name__ == "__main__":
                 niw_nu0 = vae_config.latent_dim + 10,
                 streaming_rho_niw = 1.0,
                 streaming_rho_trans = 1.0,
-                max_iters = 10,
+                max_iters = 10,  # Used only in last round; first 3 rounds use 1 iteration
                 elbo_drop_tol = 0.01,  # 1% relative tolerance
                 elbo_tol = 0.01,       # 1% relative tolerance
-                optimize_pi_every_n_steps = 100,
-                pi_iters = 10,
-                pi_lr = 5.0e-4,
+                optimize_pi_every_n_steps = 1,  # Optimize pi in every iteration of the last round
+                pi_iters = 200,
+                pi_lr = 1.0e-3,
+                pi_early_stopping_patience = 5,  # Early stop if no improvement for 5 steps
+                pi_early_stopping_min_delta = 1e-3,  # Minimum improvement threshold
                 reset_to_prior = True,
                 reset_streaming = True,
                 reset_low_count_states = False,
@@ -918,7 +926,7 @@ if __name__ == "__main__":
             hmm_repo_id = None  # Will use dummy HMM
         else:
             hmm_config = HMMOnlineConfig(
-                hmm_update_every=50_000,   # Update HMM every 50k steps
+                hmm_update_every=5_120,   # Update HMM every ~5 rollouts
                 hmm_update_growth=1.30,    # Growth factor for update interval
                 hmm_update_every_cap=60_000, # Cap for update interval
                 hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
@@ -933,11 +941,13 @@ if __name__ == "__main__":
             vae_repo_id = "CatkinChen/nethack-vae-hmm"
             hmm_repo_id = "CatkinChen/nethack-hmm"
         
-        # VAE Online Configuration
+        # VAE Online Configuration - synchronized with HMM updates
         vae_config = VAEOnlineConfig(
-            update_every=20_480,       # Update VAE every ~20 rollouts
-            vae_lr=1e-4,              # Learning rate for VAE updates
-            blend_alpha=1.0           # Blending factor for VAE updates
+            vae_update_every=5_120,       # Match HMM update frequency  
+            vae_update_growth=1.30,       # Same growth pattern as HMM
+            vae_update_every_cap=60_000,  # Same cap as HMM
+            vae_lr=1e-4,                  # Learning rate for VAE updates
+            blend_alpha=1.0               # Blending factor for VAE updates
         )
         
         # RND Configuration (used only for RND ablation)

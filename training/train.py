@@ -112,6 +112,8 @@ def fit_sticky_hmm_one_pass(
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    pi_early_stopping_patience: int = 10,
+    pi_early_stopping_min_delta: float = 1e-5,
     max_batches: int | None = None, 
     batch_multiples: int = 1,
     logger=None, 
@@ -212,7 +214,10 @@ def fit_sticky_hmm_one_pass(
             hmm_out = hmm.update(mu_combined, var_combined, F_combined, mask=valid_combined, 
                                max_iters=max_iters, tol=elbo_tol, elbo_drop_tol=elbo_drop_tol, 
                                optimize_pi=((multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
-                               pi_steps=pi_iters, pi_lr=pi_lr, logger=logger)
+                               pi_steps=pi_iters, pi_lr=pi_lr,
+                               pi_early_stopping_patience=pi_early_stopping_patience,
+                               pi_early_stopping_min_delta=pi_early_stopping_min_delta,
+                               logger=logger)
 
             # Extract ELBO from HMM update
             inner_elbo = hmm_out.get('inner_elbo', torch.tensor(float('nan')))
@@ -273,6 +278,8 @@ def fit_sticky_hmm_with_batch_accumulation(
     max_batches: int | None = None,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    pi_early_stopping_patience: int = 10,
+    pi_early_stopping_min_delta: float = 1e-5,
     logger=None, 
     use_wandb: bool = False):
     """
@@ -442,7 +449,9 @@ def fit_sticky_hmm_with_batch_accumulation(
             optimized_u_beta = hmm._optimize_u_beta(
                 hmm.u_beta, r1_mean, ElogA_for_pi,
                 hmm.p.alpha, hmm.p.kappa, hmm.p.gamma, hmm.p.K,
-                steps=pi_iters, lr=pi_lr
+                steps=pi_iters, lr=pi_lr,
+                early_stopping_patience=pi_early_stopping_patience, 
+                early_stopping_min_delta=pi_early_stopping_min_delta
             )
             
             # Update β parameters
@@ -505,6 +514,8 @@ def fit_sticky_hmm_with_game_grouped_data(
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    pi_early_stopping_patience: int = 10,
+    pi_early_stopping_min_delta: float = 1e-5,
     max_games: int | None = None,
     logger=None, 
     use_wandb: bool = False):
@@ -622,7 +633,9 @@ def fit_sticky_hmm_with_game_grouped_data(
                 elbo_drop_tol=elbo_drop_tol, 
                 optimize_pi=((game_idx + 1) % optimize_pi_every_n_steps == 0), 
                 pi_steps=pi_iters, 
-                pi_lr=pi_lr, 
+                pi_lr=pi_lr,
+                pi_early_stopping_patience=pi_early_stopping_patience,
+                pi_early_stopping_min_delta=pi_early_stopping_min_delta,
                 logger=logger
             )
             
@@ -2005,6 +2018,8 @@ def train_vae_with_sticky_hmm_em(
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    pi_early_stopping_patience: int = 10,
+    pi_early_stopping_min_delta: float = 1e-5,
     reset_to_prior: bool = False,
     reset_streaming: bool = False,
     reset_low_count_states: bool = True,
@@ -2224,7 +2239,7 @@ def train_vae_with_sticky_hmm_em(
         if logger: logger.info(f"✅ Loaded pre-trained HMM: latent_dim={hmm.p.D}, skills={hmm.p.K+1}")
         if metadata:
             if logger: logger.info(f"   🏷️  HMM Round: {metadata.get('round', 'unknown')}")
-            if logger: logger.info(f"   📅 Created: {metadata.get('created', 'unknown')}")
+            if logger: logger.info(f"   📅 Created: {metadata.get('training_timestamp', 'unknown')}")
         
         # Verify HMM dimensions match VAE config
         if hmm.p.D != D:
@@ -2442,9 +2457,11 @@ def train_vae_with_sticky_hmm_em(
                 # Use game-grouped E-step
                 fit_sticky_hmm_with_game_grouped_data(
                     model, grouped_data, device, hmm, 
-                    max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
-                    optimize_pi_every_n_steps=optimize_pi_every_n_steps,
+                    max_iters=(max_iters if r == (em_rounds - 1) else 1), elbo_drop_tol=elbo_drop_tol,
+                    optimize_pi_every_n_steps=(optimize_pi_every_n_steps if r == (em_rounds - 1) else 1000),
                     pi_iters=pi_iters, pi_lr=pi_lr, 
+                    pi_early_stopping_patience=pi_early_stopping_patience,
+                    pi_early_stopping_min_delta=pi_early_stopping_min_delta,
                     max_games=max_games_per_estep,
                     logger=logger, use_wandb=use_wandb
                 )
@@ -2452,8 +2469,11 @@ def train_vae_with_sticky_hmm_em(
                 # Use standard batched E-step
                 fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
                                         max_iters=(max_iters if r == (em_rounds - 1) else 1), elbo_drop_tol=elbo_drop_tol, elbo_tol=elbo_tol,
-                                        optimize_pi_every_n_steps=optimize_pi_every_n_steps,
-                                        pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
+                                        optimize_pi_every_n_steps=(optimize_pi_every_n_steps if r == (em_rounds - 1) else 1000),
+                                        pi_iters=pi_iters, pi_lr=pi_lr,
+                                        pi_early_stopping_patience=pi_early_stopping_patience,
+                                        pi_early_stopping_min_delta=pi_early_stopping_min_delta,
+                                        batch_multiples=batch_multiples,
                                         logger=logger, use_wandb=use_wandb)
             
             # Optional: Additional batch accumulation pass after initial HMM fitting
@@ -2463,6 +2483,8 @@ def train_vae_with_sticky_hmm_em(
                     model, train_dataset, device, hmm,
                     max_batches=accumulation_max_batches,
                     pi_iters=pi_iters, pi_lr=pi_lr,
+                    pi_early_stopping_patience=pi_early_stopping_patience,
+                    pi_early_stopping_min_delta=pi_early_stopping_min_delta,
                     logger=logger, use_wandb=use_wandb
                 )
 

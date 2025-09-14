@@ -319,7 +319,7 @@ def train_online_ppo_with_pretrained_models(
         if logger: logger.info(f"✅ HMM model loaded successfully")
         if metadata:
             if logger: logger.info(f"   🏷️  HMM Round: {metadata.get('round', 'unknown')}")
-            if logger: logger.info(f"   📅 Created: {metadata.get('created', 'unknown')}")
+            if logger: logger.info(f"   📅 Created: {metadata.get('training_timestamp', 'unknown')}")
             
         # Create environment
         if logger: logger.info(f"🎮 Creating environment: {env_name}")
@@ -402,14 +402,16 @@ def train_online_ppo_with_pretrained_models(
                 rho_emission=0.1
             )
         
-        # Configure VAE online learning
+        # Configure VAE online learning - synchronized with HMM
         if vae_config is None:
             vae_config = VAEOnlineConfig(
-                update_every=20_480,
+                vae_update_every=10000,      # Match HMM update frequency
+                vae_update_growth=1.30,      # Same growth pattern as HMM
+                vae_update_every_cap=60000,  # Same cap as HMM
                 vae_lr=1e-4,
                 blend_alpha=1.0
             )
-            if logger: logger.info(f"🔄 Using default VAE config: update_every={vae_config.update_every}")
+            if logger: logger.info(f"🔄 Using default synchronized VAE config: update_every={vae_config.vae_update_every}")
         else:
             if logger: logger.info(f"🔄 Using provided VAE config")
         
