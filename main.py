@@ -23,12 +23,29 @@ Commands:
         Batch accumulation: Additional pass that freezes HMM, accumulates statistics, then batch updates
         VAE-only with HMM: Skip E-step HMM training, load pre-trained HMM, only train VAE with HMM prior
     
-    rl                             - Train online PPO agent with pretrained VAE+HMM models
-                                    Uses configuration objects for fine-grained control over:
-                                    - PPO hyperparameters (learning rate, rollout length, etc.)
-                                    - Curiosity-driven exploration (dynamics surprise, skill entropy, transition novelty)
-                                    - HMM online learning (update frequency, fitting window)
-                                    - Training setup (environment, device, logging, checkpointing)
+    rl [ablation_mode] [options]   - Train online PPO agent with pretrained VAE+HMM models
+                                    
+        Ablation Modes:
+            baseline               - VAE+HMM+PPO with curiosity (default)
+            no_hmm                 - VAE+PPO (no HMM integration)
+            rnd                    - VAE+HMM+PPO with RND instead of curiosity
+            no_intrinsic           - VAE+HMM+PPO with no intrinsic rewards
+            curiosity_dyn_only     - VAE+HMM+PPO with only dynamics surprise
+            curiosity_skill_only   - VAE+HMM+PPO with only skill entropy
+            curiosity_trans_only   - VAE+HMM+PPO with only transition novelty
+            
+        Options:
+            --env ENV_NAME         - Environment (default: MiniHack-Room-5x5-v0)
+            --steps N              - Total training steps (default: 1M)
+            --seed N               - Random seed (default: 42)
+            --wandb                - Enable W&B logging
+            --no_upload            - Disable HuggingFace uploads
+                                    
+        Uses configuration objects for fine-grained control over:
+        - PPO hyperparameters (learning rate, rollout length, etc.)
+        - Curiosity-driven exploration (dynamics surprise, skill entropy, transition novelty)
+        - HMM online learning (update frequency, fitting window)
+        - Training setup (environment, device, logging, checkpointing)
     
     vae_analysis <repo_name>       - Run VAE analysis and visualization
     bin_count_analysis [top_k]     - Analyze glyph character/color distributions  
@@ -44,7 +61,16 @@ Examples:
     python main.py train vae_hmm game_grouped
     python main.py train vae_only_with_hmm CatkinChen/nethack-hmm
     python main.py train vae_only_with_hmm CatkinChen/nethack-hmm 2
-    python main.py rl
+    
+    # RL Ablation Studies
+    python main.py rl                                    # Default: VAE+HMM+PPO with full curiosity
+    python main.py rl baseline --wandb                   # Same as default with W&B logging
+    python main.py rl no_hmm --steps 2000000             # VAE+PPO (no HMM)
+    python main.py rl rnd --env MiniHack-Quest-Medium-v0  # VAE+HMM+PPO with RND
+    python main.py rl no_intrinsic --seed 123            # VAE+HMM+PPO with no intrinsic rewards
+    python main.py rl curiosity_dyn_only                 # VAE+HMM+PPO with dynamics curiosity only
+    python main.py rl curiosity_skill_only               # VAE+HMM+PPO with skill entropy only
+    python main.py rl curiosity_trans_only               # VAE+HMM+PPO with transition novelty only
 """
 import logging
 import os
@@ -696,9 +722,60 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "rl":
         print(f"🎮 Reinforcement Learning mode activated")
         
+        # Parse ablation mode and options
+        ablation_mode = "baseline"  # default
+        env_name = "MiniHack-Room-5x5-v0"  # default
+        total_steps = 1_000_000  # default 1M steps
+        seed = 42  # default
+        use_wandb_flag = False
+        disable_upload = False
+        
+        # Parse command line arguments
+        i = 2
+        if len(sys.argv) > i and not sys.argv[i].startswith('--'):
+            ablation_mode = sys.argv[i]
+            i += 1
+        
+        while i < len(sys.argv):
+            if sys.argv[i] == '--env' and i + 1 < len(sys.argv):
+                env_name = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--steps' and i + 1 < len(sys.argv):
+                total_steps = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--seed' and i + 1 < len(sys.argv):
+                seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--wandb':
+                use_wandb_flag = True
+                i += 1
+            elif sys.argv[i] == '--no_upload':
+                disable_upload = True
+                i += 1
+            else:
+                print(f"⚠️  Unknown option: {sys.argv[i]}")
+                i += 1
+        
+        # Validate ablation mode
+        valid_modes = [
+            "baseline", "no_hmm", "rnd", "no_intrinsic",
+            "curiosity_dyn_only", "curiosity_skill_only", "curiosity_trans_only"
+        ]
+        if ablation_mode not in valid_modes:
+            print(f"❌ Invalid ablation mode: {ablation_mode}")
+            print(f"   Valid modes: {', '.join(valid_modes)}")
+            sys.exit(1)
+        
+        print(f"🔬 Ablation Study Mode: {ablation_mode}")
+        print(f"🎮 Environment: {env_name}")
+        print(f"📊 Total Steps: {total_steps:,}")
+        print(f"🌱 Seed: {seed}")
+        print(f"📊 W&B Logging: {use_wandb_flag}")
+        print(f"☁️  HF Upload: {not disable_upload}")
+        
         # Set up logging with file output
         os.makedirs("logs", exist_ok=True)  # Create logs directory
-        log_filename = f"logs/rl_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_filename = f"logs/rl_{ablation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -712,14 +789,16 @@ if __name__ == "__main__":
         
         print(f"📝 Logging to file: {log_filename}")
         
-        # Example of using config objects for fine-grained control
-        # You can customize any aspect of training by modifying these configs
+        # Calculate PPO updates from total steps
+        num_envs = 8
+        rollout_len = 128
+        ppo_updates = total_steps // (num_envs * rollout_len)
         
-        # PPO Configuration
+        # Base PPO Configuration (same for all ablations)
         ppo_config = PPOConfig(
-            num_envs=8,
-            rollout_len=128,
-            total_updates=1000,  # Reduced for demo
+            num_envs=num_envs,
+            rollout_len=rollout_len,
+            total_updates=ppo_updates,
             minibatch_size=512,
             epochs_per_update=4,
             gamma=0.999,
@@ -730,48 +809,129 @@ if __name__ == "__main__":
             max_grad_norm=0.5,
             learning_rate=3e-4,
             vf_learning_rate=None,  # Use same as learning_rate
-            policy_uses_skill=True,
+            policy_uses_skill=True,  # Will be overridden for no_hmm mode
             deterministic_eval=True
         )
         
-        # Curiosity Configuration - Enable all intrinsic rewards
-        curiosity_config = CuriosityConfig(
-            use_dyn_kl=True,           # Dynamics surprise
-            use_skill_entropy=True,    # Skill entropy with boundary gating
-            use_skill_transition_novelty=True,  # Skill transition novelty
-            use_rnd=False,             # Disable RND for this demo
+        # Configure curiosity and RND based on ablation mode
+        if ablation_mode == "baseline":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=True,           # Dynamics surprise
+                use_skill_entropy=True,    # Skill entropy with boundary gating
+                use_skill_transition_novelty=True,  # Skill transition novelty
+                use_rnd=False,
+                # Standard annealing
+                eta0_dyn=1.0, tau_dyn=3e6,
+                eta0_hdp=1.0, tau_hdp=3e6,
+                eta0_stn=1.0, tau_stn=3e6,
+                # Skill boundary gating
+                use_skill_boundary_gate=True,
+                gate_delta_eps=1e-3,
+                ema_beta=0.99, eps=1e-8
+            )
+            description = "VAE+HMM+PPO with full curiosity (dynamics + skill entropy + transition novelty)"
             
-            # Annealing parameters
-            eta0_dyn=1.0,
-            tau_dyn=3e6,
-            eta0_hdp=1.0,
-            tau_hdp=3e6,
-            eta0_stn=1.0,
-            tau_stn=3e6,
+        elif ablation_mode == "no_hmm":
+            ppo_config.policy_uses_skill = False  # No skill features for policy
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=True,           # Only dynamics surprise (no skill-based rewards)
+                use_skill_entropy=False,   # No skill entropy without HMM
+                use_skill_transition_novelty=False,  # No skill transitions without HMM
+                use_rnd=False,
+                eta0_dyn=1.0, tau_dyn=3e6,
+                ema_beta=0.99, eps=1e-8
+            )
+            description = "VAE+PPO (no HMM) with dynamics curiosity only"
             
-            # Skill boundary gating
-            use_skill_boundary_gate=True,
-            gate_delta_eps=1e-3,
+        elif ablation_mode == "rnd":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,          # Disable curiosity components
+                use_skill_entropy=False,
+                use_skill_transition_novelty=False,
+                use_rnd=True,              # Enable RND
+                eta0_rnd=0.25, tau_rnd=3e6,
+                ema_beta=0.99, eps=1e-8
+            )
+            description = "VAE+HMM+PPO with RND intrinsic motivation"
             
-            # EMA normalization
-            ema_beta=0.99,
-            eps=1e-8
-        )
+        elif ablation_mode == "no_intrinsic":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,          # Disable all intrinsic rewards
+                use_skill_entropy=False,
+                use_skill_transition_novelty=False,
+                use_rnd=False,
+                ema_beta=0.99, eps=1e-8
+            )
+            description = "VAE+HMM+PPO with no intrinsic rewards (extrinsic only)"
+            
+        elif ablation_mode == "curiosity_dyn_only":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=True,           # Only dynamics surprise
+                use_skill_entropy=False,
+                use_skill_transition_novelty=False,
+                use_rnd=False,
+                eta0_dyn=1.0, tau_dyn=3e6,
+                ema_beta=0.99, eps=1e-8
+            )
+            description = "VAE+HMM+PPO with dynamics curiosity only"
+            
+        elif ablation_mode == "curiosity_skill_only":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,
+                use_skill_entropy=True,    # Only skill entropy
+                use_skill_transition_novelty=False,
+                use_rnd=False,
+                eta0_hdp=1.0, tau_hdp=3e6,
+                use_skill_boundary_gate=True,
+                gate_delta_eps=1e-3,
+                ema_beta=0.99, eps=1e-8
+            )
+            description = "VAE+HMM+PPO with skill entropy curiosity only"
+            
+        elif ablation_mode == "curiosity_trans_only":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,
+                use_skill_entropy=False,
+                use_skill_transition_novelty=True,  # Only skill transition novelty
+                use_rnd=False,
+                eta0_stn=1.0, tau_stn=3e6,
+                ema_beta=0.99, eps=1e-8
+            )
+            description = "VAE+HMM+PPO with skill transition novelty only"
         
-        # HMM Online Learning Configuration
-        hmm_config = HMMOnlineConfig(
-            hmm_update_every=50_000,   # Update HMM every 50k steps
-            hmm_update_growth=1.30,    # New: growth factor for update interval
-            hmm_update_every_cap=60_000, # New: cap for update interval
-            hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
-            hmm_max_iters=7,
-            hmm_tol=1e-2,
-            hmm_elbo_drop_tol=1e-2,
-            rho_emission=0.05,         # Streaming blend rate
-            rho_transition=None,       # Use same as emission
-            optimise_pi=True,
-            reset_low_count_states=5e-4
-        )
+        # HMM Online Learning Configuration (disabled for no_hmm mode)
+        if ablation_mode == "no_hmm":
+            # Use dummy HMM config (won't be used)
+            hmm_config = HMMOnlineConfig(
+                hmm_update_every=float('inf'),  # Never update
+                hmm_fit_window=1,
+                hmm_max_iters=1,
+                hmm_tol=1e-2,
+                hmm_elbo_drop_tol=1e-2,
+                rho_emission=0.0,
+                rho_transition=None,
+                optimise_pi=False,
+                reset_low_count_states=None
+            )
+            # Set VAE repo to VAE-only model
+            vae_repo_id = "CatkinChen/nethack-vae"
+            hmm_repo_id = None  # Will use dummy HMM
+        else:
+            hmm_config = HMMOnlineConfig(
+                hmm_update_every=50_000,   # Update HMM every 50k steps
+                hmm_update_growth=1.30,    # Growth factor for update interval
+                hmm_update_every_cap=60_000, # Cap for update interval
+                hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
+                hmm_max_iters=7,
+                hmm_tol=1e-2,
+                hmm_elbo_drop_tol=1e-2,
+                rho_emission=0.05,         # Streaming blend rate
+                rho_transition=None,       # Use same as emission
+                optimise_pi=True,
+                reset_low_count_states=5e-4
+            )
+            vae_repo_id = "CatkinChen/nethack-vae-hmm"
+            hmm_repo_id = "CatkinChen/nethack-hmm"
         
         # VAE Online Configuration
         vae_config = VAEOnlineConfig(
@@ -780,7 +940,7 @@ if __name__ == "__main__":
             blend_alpha=1.0           # Blending factor for VAE updates
         )
         
-        # RND Configuration (not used in this demo, but shown for completeness)
+        # RND Configuration (used only for RND ablation)
         rnd_config = RNDConfig(
             proj_dim=128,
             hidden=256,
@@ -789,10 +949,10 @@ if __name__ == "__main__":
         )
         
         # Training Configuration
-        run_name = f"online_ppo_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        run_name = f"ablation_{ablation_mode}_{env_name.replace('-', '_')}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         train_config = TrainConfig(
-            env_id='MiniHack-Room-5x5-v0',
-            seed=42,
+            env_id=env_name,
+            seed=seed,
             device='cuda' if torch.cuda.is_available() else 'cpu',
             log_dir=f"./runs/{run_name}",
             save_every=25_000,
@@ -800,35 +960,64 @@ if __name__ == "__main__":
             eval_episodes=10
         )
         
-        print(f"🔧 Training Configuration:")
+        print(f"\n🔧 Ablation Configuration:")
+        print(f"   Description: {description}")
         print(f"   Environment: {train_config.env_id}")
         print(f"   Device: {train_config.device}")
-        print(f"   Total Steps: {ppo_config.num_envs * ppo_config.rollout_len * ppo_config.total_updates:,}")
+        print(f"   Total Steps: {total_steps:,}")
         print(f"   PPO Updates: {ppo_config.total_updates:,}")
-        print(f"   Curiosity: Dynamics={curiosity_config.use_dyn_kl}, Entropy={curiosity_config.use_skill_entropy}, Transition={curiosity_config.use_skill_transition_novelty}")
-        print(f"   HMM Updates: Every {hmm_config.hmm_update_every:,} steps (growth={hmm_config.hmm_update_growth}, cap={hmm_config.hmm_update_every_cap:,})")
-        print(f"   VAE Updates: Every {vae_config.update_every:,} steps (lr={vae_config.vae_lr}, blend_alpha={vae_config.blend_alpha})")
+        print(f"   Policy Uses Skills: {ppo_config.policy_uses_skill}")
+        print(f"   VAE Repository: {vae_repo_id}")
+        print(f"   HMM Repository: {hmm_repo_id if hmm_repo_id else 'None (no HMM)'}")
+        print(f"\n🧠 Intrinsic Rewards:")
+        print(f"   Dynamics KL: {curiosity_config.use_dyn_kl}")
+        print(f"   Skill Entropy: {curiosity_config.use_skill_entropy}")
+        print(f"   Skill Transition: {curiosity_config.use_skill_transition_novelty}")
+        print(f"   RND: {curiosity_config.use_rnd}")
+        if ablation_mode != "no_hmm":
+            print(f"\n🔄 HMM Updates:")
+            print(f"   Every: {hmm_config.hmm_update_every:,} steps")
+            print(f"   Growth: {hmm_config.hmm_update_growth}")
+            print(f"   Cap: {hmm_config.hmm_update_every_cap:,}")
+        print(f"\n🎨 VAE Updates:")
+        print(f"   Every: {vae_config.update_every:,} steps")
+        print(f"   Learning Rate: {vae_config.vae_lr}")
         
-        # Train with config objects (recommended approach)
-        results = train_online_ppo_with_pretrained_models(
-            env_name=train_config.env_id,
-            vae_repo_id="CatkinChen/nethack-vae-hmm",
-            hmm_repo_id="CatkinChen/nethack-hmm",
+        # Train with the configured ablation
+        try:
+            results = train_online_ppo_with_pretrained_models(
+                env_name=train_config.env_id,
+                vae_repo_id=vae_repo_id,
+                hmm_repo_id=hmm_repo_id,
+                
+                # Use config objects for full control
+                ppo_config=ppo_config,
+                curiosity_config=curiosity_config,
+                hmm_config=hmm_config,
+                vae_config=vae_config,
+                rnd_config=rnd_config,
+                train_config=train_config,
+                
+                # Monitoring and uploading
+                use_wandb=use_wandb_flag,
+                wandb_project="SequentialSkillRL-Ablations",
+                wandb_run_name=run_name,
+                wandb_tags=["ablation", ablation_mode, env_name.split('-')[1] if '-' in env_name else env_name],
+                wandb_notes=f"Ablation study: {description}",
+                
+                push_to_hub=not disable_upload,
+                hub_repo_id=f"CatkinChen/nethack-ppo-ablation-{ablation_mode}",
+                hf_upload_artifacts=True,
+                logger=logger,
+            )
             
-            # Use config objects for full control
-            ppo_config=ppo_config,
-            curiosity_config=curiosity_config,
-            hmm_config=hmm_config,
-            vae_config=vae_config,
-            rnd_config=rnd_config,
-            train_config=train_config,
+            print(f"\n🎉 Ablation study '{ablation_mode}' completed successfully!")
+            print(f"📊 Run name: {run_name}")
+            print(f"📁 Results: {results.get('final_checkpoint', 'N/A')}")
             
-            # Monitoring and uploading
-            use_wandb=False,
-            wandb_project="SequentialSkillRL",
-            wandb_run_name=run_name,
-            push_to_hub=False,
-            hub_repo_id="CatkinChen/nethack-ppo-with-vae-hmm",
-            hf_upload_artifacts=True,
-            logger=logger,
-        )
+        except Exception as e:
+            print(f"\n❌ Ablation study '{ablation_mode}' failed: {e}")
+            import traceback
+            traceback.print_exc()
+            logger.error(f"Ablation study failed", exc_info=True)
+            sys.exit(1)
