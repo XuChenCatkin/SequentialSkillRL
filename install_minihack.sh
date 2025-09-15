@@ -3,7 +3,22 @@
 
 set -e  # Exit on any error
 
+# Ensure PATH includes common poetry installation locations
+export PATH="$HOME/.local/bin:$PATH"
+
 echo "🔧 Installing MiniHack for SequentialSkillRL..."
+
+# Check if poetry is available
+if ! command -v poetry &> /dev/null; then
+    echo "❌ Error: poetry command not found. Please install poetry first:"
+    echo "   sudo apt install -y pipx"
+    echo "   pipx install poetry"
+    echo "   pipx ensurepath"
+    echo "   source ~/.bashrc  # or restart terminal"
+    exit 1
+fi
+
+echo "✅ Found poetry: $(poetry --version)"
 
 # Ensure we're in the right directory
 if [ ! -d "minihack" ]; then
@@ -24,7 +39,7 @@ pip install minihack/dist/minihack-1.0.2+95b11cc-py3-none-any.whl --force-reinst
 
 # Install remaining dependencies
 echo "📚 Installing remaining dependencies..."
-poetry install --only-root
+poetry install
 
 # Test installation
 echo "🧪 Testing installation..."

@@ -32,7 +32,18 @@ sudo apt install -y pipx
 pipx install poetry
 pipx ensurepath
 ```
-Then relaunch the terminal.
+**⚠️ Important**: After installing Poetry, you MUST restart your terminal or source your shell profile:
+```bash
+source ~/.bashrc   # For bash users
+# OR
+source ~/.zshrc    # For zsh users
+# OR simply close and reopen your terminal
+```
+
+Verify Poetry installation:
+```bash
+poetry --version
+```
 
 ### 4. Build MiniHack Wheel (Required for Proper Environment Registration)
 ```bash
@@ -43,17 +54,20 @@ cd ..
 
 ### 5. Install Dependencies
 ```bash
-# Option 1: Use the provided installation script (recommended)
+# Option 1: Use the provided installation script (recommended - installs everything)
 ./install_minihack.sh
 
-# Option 2: Manual installation
-# Install MiniHack wheel directly with pip (bypasses Poetry hash issues)
+# Option 2: Install all dependencies with Poetry (simple one-command approach)
+poetry install
+
+# Option 3: Manual step-by-step installation
+# First build and install MiniHack wheel (bypasses Poetry hash issues)
+cd minihack && python setup.py bdist_wheel && cd ..
 pip install minihack/dist/minihack-1.0.2+95b11cc-py3-none-any.whl --force-reinstall
+# Then install all other dependencies
+poetry install
 
-# Install remaining Poetry dependencies
-poetry install --only-root
-
-# Option 3: If you prefer to use poetry install, you may need to update the lock file first
+# Option 4: If Poetry fails due to lock file issues, update and install
 poetry lock && poetry install
 ```
 
@@ -100,6 +114,13 @@ poetry run python training/online_rl.py test
 
 ## Troubleshooting
 
+### Poetry Command Not Found
+If you see "poetry: command not found" when running `./install_minihack.sh`:
+1. Ensure Poetry is installed: `pipx install poetry`
+2. Update your PATH: `pipx ensurepath`
+3. **Restart your terminal** or run: `source ~/.bashrc`
+4. Verify: `poetry --version`
+
 ### MiniHack Environments Not Found
 If you see "0 MiniHack environments found", ensure you:
 1. Built the MiniHack wheel: `cd minihack && python setup.py bdist_wheel`
@@ -107,14 +128,25 @@ If you see "0 MiniHack environments found", ensure you:
 3. Updated submodules: `git submodule update --init --recursive`
 
 ### Poetry Installation Issues
-If Poetry fails to install MiniHack due to hash mismatches:
+If Poetry fails to install dependencies:
 ```bash
-# Option 1: Use pip directly (recommended)
-pip install minihack/dist/minihack-1.0.2+95b11cc-py3-none-any.whl --force-reinstall
-poetry install --only-root
+# Option 1: Simple Poetry install (works in most cases)
+poetry install
 
-# Option 2: Update Poetry lock file
+# Option 2: Use the fixed installation script (recommended)
+./install_minihack.sh
+
+# Option 3: Manual step-by-step (for MiniHack issues)
+cd minihack && python setup.py bdist_wheel && cd ..
+pip install minihack/dist/minihack-1.0.2+95b11cc-py3-none-any.whl --force-reinstall
+poetry install
+
+# Option 4: Update Poetry lock file if there are hash mismatches
 poetry lock && poetry install
+
+# Option 5: Clear Poetry cache and reinstall
+poetry cache clear --all .
+poetry install
 ```
 
 ### CMake Issues

@@ -952,8 +952,7 @@ if __name__ == "__main__":
             vae_update_every=5_120,       # Match HMM update frequency  
             vae_update_growth=1.30,       # Same growth pattern as HMM
             vae_update_every_cap=60_000,  # Same cap as HMM
-            vae_lr=1e-4,                  # Learning rate for VAE updates
-            blend_alpha=1.0               # Blending factor for VAE updates
+            vae_lr=1e-4                   # Learning rate for VAE updates
         )
         
         # RND Configuration (used only for RND ablation)

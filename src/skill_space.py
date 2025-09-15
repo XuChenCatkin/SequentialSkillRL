@@ -811,6 +811,7 @@ class StickyHDPHMMVI(nn.Module):
         self.S_M1.copy_(S1)
         self.S_M2.copy_(S2)
         self.S_counts.copy_(counts)
+        self._no_stats = False
 
     # ---- ELBO component calculations ----------------------------------------
     @staticmethod

@@ -405,6 +405,10 @@ def train_online_ppo_with_pretrained_models(
                 pi_early_stopping_min_delta=1e-5
             )
         
+        if hmm_model is not None:
+            hmm_model.stream_rho_niw = hmm_config.rho_emission
+            hmm_model.stream_rho_trans = hmm_config.rho_transition
+        
         # Configure VAE online learning - synchronized with HMM
         if vae_config is None:
             vae_config = VAEOnlineConfig(
@@ -412,12 +416,20 @@ def train_online_ppo_with_pretrained_models(
                 vae_update_growth=1.30,      # Same growth pattern as HMM
                 vae_update_every_cap=60000,  # Same cap as HMM
                 vae_lr=1e-4,
-                blend_alpha=1.0
+                training_config=config
             )
             if logger: logger.info(f"🔄 Using default synchronized VAE config: update_every={vae_config.vae_update_every}")
         else:
+            vae_config.training_config = config
             if logger: logger.info(f"🔄 Using provided VAE config")
-        
+
+        if hmm_repo_id is None and hmm_config.hmm_update_every == float('inf'):
+            vae_config.training_config.prior_mode = "standard"
+            if logger: logger.info(f"   - VAE prior mode set to 'standard' for online training without HMM")
+        else:
+            vae_config.training_config.prior_mode = "hmm"
+            if logger: logger.info(f"   - VAE prior mode set to 'hmm' for online training")
+
         # Create PPO trainer
         if logger: logger.info("🚀 Initializing PPO trainer...")
         trainer = PPOTrainer(
@@ -493,7 +505,7 @@ def train_online_ppo_with_pretrained_models(
         if logger: logger.info("🏋️  Starting PPO training...")
         start_time = time.time()
 
-        trainer.train()
+        trainer.train(logger)
         
         training_time = time.time() - start_time
         if logger: logger.info(f"⏱️  Training completed in {training_time:.2f} seconds")

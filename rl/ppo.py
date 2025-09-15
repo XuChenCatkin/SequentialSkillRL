@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, time, math, json, random, dataclasses
+import os, time, math, json, random, dataclasses, logging
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, Dict, List
 
@@ -17,7 +17,7 @@ from nle import nethack  # action id space (615)
 # --- your code ---
 from src.model import MultiModalHackVAE, VAEConfig, vae_loss
 from src.skill_space import StickyHDPHMMVI, StickyHDPHMMParams, NIWPrior
-from src.data_collection import NetHackDataCollector
+from src.data_collection import NetHackDataCollector, one_hot
 from utils.action_utils import ACTION_DIM, KEYPRESS_INDEX_MAPPING
 
 # KL helper already used by your VAE loss
@@ -99,10 +99,10 @@ class VAEOnlineConfig:
     span_len: int = 64                      # random short spans for stability/memory
     mini_batch_B: int = 32                  # number of random spans per step
     # VAE loss coefficients for online training (lighter than offline)
+    training_config: VAEConfig = VAEConfig()  # use default VAEConfig
     mi_beta: float = 0.1                    # Mutual information beta (lighter online)
     tc_beta: float = 0.1                    # Total correlation beta
     dw_beta: float = 0.1                    # Dimension-wise KL beta
-    blend_alpha: float = 1.0                # Use HMM prior blending during online training (100% HMM)
 
 @dataclass
 class RNDConfig:
@@ -775,17 +775,15 @@ class PPOTrainer:
         self.global_steps = 0
         self.last_hmm_refresh = 0
         self._hmm_interval = self.hmm_cfg.hmm_update_every
-        # Online VAE full training - synchronized with HMM updates
-        self.vae_online = VAEOnlineConfig()
         self.last_vae_refresh = 0
-        self._vae_interval = self.vae_online.vae_update_every  # Track VAE update interval
+        self._vae_interval = self.vae_cfg.vae_update_every  # Track VAE update interval
         self.vae_opt = None
         # Enable full VAE training instead of just world model
         if self.vae is not None:
             # Unfreeze all VAE parameters for full training
             for p in self.vae.parameters():
                 p.requires_grad_(True)
-            self.vae_opt = torch.optim.Adam(self.vae.parameters(), lr=self.vae_online.vae_lr)
+            self.vae_opt = torch.optim.Adam(self.vae.parameters(), lr=self.vae_cfg.vae_lr)
         os.makedirs(run_cfg.log_dir, exist_ok=True)
         self._log_file = os.path.join(run_cfg.log_dir, "metrics.jsonl")
         # --- HMM filtering state (per-env) and cached E[log A] ---
@@ -800,6 +798,19 @@ class PPOTrainer:
         self.data_collector = NetHackDataCollector()
         self._hero_info = [None for _ in range(ppo_cfg.num_envs)]  # Current hero info per env [role, race, gender, alignment]
         self._episode_start = [True for _ in range(ppo_cfg.num_envs)]  # Track if we need to parse hero info
+
+        # --- Replay buffers for model updates ---
+        self.replay_mu = []
+        self.replay_logvar = []
+        self.replay_lowrank_factors = []
+        self.replay_actions = []
+        self.replay_obs_chars = []
+        self.replay_obs_colors = []
+        self.replay_obs_blstats = []
+        self.replay_obs_message = []
+        self.replay_obs_hero_info = []
+        self.replay_rewards = []
+        self.replay_dones = []
 
     # --------------------------- rollout -------------------------------------
 
@@ -896,7 +907,7 @@ class PPOTrainer:
         return logits.masked_fill(~self.action_mask, -1e9)
 
     @torch.no_grad()
-    def collect_rollout(self):
+    def collect_rollout(self, logger: Optional[logging.Logger] = None):
         self.buf.reset()
         # Continue from previous observation state (set in train() method)
         obs = self._obs
@@ -906,6 +917,10 @@ class PPOTrainer:
             s_wm = self._world_model_state
         else:
             s_wm = self.vae.world_model.initial_state(self.ppo_cfg.num_envs, device=self.device) if self.vae.world_model.enabled else None
+
+        # Track episode statistics for logging
+        episode_returns = [0.0] * self.ppo_cfg.num_envs
+        episode_lengths = [0] * self.ppo_cfg.num_envs
 
         for t in range(self.ppo_cfg.rollout_len):
             enc = self._encode_obs(obs)
@@ -956,6 +971,30 @@ class PPOTrainer:
             next_obs, rew, terminated, truncated, info = self.envs.step(a_local.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             
+            # Update episode statistics and log completions
+            for env_idx in range(self.ppo_cfg.num_envs):
+                episode_returns[env_idx] += rew[env_idx]
+                episode_lengths[env_idx] += 1
+                
+                if done[env_idx]:
+                    # Log episode completion
+                    if logger is not None:
+                        logger.info(f"🎮 Episode completed (env {env_idx}): return={episode_returns[env_idx]:.2f}, length={episode_lengths[env_idx]}")
+                        
+                    # Extract game message if available
+                    message = ""
+                    if hasattr(next_obs, '__getitem__') and 'message' in next_obs:
+                        try:
+                            message = message_ascii_to_string(next_obs['message'][env_idx])
+                        except:
+                            message = ""
+                    if logger is not None and len(message) > 0:
+                        logger.info(f"💬 Final game message (env {env_idx}): {message[:200]}{'...' if len(message)>200 else ''}")
+                    
+                    # Reset episode tracking for this environment
+                    episode_returns[env_idx] = 0.0
+                    episode_lengths[env_idx] = 0
+            
             # Create mask: all collected steps are valid (no padding in rollout)
             step_mask = torch.ones(self.ppo_cfg.num_envs, dtype=torch.float32, device=self.device)
             
@@ -998,6 +1037,57 @@ class PPOTrainer:
             self._world_model_state = s_wm
         
         self._obs = obs
+        
+        # Append rollout data to replay buffers for model updates
+        with torch.no_grad():
+            # Get observations and latents from current rollout
+            mu_bt = self.buf.mu.transpose(0,1)          # [B,T,D]
+            logvar_bt = self.buf.logvar.transpose(0,1)  # [B,T,D]
+            lowrank_bt = self.buf.lowrank_factors.transpose(0,1) if self.buf.lowrank_factors is not None else None  # [B,T,D,R] or None
+            acts_bt = self.buf.actions.transpose(0,1)   # [B,T]
+            
+            obs_chars_bt = self.buf.obs_chars.transpose(0,1) if self.buf.obs_chars is not None else None      # [B,T,21,79]
+            obs_colors_bt = self.buf.obs_colors.transpose(0,1) if self.buf.obs_colors is not None else None  # [B,T,21,79]
+            obs_blstats_bt = self.buf.obs_blstats.transpose(0,1) if self.buf.obs_blstats is not None else None  # [B,T,blstats_dim]
+            obs_message_bt = self.buf.obs_message.transpose(0,1) if self.buf.obs_message is not None else None  # [B,T,256]
+            obs_hero_info_bt = self.buf.obs_hero_info.transpose(0,1) if self.buf.obs_hero_info is not None else None  # [B,T,4]
+            
+            # Get extrinsic rewards and done flags for VAE training
+            rewards_bt = self.buf.rews_e.transpose(0,1)  # [B,T] - extrinsic rewards only
+            dones_bt = self.buf.dones.transpose(0,1)     # [B,T] - done flags
+            
+            # Build replay buffers using class attributes
+            if len(self.replay_actions) == 0:
+                # First rollout - initialize replay buffers
+                self.replay_mu = [mu_bt]
+                self.replay_logvar = [logvar_bt]
+                self.replay_lowrank_factors = [lowrank_bt] if lowrank_bt is not None else []
+                self.replay_actions = [acts_bt]
+                self.replay_rewards = [rewards_bt]
+                self.replay_dones = [dones_bt]
+                
+                if obs_chars_bt is not None:
+                    self.replay_obs_chars = [obs_chars_bt]
+                    self.replay_obs_colors = [obs_colors_bt]
+                    self.replay_obs_blstats = [obs_blstats_bt]
+                    self.replay_obs_message = [obs_message_bt]
+                    self.replay_obs_hero_info = [obs_hero_info_bt]
+            else:
+                # Append new rollout data
+                self.replay_mu.append(mu_bt)
+                self.replay_logvar.append(logvar_bt)
+                if lowrank_bt is not None:
+                    self.replay_lowrank_factors.append(lowrank_bt)
+                self.replay_actions.append(acts_bt)
+                self.replay_rewards.append(rewards_bt)
+                self.replay_dones.append(dones_bt)
+                
+                if obs_chars_bt is not None:
+                    self.replay_obs_chars.append(obs_chars_bt)
+                    self.replay_obs_colors.append(obs_colors_bt)
+                    self.replay_obs_blstats.append(obs_blstats_bt)
+                    self.replay_obs_message.append(obs_message_bt)
+                    self.replay_obs_hero_info.append(obs_hero_info_bt)
 
     # --------------------------- compute advantages --------------------------
 
@@ -1173,8 +1263,7 @@ class PPOTrainer:
 
     # --------------------------- HMM / VAE refresh ---------------------------
 
-    def maybe_refresh_models(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, 
-                            replay_actions: torch.Tensor, replay_mask: torch.Tensor, replay_lowrank_factors: torch.Tensor = None):
+    def maybe_refresh_models(self, logger: Optional[logging.Logger] = None):
         """
         Synchronized HMM and VAE updates. Updates happen together when either interval is reached.
         This ensures coordinated learning between the skill discovery (HMM) and representation (VAE).
@@ -1184,23 +1273,104 @@ class PPOTrainer:
         
         # Update both models if either is ready (synchronized updates)
         if hmm_ready or vae_ready:
-            print(f"🔄 Synchronized model update at step {self.global_steps:,}")
-            print(f"   HMM interval: {self._hmm_interval:,}, VAE interval: {self._vae_interval:,}")
+            if logger is not None:
+                logger.info(f"🔄 Synchronized model update at step {self.global_steps:,}")
+                logger.info(f"   HMM interval: {self._hmm_interval:,}, VAE interval: {self._vae_interval:,}")
             
-            # Always update HMM when synchronized update occurs
-            if hmm_ready:
-                self._refresh_hmm(replay_mu, replay_logvar, replay_mask, replay_lowrank_factors)
-                print(f"   ✅ HMM updated (next in {self._hmm_interval:,} steps)")
+            # Check if we have replay data
+            if len(self.replay_actions) == 0:
+                if logger is not None:
+                    logger.warning("No replay data available for model updates, skipping")
+                return
             
-            # Always update VAE when synchronized update occurs  
-            if vae_ready:
-                self._refresh_vae(replay_mu, replay_logvar, replay_actions, replay_mask)
-                print(f"   ✅ VAE updated (next in {self._vae_interval:,} steps)")
+            # Combine all replay data
+            combined_mu = torch.cat(self.replay_mu, dim=1) if len(self.replay_mu) > 0 else None
+            combined_logvar = torch.cat(self.replay_logvar, dim=1) if len(self.replay_logvar) > 0 else None
+            combined_lowrank_factors = torch.cat(self.replay_lowrank_factors, dim=1) if len(self.replay_lowrank_factors) > 0 else None
+            combined_actions = torch.cat(self.replay_actions, dim=1)
+            combined_rewards = torch.cat(self.replay_rewards, dim=1)  # Extrinsic rewards
+            combined_dones = torch.cat(self.replay_dones, dim=1)      # Done flags
+            
+            combined_obs_chars = torch.cat(self.replay_obs_chars, dim=1) if len(self.replay_obs_chars) > 0 else None
+            combined_obs_colors = torch.cat(self.replay_obs_colors, dim=1) if len(self.replay_obs_colors) > 0 else None
+            combined_obs_blstats = torch.cat(self.replay_obs_blstats, dim=1) if len(self.replay_obs_blstats) > 0 else None
+            combined_obs_message = torch.cat(self.replay_obs_message, dim=1) if len(self.replay_obs_message) > 0 else None
+            combined_obs_hero_info = torch.cat(self.replay_obs_hero_info, dim=1) if len(self.replay_obs_hero_info) > 0 else None
+            
+            # Crop to window size for all replay buffers (no mask needed - all steps are valid)
+            current_window_size = combined_actions.size(1)
+            if current_window_size > self.hmm_cfg.hmm_fit_window:
+                s = current_window_size - self.hmm_cfg.hmm_fit_window
+                combined_mu = combined_mu[:, s:, :] if combined_mu is not None else None
+                combined_logvar = combined_logvar[:, s:, :] if combined_logvar is not None else None
+                combined_lowrank_factors = combined_lowrank_factors[:, s:, :, :] if combined_lowrank_factors is not None else None
+                combined_actions = combined_actions[:, s:]
+                combined_rewards = combined_rewards[:, s:] 
+                combined_dones = combined_dones[:, s:]
+                
+                # Crop observations too
+                if combined_obs_chars is not None:
+                    combined_obs_chars = combined_obs_chars[:, s:, :, :]
+                    combined_obs_colors = combined_obs_colors[:, s:, :, :]
+                    combined_obs_blstats = combined_obs_blstats[:, s:, :]
+                    combined_obs_message = combined_obs_message[:, s:, :]
+                    combined_obs_hero_info = combined_obs_hero_info[:, s:, :]
+            
+            # Create a valid mask for the entire window (all steps are valid in PPO online training)
+            B, T = combined_actions.shape
+            valid_mask = torch.ones(B, T, device=self.device)
+            
+            # HMM update (uses latent representations that we already have)
+            if hmm_ready and combined_mu is not None:
+                self._refresh_hmm(combined_mu, combined_logvar, valid_mask, combined_lowrank_factors, logger)
+                if logger is not None:
+                    logger.info(f"   ✅ HMM updated (next in {self._hmm_interval:,} steps)")
+                # Reset only HMM-related replay buffers
+                self._reset_hmm_replay_buffers()
+            
+            # VAE update (uses raw observations)  
+            if vae_ready and combined_obs_chars is not None:
+                self._refresh_vae(combined_actions, valid_mask,
+                                 combined_obs_chars, combined_obs_colors, combined_obs_blstats, 
+                                 combined_obs_message, combined_obs_hero_info,
+                                 combined_rewards, combined_dones, logger)
+                if logger is not None:
+                    logger.info(f"   ✅ VAE updated (next in {self._vae_interval:,} steps)")
+                # Reset only VAE-related replay buffers
+                self._reset_vae_replay_buffers()
+
+    def _reset_replay_buffers(self):
+        """Reset replay buffers to prevent memory accumulation."""
+        # This method is kept for backward compatibility but now calls separate resets
+        self._reset_hmm_replay_buffers()
+        self._reset_vae_replay_buffers()
+    
+    def _reset_hmm_replay_buffers(self):
+        """Reset HMM-related replay buffers after HMM refresh."""
+        self.replay_mu = []
+        self.replay_logvar = []
+        self.replay_lowrank_factors = []
+    
+    def _reset_vae_replay_buffers(self):
+        """Reset VAE-related replay buffers after VAE refresh."""
+        self.replay_actions = []
+        self.replay_rewards = []
+        self.replay_dones = []
+        self.replay_obs_chars = []
+        self.replay_obs_colors = []
+        self.replay_obs_blstats = []
+        self.replay_obs_message = []
+        self.replay_obs_hero_info = []
 
     @torch.no_grad()
-    def _refresh_hmm(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, replay_mask: torch.Tensor, replay_lowrank_factors: torch.Tensor = None):
+    def _refresh_hmm(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, replay_mask: torch.Tensor, replay_lowrank_factors: torch.Tensor = None, logger: Optional[logging.Logger] = None):
         """Internal HMM update method."""
         B,T,D = replay_mu.shape
+        
+        # Log HMM refresh start
+        if logger is not None:
+            logger.info(f"🔄 HMM refresh starting at step {self.global_steps:,} with replay size {B}x{T}")
+        
         # run full VI update on the window
         out = self.hmm.update(
             mu_t=replay_mu, diag_var_t=replay_logvar.exp(), F_t=replay_lowrank_factors, mask=replay_mask,
@@ -1208,7 +1378,7 @@ class PPOTrainer:
             optimize_pi=self.hmm_cfg.optimise_pi,
             pi_steps=self.hmm_cfg.pi_steps, pi_lr=self.hmm_cfg.pi_lr,
             pi_early_stopping_patience=self.hmm_cfg.pi_early_stopping_patience,
-            pi_early_stopping_min_delta=self.hmm_cfg.pi_early_stopping_min_delta
+            pi_early_stopping_min_delta=self.hmm_cfg.pi_early_stopping_min_delta, logger=logger
         )
         # refresh cached ElogA used by the online filter
         self._ElogA = self.hmm._ElogA()
@@ -1238,55 +1408,74 @@ class PPOTrainer:
             "hmm_update/pi_early_stopping_min_delta": float(self.hmm_cfg.pi_early_stopping_min_delta),
             "steps": self.global_steps
         })
+        
+        # Log HMM refresh completion
+        if logger is not None:
+            num_states = self.hmm.niw.mu.size(0) - 1  # Exclude remainder state
+            status = "converged" if bool(out.get("converged", False)) else "max iters"
+            logger.info(f"   HMM refresh complete: ELBO={float(out.get('loglik', 0.0)):.4f}, iters={int(out.get('n_iters', 0))}, {status}, states={num_states}")
 
-    def _refresh_vae(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, 
-                     replay_actions: torch.Tensor, replay_mask: torch.Tensor):
+    def _refresh_vae(self, replay_actions: torch.Tensor, replay_mask: torch.Tensor,
+                     replay_obs_chars: torch.Tensor = None, replay_obs_colors: torch.Tensor = None,
+                     replay_obs_blstats: torch.Tensor = None, replay_obs_message: torch.Tensor = None,
+                     replay_obs_hero_info: torch.Tensor = None, 
+                     replay_rewards: torch.Tensor = None, replay_dones: torch.Tensor = None,
+                     logger: Optional[logging.Logger] = None):
         """Internal VAE update method."""
-        # Check if we have stored observations
-        if self.buf.obs_chars is None:
-            print("⚠️ No observations stored for full VAE training, skipping...")
+        # Check if we have stored observations in the replay buffer
+        if replay_obs_chars is None:
+            if logger is not None:
+                logger.warning("⚠️ No observations stored in replay buffer for VAE training, skipping...")
             return
+            
+        B, T = replay_obs_chars.shape[:2]
+        
+        # Log VAE refresh start
+        if logger is not None:
+            logger.info(f"🔄 VAE refresh starting at step {self.global_steps:,} with replay size {B}x{T}")
 
         device = self.device
-        B, T, D = replay_mu.shape
-        span = min(self.vae_online.span_len, T)
+        span = min(self.vae_cfg.span_len, T)
         if span < 2:
+            if logger is not None:
+                logger.warning(f"⚠️ Span length {span} too short for VAE training, skipping...")
             return
 
         # Set VAE to training mode
         self.vae.train()
         
-        for step in range(self.vae_online.vae_steps_per_call):
-            # Sample mini-batch of random spans
-            b_idx = torch.randint(low=0, high=B, size=(self.vae_online.mini_batch_B,), device=device)
-            t0 = torch.randint(low=0, high=max(1, T - span), size=(self.vae_online.mini_batch_B,), device=device)
+        final_loss = 0.0
+        
+        # Choose between span sampling and full buffer usage based on buffer size
+        total_valid_timesteps = B * T  # All timesteps are valid in PPO online training
+        use_full_buffer = total_valid_timesteps <= 2048  # Use full buffer if reasonable size
+        
+        if use_full_buffer:
+            # Use entire buffer for more complete training
+            if logger is not None:
+                logger.info(f"   Using full buffer ({total_valid_timesteps} timesteps)")
             
-            # Gather observation spans and create batches
-            batch_list = []
-            for bi, t in zip(b_idx.tolist(), t0.tolist()):
-                if t + span > T or not self.buf.mask[t:t+span, bi].all():
-                    continue  # Skip invalid spans
-                
-                batch_list.append({
-                    'game_chars': self.buf.obs_chars[t:t+span, bi],      # [span, 21, 79]
-                    'game_colors': self.buf.obs_colors[t:t+span, bi],    # [span, 21, 79]
-                    'blstats': self.buf.obs_blstats[t:t+span, bi],       # [span, blstats_dim]
-                    'message_chars': self.buf.obs_message[t:t+span, bi], # [span, 256]
-                    'hero_info': self.buf.obs_hero_info[t:t+span, bi],   # [span, 4]
-                    'valid_screen': torch.ones(span, dtype=torch.bool, device=device)
-                })
+            # Gather all valid timesteps from replay buffer
+            valid_mask = torch.ones(B, T, dtype=torch.bool, device=device)  # All timesteps are valid in PPO online training
+            all_chars = replay_obs_chars.view(-1, 21, 79)      # [B*T, 21, 79]
+            all_colors = replay_obs_colors.view(-1, 21, 79)    # [B*T, 21, 79]
+            all_blstats = replay_obs_blstats.view(-1, replay_obs_blstats.shape[-1])  # [B*T, blstats_dim]
+            all_message = replay_obs_message.view(-1, 256)     # [B*T, 256]
+            all_hero_info = replay_obs_hero_info.view(-1, 4)   # [B*T, 4]
+            all_actions = replay_actions.view(-1)              # [B*T]
             
-            if not batch_list:
-                continue  # No valid spans found
-                
-            # Concatenate all spans into a single batch
-            # Reshape from [num_spans, span_len, ...] to [num_spans * span_len, ...]
-            all_chars = torch.cat([b['game_chars'] for b in batch_list], dim=0)
-            all_colors = torch.cat([b['game_colors'] for b in batch_list], dim=0)
-            all_blstats = torch.cat([b['blstats'] for b in batch_list], dim=0)
-            all_message = torch.cat([b['message_chars'] for b in batch_list], dim=0)
-            all_hero_info = torch.cat([b['hero_info'] for b in batch_list], dim=0)
-            all_valid = torch.cat([b['valid_screen'] for b in batch_list], dim=0)
+            # Create action_onehot using one_hot encoding
+            all_action_onehot = one_hot(all_actions, ACTION_DIM)  # [B*T, ACTION_DIM]
+            
+            # Create has_next: True for all timesteps except the last in each sequence
+            all_has_next = torch.zeros(B*T, dtype=torch.bool, device=device)
+            for b in range(B):
+                for t in range(T-1):  # All except last timestep in sequence
+                    all_has_next[b*T + t] = True
+            
+            # Use real extrinsic rewards and done targets (not dummy zeros)
+            all_reward_target = replay_rewards.view(-1).float() if replay_rewards is not None else torch.zeros(B*T, dtype=torch.float32, device=device)
+            all_done_target = replay_dones.view(-1).float() if replay_dones is not None else torch.zeros(B*T, dtype=torch.float32, device=device)
             
             combined_batch = {
                 'game_chars': all_chars,
@@ -1294,52 +1483,134 @@ class PPOTrainer:
                 'blstats': all_blstats,
                 'message_chars': all_message,
                 'hero_info': all_hero_info,
-                'valid_screen': all_valid,
-                'batch_size': len(batch_list),
-                'original_batch_shape': (len(batch_list), span)
+                'valid_screen': torch.ones(B*T, dtype=torch.bool, device=device),
+                'action_onehot': all_action_onehot,
+                'has_next': all_has_next,
+                'reward_target': all_reward_target,
+                'done_target': all_done_target,
+                'original_batch_shape': (B, T)  # For sequential processing in VAE
             }
             
-            # Add HMM cache for prior blending if blend_alpha > 0
-            if self.vae_online.blend_alpha > 0.0:
-                # Get current HMM parameters for prior computation
-                Kp1 = self.hmm.niw.mu.size(0)
+            # Single training step with full buffer
+            vae_steps_to_run = 1
+        else:
+            # Use span sampling for large buffers
+            if logger is not None:
+                logger.info(f"   Using span sampling ({total_valid_timesteps} timesteps, too large for full buffer)")
+            vae_steps_to_run = self.vae_cfg.vae_steps_per_call
+        
+        for step in range(vae_steps_to_run):
+            if not use_full_buffer:
+                # Sample random spans from replay buffer
+                b_idx = torch.randint(low=0, high=B, size=(self.vae_cfg.mini_batch_B,), device=device)
+                t0 = torch.randint(low=0, high=max(1, T - span), size=(self.vae_cfg.mini_batch_B,), device=device)
                 
-                # Encode the batch to get latent representations
-                with torch.no_grad():
-                    enc_output = self.vae.encode(
-                        combined_batch['game_chars'], combined_batch['game_colors'], 
-                        combined_batch['blstats'], combined_batch['message_chars'], 
-                        combined_batch['hero_info']
-                    )
-                    mu_encoded = enc_output['mu']  # [total_samples, D]
+                # Gather observation spans and create batches from replay buffer
+                batch_list = []
+                for bi, t in zip(b_idx.tolist(), t0.tolist()):
+                    if t + span > T:
+                        continue  # Skip invalid spans
+                    
+                    # Extract span data
+                    span_chars = replay_obs_chars[bi, t:t+span]      # [span, 21, 79]
+                    span_colors = replay_obs_colors[bi, t:t+span]    # [span, 21, 79]
+                    span_blstats = replay_obs_blstats[bi, t:t+span]  # [span, blstats_dim]
+                    span_message = replay_obs_message[bi, t:t+span]  # [span, 256]
+                    span_hero_info = replay_obs_hero_info[bi, t:t+span]  # [span, 4]
+                    span_actions = replay_actions[bi, t:t+span]      # [span]
+                    
+                    # Extract real reward and done data for this span
+                    span_rewards = replay_rewards[bi, t:t+span] if replay_rewards is not None else torch.zeros(span, dtype=torch.float32, device=device)
+                    span_dones = replay_dones[bi, t:t+span] if replay_dones is not None else torch.zeros(span, dtype=torch.bool, device=device)
+                    
+                    # Create action_onehot using one_hot encoding
+                    span_action_onehot = one_hot(span_actions, ACTION_DIM)  # [span, ACTION_DIM]
+                    
+                    # Create has_next: True for all timesteps except the last in span
+                    span_has_next = torch.zeros(span, dtype=torch.bool, device=device)
+                    span_has_next[:-1] = True  # All except last timestep in span
+                    
+                    # Use real extrinsic rewards and done targets (not dummy zeros)
+                    span_reward_target = span_rewards.float()
+                    span_done_target = span_dones.float()
+                    
+                    batch_list.append({
+                        'game_chars': span_chars,
+                        'game_colors': span_colors,
+                        'blstats': span_blstats,
+                        'message_chars': span_message,
+                        'hero_info': span_hero_info,
+                        'valid_screen': torch.ones(span, dtype=torch.bool, device=device),
+                        'action_onehot': span_action_onehot,
+                        'has_next': span_has_next,
+                        'reward_target': span_reward_target,
+                        'done_target': span_done_target
+                    })
                 
-                # Get HMM responsibilities for these latents  
-                # Use diagonal covariance approximation for efficiency
-                diagvar_encoded = enc_output['logvar'].exp().clamp_min(1e-6)
-                r_hat = self.hmm.predict_posterior(mu_encoded.unsqueeze(0), diagvar_encoded.unsqueeze(0), None, 
-                                                 torch.ones(1, mu_encoded.size(0), device=device)).squeeze(0)  # [total_samples, Kp1]
+                if not batch_list:
+                    continue  # No valid spans found
                 
-                combined_batch['hmm_cache'] = {
-                    'mu_k': self.hmm.niw.mu,  # [Kp1, D] 
-                    'E_Lambda': self.hmm._get_E_Lambda(),  # [Kp1, D, D]
-                    'logdet_Sigma_k': self.hmm._get_E_logdet_Lambda(),  # [Kp1]
-                    'r_hat_flat': r_hat  # [total_samples, Kp1]
+                # Concatenate all spans into a single batch
+                # Reshape from [num_spans, span_len, ...] to [num_spans * span_len, ...]
+                all_chars = torch.cat([b['game_chars'] for b in batch_list], dim=0)
+                all_colors = torch.cat([b['game_colors'] for b in batch_list], dim=0)
+                all_blstats = torch.cat([b['blstats'] for b in batch_list], dim=0)
+                all_message = torch.cat([b['message_chars'] for b in batch_list], dim=0)
+                all_hero_info = torch.cat([b['hero_info'] for b in batch_list], dim=0)
+                all_valid = torch.cat([b['valid_screen'] for b in batch_list], dim=0)
+                all_action_onehot = torch.cat([b['action_onehot'] for b in batch_list], dim=0)
+                all_has_next = torch.cat([b['has_next'] for b in batch_list], dim=0)
+                all_reward_target = torch.cat([b['reward_target'] for b in batch_list], dim=0)
+                all_done_target = torch.cat([b['done_target'] for b in batch_list], dim=0)
+                
+                # Calculate combined batch shape for sequential processing
+                num_spans = len(batch_list)
+                span_len = batch_list[0]['game_chars'].shape[0]
+                
+                combined_batch = {
+                    'game_chars': all_chars,
+                    'game_colors': all_colors,
+                    'blstats': all_blstats,
+                    'message_chars': all_message,
+                    'hero_info': all_hero_info,
+                    'valid_screen': all_valid,
+                    'action_onehot': all_action_onehot,
+                    'has_next': all_has_next,
+                    'reward_target': all_reward_target,
+                    'done_target': all_done_target,
+                    'original_batch_shape': (num_spans, span_len)  # For sequential processing in VAE
                 }
             
-            # Forward pass through VAE
+            # Forward pass through VAE to get complete model output (like train.py)
             self.vae_opt.zero_grad()
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(device.type == 'cuda')):
+            with torch.amp.autocast('cuda', enabled=False):
                 model_output = self.vae(combined_batch)
+                
+                # Get HMM responsibilities for the encoded latents (no gradients for HMM)
+                with torch.no_grad():
+                    mu_encoded = model_output['mu']  # [total_samples, D]
+                    diagvar_encoded = model_output['logvar'].exp().clamp_min(1e-6)
+                    r_hat = self.hmm.predict_posterior(
+                        mu_encoded.unsqueeze(0), diagvar_encoded.unsqueeze(0), None, 
+                        torch.ones(1, mu_encoded.size(0), device=device)
+                    ).squeeze(0)  # [total_samples, Kp1]
+                    
+                    # Add HMM cache to the batch for VAE loss computation
+                    combined_batch['hmm_cache'] = {
+                        'mu_k': self.hmm.niw.mu,  # [Kp1, D] 
+                        'E_Lambda': self.hmm._get_E_Lambda(),  # [Kp1, D, D]
+                        'logdet_Sigma_k': self.hmm._get_E_logdet_Lambda(),  # [Kp1]
+                        'r_hat_flat': r_hat  # [total_samples, Kp1]
+                    }
                 
                 # Calculate VAE loss with lighter coefficients for online training
                 vae_loss_dict = vae_loss(
                     model_output=model_output,
                     batch=combined_batch,
-                    config=self.vae.config,
-                    mi_beta=self.vae_online.mi_beta,
-                    tc_beta=self.vae_online.tc_beta,
-                    dw_beta=self.vae_online.dw_beta,
-                    prior_blend_alpha=self.vae_online.blend_alpha
+                    config=self.vae_cfg.training_config,
+                    mi_beta=self.vae_cfg.mi_beta,
+                    tc_beta=self.vae_cfg.tc_beta,
+                    dw_beta=self.vae_cfg.dw_beta
                 )
                 loss = vae_loss_dict['total_loss']
             
@@ -1348,30 +1619,37 @@ class PPOTrainer:
             torch.nn.utils.clip_grad_norm_(self.vae.parameters(), 1.0)
             self.vae_opt.step()
             
-            # Log VAE training metrics
-            if step == 0:  # Log only on first step to avoid spam
+            # Track final loss
+            final_loss = float(loss.detach().item())
+            
+            # Log VAE training metrics (only on first step to avoid spam)
+            if step == 0:
                 self._log_scalar({
                     "vae/total_loss": float(loss.detach().item()),
                     "vae/raw_loss": float(vae_loss_dict['total_raw_loss'].item()),
-                    "vae/mi_beta": self.vae_online.mi_beta,
-                    "vae/tc_beta": self.vae_online.tc_beta,
-                    "vae/dw_beta": self.vae_online.dw_beta,
+                    "vae/mi_beta": self.vae_cfg.mi_beta,
+                    "vae/tc_beta": self.vae_cfg.tc_beta,
+                    "vae/dw_beta": self.vae_cfg.dw_beta,
                     "vae/training_triggered": 1.0,  # Flag that VAE training occurred
-                    "vae/spans_processed": float(len(batch_list)),
+                    "vae/timesteps_processed": float(total_valid_timesteps),
                     "steps": self.global_steps
                 })
         
         self.last_vae_refresh = self.global_steps
         # Relax VAE update cadence (same as HMM)
-        self._vae_interval = min(int(self._vae_interval * self.vae_online.vae_update_growth),
-                                 self.vae_online.vae_update_every_cap)
+        self._vae_interval = min(int(self._vae_interval * self.vae_cfg.vae_update_growth),
+                                 self.vae_cfg.vae_update_every_cap)
         
         # Set VAE back to eval mode for inference
         self.vae.eval()
+        
+        # Log VAE refresh completion
+        if logger is not None:
+            logger.info(f"   VAE refresh complete: loss={final_loss:.4f}, training_steps={vae_steps_to_run}, replay_timesteps={total_valid_timesteps}")
 
     # --------------------------- main train loop -----------------------------
 
-    def train(self):
+    def train(self, logger: Optional[logging.Logger] = None):
         set_seed(self.run_cfg.seed)
         # Reset environments only once at the beginning of training
         # After this, collect_rollout() will continue from the current state
@@ -1382,9 +1660,6 @@ class PPOTrainer:
         self._update_hero_info_from_obs(obs)
         
         self._obs = obs
-
-        # maintain a growing replay window of latents for HMM refresh
-        replay_mu, replay_logvar, replay_mask, replay_actions, replay_lowrank_factors = None, None, None, None, None
 
         # Calculate total training parameters for progress tracking
         total_env_steps = self.ppo_cfg.total_updates * self.ppo_cfg.rollout_len * self.ppo_cfg.num_envs
@@ -1412,7 +1687,7 @@ class PPOTrainer:
         while self.global_steps < total_env_steps:
             update_start_time = time.time()
             
-            self.collect_rollout()
+            self.collect_rollout(logger)
             bonuses = self._compute_intrinsic_for_buffer()
             # skills for policy (concat to z) during PPO update: use the SAME features we acted with
             skills_for_policy = self.buf.skill.transpose(0,1) if (self.ppo_cfg.policy_uses_skill and self.buf.skill is not None) else None  # [T,B,K]
@@ -1429,36 +1704,8 @@ class PPOTrainer:
                 for _ in range(self.rnd_cfg.update_per_rollout):
                     self.curiosity.train_rnd(mu_flat)
 
-            # append to replay window for HMM refresh
-            with torch.no_grad():
-                mu_bt     = self.buf.mu.transpose(0,1)     # [B,T,D]
-                logvar_bt = self.buf.logvar.transpose(0,1) # [B,T,D]
-                mask_bt   = self.buf.mask.transpose(0,1)   # [B,T]
-                acts_bt   = self.buf.actions.transpose(0,1)           # [B,T]
-                lowrank_bt = self.buf.lowrank_factors.transpose(0,1) if self.buf.lowrank_factors is not None else None  # [B,T,D,R] or None
-                if replay_mu is None:
-                    replay_mu, replay_logvar, replay_mask, replay_actions, replay_lowrank_factors = mu_bt, logvar_bt, mask_bt, acts_bt, lowrank_bt
-                else:
-                    # concatenate, then crop to window
-                    replay_mu = torch.cat([replay_mu, mu_bt], dim=1)
-                    replay_logvar = torch.cat([replay_logvar, logvar_bt], dim=1)
-                    replay_mask = torch.cat([replay_mask, mask_bt], dim=1)
-                    replay_actions = torch.cat([replay_actions, acts_bt], dim=1)
-                    if lowrank_bt is not None and replay_lowrank_factors is not None:
-                        replay_lowrank_factors = torch.cat([replay_lowrank_factors, lowrank_bt], dim=1)
-                    elif lowrank_bt is not None:
-                        replay_lowrank_factors = lowrank_bt
-                    if replay_mu.size(1) > self.hmm_cfg.hmm_fit_window:
-                        s = replay_mu.size(1) - self.hmm_cfg.hmm_fit_window
-                        replay_mu = replay_mu[:, s:, :]
-                        replay_logvar = replay_logvar[:, s:, :]
-                        replay_mask = replay_mask[:, s:]
-                        replay_actions = replay_actions[:, s:]
-                        if replay_lowrank_factors is not None:
-                            replay_lowrank_factors = replay_lowrank_factors[:, s:, :, :]
-
             # Use synchronized model updates for coordinated learning
-            self.maybe_refresh_models(replay_mu, replay_logvar, replay_actions, replay_mask, replay_lowrank_factors)
+            self.maybe_refresh_models(logger)
 
             # logging
             intrinsic_mean = intrinsic.mean()
