@@ -919,7 +919,10 @@ if __name__ == "__main__":
                 rho_emission=0.0,
                 rho_transition=None,
                 optimise_pi=False,
-                reset_low_count_states=None
+                pi_steps=200,
+                pi_lr=0.05,
+                pi_early_stopping_patience=10,
+                pi_early_stopping_min_delta=1e-5
             )
             # Set VAE repo to VAE-only model
             vae_repo_id = "CatkinChen/nethack-vae"
@@ -930,13 +933,16 @@ if __name__ == "__main__":
                 hmm_update_growth=1.30,    # Growth factor for update interval
                 hmm_update_every_cap=60_000, # Cap for update interval
                 hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
-                hmm_max_iters=7,
+                hmm_max_iters=5,          # Up to 5 iterations per update
                 hmm_tol=1e-2,
                 hmm_elbo_drop_tol=1e-2,
-                rho_emission=0.05,         # Streaming blend rate
+                rho_emission=0.05,        # Streaming blend rate
                 rho_transition=None,       # Use same as emission
                 optimise_pi=True,
-                reset_low_count_states=5e-4
+                pi_steps=10,               # π optimization steps
+                pi_lr=5e-4,                # π optimization learning rate
+                pi_early_stopping_patience=1,    # Early stopping patience
+                pi_early_stopping_min_delta=1e-2 # Early stopping min delta
             )
             vae_repo_id = "CatkinChen/nethack-vae-hmm"
             hmm_repo_id = "CatkinChen/nethack-hmm"
@@ -990,7 +996,7 @@ if __name__ == "__main__":
             print(f"   Growth: {hmm_config.hmm_update_growth}")
             print(f"   Cap: {hmm_config.hmm_update_every_cap:,}")
         print(f"\n🎨 VAE Updates:")
-        print(f"   Every: {vae_config.update_every:,} steps")
+        print(f"   Every: {vae_config.vae_update_every:,} steps")
         print(f"   Learning Rate: {vae_config.vae_lr}")
         
         # Train with the configured ablation

@@ -244,8 +244,7 @@ def train_online_ppo_with_pretrained_models(
                     "hmm_elbo_drop_tol": hmm_config.hmm_elbo_drop_tol,
                     "rho_emission": hmm_config.rho_emission,
                     "rho_transition": hmm_config.rho_transition,
-                    "optimise_pi": hmm_config.optimise_pi,
-                    "reset_low_count_states": hmm_config.reset_low_count_states
+                    "optimise_pi": hmm_config.optimise_pi
                 },
                 # RND Configuration
                 "rnd": {
@@ -399,7 +398,11 @@ def train_online_ppo_with_pretrained_models(
         if hmm_config is None:
             hmm_config = HMMOnlineConfig(
                 hmm_update_every=10000,
-                rho_emission=0.1
+                rho_emission=0.1,
+                pi_steps=200,
+                pi_lr=0.05,
+                pi_early_stopping_patience=10,
+                pi_early_stopping_min_delta=1e-5
             )
         
         # Configure VAE online learning - synchronized with HMM

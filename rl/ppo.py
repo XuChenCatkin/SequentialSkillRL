@@ -78,11 +78,15 @@ class HMMOnlineConfig:
     hmm_fit_window: int = 400_000           # how many most recent steps to re-fit on
     hmm_max_iters: int = 7                  # inner VI iterations
     hmm_tol: float = 1e-2                   # relative ELBO tolerance
-    hmm_elbo_drop_tol: float = 1e-2
+    hmm_elbo_drop_tol: float = 1e-2         # relative ELBO drop tolerance for early stopping
     rho_emission: float = 0.05              # streaming blend
     rho_transition: Optional[float] = None  # default to rho_emission if None
-    optimise_pi: bool = True
-    reset_low_count_states: Optional[float] = 5e-4  # if occupancy below this, reset NIW to prior
+    optimise_pi: bool = True                # optimize π using mean r1
+    # π optimization parameters
+    pi_steps: int = 200                     # π optimization steps
+    pi_lr: float = 0.05                     # π optimization learning rate
+    pi_early_stopping_patience: int = 10   # early stopping patience for π optimization
+    pi_early_stopping_min_delta: float = 1e-5  # early stopping min delta for π optimization
 
 @dataclass
 class VAEOnlineConfig:
@@ -1170,7 +1174,7 @@ class PPOTrainer:
     # --------------------------- HMM / VAE refresh ---------------------------
 
     def maybe_refresh_models(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, 
-                            replay_actions: torch.Tensor, replay_mask: torch.Tensor):
+                            replay_actions: torch.Tensor, replay_mask: torch.Tensor, replay_lowrank_factors: torch.Tensor = None):
         """
         Synchronized HMM and VAE updates. Updates happen together when either interval is reached.
         This ensures coordinated learning between the skill discovery (HMM) and representation (VAE).
@@ -1185,7 +1189,7 @@ class PPOTrainer:
             
             # Always update HMM when synchronized update occurs
             if hmm_ready:
-                self._refresh_hmm(replay_mu, replay_logvar, replay_mask)
+                self._refresh_hmm(replay_mu, replay_logvar, replay_mask, replay_lowrank_factors)
                 print(f"   ✅ HMM updated (next in {self._hmm_interval:,} steps)")
             
             # Always update VAE when synchronized update occurs  
@@ -1194,23 +1198,46 @@ class PPOTrainer:
                 print(f"   ✅ VAE updated (next in {self._vae_interval:,} steps)")
 
     @torch.no_grad()
-    def _refresh_hmm(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, replay_mask: torch.Tensor):
+    def _refresh_hmm(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, replay_mask: torch.Tensor, replay_lowrank_factors: torch.Tensor = None):
         """Internal HMM update method."""
         B,T,D = replay_mu.shape
         # run full VI update on the window
         out = self.hmm.update(
-            mu_t=replay_mu, diag_var_t=replay_logvar.exp(), F_t=None, mask=replay_mask,
+            mu_t=replay_mu, diag_var_t=replay_logvar.exp(), F_t=replay_lowrank_factors, mask=replay_mask,
             max_iters=self.hmm_cfg.hmm_max_iters, tol=self.hmm_cfg.hmm_tol, elbo_drop_tol=self.hmm_cfg.hmm_elbo_drop_tol,
-            rho=self.hmm_cfg.rho_emission, optimize_pi=self.hmm_cfg.optimise_pi, offline=False
+            optimize_pi=self.hmm_cfg.optimise_pi,
+            pi_steps=self.hmm_cfg.pi_steps, pi_lr=self.hmm_cfg.pi_lr,
+            pi_early_stopping_patience=self.hmm_cfg.pi_early_stopping_patience,
+            pi_early_stopping_min_delta=self.hmm_cfg.pi_early_stopping_min_delta
         )
         # refresh cached ElogA used by the online filter
         self._ElogA = self.hmm._ElogA()
-        if self.hmm_cfg.reset_low_count_states is not None:
-            self.hmm.reset_low_count_states(self.hmm_cfg.reset_low_count_states)
+        
         self.last_hmm_refresh = self.global_steps
         # relax cadence
         self._hmm_interval = min(int(self._hmm_interval * self.hmm_cfg.hmm_update_growth),
                                 self.hmm_cfg.hmm_update_every_cap)
+        
+        # Log HMM update diagnostics
+        self._log_scalar({
+            "hmm_update/final_elbo": float(out.get("loglik", 0.0)),
+            "hmm_update/iterations_used": int(out.get("n_iters", 0)),
+            "hmm_update/converged": bool(out.get("converged", False)),
+            "hmm_update/pi_optimization_iterations": int(out.get("pi_n_iters", 0)),
+            "hmm_update/pi_converged": bool(out.get("pi_converged", False)),
+            "hmm_update/effective_batch_size": int(B),
+            "hmm_update/sequence_length": int(T),
+            "hmm_update/rho_emission": float(self.hmm_cfg.rho_emission),
+            "hmm_update/rho_transition": float(self.hmm_cfg.rho_transition if self.hmm_cfg.rho_transition is not None else self.hmm_cfg.rho_emission),
+            "hmm_update/max_iters": int(self.hmm_cfg.hmm_max_iters),
+            "hmm_update/tolerance": float(self.hmm_cfg.hmm_tol),
+            "hmm_update/elbo_drop_tolerance": float(self.hmm_cfg.hmm_elbo_drop_tol),
+            "hmm_update/pi_steps": int(self.hmm_cfg.pi_steps),
+            "hmm_update/pi_lr": float(self.hmm_cfg.pi_lr),
+            "hmm_update/pi_early_stopping_patience": int(self.hmm_cfg.pi_early_stopping_patience),
+            "hmm_update/pi_early_stopping_min_delta": float(self.hmm_cfg.pi_early_stopping_min_delta),
+            "steps": self.global_steps
+        })
 
     def _refresh_vae(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, 
                      replay_actions: torch.Tensor, replay_mask: torch.Tensor):
@@ -1357,7 +1384,7 @@ class PPOTrainer:
         self._obs = obs
 
         # maintain a growing replay window of latents for HMM refresh
-        replay_mu, replay_logvar, replay_mask, replay_actions = None, None, None, None
+        replay_mu, replay_logvar, replay_mask, replay_actions, replay_lowrank_factors = None, None, None, None, None
 
         # Calculate total training parameters for progress tracking
         total_env_steps = self.ppo_cfg.total_updates * self.ppo_cfg.rollout_len * self.ppo_cfg.num_envs
@@ -1408,23 +1435,30 @@ class PPOTrainer:
                 logvar_bt = self.buf.logvar.transpose(0,1) # [B,T,D]
                 mask_bt   = self.buf.mask.transpose(0,1)   # [B,T]
                 acts_bt   = self.buf.actions.transpose(0,1)           # [B,T]
+                lowrank_bt = self.buf.lowrank_factors.transpose(0,1) if self.buf.lowrank_factors is not None else None  # [B,T,D,R] or None
                 if replay_mu is None:
-                    replay_mu, replay_logvar, replay_mask, replay_actions = mu_bt, logvar_bt, mask_bt, acts_bt
+                    replay_mu, replay_logvar, replay_mask, replay_actions, replay_lowrank_factors = mu_bt, logvar_bt, mask_bt, acts_bt, lowrank_bt
                 else:
                     # concatenate, then crop to window
                     replay_mu = torch.cat([replay_mu, mu_bt], dim=1)
                     replay_logvar = torch.cat([replay_logvar, logvar_bt], dim=1)
                     replay_mask = torch.cat([replay_mask, mask_bt], dim=1)
                     replay_actions = torch.cat([replay_actions, acts_bt], dim=1)
+                    if lowrank_bt is not None and replay_lowrank_factors is not None:
+                        replay_lowrank_factors = torch.cat([replay_lowrank_factors, lowrank_bt], dim=1)
+                    elif lowrank_bt is not None:
+                        replay_lowrank_factors = lowrank_bt
                     if replay_mu.size(1) > self.hmm_cfg.hmm_fit_window:
                         s = replay_mu.size(1) - self.hmm_cfg.hmm_fit_window
                         replay_mu = replay_mu[:, s:, :]
                         replay_logvar = replay_logvar[:, s:, :]
                         replay_mask = replay_mask[:, s:]
                         replay_actions = replay_actions[:, s:]
+                        if replay_lowrank_factors is not None:
+                            replay_lowrank_factors = replay_lowrank_factors[:, s:, :, :]
 
             # Use synchronized model updates for coordinated learning
-            self.maybe_refresh_models(replay_mu, replay_logvar, replay_actions, replay_mask)
+            self.maybe_refresh_models(replay_mu, replay_logvar, replay_actions, replay_mask, replay_lowrank_factors)
 
             # logging
             intrinsic_mean = intrinsic.mean()
@@ -1477,8 +1511,8 @@ class PPOTrainer:
                 "hmm/max_nu": float(self.hmm.niw.nu.max().item()),
                 "hmm/mean_nu": float(self.hmm.niw.nu.mean().item()),
                 # Natural learning cycle diagnostics to validate your hypothesis
-                "learning_cycle/unused_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, self.hmm.niw.nu <= 106.1].sum().item()),
-                "learning_cycle/used_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, self.hmm.niw.nu > 106.1].sum().item()),
+                "learning_cycle/unused_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, self.hmm.niw.nu[:-1] <= 106.1].sum().item()),
+                "learning_cycle/used_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, self.hmm.niw.nu[:-1] > 106.1].sum().item()),
                 # Synchronized model training diagnostics
                 "learning_cycle/hmm_training_gap": float(self.global_steps - self.last_hmm_refresh),
                 "learning_cycle/vae_training_gap": float(self.global_steps - self.last_vae_refresh),
