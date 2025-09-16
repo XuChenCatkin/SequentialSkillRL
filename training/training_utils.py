@@ -633,6 +633,7 @@ def load_model_from_huggingface(
     revision_name: Optional[str] = None,
     token: Optional[str] = None,
     device: str = "cpu",
+    filename: str = "pytorch_model.bin",  # Allow custom filename
     **model_kwargs
 ) -> tuple[MultiModalHackVAE, VAEConfig]:
     """
@@ -643,6 +644,7 @@ def load_model_from_huggingface(
         revision_name: Specific revision to load (default is latest)
         token: HuggingFace token (if needed for private repos)
         device: Device to load the model on
+        filename: Model file name in the repo (default: "pytorch_model.bin")
         **model_kwargs: Additional arguments for model initialization (override config)
         
     Returns:
@@ -677,7 +679,7 @@ def load_model_from_huggingface(
         print(f"📥 Downloading model weights from {repo_name}...")
         model_path = hf_hub_download(
             repo_id=repo_name,
-            filename="pytorch_model.bin",
+            filename=filename,  # Use the provided filename
             repo_type="model",
             revision=revision_name
         )
@@ -1176,7 +1178,8 @@ def load_hmm_from_huggingface(
     round_num: int = None,
     revision_name: Optional[str] = None,
     token: Optional[str] = None,
-    device: str = "cpu"
+    device: str = "cpu",
+    filename: Optional[str] = None  # Allow custom filename
 ) -> tuple:
     """
     Load Sticky-HDP-HMM model from HuggingFace Hub
@@ -1187,6 +1190,7 @@ def load_hmm_from_huggingface(
         revision_name: Specific revision to load
         token: HuggingFace token
         device: Device to load the model on
+        filename: Custom HMM file name (if None, uses "hmm_round{round_num}.pt")
         
     Returns:
         Tuple of (hmm, config, hmm_params, niw_prior, metadata)
@@ -1215,8 +1219,13 @@ def load_hmm_from_huggingface(
         if round_num is None:
             round_num = config_data.get('round', 1)
         
+        # Determine filename
+        if filename is not None:
+            hmm_filename = filename  # Use provided filename
+        else:
+            hmm_filename = f"hmm_round{round_num}.pt"  # Default format
+        
         # Download HMM file
-        hmm_filename = f"hmm_round{round_num}.pt"
         print(f"📥 Downloading HMM weights from {repo_name}: {hmm_filename}...")
         
         hmm_path = hf_hub_download(

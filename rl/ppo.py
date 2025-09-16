@@ -816,6 +816,16 @@ class PPOTrainer:
     @torch.no_grad()
     def _encode_obs(self, obs_dict: dict, hero_info_list: list) -> Dict[str, torch.Tensor]:
         # Stack current hero info for all environments
+        obs_shape = obs_dict['chars'].shape
+        if len(obs_shape) == 2:
+            # Single env case: obs_dict values are [H,W] - wrap in batch dim
+            for k in obs_dict:
+                if hasattr(obs_dict[k], 'unsqueeze'):
+                    # PyTorch tensor
+                    obs_dict[k] = obs_dict[k].unsqueeze(0)  # [1,H,W] or [1,256] etc
+                else:
+                    # Numpy array
+                    obs_dict[k] = np.expand_dims(obs_dict[k], axis=0)  # [1,H,W] or [1,256] etc
         assert len(hero_info_list) == obs_dict[list(obs_dict.keys())[0]].shape[0], "hero_info_list length must match number of envs"
         hero_info_batch = torch.stack([
             hero_info if hero_info is not None else torch.zeros(4, dtype=torch.int32)
@@ -832,7 +842,20 @@ class PPOTrainer:
         """Extract hero info from the first observation of each new episode."""
         assert len(episode_start_flags) == num_envs, "episode_start_flags length must match num_envs"
         assert len(hero_info_list) == num_envs, "hero_info_list length must match num_envs"
+        
+        obs_shape = obs_dict['chars'].shape
+        if len(obs_shape) == 2:
+            # Single env case: obs_dict values are [H,W] - wrap in batch dim
+            for k in obs_dict:
+                if hasattr(obs_dict[k], 'unsqueeze'):
+                    # PyTorch tensor
+                    obs_dict[k] = obs_dict[k].unsqueeze(0)  # [1,H,W] or [1,256] etc
+                else:
+                    # Numpy array
+                    obs_dict[k] = np.expand_dims(obs_dict[k], axis=0)  # [1,H,W] or [1,256] etc
+        
         assert len(obs_dict[list(obs_dict.keys())[0]]) == num_envs, "obs_dict batch size must match num_envs"
+        
         for env_idx in range(num_envs):
             if episode_start_flags[env_idx]:
                 try:
@@ -1821,9 +1844,10 @@ class PPOTrainer:
         env = gym.make(self.env_id)
         episode_start = [True]
         hero_info = [None]  # single env
-        st = None  # single env
+        eval_filt_state = None  # single env HMM filter state
         ret_list, len_list, succ_list = [], [], []
         cover_list = []    # unique (x,y) cells visited per episode (if blstats available)
+        len_succ_list = []  # length of successful episodes
         # HMM‑centric diagnostics
         bound_mass_list, bound_bool_list, ent_list = [], [], []
         used_skills_list, effK_list = [], []
@@ -1841,7 +1865,7 @@ class PPOTrainer:
             ep_start_time = time.time()
             o, _ = env.reset()
             episode_start = [True]
-            st = None
+            eval_filt_state = None  # Reset filter state for new episode
             self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
             done = False; ret = 0.0; ep_len = 0
             max_episode_steps = 10000  # Maximum steps per episode to prevent hanging
@@ -1864,25 +1888,27 @@ class PPOTrainer:
                 # ---- Causal skill filtering (per-env, current frame) ----
                 skill_feat = None
                 if self.ppo_cfg.policy_uses_skill:
-                    Kp1 = int(self.hmm.niw.mu.size(0))  # includes remainder
-                    mu_b = enc["mu"].squeeze(0)                                     # [D]
-                    dv_b = enc["logvar"].squeeze(0).exp().clamp_min(1e-6)           # [D]
-                    F    = enc.get('lowrank_factors', None)                         # [D,R] or None
-                    # logB_t[k] = E_q[log p(z_t | h_t=k)]
+                    # Use single-environment version of the training logic
+                    Kp1 = self.hmm.niw.mu.size(0)
+                    mu_b = enc["mu"]  # [1, D] since we have single env batch
+                    dv_b = enc["logvar"].exp().clamp_min(1e-6)  # [1, D]
+                    F_b = enc.get('lowrank_factors', None)  # [1, D, R] or None
+                    
                     logB_b = StickyHDPHMMVI.expected_emission_loglik(
                         self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                        mu_b.unsqueeze(0), dv_b.unsqueeze(0), F.unsqueeze(0) if F is not None else None, mask=None
-                    ).squeeze(0)  # [Kp1]
+                        mu_b, dv_b, F_b, mask=None
+                    ).squeeze(0)  # [Kp1] - remove batch dim for single env
 
-                    if st is None:
-                        # initialise at episode start
-                        st = self.hmm.filter_init_from_logB(logB_b)
-                        alpha_b = torch.exp(st.log_alpha.to(torch.float32))  # [Kp1]
+                    if eval_filt_state is None:
+                        # Initialize at episode start (same as training)
+                        eval_filt_state = self.hmm.filter_init_from_logB(logB_b)
+                        alpha_b = torch.exp(eval_filt_state.log_alpha.to(torch.float32))  # [Kp1]
                     else:
-                        # one causal update (uses cached ElogA)
-                        st, alpha_b, _xi, _bound, _sent = self.hmm.filter_step(st, logB_b, self._ElogA)
-                    # drop the remainder state for policy features
-                    skill_feat = alpha_b[:Kp1-1].unsqueeze(0)  # [B, K]
+                        # One causal update (same as training)
+                        eval_filt_state, alpha_b, _xi, _bound, _sent = self.hmm.filter_step(eval_filt_state, logB_b, self._ElogA)
+                    
+                    # Drop remainder state for policy features (same as training)
+                    skill_feat = alpha_b[:Kp1-1].unsqueeze(0)  # [1, K] - add batch dim for consistency
                 
                 mu_seq.append(enc["mu"].squeeze(0).cpu())
                 logvar_seq.append(enc["logvar"].squeeze(0).cpu())
@@ -1892,16 +1918,23 @@ class PPOTrainer:
                     F_seq.append(None)
 
                 logits, value = self.actor_critic(enc["z"], skill_feat)
-                masked = self._masked_logits(logits)
+                # For evaluation with single env, use only first row of action mask
+                eval_action_mask = self.action_mask[0]  # [G] 
+                masked = logits.masked_fill(~eval_action_mask, -1e9)
                 a_global = (torch.argmax(masked, dim=-1)
                      if self.ppo_cfg.deterministic_eval
                      else torch.distributions.Categorical(logits=masked).sample())
-                a_local = self.global2local.gather(1, a_global.view(-1, 1)).squeeze()
+                
+                # Convert global action to local action for single environment
+                # Use first row of global2local mapping
+                eval_global2local = self.global2local[0]  # [G]
+                a_local = eval_global2local[a_global.item()]
+                
                 o, r, term, trunc, _ = env.step(int(a_local.item()))
                 done = term or trunc
                 episode_start = [done]
                 if done:
-                    st = None  # reset HMM filter state at episode end
+                    eval_filt_state = None  # Reset HMM filter state at episode end (same as training)
                 self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
                 ret += float(r); ep_len += 1
 
@@ -1910,8 +1943,12 @@ class PPOTrainer:
                 print(f"⚠️ Episode {ep_idx + 1} terminated due to step limit ({max_episode_steps} steps)")
 
             # episode‑level tallies
-            ret_list.append(ret); len_list.append(ep_len)
-            succ_list.append(1.0 if ret > 0.0 else 0.0)
+            ret_list.append(ret)
+            len_list.append(ep_len)
+            succ = 1.0 if ret > 0.0 else 0.0
+            succ_list.append(succ)
+            if succ > 0.5:
+                len_succ_list.append(ep_len)
             cover_list.append(len(visited))
             
             # Update progress bar with episode stats
@@ -1992,11 +2029,16 @@ class PPOTrainer:
         print()
 
         # Aggregate & log
+        def _p(arr, q): return float(np.percentile(arr, q)) if len(arr) else 0.0
         log_dict = {
             "eval/return_mean": float(final_avg_ret),
+            "eval/return_median": float(_p(ret_list, 50)),
+            "eval/return_10th": float(_p(ret_list, 10)),
+            "eval/return_90th": float(_p(ret_list, 90)),
             "eval/return_std": float(np.std(ret_list) if len(ret_list) else 0.0),
             "eval/success_rate": float(final_success_rate),
             "eval/ep_len_mean": float(final_avg_len),
+            "eval/ep_len_success_mean": float(np.mean(len_succ_list) if len(len_succ_list) else 0.0),
             "eval/coverage_pos_mean": float(final_avg_coverage),
         }
         if bound_mass_list:

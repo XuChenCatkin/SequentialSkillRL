@@ -41,7 +41,6 @@ from src.skill_space import StickyHDPHMMVI, StickyHDPHMMParams, NIWPrior
 from training.training_utils import (
     load_model_from_huggingface, 
     load_hmm_from_huggingface,
-    save_checkpoint,
     WANDB_AVAILABLE,
     HF_AVAILABLE
 )
@@ -61,6 +60,10 @@ def train_online_ppo_with_pretrained_models(
     env_name: str = "MiniHack-Room-5x5-v0",
     vae_repo_id: str = "CatkinChen/nethack-vae-hmm",
     hmm_repo_id: str = "CatkinChen/nethack-hmm",
+    # PPO checkpoint loading for continuation
+    ppo_repo_id: Optional[str] = None,  # HuggingFace repo with existing PPO checkpoint
+    ppo_checkpoint_path: Optional[str] = None,  # Local path to PPO checkpoint
+    resume_training: bool = False,  # Whether to continue from existing PPO checkpoint
     # Configuration objects - provide full control over training
     ppo_config: Optional[PPOConfig] = None,
     curiosity_config: Optional[CuriosityConfig] = None,
@@ -112,7 +115,14 @@ def train_online_ppo_with_pretrained_models(
     Args:
         env_name: MiniHack environment name
         vae_repo_id: HuggingFace repository ID for VAE model
-        hmm_repo_id: HuggingFace repository ID for HMM model
+        hmm_repo_id: HuggingFace repository ID for HMM model (optional)
+        
+        # PPO checkpoint loading for continuation training
+        ppo_repo_id: HuggingFace repository ID containing existing PPO checkpoint
+        ppo_checkpoint_path: Local file path to existing PPO checkpoint (.pth file)
+        resume_training: Whether to load and continue from existing PPO checkpoint
+            - If True, requires either ppo_repo_id or ppo_checkpoint_path
+            - If False, starts fresh PPO training (default behavior)
         
         # Configuration objects (recommended approach)
         ppo_config: PPO training configuration. If None, uses legacy parameters.
@@ -297,28 +307,106 @@ def train_online_ppo_with_pretrained_models(
             wandb_run = None
     
     try:
-        # Load pretrained VAE
-        if logger: logger.info("🔄 Loading pretrained VAE model...")
-        vae_model, config = load_model_from_huggingface(
-            repo_name=vae_repo_id,
-            token=hf_token,
-            device=str(device)
-        )
+        # Determine loading strategy based on resume mode
+        if resume_training and ppo_repo_id:
+            # Resume mode: Load all components (VAE, HMM, PPO) from the same unified repo
+            unified_repo = ppo_repo_id
+            if logger: logger.info(f"🔄 Resume mode: Loading all models from unified repo: {unified_repo}")
+            
+            # Load VAE from unified repo
+            if logger: logger.info("🎨 Loading VAE from unified repo...")
+            try:
+                # Try loading from different possible VAE file names in the unified repo
+                vae_model, config = None, None
+                for vae_filename in ["vae_model.pth", "nethack-vae.pth", "vae.pth"]:
+                    try:
+                        vae_model, config = load_model_from_huggingface(
+                            repo_name=unified_repo,
+                            filename=vae_filename,
+                            token=hf_token,
+                            device=str(device)
+                        )
+                        if logger: logger.info(f"✅ VAE loaded from {vae_filename}")
+                        break
+                    except Exception:
+                        continue
+                
+                if vae_model is None:
+                    raise ValueError(f"No VAE model found in unified repo {unified_repo}")
+                    
+            except Exception as e:
+                if logger: logger.warning(f"⚠️  Failed to load VAE from unified repo: {e}")
+                if logger: logger.info(f"🔄 Falling back to separate VAE repo: {vae_repo_id}")
+                vae_model, config = load_model_from_huggingface(
+                    repo_name=vae_repo_id,
+                    token=hf_token,
+                    device=str(device)
+                )
+            
+            # Load HMM from unified repo (if HMM is being used)
+            hmm_model, loaded_config, hmm_params, niw, metadata = None, None, None, None, None
+            if hmm_repo_id:  # Only load HMM if specified
+                if logger: logger.info("🧠 Loading HMM from unified repo...")
+                try:
+                    # Try loading from different possible HMM file names in the unified repo
+                    for hmm_filename in ["hmm_model.pt", "nethack-hmm.pt", "hmm.pt"]:
+                        try:
+                            hmm_model, loaded_config, hmm_params, niw, metadata = load_hmm_from_huggingface(
+                                repo_name=unified_repo,
+                                filename=hmm_filename,
+                                round_num=None,
+                                device=str(device)
+                            )
+                            if logger: logger.info(f"✅ HMM loaded from {hmm_filename}")
+                            break
+                        except Exception:
+                            continue
+                    
+                    if hmm_model is None:
+                        raise ValueError(f"No HMM model found in unified repo {unified_repo}")
+                        
+                except Exception as e:
+                    if logger: logger.warning(f"⚠️  Failed to load HMM from unified repo: {e}")
+                    if logger: logger.info(f"🔄 Falling back to separate HMM repo: {hmm_repo_id}")
+                    hmm_model, loaded_config, hmm_params, niw, metadata = load_hmm_from_huggingface(
+                        repo_name=hmm_repo_id,
+                        round_num=None,
+                        device=str(device)
+                    )
+        else:
+            # Fresh training mode: Load VAE and HMM from separate repos (original behavior)
+            if logger: logger.info("🆕 Fresh training mode: Loading models from separate repos")
+            
+            # Load VAE from dedicated VAE repo
+            if logger: logger.info("🎨 Loading pretrained VAE model...")
+            vae_model, config = load_model_from_huggingface(
+                repo_name=vae_repo_id,
+                token=hf_token,
+                device=str(device)
+            )
+            
+            # Load HMM from dedicated HMM repo (if specified)
+            hmm_model, loaded_config, hmm_params, niw, metadata = None, None, None, None, None
+            if hmm_repo_id:
+                if logger: logger.info("🧠 Loading pretrained HMM model...")
+                hmm_model, loaded_config, hmm_params, niw, metadata = load_hmm_from_huggingface(
+                    repo_name=hmm_repo_id,
+                    round_num=None,  # None means latest
+                    device=str(device)
+                )
+        
+        # Log successful loading
         if logger: logger.info(f"✅ VAE model loaded successfully")
         if logger: logger.info(f"   - Latent dimension: {config.latent_dim}")
         if logger: logger.info(f"   - Skills: {config.skill_num}")
-
-        # Load pretrained HMM
-        if logger: logger.info("🔄 Loading pretrained HMM model...")
-        hmm_model, loaded_config, hmm_params, niw, metadata = load_hmm_from_huggingface(
-            repo_name=hmm_repo_id,
-            round_num=None,  # None means latest
-            device=str(device)
-        )
-        if logger: logger.info(f"✅ HMM model loaded successfully")
-        if metadata:
-            if logger: logger.info(f"   🏷️  HMM Round: {metadata.get('round', 'unknown')}")
-            if logger: logger.info(f"   📅 Created: {metadata.get('training_timestamp', 'unknown')}")
+        
+        if hmm_model is not None:
+            if logger: logger.info(f"✅ HMM model loaded successfully")
+            if metadata:
+                if logger: logger.info(f"   🏷️  HMM Round: {metadata.get('round', 'unknown')}")
+                if logger: logger.info(f"   📅 Created: {metadata.get('training_timestamp', 'unknown')}")
+        else:
+            if logger: logger.info("ℹ️  No HMM model loaded (HMM integration disabled)")
             
         # Create environment
         if logger: logger.info(f"🎮 Creating environment: {env_name}")
@@ -446,6 +534,86 @@ def train_online_ppo_with_pretrained_models(
         )
         if logger: logger.info("✅ PPO trainer initialized successfully")
         
+        # Load existing PPO checkpoint if resuming training
+        if resume_training:
+            if logger: logger.info("🔄 Loading existing PPO checkpoint for continuation...")
+            
+            # Validate checkpoint source
+            if not ppo_repo_id and not ppo_checkpoint_path:
+                raise ValueError("resume_training=True requires either ppo_repo_id or ppo_checkpoint_path")
+            
+            checkpoint_data = None
+            
+            # Load from HuggingFace repository
+            if ppo_repo_id:
+                try:
+                    if logger: logger.info(f"📥 Loading PPO checkpoint from HuggingFace: {ppo_repo_id}")
+                    from huggingface_hub import hf_hub_download
+                    
+                    # Download the PPO policy file
+                    ppo_path = hf_hub_download(
+                        repo_id=ppo_repo_id, 
+                        filename="ppo_policy.pth",
+                        token=hf_token
+                    )
+                    checkpoint_data = torch.load(ppo_path, map_location=device)
+                    if logger: logger.info(f"✅ PPO checkpoint loaded from HuggingFace")
+                    
+                except Exception as e:
+                    if logger: logger.error(f"❌ Failed to load PPO checkpoint from HuggingFace: {e}")
+                    if ppo_checkpoint_path:
+                        if logger: logger.info(f"🔄 Falling back to local checkpoint: {ppo_checkpoint_path}")
+                    else:
+                        raise RuntimeError(f"Failed to load PPO checkpoint from HuggingFace: {e}")
+            
+            # Load from local file (either primary or fallback)
+            if not checkpoint_data and ppo_checkpoint_path:
+                try:
+                    if logger: logger.info(f"📥 Loading PPO checkpoint from local file: {ppo_checkpoint_path}")
+                    checkpoint_data = torch.load(ppo_checkpoint_path, map_location=device)
+                    if logger: logger.info(f"✅ PPO checkpoint loaded from local file")
+                    
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load PPO checkpoint from local file: {e}")
+            
+            if not checkpoint_data:
+                raise RuntimeError("No PPO checkpoint could be loaded")
+            
+            # Restore PPO trainer state
+            try:
+                # Load actor-critic model state
+                if 'actor_critic' in checkpoint_data:
+                    trainer.actor_critic.load_state_dict(checkpoint_data['actor_critic'])
+                    if logger: logger.info("✅ Actor-critic model state restored")
+                
+                # Load optimizer state  
+                if 'opt' in checkpoint_data:
+                    trainer.opt.load_state_dict(checkpoint_data['opt'])
+                    if logger: logger.info("✅ Optimizer state restored")
+                
+                # Load training step count if available
+                if 'global_steps' in checkpoint_data:
+                    trainer.global_steps = checkpoint_data['global_steps']
+                    if logger: logger.info(f"✅ Training resumed from step {trainer.global_steps:,}")
+                
+                # Load training configuration for validation
+                if 'config' in checkpoint_data:
+                    loaded_config = checkpoint_data['config']
+                    if logger: logger.info("ℹ️  Loaded training configuration from checkpoint")
+                    
+                    # Log key differences if any
+                    if loaded_config.get('env_name') != env_name:
+                        if logger: logger.warning(f"⚠️  Environment changed: {loaded_config.get('env_name')} → {env_name}")
+                
+                if logger: logger.info("🎯 PPO checkpoint restoration completed successfully")
+                
+            except Exception as e:
+                if logger: logger.error(f"❌ Failed to restore PPO trainer state: {e}")
+                raise RuntimeError(f"Failed to restore PPO trainer state: {e}")
+        
+        else:
+            if logger: logger.info("🆕 Starting fresh PPO training (no checkpoint loading)")
+        
         # Test mode: run evaluation episodes
         if test_mode:
             if logger: logger.info(f"🧪 Running {test_episodes} test episodes...")
@@ -514,12 +682,27 @@ def train_online_ppo_with_pretrained_models(
         checkpoint_dir = Path("checkpoints") / wandb_run_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        final_checkpoint_path = save_checkpoint(
-            trainer=trainer,
-            checkpoint_dir=checkpoint_dir,
-            step=total_timesteps,
-            is_final=True
-        )
+        # Use trainer's save method to create final checkpoint
+        if logger: logger.info("💾 Saving final PPO checkpoint...")
+        final_checkpoint_path = os.path.join(checkpoint_dir, "ppo_policy.pth")
+        torch.save({
+            "actor_critic": trainer.actor_critic.state_dict(),
+            "opt": trainer.opt.state_dict(),
+            "global_steps": trainer.global_steps,
+            "config": {
+                "ppo_config": ppo_config.__dict__,
+                "curiosity_config": curiosity_config.__dict__,
+                "hmm_config": hmm_config.__dict__ if hmm_config else None,
+                "vae_config": vae_config.__dict__ if vae_config else None,
+                "train_config": train_config.__dict__
+            },
+            "training_metadata": {
+                "env_name": env_name,
+                "total_timesteps": total_timesteps,
+                "final_step": trainer.global_steps,
+                "timestamp": datetime.now().isoformat()
+            }
+        }, final_checkpoint_path)
         if logger: logger.info(f"💾 Final checkpoint saved: {final_checkpoint_path}")
         
         # Collect training results from log file or trainer state for artifact upload

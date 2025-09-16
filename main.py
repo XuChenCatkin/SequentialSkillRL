@@ -40,6 +40,15 @@ Commands:
             --seed N               - Random seed (default: 42)
             --wandb                - Enable W&B logging
             --no_upload            - Disable HuggingFace uploads
+            --resume REPO_ID       - Resume training from unified HuggingFace repo
+                                     (loads VAE, HMM, and PPO from same repo)
+            --resume_local PATH    - Resume training from local PPO checkpoint file
+                                     (loads VAE/HMM from separate repos)
+                                    
+        Model Loading Patterns:
+        - Fresh Training: VAE from vae_repo_id, HMM from hmm_repo_id (separate repos)
+        - Resume Training: VAE, HMM, PPO from same unified repo (--resume)
+        - Resume Local: PPO from local file, VAE/HMM from separate repos (--resume_local)
                                     
         Uses configuration objects for fine-grained control over:
         - PPO hyperparameters (learning rate, rollout length, etc.)
@@ -71,6 +80,10 @@ Examples:
     python main.py rl curiosity_dyn_only                 # VAE+HMM+PPO with dynamics curiosity only
     python main.py rl curiosity_skill_only               # VAE+HMM+PPO with skill entropy only
     python main.py rl curiosity_trans_only               # VAE+HMM+PPO with transition novelty only
+    
+    # Continue training from existing checkpoints
+    python main.py rl baseline --resume CatkinChen/nethack-ppo-unified     # Resume from unified repo (VAE+HMM+PPO)
+    python main.py rl baseline --resume_local ./checkpoints/ppo_policy.pth  # Resume from local PPO, load VAE/HMM separately
 """
 import logging
 import os
@@ -732,11 +745,13 @@ if __name__ == "__main__":
         
         # Parse ablation mode and options
         ablation_mode = "baseline"  # default
-        env_name = "MiniHack-Room-5x5-v0"  # default
+        env_name = "MiniHack-Room-Random-15x15-v0"  # default
         total_steps = 1_000_000  # default 1M steps
         seed = 42  # default
         use_wandb_flag = False
         disable_upload = False
+        resume_repo_id = None  # HuggingFace repo for resuming
+        resume_local_path = None  # Local checkpoint path for resuming
         
         # Parse command line arguments
         i = 2
@@ -760,6 +775,12 @@ if __name__ == "__main__":
             elif sys.argv[i] == '--no_upload':
                 disable_upload = True
                 i += 1
+            elif sys.argv[i] == '--resume' and i + 1 < len(sys.argv):
+                resume_repo_id = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--resume_local' and i + 1 < len(sys.argv):
+                resume_local_path = sys.argv[i + 1]
+                i += 2
             else:
                 print(f"⚠️  Unknown option: {sys.argv[i]}")
                 i += 1
@@ -924,8 +945,12 @@ if __name__ == "__main__":
                 pi_early_stopping_patience=10,
                 pi_early_stopping_min_delta=1e-5
             )
-            # Set VAE repo to VAE-only model
-            vae_repo_id = "CatkinChen/nethack-vae"
+            
+            if resume_repo_id is None and resume_local_path is None:
+                # Set VAE repo to VAE-only model
+                vae_repo_id = "CatkinChen/nethack-vae"
+            else:
+                vae_repo_id = None  # Resume from existing PPO checkpoint which already has VAE
             hmm_repo_id = None  # Will use dummy HMM
         else:
             hmm_config = HMMOnlineConfig(
@@ -944,8 +969,13 @@ if __name__ == "__main__":
                 pi_early_stopping_patience=1,    # Early stopping patience
                 pi_early_stopping_min_delta=1e-2 # Early stopping min delta
             )
-            vae_repo_id = "CatkinChen/nethack-vae-hmm"
-            hmm_repo_id = "CatkinChen/nethack-hmm"
+            if resume_repo_id is None and resume_local_path is None:
+                # Set VAE and HMM repos to pre-trained models
+                vae_repo_id = "CatkinChen/nethack-vae-hmm"
+                hmm_repo_id = "CatkinChen/nethack-hmm"
+            else:
+                vae_repo_id = None  # Resume from existing PPO checkpoint which already has VAE+HMM
+                hmm_repo_id = None  # Resume from existing PPO checkpoint which already has VAE+HMM
         
         # VAE Online Configuration - synchronized with HMM updates
         vae_config = VAEOnlineConfig(
@@ -971,7 +1001,7 @@ if __name__ == "__main__":
             device='cuda' if torch.cuda.is_available() else 'cpu',
             log_dir=f"./runs/{run_name}",
             save_every=25_000,
-            eval_every=5_120,
+            eval_every=25_000,
             eval_episodes=10
         )
         
@@ -1004,6 +1034,11 @@ if __name__ == "__main__":
                 env_name=train_config.env_id,
                 vae_repo_id=vae_repo_id,
                 hmm_repo_id=hmm_repo_id,
+                
+                # Resume training from existing PPO checkpoint (new!)
+                ppo_repo_id=resume_repo_id,
+                ppo_checkpoint_path=resume_local_path,
+                resume_training=resume_repo_id is not None or resume_local_path is not None,
                 
                 # Use config objects for full control
                 ppo_config=ppo_config,
