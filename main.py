@@ -971,7 +971,7 @@ if __name__ == "__main__":
             device='cuda' if torch.cuda.is_available() else 'cpu',
             log_dir=f"./runs/{run_name}",
             save_every=25_000,
-            eval_every=25_000,
+            eval_every=5_120,
             eval_episodes=10
         )
         

@@ -66,6 +66,7 @@ from enum import IntEnum
 from dataclasses import dataclass, field
 from nle import nethack
 from utils.math_utils import kl_gaussian_lowrank_q_p, kl_gaussian_lowrank_to_fixed_gaussians
+from src.skill_space import StickyHDPHMMVI
 
 # Import NetHackCategory from data_collection
 try:
@@ -1460,7 +1461,17 @@ class MultiModalHackVAE(nn.Module):
             'lowrank_factors': lowrank_factors,  # [B, LATENT_DIM, LOW_RANK] or None
             "stats_encoder": self.stats_encoder
         }
-          
+
+    def batch_encode(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Convenience: encode from a batch dict."""
+        glyph_chars = batch['game_chars'] # [B, 21, 79]
+        glyph_colors = batch['game_colors'] # [B, 21, 79]
+        blstats = batch['blstats'] # [B, BLSTATS_DIM]
+        msg_tokens = batch['message_chars'] # [B, 256]
+        hero_info = batch['hero_info'] # [B, 4]
+        enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
+        return enc
+
     def _reparameterise(self, mu, logvar, lowrank_factors=None):
         diag_std = torch.exp(0.5*logvar)
         eps1 = torch.randn_like(diag_std)
@@ -1539,7 +1550,7 @@ class MultiModalHackVAE(nn.Module):
 
         return out
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, batch: Dict[str, torch.Tensor], logger: Optional[logging.Logger] = None) -> Dict[str, torch.Tensor]:
         glyph_chars = batch['game_chars'] # [B, 21, 79]
         glyph_colors = batch['game_colors'] # [B, 21, 79]
         blstats = batch['blstats'] # [B, BLSTATS_DIM]
@@ -1548,8 +1559,47 @@ class MultiModalHackVAE(nn.Module):
         enc = self.encode(glyph_chars, glyph_colors, blstats, msg_tokens, hero_info)
         z = self._reparameterise(enc["mu"], enc["logvar"], enc["lowrank_factors"])  # [B,D]
         
+        if batch.get('sticky_hmm') is not None:
+            hmm = batch['sticky_hmm']
+            with torch.no_grad():
+                B,T = batch['original_batch_shape']
+                valid_bt = batch['valid_screen'].view(B,T)
+                mu_bt    = enc['mu'].view(B,T,-1)
+                var_bt   = enc['logvar'].exp().clamp_min(1e-6).view(B,T,-1)
+                F_btr    = enc.get('lowrank_factors', None)
+                F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
+                # emission expected log-likelihood per (b,t,k)
+                logB = StickyHDPHMMVI.expected_emission_loglik(hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu, mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
+                pi_star  = hmm._Epi()                              # [K]
+                ElogA    = hmm._ElogA()                            # [K,K]
+                log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
+                
+                # Process each sequence in the batch individually
+                r_hat_list = []
+                for b in range(B):
+                    r_hat_b, xi_hat_b, ll_b = hmm.forward_backward(log_pi, ElogA, logB[b])
+                    r_hat_list.append(r_hat_b)
+                r_hat = torch.stack(r_hat_list, dim=0)  # [B,K]
+                
+                # prior Gaussians
+                mu_k, E_Lambda, _ = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
+                # log|Σ_k| = - log|Λ_k|
+                L = torch.linalg.cholesky(E_Lambda)                       # [Kp1,D,D]
+                logdet_E_Lambda = 2.0 * torch.log(torch.diagonal(L,  dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
+                logdet_Sigma_k = -logdet_E_Lambda                           # [Kp1]
+                # flatten responsibilities to align with valid_screen
+                r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
+            # stash cache into batch so vae_loss can pick it up
+            batch['hmm_cache'] = {
+                'mu_k': mu_k.to(enc['mu'].dtype),
+                'E_Lambda': E_Lambda.to(enc['mu'].dtype),
+                'logdet_Sigma_k': logdet_Sigma_k.to(enc['mu'].dtype),
+                'r_hat_flat': r_hat_flat.to(enc['mu'].dtype),
+            }
+            batch['skill_onehot'] = r_hat[:, :, :-1].view(B*T, -1) # [B*T, K]
+        
         # Calculate z_next_detach if we have sequential data and save to batch
-        if 'has_next' in batch and 'original_batch_shape' in batch:
+        if 'has_next' in batch:
             B, T = batch['original_batch_shape']
             if T > 1:
                 # Reshape z to [B, T, latent_dim] to work with sequences
@@ -1574,11 +1624,15 @@ class MultiModalHackVAE(nn.Module):
                 lowrank_next_flat_detach = lowrank_next_detach.view(-1, lowrank_next_detach.shape[-2], lowrank_next_detach.shape[-1]) if lowrank_next_detach is not None else None
                 
                 action_onehot = batch.get('action_onehot')
+                if action_onehot is None and logger is not None:
+                    logger.warning("Batch has 'has_next' but no 'action_onehot'.")
                 action_onehot_reshaped = action_onehot.view(B, T, -1) if action_onehot is not None else None
                 action_onehot_for_dynamics = action_onehot_reshaped[:, :-1, :].contiguous() if action_onehot_reshaped is not None else None  # [B, T-1, A]
                 action_onehot_for_dynamics_flat = action_onehot_for_dynamics.view(-1, action_onehot_for_dynamics.shape[-1]) if action_onehot_for_dynamics is not None else None  # [B*(T-1), A]
                 
                 skill_onehot = batch.get('skill_onehot')
+                if skill_onehot is None and logger is not None:
+                    logger.warning("Batch has 'has_next' but no 'skill_onehot'.")
                 skill_onehot_reshaped = skill_onehot.view(B, T, -1) if skill_onehot is not None else None
                 skill_onehot_for_dynamics = skill_onehot_reshaped[:, :-1, :].contiguous() if skill_onehot_reshaped is not None else None  # [B, T-1, K]
                 skill_onehot_for_dynamics_flat = skill_onehot_for_dynamics.view(-1, skill_onehot_for_dynamics.shape[-1]) if skill_onehot_for_dynamics is not None else None  # [B*(T-1), K]
@@ -1593,7 +1647,7 @@ class MultiModalHackVAE(nn.Module):
                 rewards_for_dynamics = rewards_reshaped[:, 1:].contiguous()
                 rewards_for_dynamics_flat = rewards_for_dynamics.view(-1)  # [B*(T-1)]
                 
-                dones = batch.get('done')
+                dones = batch.get('done_target')
                 dones_reshaped = dones.view(B, T)
                 dones_for_dynamics = dones_reshaped[:, 1:].contiguous()
                 dones_for_dynamics_flat = dones_for_dynamics.view(-1)  # [B*(T-1)]
@@ -2182,9 +2236,6 @@ def vae_loss(
     # action related outputs
     passability_logits = model_output['passability_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
     safety_logits = model_output['safety_logits'][valid_screen]  # [B, PASSABILITY_DIRS]
-    skill_logits = model_output.get('skill_logits', None)  # [B, SKILL_NUM] if applicable
-    if skill_logits is not None:
-        skill_logits = skill_logits[valid_screen]  # [B, SKILL_NUM]
     
     # latent forward model
     latent_pred_mu = model_output.get('prior_mu', None)

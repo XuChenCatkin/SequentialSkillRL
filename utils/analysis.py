@@ -1980,7 +1980,7 @@ def _collect_sample_rasters(model, dataset, device, hmm: StickyHDPHMMVI, max_seq
                 
                 # Forward pass for single sequence
                 try:
-                    out = model(flat)
+                    out = model.batch_encode(flat)
                     mu_t = out['mu'].view(extended_T, -1)  # [T, latent_dim]
                     var_t = out['logvar'].exp().clamp_min(1e-6).view(extended_T, -1)  # [T, latent_dim]
                     F_tr = out.get('lowrank_factors', None)
@@ -2097,7 +2097,7 @@ def compute_hmm_diagnostics(model, dataset, device, hmm: StickyHDPHMMVI, max_bat
                         batch_dev[k] = v
                 
                 # Forward encode only
-                out = model(batch_dev)
+                out = model.batch_encode(batch_dev)
                 mu = out['mu']
                 logvar = out['logvar']
                 F = out.get('lowrank_factors', None)

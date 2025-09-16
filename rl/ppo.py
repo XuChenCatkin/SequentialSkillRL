@@ -17,7 +17,7 @@ from nle import nethack  # action id space (615)
 # --- your code ---
 from src.model import MultiModalHackVAE, VAEConfig, vae_loss
 from src.skill_space import StickyHDPHMMVI, StickyHDPHMMParams, NIWPrior
-from src.data_collection import NetHackDataCollector, one_hot
+from src.data_collection import NetHackDataCollector, one_hot, compute_passability_and_safety
 from utils.action_utils import ACTION_DIM, KEYPRESS_INDEX_MAPPING
 
 # KL helper already used by your VAE loss
@@ -292,6 +292,11 @@ class CuriosityComputer:
         xi = torch.zeros(B, max(T-1,0), Kp1, Kp1, device=self.device, dtype=mu_seq.dtype)
         H = torch.zeros(B, T, device=self.device, dtype=mu_seq.dtype)
         pchg = torch.zeros(B, T, device=self.device, dtype=mu_seq.dtype)
+        
+        logB = StickyHDPHMMVI.expected_emission_loglik(
+                    self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
+                    mu_seq, diagvar_seq, F_seq, mask=None
+                )
 
         for b in range(B):
             st = None
@@ -320,17 +325,11 @@ class CuriosityComputer:
                         H[b, t] = float('nan')
                         pchg[b, t] = float('nan')
                     continue
-                    
-                logB_t = StickyHDPHMMVI.expected_emission_loglik(
-                    self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                    mu_seq[b, t].unsqueeze(0), 
-                    (diagvar_seq[b, t].unsqueeze(0) if diagvar_seq is not None else None),
-                    (F_seq[b, t].unsqueeze(0) if F_seq is not None else None),
-                    mask=None
-                ).squeeze(0)
+                
+                logB_t = logB[b, t]  # [Kp1]
                 
                 # Diagnostic: Check for extreme logB_t values that might cause uniform posterior
-                if t % 100 == 0 and b == 0:  # Log occasionally
+                if t % 1000 == 0 and b == 0:  # Log occasionally
                     logB_range = logB_t.max() - logB_t.min()
                     unused_skills = (self.hmm.niw.nu <= 106.1).float().sum().item()  # Count near-prior skills
                     used_skills = (self.hmm.niw.nu > 106.1).float().sum().item()
@@ -815,11 +814,12 @@ class PPOTrainer:
     # --------------------------- rollout -------------------------------------
 
     @torch.no_grad()
-    def _encode_obs(self, obs_dict: dict) -> Dict[str, torch.Tensor]:
+    def _encode_obs(self, obs_dict: dict, hero_info_list: list) -> Dict[str, torch.Tensor]:
         # Stack current hero info for all environments
+        assert len(hero_info_list) == obs_dict[list(obs_dict.keys())[0]].shape[0], "hero_info_list length must match number of envs"
         hero_info_batch = torch.stack([
             hero_info if hero_info is not None else torch.zeros(4, dtype=torch.int32)
-            for hero_info in self._hero_info
+            for hero_info in hero_info_list
         ], dim=0)  # [num_envs, 4]
         
         b = obs_to_device(obs_dict, self.device, hero_info=hero_info_batch)
@@ -828,10 +828,13 @@ class PPOTrainer:
         z  = mu  # use mean latent for policy input
         return {"z": z, "mu": mu, "logvar": logvar, "F": F}
 
-    def _update_hero_info_from_obs(self, obs_dict: dict):
+    def _update_hero_info_from_obs(self, obs_dict: dict, num_envs: int, episode_start_flags: list, hero_info_list: list, logger: Optional[logging.Logger] = None):
         """Extract hero info from the first observation of each new episode."""
-        for env_idx in range(self.ppo_cfg.num_envs):
-            if self._episode_start[env_idx]:
+        assert len(episode_start_flags) == num_envs, "episode_start_flags length must match num_envs"
+        assert len(hero_info_list) == num_envs, "hero_info_list length must match num_envs"
+        assert len(obs_dict[list(obs_dict.keys())[0]]) == num_envs, "obs_dict batch size must match num_envs"
+        for env_idx in range(num_envs):
+            if episode_start_flags[env_idx]:
                 try:
                     # Extract message from observation for this environment
                     message_key = "message" if "message" in obs_dict else None
@@ -854,22 +857,22 @@ class PPOTrainer:
                     hero_info = self.data_collector.parse_hero_info_from_message(game_id, message_str)
                     
                     if hero_info is not None:
-                        self._hero_info[env_idx] = hero_info
-                        print(f"✅ Environment {env_idx}: Parsed hero info {hero_info.tolist()} from message: '{message_str[:100]}...'")
+                        hero_info_list[env_idx] = hero_info
+                        #print(f"✅ Environment {env_idx}: Parsed hero info {hero_info.tolist()} from message: '{message_str[:100]}...'")
                     else:
                         # Keep previous hero info or use zeros as fallback
-                        if self._hero_info[env_idx] is None:
-                            self._hero_info[env_idx] = torch.zeros(4, dtype=torch.int32)
-                            print(f"⚠️ Environment {env_idx}: Could not parse hero info from message: '{message_str[:100]}...'")
+                        if hero_info_list[env_idx] is None:
+                            hero_info_list[env_idx] = torch.zeros(4, dtype=torch.int32)
+                            if logger: logger.warning(f"⚠️ Environment {env_idx}: Could not parse hero info from message: '{message_str[:100]}...'")
                     
                 except Exception as e:
                     # Fallback to zeros if anything goes wrong
-                    if self._hero_info[env_idx] is None:
-                        self._hero_info[env_idx] = torch.zeros(4, dtype=torch.int32)
-                    print(f"⚠️ Environment {env_idx}: Error parsing hero info: {e}")
-                
+                    if hero_info_list[env_idx] is None:
+                        hero_info_list[env_idx] = torch.zeros(4, dtype=torch.int32)
+                    if logger: logger.warning(f"⚠️ Environment {env_idx}: Error parsing hero info: {e}")
+
                 # Mark that we've processed the episode start
-                self._episode_start[env_idx] = False
+                episode_start_flags[env_idx] = False
 
     def _init_action_adapter(self):
         """
@@ -923,38 +926,10 @@ class PPOTrainer:
         episode_lengths = [0] * self.ppo_cfg.num_envs
 
         for t in range(self.ppo_cfg.rollout_len):
-            enc = self._encode_obs(obs)
+            enc = self._encode_obs(obs, self._hero_info)  # dict of tensors [B,D], etc
             z = enc["z"]  # [B,D]
 
-            # ---- Causal skill filtering (per-env, current frame) ----
-            skill_feat = None
-            if self.ppo_cfg.policy_uses_skill:
-                B = z.size(0)
-                Kp1 = int(self.hmm.niw.mu.size(0))  # includes remainder
-                skill_list = []
-                for b in range(B):
-                    mu_b = enc["mu"][b]                                     # [D]
-                    dv_b = enc["logvar"][b].exp().clamp_min(1e-6)           # [D]
-                    F    = enc.get('lowrank_factors', None)                 # [D,R] or None
-                    # logB_t[k] = E_q[log p(z_t | h_t=k)]
-                    logB_b = StickyHDPHMMVI.expected_emission_loglik(
-                        self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                        mu_b.unsqueeze(0), dv_b.unsqueeze(0), F.unsqueeze(0) if F is not None else None, mask=None
-                    ).squeeze(0)  # [Kp1]
-
-                    st = self._filt_state[b]
-                    if st is None:
-                        # initialise at episode start
-                        st = self.hmm.filter_init_from_logB(logB_b)
-                        alpha_b = torch.exp(st.log_alpha.to(torch.float32))  # [Kp1]
-                    else:
-                        # one causal update (uses cached ElogA)
-                        st, alpha_b, _xi, _bound, _sent = self.hmm.filter_step(st, logB_b, self._ElogA)
-                    self._filt_state[b] = st
-                    # drop the remainder state for policy features
-                    skill_list.append(alpha_b[:Kp1-1])
-
-                skill_feat = torch.stack(skill_list, dim=0)  # [B, K]
+            skill_feat = self._compute_skill_features(enc)  # [B,K] or None
 
             logits, value = self.actor_critic(z, skill_feat)        # logits: [B,G]
             masked = self._masked_logits(logits)
@@ -978,8 +953,8 @@ class PPOTrainer:
                 
                 if done[env_idx]:
                     # Log episode completion
-                    if logger is not None:
-                        logger.info(f"🎮 Episode completed (env {env_idx}): return={episode_returns[env_idx]:.2f}, length={episode_lengths[env_idx]}")
+                    #if logger is not None:
+                        #logger.info(f"🎮 Episode completed (env {env_idx}): return={episode_returns[env_idx]:.2f}, length={episode_lengths[env_idx]}")
                         
                     # Extract game message if available
                     message = ""
@@ -1028,7 +1003,7 @@ class PPOTrainer:
             obs = next_obs
             
             # Update hero info for any new episodes that started
-            self._update_hero_info_from_obs(obs)
+            self._update_hero_info_from_obs(obs, self.ppo_cfg.num_envs, self._episode_start, self._hero_info, logger=logger)
             
             self.global_steps += self.ppo_cfg.num_envs
         
@@ -1096,7 +1071,7 @@ class PPOTrainer:
         T, B = self.ppo_cfg.rollout_len, self.ppo_cfg.num_envs
         
         # Encode next observation for final timestep dynamics calculation
-        next_obs_enc = self._encode_obs(self._obs)
+        next_obs_enc = self._encode_obs(self._obs, self._hero_info)
         next_obs_mu = next_obs_enc["mu"]
         next_obs_logvar = next_obs_enc["logvar"]  
         next_obs_F = next_obs_enc.get("F", None)
@@ -1162,29 +1137,26 @@ class PPOTrainer:
             return None
             
         B = enc["z"].size(0)
+        mu = enc["mu"]
+        dv = enc["logvar"].exp()
+        F = enc.get("lowrank_factors", None)
+        logB = StickyHDPHMMVI.expected_emission_loglik(
+            self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
+            mu, dv, F, mask=None
+        )  # [B, Kp1]
         Kp1 = self.hmm.niw.mu.size(0)
         skill_list = []
         
         for b in range(B):
-            mu_b = enc["mu"][b]
-            dv_b = enc["logvar"][b].exp()
-            
-            logB_b = StickyHDPHMMVI.expected_emission_loglik(
-                self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                mu_b.unsqueeze(0), dv_b.unsqueeze(0), None, mask=None
-            ).squeeze(0)
-            
             st = self._filt_state[b]
             if st is None:
-                if hasattr(self.hmm, "filter_init_from_logB"):
-                    st = self.hmm.filter_init_from_logB(logB_b)
-                    alpha_b = torch.exp(st.log_alpha.to(torch.float32))
-                else:
-                    # Fallback for older HMM classes
-                    alpha_b = torch.softmax(logB_b, dim=-1)
+                # initialise at episode start
+                st = self.hmm.filter_init_from_logB(logB[b])
+                alpha_b = torch.exp(st.log_alpha.to(torch.float32))  # [Kp1]
             else:
-                st, alpha_b, _, _, _ = self.hmm.filter_step(st, logB_b, self._ElogA)
-            
+                # one causal update (uses cached ElogA)
+                st, alpha_b, _, _, _ = self.hmm.filter_step(st, logB[b], self._ElogA)
+
             self._filt_state[b] = st
             skill_list.append(alpha_b[:Kp1-1])  # Drop remainder state
         
@@ -1203,7 +1175,7 @@ class PPOTrainer:
         T, B = rews_total.size()
         
         # Get bootstrap values (value of observation after rollout)
-        enc = self._encode_obs(self._obs)
+        enc = self._encode_obs(self._obs, self._hero_info)
         skill_feat = self._compute_skill_features(enc)
         _, bootstrap_values = self.actor_critic(enc["z"], skill_feat)
         
@@ -1318,7 +1290,7 @@ class PPOTrainer:
             
             # Create a valid mask for the entire window (all steps are valid in PPO online training)
             B, T = combined_actions.shape
-            valid_mask = torch.ones(B, T, device=self.device)
+            valid_mask = torch.ones(B, T, device=self.device, dtype=torch.bool)
             
             # HMM update (uses latent representations that we already have)
             if hmm_ready and combined_mu is not None:
@@ -1456,7 +1428,6 @@ class PPOTrainer:
                 logger.info(f"   Using full buffer ({total_valid_timesteps} timesteps)")
             
             # Gather all valid timesteps from replay buffer
-            valid_mask = torch.ones(B, T, dtype=torch.bool, device=device)  # All timesteps are valid in PPO online training
             all_chars = replay_obs_chars.view(-1, 21, 79)      # [B*T, 21, 79]
             all_colors = replay_obs_colors.view(-1, 21, 79)    # [B*T, 21, 79]
             all_blstats = replay_obs_blstats.view(-1, replay_obs_blstats.shape[-1])  # [B*T, blstats_dim]
@@ -1467,15 +1438,45 @@ class PPOTrainer:
             # Create action_onehot using one_hot encoding
             all_action_onehot = one_hot(all_actions, ACTION_DIM)  # [B*T, ACTION_DIM]
             
-            # Create has_next: True for all timesteps except the last in each sequence
+            # Create has_next: True for timesteps that are not the last AND not done
             all_has_next = torch.zeros(B*T, dtype=torch.bool, device=device)
+            all_dones_flat = replay_dones.view(-1) if replay_dones is not None else torch.zeros(B*T, dtype=torch.bool, device=device)
             for b in range(B):
                 for t in range(T-1):  # All except last timestep in sequence
-                    all_has_next[b*T + t] = True
+                    idx = b*T + t
+                    # has_next is True if not done at current timestep
+                    all_has_next[idx] = not all_dones_flat[idx]
             
             # Use real extrinsic rewards and done targets (not dummy zeros)
             all_reward_target = replay_rewards.view(-1).float() if replay_rewards is not None else torch.zeros(B*T, dtype=torch.float32, device=device)
             all_done_target = replay_dones.view(-1).float() if replay_dones is not None else torch.zeros(B*T, dtype=torch.float32, device=device)
+            
+            # Use replay_mask for valid_screen instead of creating new mask
+            all_valid_screen = replay_mask.view(-1).bool() if replay_mask is not None else torch.ones(B*T, dtype=torch.bool, device=device)
+            
+            # Calculate passability and safety targets
+            all_passability_target = torch.zeros(B*T, 8, dtype=torch.float32, device=device)
+            all_safety_target = torch.zeros(B*T, 8, dtype=torch.float32, device=device)
+            all_hard_mask = torch.zeros(B*T, 8, dtype=torch.float32, device=device)
+            all_weight = torch.zeros(B*T, 8, dtype=torch.float32, device=device)
+            
+            # Calculate passability and safety for each timestep where hero is visible
+            for b in range(B):
+                for t in range(T):
+                    idx = b*T + t
+                    if all_valid_screen[idx]:  # Only calculate for valid timesteps
+                        chars_map = all_chars[idx]  # [21, 79]
+                        colors_map = all_colors[idx]  # [21, 79]
+                        
+                        # Find hero position (prefer '@' character)
+                        ys, xs = (chars_map == ord('@')).nonzero(as_tuple=True)
+                        if ys.numel() > 0:
+                            hy, hx = int(ys[0].item()), int(xs[0].item())
+                            p8, s8, hm8, w8 = compute_passability_and_safety(chars_map, colors_map, hy, hx)
+                            all_passability_target[idx] = p8
+                            all_safety_target[idx] = s8
+                            all_hard_mask[idx] = hm8
+                            all_weight[idx] = w8
             
             combined_batch = {
                 'game_chars': all_chars,
@@ -1483,11 +1484,15 @@ class PPOTrainer:
                 'blstats': all_blstats,
                 'message_chars': all_message,
                 'hero_info': all_hero_info,
-                'valid_screen': torch.ones(B*T, dtype=torch.bool, device=device),
+                'valid_screen': all_valid_screen,
                 'action_onehot': all_action_onehot,
                 'has_next': all_has_next,
                 'reward_target': all_reward_target,
                 'done_target': all_done_target,
+                'passability_target': all_passability_target,
+                'safety_target': all_safety_target,
+                'hard_mask': all_hard_mask,
+                'weight': all_weight,
                 'original_batch_shape': (B, T)  # For sequential processing in VAE
             }
             
@@ -1522,17 +1527,42 @@ class PPOTrainer:
                     # Extract real reward and done data for this span
                     span_rewards = replay_rewards[bi, t:t+span] if replay_rewards is not None else torch.zeros(span, dtype=torch.float32, device=device)
                     span_dones = replay_dones[bi, t:t+span] if replay_dones is not None else torch.zeros(span, dtype=torch.bool, device=device)
+                    span_mask = replay_mask[bi, t:t+span].bool() if replay_mask is not None else torch.ones(span, dtype=torch.bool, device=device)
                     
                     # Create action_onehot using one_hot encoding
                     span_action_onehot = one_hot(span_actions, ACTION_DIM)  # [span, ACTION_DIM]
                     
-                    # Create has_next: True for all timesteps except the last in span
+                    # Create has_next: True for timesteps that are not the last AND not done
                     span_has_next = torch.zeros(span, dtype=torch.bool, device=device)
-                    span_has_next[:-1] = True  # All except last timestep in span
+                    for s in range(span-1):  # All except last timestep in span
+                        # has_next is True if not done at current timestep
+                        span_has_next[s] = not span_dones[s]
                     
                     # Use real extrinsic rewards and done targets (not dummy zeros)
                     span_reward_target = span_rewards.float()
                     span_done_target = span_dones.float()
+                    
+                    # Calculate passability and safety targets for this span
+                    span_passability_target = torch.zeros(span, 8, dtype=torch.float32, device=device)
+                    span_safety_target = torch.zeros(span, 8, dtype=torch.float32, device=device)
+                    span_hard_mask = torch.zeros(span, 8, dtype=torch.float32, device=device)
+                    span_weight = torch.zeros(span, 8, dtype=torch.float32, device=device)
+                    
+                    # Calculate passability and safety for each timestep in span where hero is visible
+                    for s in range(span):
+                        if span_mask[s]:  # Only calculate for valid timesteps
+                            chars_map = span_chars[s]  # [21, 79]
+                            colors_map = span_colors[s]  # [21, 79]
+                            
+                            # Find hero position (prefer '@' character)
+                            ys, xs = (chars_map == ord('@')).nonzero(as_tuple=True)
+                            if ys.numel() > 0:
+                                hy, hx = int(ys[0].item()), int(xs[0].item())
+                                p8, s8, hm8, w8 = compute_passability_and_safety(chars_map, colors_map, hy, hx)
+                                span_passability_target[s] = p8
+                                span_safety_target[s] = s8
+                                span_hard_mask[s] = hm8
+                                span_weight[s] = w8
                     
                     batch_list.append({
                         'game_chars': span_chars,
@@ -1540,11 +1570,15 @@ class PPOTrainer:
                         'blstats': span_blstats,
                         'message_chars': span_message,
                         'hero_info': span_hero_info,
-                        'valid_screen': torch.ones(span, dtype=torch.bool, device=device),
+                        'valid_screen': span_mask,
                         'action_onehot': span_action_onehot,
                         'has_next': span_has_next,
                         'reward_target': span_reward_target,
-                        'done_target': span_done_target
+                        'done_target': span_done_target,
+                        'passability_target': span_passability_target,
+                        'safety_target': span_safety_target,
+                        'hard_mask': span_hard_mask,
+                        'weight': span_weight
                     })
                 
                 if not batch_list:
@@ -1562,6 +1596,10 @@ class PPOTrainer:
                 all_has_next = torch.cat([b['has_next'] for b in batch_list], dim=0)
                 all_reward_target = torch.cat([b['reward_target'] for b in batch_list], dim=0)
                 all_done_target = torch.cat([b['done_target'] for b in batch_list], dim=0)
+                all_passability_target = torch.cat([b['passability_target'] for b in batch_list], dim=0)
+                all_safety_target = torch.cat([b['safety_target'] for b in batch_list], dim=0)
+                all_hard_mask = torch.cat([b['hard_mask'] for b in batch_list], dim=0)
+                all_weight = torch.cat([b['weight'] for b in batch_list], dim=0)
                 
                 # Calculate combined batch shape for sequential processing
                 num_spans = len(batch_list)
@@ -1578,30 +1616,17 @@ class PPOTrainer:
                     'has_next': all_has_next,
                     'reward_target': all_reward_target,
                     'done_target': all_done_target,
+                    'passability_target': all_passability_target,
+                    'safety_target': all_safety_target,
+                    'hard_mask': all_hard_mask,
+                    'weight': all_weight,
                     'original_batch_shape': (num_spans, span_len)  # For sequential processing in VAE
                 }
-            
+            combined_batch['sticky_hmm'] = self.hmm
             # Forward pass through VAE to get complete model output (like train.py)
             self.vae_opt.zero_grad()
             with torch.amp.autocast('cuda', enabled=False):
                 model_output = self.vae(combined_batch)
-                
-                # Get HMM responsibilities for the encoded latents (no gradients for HMM)
-                with torch.no_grad():
-                    mu_encoded = model_output['mu']  # [total_samples, D]
-                    diagvar_encoded = model_output['logvar'].exp().clamp_min(1e-6)
-                    r_hat = self.hmm.predict_posterior(
-                        mu_encoded.unsqueeze(0), diagvar_encoded.unsqueeze(0), None, 
-                        torch.ones(1, mu_encoded.size(0), device=device)
-                    ).squeeze(0)  # [total_samples, Kp1]
-                    
-                    # Add HMM cache to the batch for VAE loss computation
-                    combined_batch['hmm_cache'] = {
-                        'mu_k': self.hmm.niw.mu,  # [Kp1, D] 
-                        'E_Lambda': self.hmm._get_E_Lambda(),  # [Kp1, D, D]
-                        'logdet_Sigma_k': self.hmm._get_E_logdet_Lambda(),  # [Kp1]
-                        'r_hat_flat': r_hat  # [total_samples, Kp1]
-                    }
                 
                 # Calculate VAE loss with lighter coefficients for online training
                 vae_loss_dict = vae_loss(
@@ -1657,7 +1682,7 @@ class PPOTrainer:
         
         # Parse hero info from initial observations (episode start)
         self._episode_start = [True for _ in range(self.ppo_cfg.num_envs)]
-        self._update_hero_info_from_obs(obs)
+        self._update_hero_info_from_obs(obs, self.ppo_cfg.num_envs, self._episode_start, self._hero_info, logger=logger)
         
         self._obs = obs
 
@@ -1794,6 +1819,9 @@ class PPOTrainer:
         start_time = time.time()
         
         env = gym.make(self.env_id)
+        episode_start = [True]
+        hero_info = [None]  # single env
+        st = None  # single env
         ret_list, len_list, succ_list = [], [], []
         cover_list = []    # unique (x,y) cells visited per episode (if blstats available)
         # HMM‑centric diagnostics
@@ -1812,12 +1840,16 @@ class PPOTrainer:
         for ep_idx in eval_pbar:
             ep_start_time = time.time()
             o, _ = env.reset()
+            episode_start = [True]
+            st = None
+            self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
             done = False; ret = 0.0; ep_len = 0
+            max_episode_steps = 10000  # Maximum steps per episode to prevent hanging
             # buffers to run HMM causal filter post‑episode
-            mu_seq, logvar_seq = [], []
+            mu_seq, logvar_seq, F_seq = [], [], []
             visited = set()
 
-            while not done:
+            while not done and ep_len < max_episode_steps:
                 # coverage proxy from blstats (x,y)
                 if isinstance(o, dict) and "blstats" in o:
                     bl = o["blstats"]
@@ -1827,17 +1859,55 @@ class PPOTrainer:
                         x, y = int(bl[0][0]), int(bl[0][1])  # [B,dim]
                     visited.add((x, y))
 
-                enc = self._encode_obs(o)
+                enc = self._encode_obs(o, hero_info)
+                
+                # ---- Causal skill filtering (per-env, current frame) ----
+                skill_feat = None
+                if self.ppo_cfg.policy_uses_skill:
+                    Kp1 = int(self.hmm.niw.mu.size(0))  # includes remainder
+                    mu_b = enc["mu"].squeeze(0)                                     # [D]
+                    dv_b = enc["logvar"].squeeze(0).exp().clamp_min(1e-6)           # [D]
+                    F    = enc.get('lowrank_factors', None)                         # [D,R] or None
+                    # logB_t[k] = E_q[log p(z_t | h_t=k)]
+                    logB_b = StickyHDPHMMVI.expected_emission_loglik(
+                        self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
+                        mu_b.unsqueeze(0), dv_b.unsqueeze(0), F.unsqueeze(0) if F is not None else None, mask=None
+                    ).squeeze(0)  # [Kp1]
+
+                    if st is None:
+                        # initialise at episode start
+                        st = self.hmm.filter_init_from_logB(logB_b)
+                        alpha_b = torch.exp(st.log_alpha.to(torch.float32))  # [Kp1]
+                    else:
+                        # one causal update (uses cached ElogA)
+                        st, alpha_b, _xi, _bound, _sent = self.hmm.filter_step(st, logB_b, self._ElogA)
+                    # drop the remainder state for policy features
+                    skill_feat = alpha_b[:Kp1-1].unsqueeze(0)  # [B, K]
+                
                 mu_seq.append(enc["mu"].squeeze(0).cpu())
                 logvar_seq.append(enc["logvar"].squeeze(0).cpu())
+                if "lowrank_factors" in enc and enc["lowrank_factors"] is not None:
+                    F_seq.append(enc["lowrank_factors"].squeeze(0).cpu())
+                else:
+                    F_seq.append(None)
 
-                logits, value = self.actor_critic(enc["z"], None)
-                a = (torch.argmax(logits, dim=-1)
+                logits, value = self.actor_critic(enc["z"], skill_feat)
+                masked = self._masked_logits(logits)
+                a_global = (torch.argmax(masked, dim=-1)
                      if self.ppo_cfg.deterministic_eval
-                     else torch.distributions.Categorical(logits=logits).sample())
-                o, r, term, trunc, _ = env.step(int(a.item()))
+                     else torch.distributions.Categorical(logits=masked).sample())
+                a_local = self.global2local.gather(1, a_global.view(-1, 1)).squeeze()
+                o, r, term, trunc, _ = env.step(int(a_local.item()))
                 done = term or trunc
+                episode_start = [done]
+                if done:
+                    st = None  # reset HMM filter state at episode end
+                self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
                 ret += float(r); ep_len += 1
+
+            # Check if episode was terminated due to step limit
+            if ep_len >= max_episode_steps and not done:
+                print(f"⚠️ Episode {ep_idx + 1} terminated due to step limit ({max_episode_steps} steps)")
 
             # episode‑level tallies
             ret_list.append(ret); len_list.append(ep_len)
@@ -1858,48 +1928,45 @@ class PPOTrainer:
             })
 
             # ---------- HMM filter over the episode ----------
-            try:
+            if self.ppo_cfg.policy_uses_skill:
                 mu_t = torch.stack(mu_seq, dim=0).to(self.device)           # [T,D]
                 logvar_t = torch.stack(logvar_seq, dim=0).to(self.device)   # [T,D]
                 diag_var_t = torch.exp(logvar_t)
+                F_t = torch.stack(F_seq, dim=0).to(self.device) if F_seq[0] is not None else None  # [T,D,R] or None
 
                 # Emission potentials and causal filter
                 logB = StickyHDPHMMVI.expected_emission_loglik(
                     self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                    mu_t.unsqueeze(0), diag_var_t.unsqueeze(0), None, None
+                    mu_t.unsqueeze(0), diag_var_t.unsqueeze(0), F_t.unsqueeze(0) if F_t is not None else None, None
                 ).squeeze(0)                                                # [T,Kp1]
 
-                if hasattr(self.hmm, "filter_sequence"):
-                    fs = self.hmm.filter_sequence(logB)                     # dict with alpha, xi, boundary_prob, skill_entropy
-                    alpha = fs["alpha"]                                     # [T,Kp1]
-                    boundary_prob = fs["boundary_prob"]                     # [T]
-                    skill_entropy = fs["skill_entropy"]                     # [T]
+                fs = self.hmm.filter_sequence(logB)                     # dict with alpha, xi, boundary_prob, skill_entropy
+                alpha = fs["alpha"]                                     # [T,Kp1]
+                boundary_prob = fs["boundary_prob"]                     # [T]
+                skill_entropy = fs["skill_entropy"]                     # [T]
 
-                    # boolean gate 1[ΔH_t > 0]
-                    dH = torch.nan_to_num(skill_entropy[1:] - skill_entropy[:-1])
-                    gate_bool = (dH > 0).float()
-                    bound_bool_rate = float(gate_bool.mean().item()) if gate_bool.numel() > 0 else 0.0
-                    bound_mass_rate = float(torch.nan_to_num(boundary_prob[1:]).mean().item()) if boundary_prob.numel() > 1 else 0.0
-                    ent_mean = float(torch.nan_to_num(skill_entropy).mean().item())
+                # boolean gate 1[ΔH_t > 0]
+                dH = torch.nan_to_num(skill_entropy[1:] - skill_entropy[:-1])
+                gate_bool = (dH > 0).float()
+                bound_bool_rate = float(gate_bool.mean().item()) if gate_bool.numel() > 0 else 0.0
+                bound_mass_rate = float(torch.nan_to_num(boundary_prob[1:]).mean().item()) if boundary_prob.numel() > 1 else 0.0
+                ent_mean = float(torch.nan_to_num(skill_entropy).mean().item())
 
-                    # used skills (exclude remainder state = last index)
-                    if alpha.numel() > 0:
-                        Kp1 = alpha.size(-1)
-                        alpha_no_rest = alpha[:, :Kp1-1]
-                        used = torch.unique(torch.argmax(alpha_no_rest, dim=-1)).numel()
-                        occ = alpha_no_rest.sum(dim=0); occ = occ / (occ.sum() + 1e-12)
-                        effK = float(torch.exp(-(occ.clamp_min(1e-12) * occ.clamp_min(1e-12).log()).sum()).item())
-                    else:
-                        used, effK = 0, 0.0
+                # used skills (exclude remainder state = last index)
+                if alpha.numel() > 0:
+                    Kp1 = alpha.size(-1)
+                    alpha_no_rest = alpha[:, :Kp1-1]
+                    used = torch.unique(torch.argmax(alpha_no_rest, dim=-1)).numel()
+                    occ = alpha_no_rest.sum(dim=0); occ = occ / (occ.sum() + 1e-12)
+                    effK = float(torch.exp(-(occ.clamp_min(1e-12) * occ.clamp_min(1e-12).log()).sum()).item())
+                else:
+                    used, effK = 0, 0.0
 
-                    bound_mass_list.append(bound_mass_rate)
-                    bound_bool_list.append(bound_bool_rate)
-                    ent_list.append(ent_mean)
-                    used_skills_list.append(int(used))
-                    effK_list.append(effK)
-            except Exception:
-                # Robustness in case HMM diagnostics fail on early runs
-                pass
+                bound_mass_list.append(bound_mass_rate)
+                bound_bool_list.append(bound_bool_rate)
+                ent_list.append(ent_mean)
+                used_skills_list.append(int(used))
+                effK_list.append(effK)
 
         eval_pbar.close()
         env.close()

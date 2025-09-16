@@ -185,10 +185,10 @@ def fit_sticky_hmm_one_pass(
                 
                 # forward encode only (keep no_grad for model inference)
                 with torch.no_grad():
-                    out = model(batch_dev)  # returns 'mu', 'logvar', optionally 'lowrank_factors'
-                    mu    = out['mu'].detach()  # Detach from computation graph
-                    logvar= out['logvar'].detach()  # Detach from computation graph
-                    F     = out.get('lowrank_factors', None)
+                    enc = model.batch_encode(batch_dev)
+                    mu    = enc['mu'].detach()  # Detach from computation graph
+                    logvar= enc['logvar'].detach()  # Detach from computation graph
+                    F     = enc.get('lowrank_factors', None)
                     if F is not None:
                         F = F.detach()  # Detach from computation graph
                     valid = batch_dev['valid_screen'].view(B,T)
@@ -1270,48 +1270,12 @@ def train_multimodalhack_vae(
                     batch_device['original_batch_shape'] = (B, T)
                     batch_device['batch_size'] = B
                 
+                if use_hmm_prior and hmm is not None:
+                    batch_device['sticky_hmm'] = hmm
+                
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
-                    model_output = model(batch_device)
-                    
-                    # ==== (M‑step) HMM prior cache for this batch (no gradients) ====
-                    if use_hmm_prior and (hmm is not None):
-                        with torch.no_grad():
-                            B,T = batch_device['original_batch_shape']
-                            valid_bt = batch_device['valid_screen'].view(B,T)
-                            mu_bt    = model_output['mu'].view(B,T,-1)
-                            var_bt   = model_output['logvar'].exp().clamp_min(1e-6).view(B,T,-1)
-                            F_btr    = model_output.get('lowrank_factors', None)
-                            F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
-                            # emission expected log-likelihood per (b,t,k)
-                            logB = StickyHDPHMMVI.expected_emission_loglik(hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu, mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
-                            pi_star  = hmm._Epi()                              # [K]
-                            ElogA    = hmm._ElogA()                            # [K,K]
-                            log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
-                            
-                            # Process each sequence in the batch individually
-                            r_hat_list = []
-                            for b in range(B):
-                                r_hat_b, xi_hat_b, ll_b = hmm.forward_backward(log_pi, ElogA, logB[b])
-                                r_hat_list.append(r_hat_b)
-                            r_hat = torch.stack(r_hat_list, dim=0)  # [B,T,K]
-                            
-                            # prior Gaussians
-                            mu_k, E_Lambda, _ = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
-                            # log|Σ_k| = - log|Λ_k|
-                            L = torch.linalg.cholesky(E_Lambda)                       # [Kp1,D,D]
-                            logdet_E_Lambda = 2.0 * torch.log(torch.diagonal(L,  dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
-                            logdet_Sigma_k = -logdet_E_Lambda                           # [Kp1]
-                            # flatten responsibilities to align with valid_screen
-                            r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
-                        # stash cache into batch so vae_loss can pick it up
-                        batch_device['sticky_hmm'] = hmm
-                        batch_device['hmm_cache'] = {
-                            'mu_k': mu_k.to(model_output['mu'].dtype),
-                            'E_Lambda': E_Lambda.to(model_output['mu'].dtype),
-                            'logdet_Sigma_k': logdet_Sigma_k.to(model_output['mu'].dtype),
-                            'r_hat_flat': r_hat_flat.to(model_output['mu'].dtype),
-                        }
+                    model_output = model(batch_device, logger)
 
                     # Calculate adaptive weights for this step
                     mi_beta, tc_beta, dw_beta, blend_alpha = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
@@ -1497,49 +1461,13 @@ def train_multimodalhack_vae(
                     B, T = batch['game_chars'].shape[:2]
                     batch_device['original_batch_shape'] = (B, T)
                     batch_device['batch_size'] = B
+                    
+                if use_hmm_prior and hmm is not None:
+                    batch_device['sticky_hmm'] = hmm
                 
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
-                    model_output = model(batch_device)
-                    
-                    # ==== (M‑step) HMM prior cache for this batch (no gradients) ====
-                    if use_hmm_prior and (hmm is not None):
-                        with torch.no_grad():
-                            B,T = batch_device['original_batch_shape']
-                            valid_bt = batch_device['valid_screen'].view(B,T)
-                            mu_bt    = model_output['mu'].view(B,T,-1)
-                            var_bt   = model_output['logvar'].exp().clamp_min(1e-6).view(B,T,-1)
-                            F_btr    = model_output.get('lowrank_factors', None)
-                            F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
-                            # emission expected log-likelihood per (b,t,k)
-                            logB = StickyHDPHMMVI.expected_emission_loglik(hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu, mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
-                            pi_star  = hmm._Epi()                              # [K]
-                            ElogA    = hmm._ElogA()                            # [K,K]
-                            log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
-                            
-                            # Process each sequence in the batch individually
-                            r_hat_list = []
-                            for b in range(B):
-                                r_hat_b, xi_hat_b, ll_b = hmm.forward_backward(log_pi, ElogA, logB[b])
-                                r_hat_list.append(r_hat_b)
-                            r_hat = torch.stack(r_hat_list, dim=0)  # [B,T,K]
-                            
-                            # prior Gaussians
-                            mu_k, E_Lambda, _ = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
-                            # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
-                            L = torch.linalg.cholesky(E_Lambda)                       # [Kp1,D,D]
-                            logdet_E_Lambda = 2.0 * torch.log(torch.diagonal(L,  dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
-                            logdet_Sigma_k = -logdet_E_Lambda                         # [Kp1]
-                            # flatten responsibilities to align with valid_screen
-                            r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
-                        # stash cache into batch so vae_loss can pick it up
-                        batch_device['sticky_hmm'] = hmm
-                        batch_device['hmm_cache'] = {
-                            'mu_k': mu_k.to(model_output['mu'].dtype),
-                            'E_Lambda': E_Lambda.to(model_output['mu'].dtype),
-                            'logdet_Sigma_k': logdet_Sigma_k.to(model_output['mu'].dtype),
-                            'r_hat_flat': r_hat_flat.to(model_output['mu'].dtype),
-                        }
+                    model_output = model(batch_device, logger)
                         
                     # Calculate adaptive weights for this step (use current global step for consistency)
                     mi_beta, tc_beta, dw_beta, blend_alpha = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
@@ -2325,8 +2253,8 @@ def train_vae_with_sticky_hmm_em(
                             bdev[k] = x
                     else:
                         bdev[k] = v
-                out = model(bdev)
-                mu_bt = out['mu'].view(B, T, -1).detach().cpu()
+                enc = model.batch_encode(bdev)
+                mu_bt = enc['mu'].view(B, T, -1).detach().cpu()
                 valid = bdev['valid_screen'].view(B, T).cpu().bool()
                 X.append(mu_bt[valid])
                 collected += int(valid.sum().item())
