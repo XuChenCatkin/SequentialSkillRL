@@ -86,7 +86,9 @@ class HMMOnlineConfig:
     pi_steps: int = 200                     # π optimization steps
     pi_lr: float = 0.05                     # π optimization learning rate
     pi_early_stopping_patience: int = 10   # early stopping patience for π optimization
-    pi_early_stopping_min_delta: float = 1e-5  # early stopping min delta for π optimization
+    pi_early_stopping_min_delta: float = 1e-5,  # early stopping min delta for π optimization
+    emission_mode: str = "sample",          # "sample" or "mean" or "expected" or "student_t"
+    student_t_use_sample: bool = False      # if using student_t, use sampled z for logB (else mean)
 
 @dataclass
 class VAEOnlineConfig:
@@ -129,24 +131,26 @@ def set_seed(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 class EMANormalizer:
-    """Track mean/var with EMA and normalise new values."""
-    def __init__(self, beta=0.99, eps=1e-8, device="cpu"):
-        self.beta = beta; self.eps = eps
+    """
+    Track var with EMA and normalise new values.
+    If center=False, we divide by running std only (keeps non‑negative signals non‑negative).
+    """
+    def __init__(self, beta=0.99, eps=1e-8, device="cpu", center: bool = True):
+        self.beta = beta; self.eps = eps; self.center = center
         self.mean = torch.zeros((), device=device)
         self.var  = torch.ones((), device=device)
         self.initialised = False
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [N] or [N, ...] flattened later
         val = x.detach()
-        m = val.mean()
-        v = val.var(unbiased=False) + self.eps
+        m = val.mean(); v = val.var(unbiased=False) + self.eps
         if not self.initialised:
             self.mean.copy_(m); self.var.copy_(v); self.initialised = True
         else:
             self.mean = self.beta * self.mean + (1 - self.beta) * m
             self.var  = self.beta * self.var  + (1 - self.beta) * v
-        return (x - self.mean) / (self.var.sqrt() + self.eps)
+        y = (x - self.mean) if self.center else x
+        return y / (self.var.sqrt() + self.eps)
 
 def one_hot(indices: torch.Tensor, num_classes: int) -> torch.Tensor:
     y = torch.zeros(*indices.shape, num_classes, device=indices.device)
@@ -241,16 +245,17 @@ class CuriosityComputer:
     Compute (A) dynamics surprise, (B) skill entropy, and (C) optional RND.
     All terms are normalised with EMA and annealed with time.
     """
-    def __init__(self, vae: MultiModalHackVAE, hmm: StickyHDPHMMVI, device, cur_cfg: CuriosityConfig, rnd_cfg: RNDConfig, z_dim: int, skill_K: int):
+    def __init__(self, vae: MultiModalHackVAE, hmm: StickyHDPHMMVI, device, cur_cfg: CuriosityConfig, hmm_cfg: HMMOnlineConfig, rnd_cfg: RNDConfig, z_dim: int, skill_K: int):
         self.vae = vae
         self.hmm = hmm
         self.device = device
         self.cfg = cur_cfg
+        self.hmm_cfg = hmm_cfg
 
-        self.norm_dyn = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device)
-        self.norm_hdp = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device)
-        self.norm_trans = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device)
-        self.norm_rnd = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device)
+        self.norm_dyn = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device, center=False)
+        self.norm_hdp = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device, center=False)
+        self.norm_trans = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device, center=False)
+        self.norm_rnd = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device, center=False)
 
         self.global_step = 0
 
@@ -293,9 +298,8 @@ class CuriosityComputer:
         H = torch.zeros(B, T, device=self.device, dtype=mu_seq.dtype)
         pchg = torch.zeros(B, T, device=self.device, dtype=mu_seq.dtype)
         
-        logB = StickyHDPHMMVI.expected_emission_loglik(
-                    self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                    mu_seq, diagvar_seq, F_seq, mask=None
+        logB = self.hmm.make_logB_for_filter(
+                    mu_seq, diagvar_seq, F_seq, None, self.hmm_cfg.emission_mode, self.hmm_cfg.student_t_use_sample
                 )
 
         for b in range(B):
@@ -417,12 +421,14 @@ class CuriosityComputer:
                         gate_bool[b, t] = 0.0  # no previous step to compare to
                     else:
                         dH = h_entropy[b, t] - prev_H
-                        gate_bool[b, t] = 1.0 if dH > 0.0 else 0.0
+                        gate_bool[b, t] = 1.0 if dH > self.cfg.gate_delta_eps else 0.0
                     prev_H = float(h_entropy[b, t].item())
 
             # Compute transition novelty using already computed xi
             trans_novel = torch.zeros(B, T, device=device)
             # xi is [B, T-1, Kp1, Kp1] - pairwise posteriors ξ_{t-1,t}
+            neg_logA = (-ElogA).clamp_min(0.0)            # [Kp1,Kp1]
+            neg_logA.fill_diagonal_(0.0)                  # ignore self-transitions
             for t in range(1, T):  # start from t=1 since xi[t-1] exists
                 # Don't compute transition novelty across episode boundaries
                 for b in range(B):
@@ -430,7 +436,7 @@ class CuriosityComputer:
                         # Episode terminated at t-1, so no transition to t
                         trans_novel[b, t] = 0.0
                     else:
-                        trans_novel[b, t] = torch.clamp(-(xi[b, t-1] * ElogA).sum(), min=0.0)
+                        trans_novel[b, t] = (xi[b, t-1] * neg_logA).sum()
 
             # gated boundary entropy: H(α_t) * 1{ΔH_t > 0}
             h_boundary_gated = (h_entropy * gate_bool) * mask  # [B,T]
@@ -765,7 +771,7 @@ class PPOTrainer:
         self.opt = torch.optim.Adam(self.actor_critic.parameters(), lr=ppo_cfg.learning_rate)
 
         # Curiosity computer
-        self.curiosity = CuriosityComputer(self.vae, self.hmm, self.device, cur_cfg, rnd_cfg, z_dim, skill_dim)
+        self.curiosity = CuriosityComputer(self.vae, self.hmm, self.device, cur_cfg, hmm_cfg, rnd_cfg, z_dim, skill_dim)
 
         # Storage
         self.buf = RolloutBuffer(ppo_cfg.num_envs, ppo_cfg.rollout_len, z_dim, skill_dim, self.device)
@@ -1163,9 +1169,8 @@ class PPOTrainer:
         mu = enc["mu"]
         dv = enc["logvar"].exp()
         F = enc.get("lowrank_factors", None)
-        logB = StickyHDPHMMVI.expected_emission_loglik(
-            self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-            mu, dv, F, mask=None
+        logB = self.hmm.make_logB_for_filter(
+            mu, dv, F, None, self.hmm_cfg.emission_mode, self.hmm_cfg.student_t_use_sample
         )  # [B, Kp1]
         Kp1 = self.hmm.niw.mu.size(0)
         skill_list = []
@@ -1740,7 +1745,7 @@ class PPOTrainer:
             # skills for policy (concat to z) during PPO update: use the SAME features we acted with
             skills_for_policy = self.buf.skill.transpose(0,1) if (self.ppo_cfg.policy_uses_skill and self.buf.skill is not None) else None  # [T,B,K]
             # total reward
-            intrinsic = bonuses["dyn"] + bonuses["hdp"] + bonuses["trans"] + bonuses["rnd"]  # [B, T]
+            intrinsic = torch.relu(bonuses["dyn"]) + torch.relu(bonuses["hdp"]) + torch.relu(bonuses["trans"]) + torch.relu(bonuses["rnd"])  # [B, T]
             ext = self.buf.rews_e  # [T, B]
             rews_total = ext + intrinsic.transpose(0, 1)  # [T, B]
             adv, ret = self._advantages(rews_total, self.buf.val, self.buf.dones)
@@ -1894,10 +1899,9 @@ class PPOTrainer:
                     dv_b = enc["logvar"].exp().clamp_min(1e-6)  # [1, D]
                     F_b = enc.get('lowrank_factors', None)  # [1, D, R] or None
                     
-                    logB_b = StickyHDPHMMVI.expected_emission_loglik(
-                        self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                        mu_b, dv_b, F_b, mask=None
-                    ).squeeze(0)  # [Kp1] - remove batch dim for single env
+                    logB_b = self.hmm.make_logB_for_filter(
+                        mu_b, dv_b, F_b, None, ('mean' if self.hmm_cfg.emission_mode is not 'student_t' else 'student_t'), False
+                    ).squeeze(0)  # [Kp1] - always use deterministic mean for eval
 
                     if eval_filt_state is None:
                         # Initialize at episode start (same as training)
@@ -1972,10 +1976,14 @@ class PPOTrainer:
                 F_t = torch.stack(F_seq, dim=0).to(self.device) if F_seq[0] is not None else None  # [T,D,R] or None
 
                 # Emission potentials and causal filter
-                logB = StickyHDPHMMVI.expected_emission_loglik(
-                    self.hmm.niw.mu, self.hmm.niw.kappa, self.hmm.niw.Psi, self.hmm.niw.nu,
-                    mu_t.unsqueeze(0), diag_var_t.unsqueeze(0), F_t.unsqueeze(0) if F_t is not None else None, None
-                ).squeeze(0)                                                # [T,Kp1]
+                logB = self.hmm.make_logB_for_filter(
+                    mu_t.unsqueeze(0), 
+                    diag_var_t.unsqueeze(0), 
+                    F_t.unsqueeze(0) if F_t is not None else None, 
+                    None, 
+                    ('mean' if self.hmm_cfg.emission_mode is not 'student_t' else 'student_t'), 
+                    False
+                ).squeeze(0) # [T,Kp1], always use deterministic mean for eval
 
                 fs = self.hmm.filter_sequence(logB)                     # dict with alpha, xi, boundary_prob, skill_entropy
                 alpha = fs["alpha"]                                     # [T,Kp1]
@@ -1984,7 +1992,7 @@ class PPOTrainer:
 
                 # boolean gate 1[ΔH_t > 0]
                 dH = torch.nan_to_num(skill_entropy[1:] - skill_entropy[:-1])
-                gate_bool = (dH > 0).float()
+                gate_bool = (dH > self.cur_cfg.gate_delta_eps).float()
                 bound_bool_rate = float(gate_bool.mean().item()) if gate_bool.numel() > 0 else 0.0
                 bound_mass_rate = float(torch.nan_to_num(boundary_prob[1:]).mean().item()) if boundary_prob.numel() > 1 else 0.0
                 ent_mean = float(torch.nan_to_num(skill_entropy).mean().item())

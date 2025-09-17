@@ -850,9 +850,9 @@ if __name__ == "__main__":
                 use_skill_transition_novelty=True,  # Skill transition novelty
                 use_rnd=False,
                 # Standard annealing
-                eta0_dyn=1.0, tau_dyn=3e6,
-                eta0_hdp=1.0, tau_hdp=3e6,
-                eta0_stn=1.0, tau_stn=3e6,
+                eta0_dyn=0.25, tau_dyn=3e6,
+                eta0_hdp=0.25, tau_hdp=3e6,
+                eta0_stn=0.25, tau_stn=3e6,
                 # Skill boundary gating
                 use_skill_boundary_gate=True,
                 gate_delta_eps=1e-3,
@@ -923,7 +923,7 @@ if __name__ == "__main__":
                 use_skill_entropy=False,
                 use_skill_transition_novelty=True,  # Only skill transition novelty
                 use_rnd=False,
-                eta0_stn=1.0, tau_stn=3e6,
+                eta0_stn=0.25, tau_stn=3e6,
                 ema_beta=0.99, eps=1e-8
             )
             description = "VAE+HMM+PPO with skill transition novelty only"
@@ -955,7 +955,7 @@ if __name__ == "__main__":
         else:
             hmm_config = HMMOnlineConfig(
                 hmm_update_every=5_120,   # Update HMM every ~5 rollouts
-                hmm_update_growth=1.30,    # Growth factor for update interval
+                hmm_update_growth=1.10,    # Growth factor for update interval
                 hmm_update_every_cap=60_000, # Cap for update interval
                 hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
                 hmm_max_iters=5,          # Up to 5 iterations per update
@@ -967,7 +967,9 @@ if __name__ == "__main__":
                 pi_steps=10,               # π optimization steps
                 pi_lr=5e-4,                # π optimization learning rate
                 pi_early_stopping_patience=1,    # Early stopping patience
-                pi_early_stopping_min_delta=1e-2 # Early stopping min delta
+                pi_early_stopping_min_delta=1e-2, # Early stopping min delta
+                emission_mode = "student_t",          # "sample" or "mean" or "expected" or "student_t"
+                student_t_use_sample = True      # if using student_t, use sampled z for logB (else mean)
             )
             if resume_repo_id is None and resume_local_path is None:
                 # Set VAE and HMM repos to pre-trained models
@@ -980,7 +982,7 @@ if __name__ == "__main__":
         # VAE Online Configuration - synchronized with HMM updates
         vae_config = VAEOnlineConfig(
             vae_update_every=5_120,       # Match HMM update frequency  
-            vae_update_growth=1.30,       # Same growth pattern as HMM
+            vae_update_growth=1.10,       # Same growth pattern as HMM
             vae_update_every_cap=60_000,  # Same cap as HMM
             vae_lr=1e-4                   # Learning rate for VAE updates
         )
@@ -1000,8 +1002,8 @@ if __name__ == "__main__":
             seed=seed,
             device='cuda' if torch.cuda.is_available() else 'cpu',
             log_dir=f"./runs/{run_name}",
-            save_every=25_000,
-            eval_every=25_000,
+            save_every=10_000,
+            eval_every=10_000,
             eval_episodes=10
         )
         

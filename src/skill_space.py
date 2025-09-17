@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from math import fabs
+import math
 from typing import Optional, Tuple, Dict, List
 
 import torch
@@ -1469,6 +1469,99 @@ class StickyHDPHMMVI(nn.Module):
         """Minimal per‑sequence filter state."""
         log_alpha: torch.Tensor  # [Kp1] normalized (log) filtering marginals
         loglik: float = 0.0      # cumulative log-likelihood
+
+
+    # ---- Unified emission helper for ONLINE filtering (used by both curiosity and policy features)
+    @torch.no_grad()
+    def make_logB_for_filter(
+        self,
+        mu: torch.Tensor,            # [B,T,D] or [B,D]
+        logvar: torch.Tensor,        # [B,T,D] or [B,D]
+        F: Optional[torch.Tensor],   # [B,T,D,R] or [B,D,R] or None
+        mask: Optional[torch.Tensor] = None,  # [B,T] or None
+        emission_mode: str = "sample",  # "sample", "mean", "expected", or "student_t"
+        student_t_use_sample: bool = False  # use sample in student_t mode
+    ) -> torch.Tensor:
+        """
+        Build emission log-likelihoods for ONLINE filtering under the configured mode.
+        Returns: logB with shape [B,T,Kp1] (or [B,Kp1] if input is [B,D], but we always
+        upcast to [B,1,Kp1] and squeeze at the caller to simplify broadcasting).
+        
+        Modes:
+        - "sample": sample z_t ~ N(μ,diagvar + FF^T) and compute log-likelihood under NIW mixture
+        - "mean": use z_t = μ and compute log-likelihood under NIW mixture
+        - "expected": compute expected log-likelihood under N(μ,diagvar) and NIW mixture, VB style
+        - "student_t": compute log-likelihood under multivariate Student-t predictive distribution
+          (optionally using z_t ~ N(μ,diagvar) if student_t_use_sample is True, otherwise z_t = μ)
+        """
+        # Ensure [B,T,D] shape
+        input_was_2d = (mu.dim() == 2)
+        if input_was_2d:
+            mu = mu.unsqueeze(1); logvar = logvar.unsqueeze(1)
+            F = F.unsqueeze(1) if (F is not None and F.dim() == 2) else F
+            mask = mask.unsqueeze(1) if (mask is not None and mask.dim() == 1) else mask
+        B, T, D = mu.shape
+        Kp1 = self.niw.mu.size(0)
+
+        if emission_mode == "expected":
+            diagvar = logvar.exp().clamp_min(1e-6)
+            logB = StickyHDPHMMVI.expected_emission_loglik(
+                self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
+                mu, diagvar, F, mask)
+        elif emission_mode == "mean":
+            logB = StickyHDPHMMVI.expected_emission_loglik(
+                self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
+                mu, None, None, mask)
+        elif emission_mode == "sample":
+            eps = torch.randn_like(mu)
+            z = mu + eps * (logvar.mul(0.5).exp())
+            if F is not None:
+                R = F.size(-1)
+                eps_lr = torch.randn(B, T, R, device=mu.device, dtype=mu.dtype)
+                z = z + torch.einsum('btr,btdr->btd', eps_lr, F)
+            logB = StickyHDPHMMVI.expected_emission_loglik(
+                self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
+                z, None, None, mask)
+        elif emission_mode == "student_t":
+            # Multivariate Student-t predictive under NIW posterior
+            mu_hat  = self.niw.mu         # [Kp1,D]
+            k_hat   = self.niw.kappa      # [Kp1]
+            Psi_hat = self.niw.Psi        # [Kp1,D,D]
+            nu_hat  = self.niw.nu         # [Kp1]
+            # degrees of freedom and scale
+            dof = (nu_hat - D + 1.0)  # [Kp1]
+            assert (dof > 0).all(), "NIW nu too small for Student-t!"
+            scale = ((k_hat + 1.0) / (k_hat * dof)).view(Kp1, 1, 1) * Psi_hat                # [Kp1,D,D]
+            # Cholesky of scale
+            L = torch.linalg.cholesky(scale)                                                 # [Kp1,D,D]
+            logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)           # [Kp1]
+            # choose point
+            if student_t_use_sample:
+                eps = torch.randn_like(mu); z = mu + eps * (logvar.mul(0.5).exp())
+                if F is not None:
+                    R = F.size(-1); eps_lr = torch.randn(B, T, R, device=mu.device, dtype=mu.dtype)
+                    z = z + torch.einsum('btr,btdr->btd', eps_lr, F)
+            else:
+                z = mu
+            # quadratic form δ^T Σ^{-1} δ via Cholesky solve
+            delta = z.unsqueeze(2) - mu_hat.view(1, 1, Kp1, D)                            # [B,T,Kp1,D]
+            # y = L^{-1} δ
+            # Add extra dimension for triangular solve: [B,T,Kp1,D] -> [B,T,Kp1,D,1]
+            delta_expanded = delta.unsqueeze(-1)  # [B,T,Kp1,D,1]
+            y = torch.linalg.solve_triangular(
+                L.view(1,1,Kp1,D,D).expand(B,T,-1,-1,-1), delta_expanded, upper=False)
+            y = y.squeeze(-1)  # Remove the extra dimension: [B,T,Kp1,D,1] -> [B,T,Kp1,D]
+            quad = (y**2).sum(-1)                                                               # [B,T,Kp1]
+            c1 = torch.lgamma((dof + D)*0.5) - torch.lgamma(dof*0.5)
+            c2 = -0.5*logdet - (D/2.0)*torch.log(dof*math.pi)
+            logB = (c1 + c2) + (-(dof + D)/2.0) * torch.log1p(quad / dof)
+            if mask is not None:
+                logB = logB * mask.unsqueeze(-1)
+        else:
+            raise ValueError(f"Unknown emission_mode: {emission_mode}")
+
+        return logB if not input_was_2d else logB.squeeze(1)  # [B,T,Kp1] or [B,Kp1]
+
 
     @torch.no_grad()
     def filter_init_from_logB(self, logB0: torch.Tensor) -> "StickyHDPHMMVI.FilterState":
