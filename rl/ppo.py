@@ -245,12 +245,30 @@ class CuriosityComputer:
     Compute (A) dynamics surprise, (B) skill entropy, and (C) optional RND.
     All terms are normalised with EMA and annealed with time.
     """
-    def __init__(self, vae: MultiModalHackVAE, hmm: StickyHDPHMMVI, device, cur_cfg: CuriosityConfig, hmm_cfg: HMMOnlineConfig, rnd_cfg: RNDConfig, z_dim: int, skill_K: int):
+    def __init__(
+        self,
+        vae: MultiModalHackVAE,
+        hmm: StickyHDPHMMVI | None,
+        device,
+        cur_cfg: CuriosityConfig,
+        hmm_cfg: HMMOnlineConfig,
+        rnd_cfg: RNDConfig,
+        z_dim: int,
+        skill_K: int,
+    ):
         self.vae = vae
         self.hmm = hmm
+        self.has_hmm = hmm is not None
         self.device = device
         self.cfg = cur_cfg
         self.hmm_cfg = hmm_cfg
+
+        if not self.has_hmm:
+            if cur_cfg.use_skill_entropy or cur_cfg.use_skill_transition_novelty:
+                raise ValueError("Skill-based curiosity requires an HMM; disable those terms in the config when no HMM is provided.")
+            if cur_cfg.use_skill_boundary_gate:
+                # Boundary gate only matters when skill entropy is used, but be explicit.
+                self.cfg.use_skill_boundary_gate = False
 
         self.norm_dyn = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device, center=False)
         self.norm_hdp = EMANormalizer(cur_cfg.ema_beta, cur_cfg.eps, device, center=False)
@@ -266,7 +284,11 @@ class CuriosityComputer:
             self.rnd = RNDModule(z_dim, proj_dim=rnd_cfg.proj_dim, hidden=rnd_cfg.hidden).to(device)
             self.rnd_opt = torch.optim.Adam(self.rnd.predictor.parameters(), lr=rnd_cfg.lr)
             self.rnd_updates_per_rollout = rnd_cfg.update_per_rollout
-        self.skill_K = skill_K
+        if self.has_hmm:
+            self.skill_K = skill_K
+        else:
+            # Fall back to the world-model skill dimension so we can feed zeros.
+            self.skill_K = getattr(self.vae.world_model, "skill_num", 0)
 
     @torch.no_grad()
     def _eta(self, eta0: float, tau: float) -> float:
@@ -290,6 +312,8 @@ class CuriosityComputer:
             H     : [B,T]       entropy H(α_t)
             p_change : [B,T]    boundary prob 1 - ∑_k ξ_{t-1,t}(k,k); first step NaN
         """
+        if not self.has_hmm:
+            raise RuntimeError("compute_skill_filtered called without an HMM present")
         B, T, _ = mu_seq.shape
         ElogA = self.hmm._ElogA()
         Kp1 = self.hmm.niw.mu.size(0)
@@ -393,54 +417,63 @@ class CuriosityComputer:
         else:
             hmm_mask = mask
 
-        # ---- HMM responsibilities rhat and (B) skill entropy ----
-        filted = self.compute_skill_filtered(mu, logvar.exp().clamp_min(1e-6), F, hmm_mask, dones)  # [B,T,Kp1]
-        alpha = filted["alpha"]  # [B,T,Kp1]
-        xi = filted["xi"]      # [B,T-1,Kp1,Kp1]
-        h_entropy = filted["H"]  # [B,T]
-        Kp1 = alpha.shape[-1]
-        skill_soft = alpha[...,:(Kp1-1)]
+        h_boundary_gated = torch.zeros(B, T, device=device, dtype=mu.dtype)
 
-        # ---- (B) Skill-boundary entropy gated + (C) Skill-transition novelty ----
-        with torch.no_grad():
-            ElogA = self.hmm._ElogA()  # [Kp1,Kp1]
-            
-            # Compute boundary gate: 1{ΔH_t > 0} with episode boundary awareness
-            gate_bool = torch.zeros(B, T, device=device)
-            for b in range(B):
-                prev_H = None
-                for t in range(T):
-                    if mask[b, t] < 0.5:
-                        prev_H = None
-                        continue
-                    # Reset at episode boundaries
-                    if dones is not None and t > 0 and dones[b, t-1]:
-                        prev_H = None
-                    
-                    if prev_H is None:
-                        gate_bool[b, t] = 0.0  # no previous step to compare to
-                    else:
-                        dH = h_entropy[b, t] - prev_H
-                        gate_bool[b, t] = 1.0 if dH > self.cfg.gate_delta_eps else 0.0
-                    prev_H = float(h_entropy[b, t].item())
+        if self.has_hmm:
+            # ---- HMM responsibilities rhat and (B) skill entropy ----
+            filted = self.compute_skill_filtered(mu, logvar.exp().clamp_min(1e-6), F, hmm_mask, dones)  # [B,T,Kp1]
+            alpha = filted["alpha"]  # [B,T,Kp1]
+            xi = filted["xi"]      # [B,T-1,Kp1,Kp1]
+            h_entropy = filted["H"]  # [B,T]
+            Kp1 = alpha.shape[-1]
+            skill_soft = alpha[...,:(Kp1-1)]
 
-            # Compute transition novelty using already computed xi
-            trans_novel = torch.zeros(B, T, device=device)
-            # xi is [B, T-1, Kp1, Kp1] - pairwise posteriors ξ_{t-1,t}
-            neg_logA = (-ElogA).clamp_min(0.0)            # [Kp1,Kp1]
-            neg_logA.fill_diagonal_(0.0)                  # ignore self-transitions
-            for t in range(1, T):  # start from t=1 since xi[t-1] exists
-                # Don't compute transition novelty across episode boundaries
+            # ---- (B) Skill-boundary entropy gated + (C) Skill-transition novelty ----
+            with torch.no_grad():
+                ElogA = self.hmm._ElogA()  # [Kp1,Kp1]
+                
+                # Compute boundary gate: 1{ΔH_t > 0} with episode boundary awareness
+                gate_bool = torch.zeros(B, T, device=device)
                 for b in range(B):
-                    if dones is not None and dones[b, t-1]:
-                        # Episode terminated at t-1, so no transition to t
-                        trans_novel[b, t] = 0.0
-                    else:
-                        trans_novel[b, t] = (xi[b, t-1] * neg_logA).sum()
+                    prev_H = None
+                    for t in range(T):
+                        if mask[b, t] < 0.5:
+                            prev_H = None
+                            continue
+                        # Reset at episode boundaries
+                        if dones is not None and t > 0 and dones[b, t-1]:
+                            prev_H = None
+                        
+                        if prev_H is None:
+                            gate_bool[b, t] = 0.0  # no previous step to compare to
+                        else:
+                            dH = h_entropy[b, t] - prev_H
+                            gate_bool[b, t] = 1.0 if dH > self.cfg.gate_delta_eps else 0.0
+                        prev_H = float(h_entropy[b, t].item())
 
-            # gated boundary entropy: H(α_t) * 1{ΔH_t > 0}
-            h_boundary_gated = (h_entropy * gate_bool) * mask  # [B,T]
-            trans_novel = trans_novel * mask                # [B,T]
+                # Compute transition novelty using already computed xi
+                trans_novel = torch.zeros(B, T, device=device)
+                # xi is [B, T-1, Kp1, Kp1] - pairwise posteriors ξ_{t-1,t}
+                neg_logA = (-ElogA).clamp_min(0.0)            # [Kp1,Kp1]
+                neg_logA.fill_diagonal_(0.0)                  # ignore self-transitions
+                for t in range(1, T):  # start from t=1 since xi[t-1] exists
+                    # Don't compute transition novelty across episode boundaries
+                    for b in range(B):
+                        if dones is not None and dones[b, t-1]:
+                            # Episode terminated at t-1, so no transition to t
+                            trans_novel[b, t] = 0.0
+                        else:
+                            trans_novel[b, t] = (xi[b, t-1] * neg_logA).sum()
+
+                # gated boundary entropy: H(α_t) * 1{ΔH_t > 0}
+                h_boundary_gated = (h_entropy * gate_bool) * mask  # [B,T]
+                trans_novel = trans_novel * mask                # [B,T]
+        else:
+            skill_soft = torch.zeros(B, T, self.skill_K, device=device, dtype=mu.dtype)
+            h_entropy = torch.zeros(B, T, device=device, dtype=mu.dtype)
+            gate_bool = torch.zeros(B, T, device=device, dtype=mu.dtype)
+            trans_novel = torch.zeros(B, T, device=device, dtype=mu.dtype)
+            h_boundary_gated = h_boundary_gated * 0.0
 
         # ---- (A) dynamics KL surprise using world-model prior ----
         dyn = torch.zeros(B, T, device=device)
@@ -763,15 +796,20 @@ class PPOTrainer:
         # Models
         self.vae = vae.to(self.device).eval()  # encoder used in no-grad mode during rollouts
         self.hmm = hmm
+        self.has_hmm = hmm is not None
 
         # Policy
         z_dim = vae.latent_dim
-        skill_dim = hmm.niw.mu.size(0)-1 if ppo_cfg.policy_uses_skill else 0  # exclude remainder
+        if self.has_hmm and ppo_cfg.policy_uses_skill:
+            skill_dim = hmm.niw.mu.size(0) - 1  # exclude remainder
+        else:
+            skill_dim = 0
         self.actor_critic = ActorCritic(z_dim, self.n_actions, skill_dim=skill_dim).to(self.device)
         self.opt = torch.optim.Adam(self.actor_critic.parameters(), lr=ppo_cfg.learning_rate)
 
         # Curiosity computer
-        self.curiosity = CuriosityComputer(self.vae, self.hmm, self.device, cur_cfg, hmm_cfg, rnd_cfg, z_dim, skill_dim)
+        curiosity_skill_dim = (hmm.niw.mu.size(0) - 1) if self.has_hmm else getattr(self.vae.world_model, "skill_num", 0)
+        self.curiosity = CuriosityComputer(self.vae, self.hmm, self.device, cur_cfg, hmm_cfg, rnd_cfg, z_dim, curiosity_skill_dim)
 
         # Storage
         self.buf = RolloutBuffer(ppo_cfg.num_envs, ppo_cfg.rollout_len, z_dim, skill_dim, self.device)
@@ -779,7 +817,7 @@ class PPOTrainer:
         # Bookkeeping
         self.global_steps = 0
         self.last_hmm_refresh = 0
-        self._hmm_interval = self.hmm_cfg.hmm_update_every
+        self._hmm_interval = self.hmm_cfg.hmm_update_every if self.has_hmm else float('inf')
         self.last_vae_refresh = 0
         self._vae_interval = self.vae_cfg.vae_update_every  # Track VAE update interval
         self.vae_opt = None
@@ -792,9 +830,9 @@ class PPOTrainer:
         os.makedirs(run_cfg.log_dir, exist_ok=True)
         self._log_file = os.path.join(run_cfg.log_dir, "metrics.jsonl")
         # --- HMM filtering state (per-env) and cached E[log A] ---
-        self._filt_state = [None for _ in range(ppo_cfg.num_envs)]  # StickyHDPHMMVI.FilterState or None per env
+        self._filt_state = [None for _ in range(ppo_cfg.num_envs)] if (self.has_hmm and self.ppo_cfg.policy_uses_skill) else None
         # cache ElogA; refresh whenever HMM is updated
-        self._ElogA = self.hmm._ElogA()
+        self._ElogA = self.hmm._ElogA() if self.has_hmm else None
         
         # --- World model state for continuity across rollouts ---
         self._world_model_state = None  # Store final world model state from previous rollout
@@ -1061,15 +1099,28 @@ class PPOTrainer:
             dones_bt = self.buf.dones.transpose(0,1)     # [B,T] - done flags
             
             # Build replay buffers using class attributes
+            if self.has_hmm:
+                if len(self.replay_mu) == 0:
+                    self.replay_mu = [mu_bt]
+                    self.replay_logvar = [logvar_bt]
+                    self.replay_lowrank_factors = [lowrank_bt] if lowrank_bt is not None else []
+                else:
+                    self.replay_mu.append(mu_bt)
+                    self.replay_logvar.append(logvar_bt)
+                    if lowrank_bt is not None:
+                        self.replay_lowrank_factors.append(lowrank_bt)
+            else:
+                # Keep HMM-specific buffers empty to avoid unbounded growth when no HMM is present
+                self.replay_mu = []
+                self.replay_logvar = []
+                self.replay_lowrank_factors = []
+
             if len(self.replay_actions) == 0:
-                # First rollout - initialize replay buffers
-                self.replay_mu = [mu_bt]
-                self.replay_logvar = [logvar_bt]
-                self.replay_lowrank_factors = [lowrank_bt] if lowrank_bt is not None else []
+                # First rollout - initialize VAE replay buffers
                 self.replay_actions = [acts_bt]
                 self.replay_rewards = [rewards_bt]
                 self.replay_dones = [dones_bt]
-                
+
                 if obs_chars_bt is not None:
                     self.replay_obs_chars = [obs_chars_bt]
                     self.replay_obs_colors = [obs_colors_bt]
@@ -1077,15 +1128,11 @@ class PPOTrainer:
                     self.replay_obs_message = [obs_message_bt]
                     self.replay_obs_hero_info = [obs_hero_info_bt]
             else:
-                # Append new rollout data
-                self.replay_mu.append(mu_bt)
-                self.replay_logvar.append(logvar_bt)
-                if lowrank_bt is not None:
-                    self.replay_lowrank_factors.append(lowrank_bt)
+                # Append new rollout data for VAE buffers
                 self.replay_actions.append(acts_bt)
                 self.replay_rewards.append(rewards_bt)
                 self.replay_dones.append(dones_bt)
-                
+
                 if obs_chars_bt is not None:
                     self.replay_obs_chars.append(obs_chars_bt)
                     self.replay_obs_colors.append(obs_colors_bt)
@@ -1108,6 +1155,8 @@ class PPOTrainer:
         # Get extended data that includes previous rollout's last timestep
         extended_data = self.buf.get_extended_data_for_transitions()
         
+        self.curiosity.global_step = self.global_steps
+
         if extended_data["has_prev"]:
             # Use extended data for transition computations
             # extended_data has shape [T+1, B, ...] where 0 is prev timestep
@@ -1155,8 +1204,6 @@ class PPOTrainer:
                 mu_curr, logvar_curr, lowrank_factors_curr, actions_curr, mask_curr, dones_curr,
                 next_obs_mu=next_obs_mu, next_obs_logvar=next_obs_logvar, next_obs_F=next_obs_F
             )
-        
-        self.curiosity.global_step = self.global_steps
         return result_bonuses
 
     @torch.no_grad()
@@ -1268,7 +1315,7 @@ class PPOTrainer:
         Synchronized HMM and VAE updates. Updates happen together when either interval is reached.
         This ensures coordinated learning between the skill discovery (HMM) and representation (VAE).
         """
-        hmm_ready = (self.global_steps - self.last_hmm_refresh) >= self._hmm_interval
+        hmm_ready = self.has_hmm and ((self.global_steps - self.last_hmm_refresh) >= self._hmm_interval)
         vae_ready = (self.global_steps - self.last_vae_refresh) >= self._vae_interval and self.vae_opt is not None
         
         # Update both models if either is ready (synchronized updates)
@@ -1282,7 +1329,7 @@ class PPOTrainer:
                 if logger is not None:
                     logger.warning("No replay data available for model updates, skipping")
                 return
-            
+
             # Combine all replay data
             combined_mu = torch.cat(self.replay_mu, dim=1) if len(self.replay_mu) > 0 else None
             combined_logvar = torch.cat(self.replay_logvar, dim=1) if len(self.replay_logvar) > 0 else None
@@ -1299,7 +1346,7 @@ class PPOTrainer:
             
             # Crop to window size for all replay buffers (no mask needed - all steps are valid)
             current_window_size = combined_actions.size(1)
-            if current_window_size > self.hmm_cfg.hmm_fit_window:
+            if self.has_hmm and current_window_size > self.hmm_cfg.hmm_fit_window:
                 s = current_window_size - self.hmm_cfg.hmm_fit_window
                 combined_mu = combined_mu[:, s:, :] if combined_mu is not None else None
                 combined_logvar = combined_logvar[:, s:, :] if combined_logvar is not None else None
@@ -1319,10 +1366,17 @@ class PPOTrainer:
             # Create a valid mask for the entire window (all steps are valid in PPO online training)
             B, T = combined_actions.shape
             valid_mask = torch.ones(B, T, device=self.device, dtype=torch.bool)
-            
+
             # HMM update (uses latent representations that we already have)
             if hmm_ready and combined_mu is not None:
-                self._refresh_hmm(combined_mu, combined_logvar, valid_mask, combined_lowrank_factors, logger)
+                self._refresh_hmm(
+                    combined_mu,
+                    combined_logvar,
+                    valid_mask,
+                    combined_lowrank_factors,
+                    combined_dones,
+                    logger,
+                )
                 if logger is not None:
                     logger.info(f"   ✅ HMM updated (next in {self._hmm_interval:,} steps)")
                 # Reset only HMM-related replay buffers
@@ -1339,6 +1393,10 @@ class PPOTrainer:
                 # Reset only VAE-related replay buffers
                 self._reset_vae_replay_buffers()
 
+            if not self.has_hmm:
+                # Ensure HMM buffers stay clear when we are not training an HMM
+                self._reset_hmm_replay_buffers()
+
     def _reset_replay_buffers(self):
         """Reset replay buffers to prevent memory accumulation."""
         # This method is kept for backward compatibility but now calls separate resets
@@ -1350,7 +1408,7 @@ class PPOTrainer:
         self.replay_mu = []
         self.replay_logvar = []
         self.replay_lowrank_factors = []
-    
+
     def _reset_vae_replay_buffers(self):
         """Reset VAE-related replay buffers after VAE refresh."""
         self.replay_actions = []
@@ -1362,10 +1420,107 @@ class PPOTrainer:
         self.replay_obs_message = []
         self.replay_obs_hero_info = []
 
+    def _split_rollouts_by_episode(
+        self,
+        mu: torch.Tensor,
+        diag_var: torch.Tensor,
+        lowrank: torch.Tensor | None,
+        mask: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Split [B,T,...] sequences into per-episode segments using done flags."""
+        if dones is None:
+            return mu, diag_var, lowrank, mask
+
+        B, T, D = mu.shape
+        device = mu.device
+        mask_dtype = mask.dtype if mask is not None else torch.bool
+        segments_mu: list[torch.Tensor] = []
+        segments_diag: list[torch.Tensor] = []
+        segments_lowrank: list[torch.Tensor] | None = [] if lowrank is not None else None
+        lengths: list[int] = []
+
+        for b in range(B):
+            start_idx = None
+            for t in range(T):
+                is_valid = bool(mask[b, t].item()) if mask is not None else True
+                if not is_valid:
+                    if start_idx is not None and t > start_idx:
+                        end = t
+                        segments_mu.append(mu[b, start_idx:end].clone())
+                        segments_diag.append(diag_var[b, start_idx:end].clone())
+                        if segments_lowrank is not None:
+                            segments_lowrank.append(lowrank[b, start_idx:end].clone())
+                        lengths.append(end - start_idx)
+                        start_idx = None
+                    continue
+
+                if start_idx is None:
+                    start_idx = t
+
+                if bool(dones[b, t].item()):
+                    end = t + 1
+                    if start_idx is not None and end > start_idx:
+                        segments_mu.append(mu[b, start_idx:end].clone())
+                        segments_diag.append(diag_var[b, start_idx:end].clone())
+                        if segments_lowrank is not None:
+                            segments_lowrank.append(lowrank[b, start_idx:end].clone())
+                        lengths.append(end - start_idx)
+                    start_idx = None
+
+            if start_idx is not None and start_idx < T:
+                segments_mu.append(mu[b, start_idx:T].clone())
+                segments_diag.append(diag_var[b, start_idx:T].clone())
+                if segments_lowrank is not None:
+                    segments_lowrank.append(lowrank[b, start_idx:T].clone())
+                lengths.append(T - start_idx)
+
+        if not segments_mu:
+            return mu, diag_var, lowrank, mask
+
+        max_len = max(lengths)
+        new_B = len(segments_mu)
+        new_mu = torch.zeros(new_B, max_len, D, device=device, dtype=mu.dtype)
+        new_diag = torch.zeros(new_B, max_len, D, device=device, dtype=diag_var.dtype)
+        new_mask = torch.zeros(new_B, max_len, device=device, dtype=mask_dtype)
+        new_lowrank = None
+        if segments_lowrank is not None and len(segments_lowrank) > 0:
+            R = segments_lowrank[0].shape[-1]
+            new_lowrank = torch.zeros(new_B, max_len, D, R, device=device, dtype=segments_lowrank[0].dtype)
+
+        for idx, (seg_mu, seg_diag) in enumerate(zip(segments_mu, segments_diag)):
+            L = seg_mu.shape[0]
+            new_mu[idx, :L] = seg_mu
+            new_diag[idx, :L] = seg_diag
+            if new_lowrank is not None:
+                new_lowrank[idx, :L] = segments_lowrank[idx]
+            new_mask[idx, :L] = True
+
+        return new_mu, new_diag, new_lowrank, new_mask
+
     @torch.no_grad()
-    def _refresh_hmm(self, replay_mu: torch.Tensor, replay_logvar: torch.Tensor, replay_mask: torch.Tensor, replay_lowrank_factors: torch.Tensor = None, logger: Optional[logging.Logger] = None):
+    def _refresh_hmm(
+        self,
+        replay_mu: torch.Tensor,
+        replay_logvar: torch.Tensor,
+        replay_mask: torch.Tensor,
+        replay_lowrank_factors: torch.Tensor | None = None,
+        replay_dones: torch.Tensor | None = None,
+        logger: Optional[logging.Logger] = None,
+    ):
         """Internal HMM update method."""
-        B,T,D = replay_mu.shape
+        if not self.has_hmm:
+            return
+
+        diag_var = replay_logvar.exp().clamp_min(1e-6)
+        mu = replay_mu
+        mask = replay_mask
+        lowrank = replay_lowrank_factors
+
+        if replay_dones is not None:
+            mu, diag_var, lowrank, mask = self._split_rollouts_by_episode(mu, diag_var, lowrank, mask, replay_dones)
+
+        B, T, D = mu.shape
         
         # Log HMM refresh start
         if logger is not None:
@@ -1373,7 +1528,10 @@ class PPOTrainer:
         
         # run full VI update on the window
         out = self.hmm.update(
-            mu_t=replay_mu, diag_var_t=replay_logvar.exp(), F_t=replay_lowrank_factors, mask=replay_mask,
+            mu_t=mu,
+            diag_var_t=diag_var,
+            F_t=lowrank,
+            mask=mask,
             max_iters=self.hmm_cfg.hmm_max_iters, tol=self.hmm_cfg.hmm_tol, elbo_drop_tol=self.hmm_cfg.hmm_elbo_drop_tol,
             optimize_pi=self.hmm_cfg.optimise_pi,
             pi_steps=self.hmm_cfg.pi_steps, pi_lr=self.hmm_cfg.pi_lr,
@@ -1650,7 +1808,7 @@ class PPOTrainer:
                     'weight': all_weight,
                     'original_batch_shape': (num_spans, span_len)  # For sequential processing in VAE
                 }
-            combined_batch['sticky_hmm'] = self.hmm
+            combined_batch['sticky_hmm'] = self.hmm if self.has_hmm else None
             # Forward pass through VAE to get complete model output (like train.py)
             self.vae_opt.zero_grad()
             with torch.amp.autocast('cuda', enabled=False):
@@ -1782,7 +1940,7 @@ class PPOTrainer:
             })
             pbar.update(1)
             
-            self._log_scalar({
+            metrics = {
                 "steps": self.global_steps,
                 "return/mean_ext": float(ext.mean().item()),
                 "int/dyn_mean": float(bonuses["dyn"].mean().item()),
@@ -1799,26 +1957,46 @@ class PPOTrainer:
                 "int/negative_ratio": float((intrinsic < 0).float().mean().item()),
                 "int/total_mean": float(intrinsic.mean().item()),
                 "int/total_std": float(intrinsic.std().item()),
-                # HMM health diagnostics - detect uniform posterior issue
-                "hmm/hdp_raw_std": float(bonuses["hdp_raw"].std().item()),
-                "hmm/hdp_raw_min": float(bonuses["hdp_raw"].min().item()),
-                "hmm/hdp_raw_max": float(bonuses["hdp_raw"].max().item()),
-                "hmm/skill_posterior_entropy_var": float(bonuses["hdp_raw"].var().item()),
-                "hmm/constant_entropy_ratio": float((torch.abs(bonuses["hdp_raw"] - bonuses["hdp_raw"].mean()) < 0.01).float().mean().item()),
-                # Skill usage diagnostics
-                "hmm/unused_skills": float((self.hmm.niw.nu <= 106.1).float().sum().item()),
-                "hmm/used_skills": float((self.hmm.niw.nu > 106.1).float().sum().item()),
-                "hmm/max_nu": float(self.hmm.niw.nu.max().item()),
-                "hmm/mean_nu": float(self.hmm.niw.nu.mean().item()),
-                # Natural learning cycle diagnostics to validate your hypothesis
-                "learning_cycle/unused_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, self.hmm.niw.nu[:-1] <= 106.1].sum().item()),
-                "learning_cycle/used_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, self.hmm.niw.nu[:-1] > 106.1].sum().item()),
                 # Synchronized model training diagnostics
                 "learning_cycle/hmm_training_gap": float(self.global_steps - self.last_hmm_refresh),
                 "learning_cycle/vae_training_gap": float(self.global_steps - self.last_vae_refresh),
                 "learning_cycle/hmm_interval": float(self._hmm_interval),
-                "learning_cycle/vae_interval": float(self._vae_interval)
-            })
+                "learning_cycle/vae_interval": float(self._vae_interval),
+            }
+
+            if self.has_hmm:
+                nu = self.hmm.niw.nu
+                unused_mask = (nu[:-1] <= 106.1)
+                used_mask = (nu[:-1] > 106.1)
+                metrics.update({
+                    "hmm/hdp_raw_std": float(bonuses["hdp_raw"].std().item()),
+                    "hmm/hdp_raw_min": float(bonuses["hdp_raw"].min().item()),
+                    "hmm/hdp_raw_max": float(bonuses["hdp_raw"].max().item()),
+                    "hmm/skill_posterior_entropy_var": float(bonuses["hdp_raw"].var().item()),
+                    "hmm/constant_entropy_ratio": float((torch.abs(bonuses["hdp_raw"] - bonuses["hdp_raw"].mean()) < 0.01).float().mean().item()),
+                    "hmm/unused_skills": float(unused_mask.float().sum().item()),
+                    "hmm/used_skills": float(used_mask.float().sum().item()),
+                    "hmm/max_nu": float(nu.max().item()),
+                    "hmm/mean_nu": float(nu.mean().item()),
+                    "learning_cycle/unused_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, unused_mask].sum().item()),
+                    "learning_cycle/used_skill_posterior_mass": float(bonuses["rhat_skill"][:, :, used_mask].sum().item()),
+                })
+            else:
+                metrics.update({
+                    "hmm/hdp_raw_std": 0.0,
+                    "hmm/hdp_raw_min": 0.0,
+                    "hmm/hdp_raw_max": 0.0,
+                    "hmm/skill_posterior_entropy_var": 0.0,
+                    "hmm/constant_entropy_ratio": 0.0,
+                    "hmm/unused_skills": 0.0,
+                    "hmm/used_skills": 0.0,
+                    "hmm/max_nu": 0.0,
+                    "hmm/mean_nu": 0.0,
+                    "learning_cycle/unused_skill_posterior_mass": 0.0,
+                    "learning_cycle/used_skill_posterior_mass": 0.0,
+                })
+
+            self._log_scalar(metrics)
             if (self.global_steps % self.run_cfg.eval_every) < (self.ppo_cfg.num_envs * self.ppo_cfg.rollout_len):
                 pbar.write(f"🧪 Running evaluation at step {self.global_steps:,}...")
                 self.evaluate(self.run_cfg.eval_episodes)
@@ -1900,7 +2078,7 @@ class PPOTrainer:
                     F_b = enc.get('lowrank_factors', None)  # [1, D, R] or None
                     
                     logB_b = self.hmm.make_logB_for_filter(
-                        mu_b, dv_b, F_b, None, ('mean' if self.hmm_cfg.emission_mode is not 'student_t' else 'student_t'), False
+                        mu_b, dv_b, F_b, None, ('mean' if self.hmm_cfg.emission_mode != 'student_t' else 'student_t'), False
                     ).squeeze(0)  # [Kp1] - always use deterministic mean for eval
 
                     if eval_filt_state is None:
@@ -1981,7 +2159,7 @@ class PPOTrainer:
                     diag_var_t.unsqueeze(0), 
                     F_t.unsqueeze(0) if F_t is not None else None, 
                     None, 
-                    ('mean' if self.hmm_cfg.emission_mode is not 'student_t' else 'student_t'), 
+                    ('mean' if self.hmm_cfg.emission_mode != 'student_t' else 'student_t'), 
                     False
                 ).squeeze(0) # [T,Kp1], always use deterministic mean for eval
 
@@ -2078,8 +2256,10 @@ class PPOTrainer:
 
     def _save_ckpt(self):
         path = os.path.join(self.run_cfg.log_dir, f"ckpt_{self.global_steps}.pt")
-        torch.save({
+        payload = {
             "actor_critic": self.actor_critic.state_dict(),
             "opt": self.opt.state_dict(),
-            "hmm": self.hmm.get_posterior_params()
-        }, path)
+        }
+        if self.has_hmm:
+            payload["hmm"] = self.hmm.get_posterior_params()
+        torch.save(payload, path)

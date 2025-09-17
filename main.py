@@ -867,7 +867,7 @@ if __name__ == "__main__":
                 use_skill_entropy=False,   # No skill entropy without HMM
                 use_skill_transition_novelty=False,  # No skill transitions without HMM
                 use_rnd=False,
-                eta0_dyn=1.0, tau_dyn=3e6,
+                eta0_dyn=0.25, tau_dyn=3e6,
                 ema_beta=0.99, eps=1e-8
             )
             description = "VAE+PPO (no HMM) with dynamics curiosity only"
@@ -899,7 +899,7 @@ if __name__ == "__main__":
                 use_skill_entropy=False,
                 use_skill_transition_novelty=False,
                 use_rnd=False,
-                eta0_dyn=1.0, tau_dyn=3e6,
+                eta0_dyn=0.25, tau_dyn=3e6,
                 ema_beta=0.99, eps=1e-8
             )
             description = "VAE+HMM+PPO with dynamics curiosity only"
@@ -910,7 +910,7 @@ if __name__ == "__main__":
                 use_skill_entropy=True,    # Only skill entropy
                 use_skill_transition_novelty=False,
                 use_rnd=False,
-                eta0_hdp=1.0, tau_hdp=3e6,
+                eta0_hdp=0.25, tau_hdp=3e6,
                 use_skill_boundary_gate=True,
                 gate_delta_eps=1e-3,
                 ema_beta=0.99, eps=1e-8
@@ -955,8 +955,8 @@ if __name__ == "__main__":
         else:
             hmm_config = HMMOnlineConfig(
                 hmm_update_every=5_120,   # Update HMM every ~5 rollouts
-                hmm_update_growth=1.10,    # Growth factor for update interval
-                hmm_update_every_cap=60_000, # Cap for update interval
+                hmm_update_growth=1.05,    # Growth factor for update interval
+                hmm_update_every_cap=12_000, # Cap for update interval
                 hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
                 hmm_max_iters=5,          # Up to 5 iterations per update
                 hmm_tol=1e-2,
@@ -981,10 +981,11 @@ if __name__ == "__main__":
         
         # VAE Online Configuration - synchronized with HMM updates
         vae_config = VAEOnlineConfig(
-            vae_update_every=5_120,       # Match HMM update frequency  
-            vae_update_growth=1.10,       # Same growth pattern as HMM
-            vae_update_every_cap=60_000,  # Same cap as HMM
-            vae_lr=1e-4                   # Learning rate for VAE updates
+            vae_update_every=5_120,       # Match HMM update frequency
+            vae_update_growth=1.05,       # Same growth pattern as HMM
+            vae_update_every_cap=12_000,  # Same cap as HMM
+            vae_lr=1e-4,                  # Learning rate for VAE updates
+            vae_steps_per_call=128,        # Number of gradient steps per VAE update
         )
         
         # RND Configuration (used only for RND ablation)
