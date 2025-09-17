@@ -1476,7 +1476,7 @@ class StickyHDPHMMVI(nn.Module):
     def make_logB_for_filter(
         self,
         mu: torch.Tensor,            # [B,T,D] or [B,D]
-        logvar: torch.Tensor,        # [B,T,D] or [B,D]
+        diagvar: torch.Tensor,       # [B,T,D] or [B,D]
         F: Optional[torch.Tensor],   # [B,T,D,R] or [B,D,R] or None
         mask: Optional[torch.Tensor] = None,  # [B,T] or None
         emission_mode: str = "sample",  # "sample", "mean", "expected", or "student_t"
@@ -1497,14 +1497,14 @@ class StickyHDPHMMVI(nn.Module):
         # Ensure [B,T,D] shape
         input_was_2d = (mu.dim() == 2)
         if input_was_2d:
-            mu = mu.unsqueeze(1); logvar = logvar.unsqueeze(1)
+            mu = mu.unsqueeze(1); diagvar = diagvar.unsqueeze(1)
             F = F.unsqueeze(1) if (F is not None and F.dim() == 2) else F
             mask = mask.unsqueeze(1) if (mask is not None and mask.dim() == 1) else mask
         B, T, D = mu.shape
         Kp1 = self.niw.mu.size(0)
 
         if emission_mode == "expected":
-            diagvar = logvar.exp().clamp_min(1e-6)
+            diagvar = diagvar.clamp_min(1e-6)
             logB = StickyHDPHMMVI.expected_emission_loglik(
                 self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
                 mu, diagvar, F, mask)
@@ -1514,7 +1514,7 @@ class StickyHDPHMMVI(nn.Module):
                 mu, None, None, mask)
         elif emission_mode == "sample":
             eps = torch.randn_like(mu)
-            z = mu + eps * (logvar.mul(0.5).exp())
+            z = mu + eps * (diagvar.clamp_min(1e-6).sqrt())
             if F is not None:
                 R = F.size(-1)
                 eps_lr = torch.randn(B, T, R, device=mu.device, dtype=mu.dtype)
@@ -1537,7 +1537,7 @@ class StickyHDPHMMVI(nn.Module):
             logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)           # [Kp1]
             # choose point
             if student_t_use_sample:
-                eps = torch.randn_like(mu); z = mu + eps * (logvar.mul(0.5).exp())
+                eps = torch.randn_like(mu); z = mu + eps * (diagvar.clamp_min(1e-6).sqrt())
                 if F is not None:
                     R = F.size(-1); eps_lr = torch.randn(B, T, R, device=mu.device, dtype=mu.dtype)
                     z = z + torch.einsum('btr,btdr->btd', eps_lr, F)
