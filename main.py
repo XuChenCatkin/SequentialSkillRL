@@ -985,7 +985,7 @@ if __name__ == "__main__":
             vae_update_growth=1.05,       # Same growth pattern as HMM
             vae_update_every_cap=12_000,  # Same cap as HMM
             vae_lr=1e-4,                  # Learning rate for VAE updates
-            vae_steps_per_call=128,        # Number of gradient steps per VAE update
+            vae_steps_per_call=16,        # Number of gradient steps per VAE update
         )
         
         # RND Configuration (used only for RND ablation)

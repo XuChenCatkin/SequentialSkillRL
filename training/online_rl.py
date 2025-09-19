@@ -74,7 +74,6 @@ def train_online_ppo_with_pretrained_models(
     # Legacy parameters for backwards compatibility
     total_timesteps: int = 50000,
     learning_rate: float = 5e-4,
-    batch_size: int = 32,
     n_epochs: int = 10,
     gamma: float = 0.99,
     vf_coef: float = 0.5,
@@ -135,7 +134,6 @@ def train_online_ppo_with_pretrained_models(
         # Legacy parameters (for backwards compatibility)
         total_timesteps: Total training timesteps
         learning_rate: PPO learning rate
-        batch_size: Training batch size
         n_epochs: Number of PPO epochs per update
         gamma: Discount factor
         vf_coef: Value function coefficient
@@ -198,113 +196,8 @@ def train_online_ppo_with_pretrained_models(
         mode_str = "test" if test_mode else "train"
         wandb_run_name = f"online_ppo_{env_name}_{mode_str}_{timestamp}"
 
-    # Initialize W&B
+    # W&B will be initialized later after config objects are created
     wandb_run = None
-    if WANDB_AVAILABLE and use_wandb and not test_mode:
-        try:
-            # Create comprehensive config for W&B logging
-            wandb_config = {
-                "env_name": env_name,
-                "vae_repo_id": vae_repo_id,
-                "hmm_repo_id": hmm_repo_id,
-                "device": str(device),
-                "seed": seed,
-                # PPO Configuration
-                "ppo": {
-                    "num_envs": ppo_config.num_envs,
-                    "rollout_len": ppo_config.rollout_len,
-                    "total_updates": ppo_config.total_updates,
-                    "minibatch_size": ppo_config.minibatch_size,
-                    "epochs_per_update": ppo_config.epochs_per_update,
-                    "gamma": ppo_config.gamma,
-                    "gae_lambda": ppo_config.gae_lambda,
-                    "clip_coef": ppo_config.clip_coef,
-                    "ent_coef": ppo_config.ent_coef,
-                    "vf_coef": ppo_config.vf_coef,
-                    "max_grad_norm": ppo_config.max_grad_norm,
-                    "learning_rate": ppo_config.learning_rate,
-                    "policy_uses_skill": ppo_config.policy_uses_skill,
-                    "deterministic_eval": ppo_config.deterministic_eval
-                },
-                # Curiosity Configuration
-                "curiosity": {
-                    "use_dyn_kl": curiosity_config.use_dyn_kl,
-                    "use_skill_entropy": curiosity_config.use_skill_entropy,
-                    "use_skill_transition_novelty": curiosity_config.use_skill_transition_novelty,
-                    "use_rnd": curiosity_config.use_rnd,
-                    "eta0_dyn": curiosity_config.eta0_dyn,
-                    "tau_dyn": curiosity_config.tau_dyn,
-                    "eta0_hdp": curiosity_config.eta0_hdp,
-                    "tau_hdp": curiosity_config.tau_hdp,
-                    "eta0_rnd": curiosity_config.eta0_rnd,
-                    "tau_rnd": curiosity_config.tau_rnd,
-                    "use_skill_boundary_gate": curiosity_config.use_skill_boundary_gate,
-                    "gate_delta_eps": curiosity_config.gate_delta_eps,
-                    "eta0_stn": curiosity_config.eta0_stn,
-                    "tau_stn": curiosity_config.tau_stn,
-                    "ema_beta": curiosity_config.ema_beta,
-                    "eps": curiosity_config.eps
-                },
-                # HMM Configuration
-                "hmm": {
-                    "hmm_update_every": hmm_config.hmm_update_every,
-                    "hmm_fit_window": hmm_config.hmm_fit_window,
-                    "hmm_max_iters": hmm_config.hmm_max_iters,
-                    "hmm_tol": hmm_config.hmm_tol,
-                    "hmm_elbo_drop_tol": hmm_config.hmm_elbo_drop_tol,
-                    "rho_emission": hmm_config.rho_emission,
-                    "rho_transition": hmm_config.rho_transition,
-                    "optimise_pi": hmm_config.optimise_pi
-                },
-                # RND Configuration
-                "rnd": {
-                    "proj_dim": rnd_config.proj_dim,
-                    "hidden": rnd_config.hidden,
-                    "lr": rnd_config.lr,
-                    "update_per_rollout": rnd_config.update_per_rollout
-                },
-                # Training Configuration
-                "training": {
-                    "env_id": train_config.env_id,
-                    "seed": train_config.seed,
-                    "device": train_config.device,
-                    "log_dir": train_config.log_dir,
-                    "save_every": train_config.save_every,
-                    "eval_every": train_config.eval_every,
-                    "eval_episodes": train_config.eval_episodes
-                },
-                # Legacy parameters for compatibility
-                "legacy": {
-                    "total_timesteps": total_timesteps,
-                    "learning_rate": learning_rate,
-                    "batch_size": batch_size,
-                    "n_epochs": n_epochs,
-                    "gamma": gamma,
-                    "vf_coef": vf_coef,
-                    "ent_coef": ent_coef,
-                    "max_grad_norm": max_grad_norm,
-                    "use_curiosity": use_curiosity,
-                    "curiosity_lr": curiosity_lr,
-                    "curiosity_forward_coef": curiosity_forward_coef,
-                    "curiosity_inverse_coef": curiosity_inverse_coef,
-                    "use_rnd": use_rnd,
-                    "rnd_lr": rnd_lr,
-                    "rnd_coef": rnd_coef
-                }
-            }
-            
-            wandb_run = wandb.init(
-                project=wandb_project,
-                name=wandb_run_name,
-                config=wandb_config,
-                entity=wandb_entity,
-                tags=wandb_tags,
-                notes=wandb_notes
-            )
-            if logger: logger.info(f"📊 W&B initialized with run name: {wandb_run_name}")
-        except Exception as e:
-            if logger: logger.warning(f"⚠️  W&B initialization failed: {e}")
-            wandb_run = None
     
     try:
         # Determine loading strategy based on resume mode
@@ -444,8 +337,7 @@ def train_online_ppo_with_pretrained_models(
                 vf_coef=vf_coef,
                 ent_coef=ent_coef,
                 max_grad_norm=max_grad_norm,
-                epochs_per_update=n_epochs,
-                minibatch_size=batch_size
+                epochs_per_update=n_epochs
             )
         
         # Configure curiosity if enabled or if config provided
@@ -502,6 +394,7 @@ def train_online_ppo_with_pretrained_models(
         
         if hmm_model is not None:
             hmm_model.set_posterior_as_prior(hmm_config.temper_weight, skip_remainder_state=True)
+            logger.info("🔄 HMM posterior set as prior for online updates with tempered weight {}".format(hmm_config.temper_weight))
             hmm_model.stream_rho_niw = hmm_config.rho_emission
             hmm_model.stream_rho_trans = hmm_config.rho_transition
         
@@ -526,6 +419,113 @@ def train_online_ppo_with_pretrained_models(
         else:
             vae_config.training_config.prior_mode = "hmm"
             if logger: logger.info(f"   - VAE prior mode set to 'hmm' for online training")
+
+        # Initialize W&B now that all config objects are created
+        if WANDB_AVAILABLE and use_wandb and not test_mode:
+            try:
+                # Create comprehensive config for W&B logging
+                wandb_config = {
+                    "env_name": env_name,
+                    "vae_repo_id": vae_repo_id,
+                    "hmm_repo_id": hmm_repo_id,
+                    "device": str(device),
+                    "seed": seed,
+                    # PPO Configuration
+                    "ppo": {
+                        "num_envs": ppo_config.num_envs,
+                        "rollout_len": ppo_config.rollout_len,
+                        "total_updates": ppo_config.total_updates,
+                        "minibatch_envs": ppo_config.minibatch_envs,
+                        "epochs_per_update": ppo_config.epochs_per_update,
+                        "gamma": ppo_config.gamma,
+                        "gae_lambda": ppo_config.gae_lambda,
+                        "clip_coef": ppo_config.clip_coef,
+                        "ent_coef": ppo_config.ent_coef,
+                        "vf_coef": ppo_config.vf_coef,
+                        "max_grad_norm": ppo_config.max_grad_norm,
+                        "learning_rate": ppo_config.learning_rate,
+                        "policy_uses_skill": ppo_config.policy_uses_skill,
+                        "deterministic_eval": ppo_config.deterministic_eval,
+                        "rnn_hidden_size": ppo_config.rnn_hidden_size
+                    },
+                    # Curiosity Configuration
+                    "curiosity": {
+                        "use_dyn_kl": curiosity_config.use_dyn_kl,
+                        "use_skill_entropy": curiosity_config.use_skill_entropy,
+                        "use_skill_transition_novelty": curiosity_config.use_skill_transition_novelty,
+                        "use_rnd": curiosity_config.use_rnd,
+                        "eta0_dyn": curiosity_config.eta0_dyn,
+                        "tau_dyn": curiosity_config.tau_dyn,
+                        "eta0_hdp": curiosity_config.eta0_hdp,
+                        "tau_hdp": curiosity_config.tau_hdp,
+                        "eta0_rnd": curiosity_config.eta0_rnd,
+                        "tau_rnd": curiosity_config.tau_rnd,
+                        "use_skill_boundary_gate": curiosity_config.use_skill_boundary_gate,
+                        "gate_delta_eps": curiosity_config.gate_delta_eps,
+                        "eta0_stn": curiosity_config.eta0_stn,
+                        "tau_stn": curiosity_config.tau_stn,
+                        "ema_beta": curiosity_config.ema_beta,
+                        "eps": curiosity_config.eps
+                    },
+                    # HMM Configuration
+                    "hmm": {
+                        "hmm_update_every": hmm_config.hmm_update_every,
+                        "hmm_fit_window": hmm_config.hmm_fit_window,
+                        "hmm_max_iters": hmm_config.hmm_max_iters,
+                        "hmm_tol": hmm_config.hmm_tol,
+                        "hmm_elbo_drop_tol": hmm_config.hmm_elbo_drop_tol,
+                        "rho_emission": hmm_config.rho_emission,
+                        "rho_transition": hmm_config.rho_transition,
+                        "optimise_pi": hmm_config.optimise_pi
+                    },
+                    # RND Configuration
+                    "rnd": {
+                        "proj_dim": rnd_config.proj_dim,
+                        "hidden": rnd_config.hidden,
+                        "lr": rnd_config.lr,
+                        "update_per_rollout": rnd_config.update_per_rollout
+                    },
+                    # Training Configuration
+                    "training": {
+                        "env_id": train_config.env_id,
+                        "seed": train_config.seed,
+                        "device": train_config.device,
+                        "log_dir": train_config.log_dir,
+                        "save_every": train_config.save_every,
+                        "eval_every": train_config.eval_every,
+                        "eval_episodes": train_config.eval_episodes
+                    },
+                    # Legacy parameters for compatibility
+                    "legacy": {
+                        "total_timesteps": total_timesteps,
+                        "learning_rate": learning_rate,
+                        "n_epochs": n_epochs,
+                        "gamma": gamma,
+                        "vf_coef": vf_coef,
+                        "ent_coef": ent_coef,
+                        "max_grad_norm": max_grad_norm,
+                        "use_curiosity": use_curiosity,
+                        "curiosity_lr": curiosity_lr,
+                        "curiosity_forward_coef": curiosity_forward_coef,
+                        "curiosity_inverse_coef": curiosity_inverse_coef,
+                        "use_rnd": use_rnd,
+                        "rnd_lr": rnd_lr,
+                        "rnd_coef": rnd_coef
+                    }
+                }
+                
+                wandb_run = wandb.init(
+                    project=wandb_project,
+                    name=wandb_run_name,
+                    config=wandb_config,
+                    entity=wandb_entity,
+                    tags=wandb_tags,
+                    notes=wandb_notes
+                )
+                if logger: logger.info(f"📊 W&B initialized with run name: {wandb_run_name}")
+            except Exception as e:
+                if logger: logger.warning(f"⚠️  W&B initialization failed: {e}")
+                wandb_run = None
 
         # Create PPO trainer
         if logger: logger.info("🚀 Initializing PPO trainer...")
@@ -723,7 +723,6 @@ def train_online_ppo_with_pretrained_models(
             'config': {
                 'env_name': env_name,
                 'learning_rate': learning_rate,
-                'batch_size': batch_size,
                 'n_epochs': n_epochs,
                 'gamma': gamma,
                 'vf_coef': vf_coef,
@@ -885,7 +884,6 @@ results = train_online_ppo_with_pretrained_models(
 
 - **Environment**: {env_name}
 - **Learning Rate**: {learning_rate}
-- **Batch Size**: {batch_size}
 - **Training Time**: {training_time:.2f} seconds
 - **Device**: {device}
 - **Seed**: {seed}
@@ -922,7 +920,6 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                             'env_name': env_name,
                             'total_timesteps': total_timesteps,
                             'learning_rate': learning_rate,
-                            'batch_size': batch_size,
                             'n_epochs': n_epochs,
                             'gamma': gamma,
                             'vf_coef': vf_coef,
@@ -993,7 +990,6 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                             'device': str(device),
                             'ppo_config': {
                                 'learning_rate': learning_rate,
-                                'batch_size': batch_size,
                                 'n_epochs': n_epochs,
                                 'gamma': gamma,
                                 'vf_coef': vf_coef,

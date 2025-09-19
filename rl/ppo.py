@@ -235,7 +235,7 @@ class ActorCritic(nn.Module):
         super().__init__()
         in_dim = z_dim + (skill_dim if skill_dim > 0 else 0)
         self.fc = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
-        self.rnn = nn.GRU(input_size=hidden, hidden_size=rnn_hidden, batch_first=True)
+        self.rnn = nn.GRU(input_size=hidden, hidden_size=rnn_hidden, batch_first=False)
         self.pi_head = nn.Linear(rnn_hidden, n_actions)
         self.v_head = nn.Linear(rnn_hidden, 1)
         self.rnn_hidden = rnn_hidden
@@ -243,15 +243,15 @@ class ActorCritic(nn.Module):
     def forward(self, z: torch.Tensor, skill_feat: Optional[torch.Tensor], h: Optional[torch.Tensor]):
         """One step forward. z:[B,D], skill_feat:[B,K] or None, h:[B,H] or None."""
         x = z if skill_feat is None else torch.cat([z, skill_feat], dim=-1)  # [B,in]
-        x = self.fc(x).unsqueeze(1)  # [B,1,H]
+        x = self.fc(x).unsqueeze(0)  # [1,B,H]
         if h is not None:
             h0 = h.unsqueeze(0)  # [1,B,H]
         else:
-            B = x.size(0)
+            B = x.size(1)
             h0 = torch.zeros(1, B, self.rnn_hidden, device=x.device, dtype=x.dtype)
-        out, h1 = self.rnn(x, h0)      # out:[B,1,H], h1:[1,B,H]
+        out, h1 = self.rnn(x, h0)      # out:[1,B,H], h1:[1,B,H]
         h_next = h1.squeeze(0)         # [B,H]
-        y = out[:, -1, :]              # [B,H]
+        y = out[-1, :, :]              # [B,H]
         logits = self.pi_head(y)       # [B,G]
         value = self.v_head(y).squeeze(-1)  # [B]
         return logits, value, h_next
@@ -1865,13 +1865,47 @@ class PPOTrainer:
             
             # Single training step with full buffer
             vae_steps_to_run = 1
+            
+            # Set batch info for full buffer case
+            if 'batch_info' not in locals():
+                batch_info = {
+                    'buffer_shape': f"{B}x{T}",
+                    'total_timesteps': B * T,
+                    'sampling_mode': 'full_buffer'
+                }
+                actual_timesteps_processed = B * T
         else:
             # Use span sampling for large buffers
             if logger is not None:
                 logger.info(f"   Using span sampling ({total_valid_timesteps} timesteps, too large for full buffer)")
             vae_steps_to_run = self.vae_cfg.vae_steps_per_call
         
+        # Create progress bar for VAE training steps
+        if vae_steps_to_run > 1:
+            vae_pbar = tqdm(
+                total=vae_steps_to_run,
+                desc="VAE Training",
+                unit="step",
+                leave=False,
+                bar_format="{l_bar}{bar:20}{r_bar}",
+                dynamic_ncols=True,
+                mininterval=1.0,  # Update at most once per second
+                file=None  # Use default stdout but ensure proper handling
+            )
+        else:
+            vae_pbar = None
+        
+        # Track loss components for logging
+        total_losses = []
+        raw_losses = []
+        span_length_used = span  # Track span length for final logging
+        
         for step in range(vae_steps_to_run):
+            # Track batch information for logging
+            actual_spans_processed = 0
+            actual_timesteps_processed = 0
+            batch_info = {}
+            
             if not use_full_buffer:
                 # Sample random spans from replay buffer
                 b_idx = torch.randint(low=0, high=B, size=(self.vae_cfg.mini_batch_B,), device=device)
@@ -1949,7 +1983,26 @@ class PPOTrainer:
                     })
                 
                 if not batch_list:
+                    if logger is not None and step == 0:
+                        if vae_pbar is not None:
+                            vae_pbar.write(f"   Step {step+1}: No valid spans found (requested={self.vae_cfg.mini_batch_B}, span_len={span})")
+                        else:
+                            logger.info(f"   Step {step+1}: No valid spans found (requested={self.vae_cfg.mini_batch_B}, span_len={span})")
                     continue  # No valid spans found
+                
+                # Calculate span information
+                actual_spans_processed = len(batch_list)
+                span_len = batch_list[0]['game_chars'].shape[0]
+                actual_timesteps_processed = actual_spans_processed * span_len
+                
+                batch_info = {
+                    'requested_spans': self.vae_cfg.mini_batch_B,
+                    'actual_spans': actual_spans_processed,
+                    'span_length': span_len,
+                    'total_timesteps': actual_timesteps_processed,
+                    'buffer_shape': f"{B}x{T}",
+                    'sampling_mode': 'span_sampling'
+                }
                 
                 # Concatenate all spans into a single batch
                 # Reshape from [num_spans, span_len, ...] to [num_spans * span_len, ...]
@@ -1989,6 +2042,15 @@ class PPOTrainer:
                     'weight': all_weight,
                     'original_batch_shape': (num_spans, span_len)  # For sequential processing in VAE
                 }
+            else:
+                # For full buffer case, set batch info
+                batch_info = {
+                    'buffer_shape': f"{B}x{T}",
+                    'total_timesteps': B * T,
+                    'sampling_mode': 'full_buffer'
+                }
+                actual_timesteps_processed = B * T
+                
             combined_batch['sticky_hmm'] = self.hmm if self.has_hmm else None
             # Forward pass through VAE to get complete model output (like train.py)
             self.vae_opt.zero_grad()
@@ -2011,21 +2073,99 @@ class PPOTrainer:
             torch.nn.utils.clip_grad_norm_(self.vae.parameters(), 1.0)
             self.vae_opt.step()
             
-            # Track final loss
-            final_loss = float(loss.detach().item())
+            # Track losses for summary
+            current_loss = float(loss.detach().item())
+            current_raw_loss = float(vae_loss_dict['total_raw_loss'].item())
+            total_losses.append(current_loss)
+            raw_losses.append(current_raw_loss)
+            final_loss = current_loss
             
-            # Log VAE training metrics (only on first step to avoid spam)
-            if step == 0:
-                self._log_scalar({
-                    "vae/total_loss": float(loss.detach().item()),
-                    "vae/raw_loss": float(vae_loss_dict['total_raw_loss'].item()),
-                    "vae/mi_beta": self.vae_cfg.mi_beta,
-                    "vae/tc_beta": self.vae_cfg.tc_beta,
-                    "vae/dw_beta": self.vae_cfg.dw_beta,
-                    "vae/training_triggered": 1.0,  # Flag that VAE training occurred
-                    "vae/timesteps_processed": float(total_valid_timesteps),
-                    "steps": self.global_steps
+            # Update progress bar
+            if vae_pbar is not None:
+                vae_pbar.set_postfix({
+                    'loss': f"{current_loss:.4f}",
+                    'raw': f"{current_raw_loss:.4f}"
                 })
+                vae_pbar.update(1)
+            
+            # Log detailed metrics every 10 steps or on first/last step
+            log_this_step = (step == 0 or step == vae_steps_to_run - 1 or (step + 1) % 10 == 0)
+            if log_this_step:
+                step_metrics = {
+                    "vae/total_loss": current_loss,
+                    "vae/raw_loss": current_raw_loss,
+                    "vae/step": step + 1,
+                    "vae/total_steps": vae_steps_to_run,
+                    "steps": self.global_steps
+                }
+                
+                # Add batch information to metrics
+                step_metrics.update({
+                    "vae/timesteps_in_batch": actual_timesteps_processed,
+                    "vae/sampling_mode": batch_info['sampling_mode']
+                })
+                
+                # Add span-specific metrics if available
+                if 'actual_spans' in batch_info:
+                    step_metrics.update({
+                        "vae/requested_spans": batch_info['requested_spans'],
+                        "vae/actual_spans": batch_info['actual_spans'],
+                        "vae/span_length": batch_info['span_length']
+                    })
+                
+                # Add loss components if available
+                if 'recon_loss' in vae_loss_dict:
+                    step_metrics["vae/recon_loss"] = float(vae_loss_dict['recon_loss'].item())
+                if 'kl_loss' in vae_loss_dict:
+                    step_metrics["vae/kl_loss"] = float(vae_loss_dict['kl_loss'].item())
+                if 'beta_vae_loss' in vae_loss_dict:
+                    step_metrics["vae/beta_vae_loss"] = float(vae_loss_dict['beta_vae_loss'].item())
+                
+                self._log_scalar(step_metrics)
+                
+                # Enhanced console logging with batch information
+                if logger is not None and step == 0:
+                    if batch_info['sampling_mode'] == 'span_sampling':
+                        batch_details = f"spans={batch_info['actual_spans']}/{batch_info['requested_spans']}, span_len={batch_info['span_length']}, timesteps={actual_timesteps_processed}"
+                    else:
+                        batch_details = f"full_buffer={batch_info['buffer_shape']}, timesteps={actual_timesteps_processed}"
+                    
+                    log_msg = f"   VAE step {step+1}/{vae_steps_to_run}: loss={current_loss:.4f}, {batch_details}"
+                    
+                    # Use tqdm.write for proper alignment with progress bar
+                    if vae_pbar is not None:
+                        vae_pbar.write(log_msg)
+                    else:
+                        logger.info(log_msg)
+        
+        # Close progress bar before final logging
+        if vae_pbar is not None:
+            vae_pbar.close()
+            # Small delay and newline to ensure clean terminal output
+            import time
+            time.sleep(0.1)
+            print()  # Force a newline for clean separation
+        
+        # Log summary metrics
+        if total_losses:
+            avg_loss = sum(total_losses) / len(total_losses)
+            min_loss = min(total_losses)
+            max_loss = max(total_losses)
+            
+            summary_metrics = {
+                "vae/avg_loss": avg_loss,
+                "vae/min_loss": min_loss,
+                "vae/max_loss": max_loss,
+                "vae/final_loss": final_loss,
+                "vae/mi_beta": self.vae_cfg.mi_beta,
+                "vae/tc_beta": self.vae_cfg.tc_beta,
+                "vae/dw_beta": self.vae_cfg.dw_beta,
+                "vae/training_triggered": 1.0,  # Flag that VAE training occurred
+                "vae/timesteps_processed": float(total_valid_timesteps),
+                "vae/completed_steps": len(total_losses),
+                "steps": self.global_steps
+            }
+            self._log_scalar(summary_metrics)
         
         self.last_vae_refresh = self.global_steps
         # Relax VAE update cadence (same as HMM)
@@ -2035,9 +2175,23 @@ class PPOTrainer:
         # Set VAE back to eval mode for inference
         self.vae.eval()
         
-        # Log VAE refresh completion
+        # Log VAE refresh completion with detailed summary
         if logger is not None:
-            logger.info(f"   VAE refresh complete: loss={final_loss:.4f}, training_steps={vae_steps_to_run}, replay_timesteps={total_valid_timesteps}")
+            if total_losses:
+                avg_loss = sum(total_losses) / len(total_losses)
+                loss_trend = "improving" if len(total_losses) > 1 and total_losses[-1] < total_losses[0] else "stable"
+                
+                # Create detailed summary with batch information
+                if use_full_buffer:
+                    batch_summary = f"full_buffer={B}x{T}"
+                else:
+                    batch_summary = f"span_sampling={self.vae_cfg.mini_batch_B}_requested×{len(total_losses)}_steps, span_len={span_length_used}"
+                
+                logger.info(f"   VAE refresh complete: final_loss={final_loss:.4f}, avg_loss={avg_loss:.4f}, "
+                          f"steps={len(total_losses)}/{vae_steps_to_run}, trend={loss_trend}, "
+                          f"total_timesteps={total_valid_timesteps}, {batch_summary}")
+            else:
+                logger.info(f"   VAE refresh complete: loss={final_loss:.4f}, training_steps={vae_steps_to_run}, replay_timesteps={total_valid_timesteps}")
 
     # --------------------------- main train loop -----------------------------
 
