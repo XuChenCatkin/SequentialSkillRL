@@ -828,7 +828,7 @@ if __name__ == "__main__":
             num_envs=num_envs,
             rollout_len=rollout_len,
             total_updates=ppo_updates,
-            minibatch_size=512,
+            minibatch_envs=4,
             epochs_per_update=4,
             gamma=0.999,
             gae_lambda=0.95,

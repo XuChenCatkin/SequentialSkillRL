@@ -485,25 +485,34 @@ def train_online_ppo_with_pretrained_models(
         # Configure HMM integration
         if hmm_config is None:
             hmm_config = HMMOnlineConfig(
-                hmm_update_every=10000,
-                rho_emission=0.1,
-                pi_steps=200,
-                pi_lr=0.05,
-                pi_early_stopping_patience=10,
-                pi_early_stopping_min_delta=1e-5
-            )
+                    hmm_update_every=8192,
+                    hmm_update_growth=1.05,
+                    hmm_update_every_cap=12000,
+                    rho_emission=0.1,
+                    pi_steps=200,
+                    pi_lr=0.05,
+                    pi_early_stopping_patience=10,
+                    pi_early_stopping_min_delta=1e-5,
+                    emission_mode="student_t",
+                    student_t_use_sample=True,
+                    student_t_scale_temp=1.0,
+                    transition_mode="elog",
+                    transition_temperature=1.0
+                )
         
         if hmm_model is not None:
+            hmm_model.set_posterior_as_prior(hmm_config.temper_weight, skip_remainder_state=True)
             hmm_model.stream_rho_niw = hmm_config.rho_emission
             hmm_model.stream_rho_trans = hmm_config.rho_transition
         
         # Configure VAE online learning - synchronized with HMM
         if vae_config is None:
             vae_config = VAEOnlineConfig(
-                vae_update_every=10000,      # Match HMM update frequency
-                vae_update_growth=1.30,      # Same growth pattern as HMM
-                vae_update_every_cap=60000,  # Same cap as HMM
+                vae_update_every=8192,      # Match HMM update frequency
+                vae_update_growth=1.05,      # Same growth pattern as HMM
+                vae_update_every_cap=12000,  # Same cap as HMM
                 vae_lr=1e-4,
+                vae_steps_per_call=128,
                 training_config=config
             )
             if logger: logger.info(f"🔄 Using default synchronized VAE config: update_every={vae_config.vae_update_every}")
