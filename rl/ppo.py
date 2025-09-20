@@ -1085,18 +1085,53 @@ class PPOTrainer:
             allowed = list(range(G))  # full action set
         allowed = [int(a) for a in allowed]
 
+        # Log action adapter setup
+        print(f"🎮 Action Adapter Setup:")
+        print(f"   Environment: {self.env_id}")
+        print(f"   Total NLE actions: {G}")
+        print(f"   Allowed actions from env: {allowed}")
+        
         # mask over global ids
         mask = torch.zeros(G, dtype=torch.bool, device=self.device)
         allowed_indices = [KEYPRESS_INDEX_MAPPING[k] for k in allowed]
         mask[allowed_indices] = True
+        
+        print(f"   Allowed global indices: {allowed_indices}")
+        
         # global->local index (for stepping env)
         g2l = torch.full((G,), -1, dtype=torch.long, device=self.device)
         for li, gid in enumerate(allowed_indices):
             g2l[gid] = li
+            
+        # Show the mapping
+        mapping_info = []
+        for li, gid in enumerate(allowed_indices):
+            from nle import nethack
+            # Find the action object with matching value
+            action_obj = next((action for action in nethack.ACTIONS if action.value == allowed[li]), None)
+            if action_obj:
+                action_name = f"{action_obj.__class__.__name__}.{action_obj.name}"
+            else:
+                action_name = f"Action_{allowed[li]}"
+            mapping_info.append(f"local_{li}->global_{gid}({action_name})")
+        print(f"   Action mappings: {mapping_info}")
+        
+        # Show unmapped actions
+        valid_global_indices = set(allowed_indices)
+        all_global_indices = set(range(G))
+        unmapped = all_global_indices - valid_global_indices
+        if unmapped:
+            print(f"   Unmapped global indices: {sorted(list(unmapped))[:20]}{'...' if len(unmapped) > 20 else ''} (total: {len(unmapped)})")
+        
         # Broadcast to all env slots
         B = self.ppo_cfg.num_envs
         self.action_mask = mask.view(1, G).expand(B, G).contiguous()      # [B,G] bool
         self.global2local = g2l.view(1, G).expand(B, G).contiguous()      # [B,G] long
+        
+        print(f"   Action mask shape: {self.action_mask.shape}")
+        print(f"   Global2local shape: {self.global2local.shape}")
+        print(f"   Valid actions count: {mask.sum().item()}/{G}")
+        print()
 
     def _masked_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """
@@ -1142,6 +1177,40 @@ class PPOTrainer:
 
             # Map to per-env local indices for stepping vectorized env
             a_local = self.global2local.gather(1, a_global.view(-1,1)).squeeze(1)  # [B]
+
+            # Debug logging for action mapping (log occasionally to avoid spam)
+            if t == 0 and self.global_steps % 10000 < self.ppo_cfg.num_envs:  # Log every ~10k steps
+                if logger is not None:
+                    logger.info(f"🎮 Action Mapping Debug (step {self.global_steps:,}, timestep {t}):")
+                    logger.info(f"   Global actions sampled: {a_global.cpu().numpy()}")
+                    logger.info(f"   Local actions mapped:   {a_local.cpu().numpy()}")
+                    
+                    # Show available actions for first env
+                    base_env = self.envs.envs[0]
+                    allowed_actions = getattr(base_env.unwrapped, "actions", None)
+                    if allowed_actions is not None:
+                        logger.info(f"   Available env actions:  {allowed_actions}")
+                        
+                        # Show mapping from global to local for available actions
+                        action_mappings = []
+                        for local_idx, global_action in enumerate(allowed_actions):
+                            if hasattr(__import__('utils.action_utils', fromlist=['KEYPRESS_INDEX_MAPPING']), 'KEYPRESS_INDEX_MAPPING'):
+                                global_idx = KEYPRESS_INDEX_MAPPING.get(global_action, global_action)
+                                action_mappings.append(f"local_{local_idx}->global_{global_idx}({global_action})")
+                        logger.info(f"   Action mapping:         {action_mappings}")
+                    else:
+                        logger.info(f"   Available env actions:  Full NLE action set (0-{ACTION_DIM-1})")
+                    
+                    # Show action mask for first env
+                    mask_info = self.action_mask[0].nonzero().squeeze(-1).cpu().numpy()
+                    logger.info(f"   Valid global indices:   {mask_info[:10]}{'...' if len(mask_info) > 10 else ''} (total: {len(mask_info)})")
+                    
+                    # Show global2local mapping for sampled actions
+                    g2l_mappings = []
+                    for i, (g_act, l_act) in enumerate(zip(a_global.cpu().numpy(), a_local.cpu().numpy())):
+                        g2l_mappings.append(f"env{i}:g{g_act}->l{l_act}")
+                    logger.info(f"   Global->Local mapping:  {g2l_mappings}")
+            
             # Safety: if something is -1 (shouldn't happen with mask), map to 0
             a_local = torch.where(a_local < 0, torch.zeros_like(a_local), a_local)
 

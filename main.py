@@ -23,16 +23,27 @@ Commands:
         Batch accumulation: Additional pass that freezes HMM, accumulates statistics, then batch updates
         VAE-only with HMM: Skip E-step HMM training, load pre-trained HMM, only train VAE with HMM prior
     
-    rl [ablation_mode] [options]   - Train online PPO agent with pretrained VAE+HMM models
+    rl [model_mode] [reward_mode] [options]   - Train online PPO agent with pretrained VAE+HMM models
                                     
         Ablation Modes:
-            baseline               - VAE+HMM+PPO with curiosity (default)
-            no_hmm                 - VAE+PPO (no HMM integration)
-            rnd                    - VAE+HMM+PPO with RND instead of curiosity
-            no_intrinsic           - VAE+HMM+PPO with no intrinsic rewards
-            curiosity_dyn_only     - VAE+HMM+PPO with only dynamics surprise
-            curiosity_skill_only   - VAE+HMM+PPO with only skill entropy
-            curiosity_trans_only   - VAE+HMM+PPO with only transition novelty
+            Model Layer (choose one):
+                baseline               - VAE+HMM+PPO (default)
+                no_hmm                 - VAE+PPO (no HMM integration)
+            
+            Reward Layer (choose one):
+                full_curiosity         - All three intrinsic rewards: dynamics + skill entropy + transition novelty (default)
+                curiosity_dyn_only     - Only dynamics surprise
+                curiosity_skill_only   - Only skill entropy (requires HMM)
+                curiosity_trans_only   - Only transition novelty (requires HMM)
+                rnd                    - Random Network Distillation
+                no_intrinsic           - No intrinsic rewards (extrinsic only)
+            
+            Usage: python main.py rl [model_mode] [reward_mode] [options]
+            Examples:
+                python main.py rl baseline full_curiosity    # VAE+HMM with all curiosity
+                python main.py rl no_hmm curiosity_dyn_only  # VAE-only with dynamics curiosity
+                python main.py rl baseline rnd               # VAE+HMM with RND
+                python main.py rl no_hmm no_intrinsic        # VAE-only with no intrinsic rewards
             
         Options:
             --env ENV_NAME         - Environment (default: MiniHack-Room-5x5-v0)
@@ -744,7 +755,8 @@ if __name__ == "__main__":
         print(f"🎮 Reinforcement Learning mode activated")
         
         # Parse ablation mode and options
-        ablation_mode = "baseline"  # default
+        model_mode = "baseline"  # default: VAE+HMM
+        reward_mode = "full_curiosity"  # default: all intrinsic rewards
         env_name = "MiniHack-Room-Random-15x15-v0"  # default
         total_steps = 1_000_000  # default 1M steps
         seed = 42  # default
@@ -755,9 +767,52 @@ if __name__ == "__main__":
         
         # Parse command line arguments
         i = 2
-        if len(sys.argv) > i and not sys.argv[i].startswith('--'):
-            ablation_mode = sys.argv[i]
+        no_hmm_flag = False
+        no_intrinsic_flag = False
+        
+        # Parse positional arguments (model_mode and/or reward_mode) - order independent!
+        valid_model_modes = ["baseline", "no_hmm"]
+        valid_reward_modes = ["full_curiosity", "curiosity_dyn_only", "skill_entropy_only", 
+                             "skill_transition_only", "rnd_only", "no_intrinsic"]
+        
+        positional_args = []
+        # Collect all positional arguments (non-flag arguments)
+        while i < len(sys.argv) and not sys.argv[i].startswith('--'):
+            positional_args.append(sys.argv[i])
             i += 1
+        
+        # Parse positional arguments flexibly
+        for arg in positional_args:
+            if arg in valid_model_modes:
+                model_mode = arg
+            elif arg in valid_reward_modes:
+                reward_mode = arg
+            else:
+                # Legacy compatibility: try to map old single-mode names
+                legacy_mappings = {
+                    "rnd": ("baseline", "rnd_only"),
+                    "curiosity_skill_only": ("baseline", "skill_entropy_only"),
+                    "curiosity_trans_only": ("baseline", "skill_transition_only"),
+                }
+                if arg in legacy_mappings:
+                    legacy_model, legacy_reward = legacy_mappings[arg]
+                    if model_mode == "baseline":  # Only override if still default
+                        model_mode = legacy_model
+                    if reward_mode == "full_curiosity":  # Only override if still default
+                        reward_mode = legacy_reward
+                else:
+                    print(f"❌ Unknown argument: {arg}")
+                    print(f"   Valid model modes: {valid_model_modes}")
+                    print(f"   Valid reward modes: {valid_reward_modes}")
+                    print("   Use: python main.py rl [model_mode] [reward_mode] [options]")
+                    print("   Arguments can be in any order!")
+                    sys.exit(1)
+        
+        # Smart default: if no_hmm is specified but reward_mode is still default, 
+        # use a compatible reward mode
+        if model_mode == "no_hmm" and reward_mode == "full_curiosity":
+            reward_mode = "curiosity_dyn_only"  # Safe default for no_hmm
+            print(f"🔧 Auto-adjusted: Using '{reward_mode}' reward mode with '{model_mode}' (skill-based rewards require HMM)")
         
         while i < len(sys.argv):
             if sys.argv[i] == '--env' and i + 1 < len(sys.argv):
@@ -775,6 +830,12 @@ if __name__ == "__main__":
             elif sys.argv[i] == '--no_upload':
                 disable_upload = True
                 i += 1
+            elif sys.argv[i] == '--no_hmm':
+                model_mode = "no_hmm"
+                i += 1
+            elif sys.argv[i] == '--no_intrinsic':
+                reward_mode = "no_intrinsic"
+                i += 1
             elif sys.argv[i] == '--resume' and i + 1 < len(sys.argv):
                 resume_repo_id = sys.argv[i + 1]
                 i += 2
@@ -785,17 +846,47 @@ if __name__ == "__main__":
                 print(f"⚠️  Unknown option: {sys.argv[i]}")
                 i += 1
         
-        # Validate ablation mode
-        valid_modes = [
-            "baseline", "no_hmm", "rnd", "no_intrinsic",
-            "curiosity_dyn_only", "curiosity_skill_only", "curiosity_trans_only"
-        ]
-        if ablation_mode not in valid_modes:
-            print(f"❌ Invalid ablation mode: {ablation_mode}")
-            print(f"   Valid modes: {', '.join(valid_modes)}")
+        # Validate model and reward mode combinations
+        valid_model_modes = ["baseline", "no_hmm"]
+        valid_reward_modes = ["full_curiosity", "curiosity_dyn_only", "curiosity_skill_only", 
+                             "curiosity_trans_only", "rnd", "no_intrinsic"]
+        
+        if model_mode not in valid_model_modes:
+            print(f"❌ Invalid model mode: {model_mode}")
+            print(f"   Valid model modes: {', '.join(valid_model_modes)}")
+            sys.exit(1)
+            
+        if reward_mode not in valid_reward_modes:
+            print(f"❌ Invalid reward mode: {reward_mode}")
+            print(f"   Valid reward modes: {', '.join(valid_reward_modes)}")
             sys.exit(1)
         
-        print(f"🔬 Ablation Study Mode: {ablation_mode}")
+        # Final validation of parsed modes
+        if model_mode not in valid_model_modes:
+            print(f"❌ Invalid model mode: {model_mode}")
+            print(f"   Valid model modes: {', '.join(valid_model_modes)}")
+            sys.exit(1)
+        
+        if reward_mode not in valid_reward_modes:
+            print(f"❌ Invalid reward mode: {reward_mode}")
+            print(f"   Valid reward modes: {', '.join(valid_reward_modes)}")
+            sys.exit(1)
+        
+        # Validate that skill-based rewards require HMM
+        skill_based_rewards = ["skill_entropy_only", "skill_transition_only", "full_curiosity"]
+        if model_mode == "no_hmm" and reward_mode in skill_based_rewards:
+            print(f"❌ Invalid combination: {reward_mode} requires HMM but model_mode is {model_mode}")
+            print(f"   Skill-based rewards (skill entropy, transition novelty) require HMM")
+            print(f"   Use 'curiosity_dyn_only', 'rnd_only', or 'no_intrinsic' with 'no_hmm'")
+            sys.exit(1)
+        
+        # Create combined ablation name for logging and identification
+        ablation_name = f"{model_mode}_{reward_mode}"
+        
+        print(f"🔬 Ablation Study Configuration:")
+        print(f"   Model Layer: {model_mode}")
+        print(f"   Reward Layer: {reward_mode}")
+        print(f"   Combined Name: {ablation_name}")
         print(f"🎮 Environment: {env_name}")
         print(f"📊 Total Steps: {total_steps:,}")
         print(f"🌱 Seed: {seed}")
@@ -804,7 +895,7 @@ if __name__ == "__main__":
         
         # Set up logging with file output
         os.makedirs("logs", exist_ok=True)  # Create logs directory
-        log_filename = f"logs/rl_{ablation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_filename = f"logs/rl_{ablation_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -842,8 +933,8 @@ if __name__ == "__main__":
             deterministic_eval=True
         )
         
-        # Configure curiosity and RND based on ablation mode
-        if ablation_mode == "baseline":
+        # Configure curiosity and RND based on reward mode
+        if reward_mode == "full_curiosity":
             curiosity_config = CuriosityConfig(
                 use_dyn_kl=True,           # Dynamics surprise
                 use_skill_entropy=True,    # Skill entropy with boundary gating
@@ -858,42 +949,9 @@ if __name__ == "__main__":
                 gate_delta_eps=1e-3,
                 ema_beta=0.99, eps=1e-8
             )
-            description = "VAE+HMM+PPO with full curiosity (dynamics + skill entropy + transition novelty)"
+            reward_description = "full curiosity (dynamics + skill entropy + transition novelty)"
             
-        elif ablation_mode == "no_hmm":
-            ppo_config.policy_uses_skill = False  # No skill features for policy
-            curiosity_config = CuriosityConfig(
-                use_dyn_kl=True,           # Only dynamics surprise (no skill-based rewards)
-                use_skill_entropy=False,   # No skill entropy without HMM
-                use_skill_transition_novelty=False,  # No skill transitions without HMM
-                use_rnd=False,
-                eta0_dyn=0.25, tau_dyn=3e6,
-                ema_beta=0.99, eps=1e-8
-            )
-            description = "VAE+PPO (no HMM) with dynamics curiosity only"
-            
-        elif ablation_mode == "rnd":
-            curiosity_config = CuriosityConfig(
-                use_dyn_kl=False,          # Disable curiosity components
-                use_skill_entropy=False,
-                use_skill_transition_novelty=False,
-                use_rnd=True,              # Enable RND
-                eta0_rnd=0.25, tau_rnd=3e6,
-                ema_beta=0.99, eps=1e-8
-            )
-            description = "VAE+HMM+PPO with RND intrinsic motivation"
-            
-        elif ablation_mode == "no_intrinsic":
-            curiosity_config = CuriosityConfig(
-                use_dyn_kl=False,          # Disable all intrinsic rewards
-                use_skill_entropy=False,
-                use_skill_transition_novelty=False,
-                use_rnd=False,
-                ema_beta=0.99, eps=1e-8
-            )
-            description = "VAE+HMM+PPO with no intrinsic rewards (extrinsic only)"
-            
-        elif ablation_mode == "curiosity_dyn_only":
+        elif reward_mode == "curiosity_dyn_only":
             curiosity_config = CuriosityConfig(
                 use_dyn_kl=True,           # Only dynamics surprise
                 use_skill_entropy=False,
@@ -902,9 +960,9 @@ if __name__ == "__main__":
                 eta0_dyn=0.25, tau_dyn=3e6,
                 ema_beta=0.99, eps=1e-8
             )
-            description = "VAE+HMM+PPO with dynamics curiosity only"
+            reward_description = "dynamics curiosity only"
             
-        elif ablation_mode == "curiosity_skill_only":
+        elif reward_mode == "curiosity_skill_only":
             curiosity_config = CuriosityConfig(
                 use_dyn_kl=False,
                 use_skill_entropy=True,    # Only skill entropy
@@ -915,9 +973,9 @@ if __name__ == "__main__":
                 gate_delta_eps=1e-3,
                 ema_beta=0.99, eps=1e-8
             )
-            description = "VAE+HMM+PPO with skill entropy curiosity only"
+            reward_description = "skill entropy curiosity only"
             
-        elif ablation_mode == "curiosity_trans_only":
+        elif reward_mode == "curiosity_trans_only":
             curiosity_config = CuriosityConfig(
                 use_dyn_kl=False,
                 use_skill_entropy=False,
@@ -926,10 +984,39 @@ if __name__ == "__main__":
                 eta0_stn=0.25, tau_stn=3e6,
                 ema_beta=0.99, eps=1e-8
             )
-            description = "VAE+HMM+PPO with skill transition novelty only"
+            reward_description = "skill transition novelty only"
+            
+        elif reward_mode == "rnd":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,          # Disable curiosity components
+                use_skill_entropy=False,
+                use_skill_transition_novelty=False,
+                use_rnd=True,              # Enable RND
+                eta0_rnd=0.25, tau_rnd=3e6,
+                ema_beta=0.99, eps=1e-8
+            )
+            reward_description = "RND intrinsic motivation"
+            
+        elif reward_mode == "no_intrinsic":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,          # Disable all intrinsic rewards
+                use_skill_entropy=False,
+                use_skill_transition_novelty=False,
+                use_rnd=False,
+                ema_beta=0.99, eps=1e-8
+            )
+            reward_description = "no intrinsic rewards (extrinsic only)"
+        
+        # Create full description
+        model_description = "VAE+HMM+PPO" if model_mode == "baseline" else "VAE+PPO (no HMM)"
+        description = f"{model_description} with {reward_description}"
+        
+        # Configure PPO based on model mode
+        if model_mode == "no_hmm":
+            ppo_config.policy_uses_skill = False  # No skill features for policy
         
         # HMM Online Learning Configuration (disabled for no_hmm mode)
-        if ablation_mode == "no_hmm":
+        if model_mode == "no_hmm":
             # Use dummy HMM config (won't be used)
             hmm_config = HMMOnlineConfig(
                 hmm_update_every=float('inf'),  # Never update
@@ -997,7 +1084,7 @@ if __name__ == "__main__":
         )
         
         # Training Configuration
-        run_name = f"ablation_{ablation_mode}_{env_name.replace('-', '_')}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        run_name = f"ablation_{ablation_name}_{env_name.replace('-', '_')}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         train_config = TrainConfig(
             env_id=env_name,
             seed=seed,
@@ -1022,7 +1109,7 @@ if __name__ == "__main__":
         print(f"   Skill Entropy: {curiosity_config.use_skill_entropy}")
         print(f"   Skill Transition: {curiosity_config.use_skill_transition_novelty}")
         print(f"   RND: {curiosity_config.use_rnd}")
-        if ablation_mode != "no_hmm":
+        if model_mode != "no_hmm":
             print(f"\n🔄 HMM Updates:")
             print(f"   Every: {hmm_config.hmm_update_every:,} steps")
             print(f"   Growth: {hmm_config.hmm_update_growth}")
@@ -1055,21 +1142,21 @@ if __name__ == "__main__":
                 use_wandb=use_wandb_flag,
                 wandb_project="SequentialSkillRL-Ablations",
                 wandb_run_name=run_name,
-                wandb_tags=["ablation", ablation_mode, env_name.split('-')[1] if '-' in env_name else env_name],
+                wandb_tags=["ablation", ablation_name, env_name.split('-')[1] if '-' in env_name else env_name],
                 wandb_notes=f"Ablation study: {description}",
                 
                 push_to_hub=not disable_upload,
-                hub_repo_id=f"CatkinChen/nethack-ppo-ablation-{ablation_mode}",
+                hub_repo_id=f"CatkinChen/nethack-ppo-ablation-{ablation_name}",
                 hf_upload_artifacts=True,
                 logger=logger,
             )
             
-            print(f"\n🎉 Ablation study '{ablation_mode}' completed successfully!")
+            print(f"\n🎉 Ablation study '{ablation_name}' completed successfully!")
             print(f"📊 Run name: {run_name}")
             print(f"📁 Results: {results.get('final_checkpoint', 'N/A')}")
             
         except Exception as e:
-            print(f"\n❌ Ablation study '{ablation_mode}' failed: {e}")
+            print(f"\n❌ Ablation study '{ablation_name}' failed: {e}")
             import traceback
             traceback.print_exc()
             logger.error(f"Ablation study failed", exc_info=True)
