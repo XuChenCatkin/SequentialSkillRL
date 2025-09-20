@@ -148,6 +148,8 @@ class TrainConfig:
     save_every: int = 50_000  # env steps
     eval_every: int = 50_000  # env steps
     eval_episodes: int = 10
+    use_hmm: bool = True
+    test_mode: bool = False  # if True, run one eval and exit
 
 # --------------------------------------------------------------------------------------
 # Utilities
@@ -499,62 +501,57 @@ class CuriosityComputer:
             hmm_mask = mask
 
         h_boundary_gated = torch.zeros(B, T, device=device, dtype=mu.dtype)
-
-        if self.has_hmm:
+        alpha_skill = torch.zeros(B, T, self.skill_K, device=device, dtype=mu.dtype)
+        h_entropy = torch.zeros(B, T, device=device, dtype=mu.dtype)
+        gate_bool = torch.zeros(B, T, device=device, dtype=mu.dtype)
+        trans_novel = torch.zeros(B, T, device=device, dtype=mu.dtype)
+        if self.has_hmm and (self.cfg.use_skill_entropy or self.cfg.use_skill_transition_novelty):
             # ---- HMM filtered marginals (alpha) and (B) skill entropy ----
             filted = self.compute_skill_filtered(mu, logvar.exp().clamp_min(1e-6), F, hmm_mask, dones)  # [B,T,Kp1]
             alpha = filted["alpha"]  # [B,T,Kp1]
-            xi = filted["xi"]      # [B,T-1,Kp1,Kp1]
-            h_entropy = filted["H"]  # [B,T]
             Kp1 = alpha.shape[-1]
             alpha_skill = alpha[...,:(Kp1-1)]
 
             # ---- (B) Skill-boundary entropy gated + (C) Skill-transition novelty ----
             with torch.no_grad():
-                logA = self.hmm.make_logA_for_filter(self.hmm_cfg.transition_mode, self.hmm_cfg.transition_temperature) 
-                
-                # Compute boundary gate: 1{ΔH_t > 0} with episode boundary awareness
-                gate_bool = torch.zeros(B, T, device=device)
-                for b in range(B):
-                    prev_H = None
-                    for t in range(T):
-                        if mask[b, t] < 0.5:
-                            prev_H = None
-                            continue
-                        # Reset at episode boundaries
-                        if dones is not None and t > 0 and dones[b, t-1]:
-                            prev_H = None
-                        
-                        if prev_H is None:
-                            gate_bool[b, t] = 0.0  # no previous step to compare to
-                        else:
-                            dH = h_entropy[b, t] - prev_H
-                            gate_bool[b, t] = 1.0 if dH > self.cfg.gate_delta_eps else 0.0
-                        prev_H = float(h_entropy[b, t].item())
-
-                # Compute transition novelty using already computed xi
-                trans_novel = torch.zeros(B, T, device=device)
-                # xi is [B, T-1, Kp1, Kp1] - pairwise posteriors ξ_{t-1,t}
-                neg_logA = (-logA).clamp_min(0.0)            # [Kp1,Kp1]
-                neg_logA.fill_diagonal_(0.0)                  # ignore self-transitions
-                for t in range(1, T):  # start from t=1 since xi[t-1] exists
-                    # Don't compute transition novelty across episode boundaries
+                if self.cfg.use_skill_entropy:
+                    # Compute boundary gate: 1{ΔH_t > 0} with episode boundary awareness
+                    h_entropy = filted["H"]  # [B,T]
+                    gate_bool = torch.zeros(B, T, device=device)
                     for b in range(B):
-                        if dones is not None and dones[b, t-1]:
-                            # Episode terminated at t-1, so no transition to t
-                            trans_novel[b, t] = 0.0
-                        else:
-                            trans_novel[b, t] = (xi[b, t-1] * neg_logA).sum()
+                        prev_H = None
+                        for t in range(T):
+                            if mask[b, t] < 0.5:
+                                prev_H = None
+                                continue
+                            # Reset at episode boundaries
+                            if dones is not None and t > 0 and dones[b, t-1]:
+                                prev_H = None
+                            
+                            if prev_H is None:
+                                gate_bool[b, t] = 0.0  # no previous step to compare to
+                            else:
+                                dH = h_entropy[b, t] - prev_H
+                                gate_bool[b, t] = 1.0 if dH > self.cfg.gate_delta_eps else 0.0
+                            prev_H = float(h_entropy[b, t].item())
+                    # gated boundary entropy: H(α_t) * 1{ΔH_t > 0}
+                    h_boundary_gated = (h_entropy * gate_bool) * mask  # [B,T]
 
-                # gated boundary entropy: H(α_t) * 1{ΔH_t > 0}
-                h_boundary_gated = (h_entropy * gate_bool) * mask  # [B,T]
-                trans_novel = trans_novel * mask                # [B,T]
-        else:
-            alpha_skill = torch.zeros(B, T, self.skill_K, device=device, dtype=mu.dtype)
-            h_entropy = torch.zeros(B, T, device=device, dtype=mu.dtype)
-            gate_bool = torch.zeros(B, T, device=device, dtype=mu.dtype)
-            trans_novel = torch.zeros(B, T, device=device, dtype=mu.dtype)
-            h_boundary_gated = h_boundary_gated * 0.0
+                if self.cfg.use_skill_transition_novelty:
+                    # xi is [B, T-1, Kp1, Kp1] - pairwise posteriors ξ_{t-1,t}
+                    xi = filted["xi"]      # [B,T-1,Kp1,Kp1]
+                    logA = self.hmm.make_logA_for_filter(self.hmm_cfg.transition_mode, self.hmm_cfg.transition_temperature) 
+                    neg_logA = (-logA).clamp_min(0.0)            # [Kp1,Kp1]
+                    neg_logA.fill_diagonal_(0.0)                  # ignore self-transitions
+                    for t in range(1, T):  # start from t=1 since xi[t-1] exists
+                        # Don't compute transition novelty across episode boundaries
+                        for b in range(B):
+                            if dones is not None and dones[b, t-1]:
+                                # Episode terminated at t-1, so no transition to t
+                                trans_novel[b, t] = 0.0
+                            else:
+                                trans_novel[b, t] = (xi[b, t-1] * neg_logA).sum()
+                    trans_novel = trans_novel * mask                # [B,T]       
 
         # ---- (A) dynamics KL surprise using world-model prior ----
         dyn = torch.zeros(B, T, device=device)
@@ -978,6 +975,10 @@ class PPOTrainer:
         else:
             self._skills_used_this_train = set()
         
+        # --- Global action usage tracking for diagnostics ---
+        self._actions_used_in_train = set()  # Set of global action indices used during train()
+        self._actions_used_in_eval = set()   # Set of global action indices used during evaluate()
+        
     @torch.no_grad()
     def _policy_forward(self, z: torch.Tensor, skill_feat: Optional[torch.Tensor]):
         """Forward through policy; updates internal RNN state"""
@@ -1175,6 +1176,10 @@ class PPOTrainer:
             a_global = dist.sample()               # [B] global ids in NLE space
             logp = dist.log_prob(a_global)
 
+            # Track global actions used during training
+            for action_id in a_global.cpu().numpy():
+                self._actions_used_in_train.add(int(action_id))
+
             # Map to per-env local indices for stepping vectorized env
             a_local = self.global2local.gather(1, a_global.view(-1,1)).squeeze(1)  # [B]
 
@@ -1211,8 +1216,7 @@ class PPOTrainer:
                         g2l_mappings.append(f"env{i}:g{g_act}->l{l_act}")
                     logger.info(f"   Global->Local mapping:  {g2l_mappings}")
             
-            # Safety: if something is -1 (shouldn't happen with mask), map to 0
-            a_local = torch.where(a_local < 0, torch.zeros_like(a_local), a_local)
+            assert (a_local >= 0).all(), "Mapped local action has -1 (invalid) value!"
 
             # step
             next_obs, rew, terminated, truncated, info = self.envs.step(a_local.cpu().numpy())
@@ -2361,6 +2365,10 @@ class PPOTrainer:
                 "int/negative_ratio": float((intrinsic < 0).float().mean().item()),
                 "int/total_mean": float(intrinsic.mean().item()),
                 "int/total_std": float(intrinsic.std().item()),
+                # Action usage statistics
+                "actions/train_unique_count": float(len(self._actions_used_in_train)),
+                "actions/eval_unique_count": float(len(self._actions_used_in_eval)),
+                "actions/total_unique_count": float(len(self._actions_used_in_train | self._actions_used_in_eval)),
                 # Synchronized model training diagnostics
                 "learning_cycle/hmm_training_gap": float(self.global_steps - self.last_hmm_refresh),
                 "learning_cycle/vae_training_gap": float(self.global_steps - self.last_vae_refresh),
@@ -2422,7 +2430,7 @@ class PPOTrainer:
             self._log_scalar(metrics)
             if (self.global_steps % self.run_cfg.eval_every) < (self.ppo_cfg.num_envs * self.ppo_cfg.rollout_len):
                 pbar.write(f"🧪 Running evaluation at step {self.global_steps:,}...")
-                self.evaluate(self.run_cfg.eval_episodes)
+                self.evaluate(self.run_cfg.eval_episodes, logger)
             if (self.global_steps % self.run_cfg.save_every) < (self.ppo_cfg.num_envs * self.ppo_cfg.rollout_len):
                 pbar.write(f"💾 Saving checkpoint at step {self.global_steps:,}...")
                 self._save_ckpt()
@@ -2438,13 +2446,16 @@ class PPOTrainer:
         print()
 
     @torch.no_grad()
-    def evaluate(self, episodes: int):
+    def evaluate(self, episodes: int, logger: Optional[logging.Logger] = None):
         """
         Evaluation with richer diagnostics to support:
           (1) VAE+HMM+PPO vs VAE+PPO (task returns, success, sample-efficiency)
           (2) Curiosity vs RND (decomposition & exploration proxies)
         """
-        print(f"🧪 Starting evaluation with {episodes} episodes...")
+        if logger is not None:
+            logger.info(f"🧪 Starting evaluation with {episodes} episodes...")
+        else:
+            print(f"🧪 Starting evaluation with {episodes} episodes...")
         start_time = time.time()
         
         env = gym.make(self.env_id)
@@ -2531,6 +2542,9 @@ class PPOTrainer:
                      if self.ppo_cfg.deterministic_eval
                      else torch.distributions.Categorical(logits=masked).sample())
                 
+                # Track global actions used during evaluation
+                self._actions_used_in_eval.add(int(a_global.item()))
+                
                 # Convert global action to local action for single environment
                 # Use first row of global2local mapping
                 eval_global2local = self.global2local[0]  # [G]
@@ -2546,7 +2560,10 @@ class PPOTrainer:
 
             # Check if episode was terminated due to step limit
             if ep_len >= max_episode_steps and not done:
-                print(f"⚠️ Episode {ep_idx + 1} terminated due to step limit ({max_episode_steps} steps)")
+                if logger is not None:
+                    logger.warning(f"⚠️ Episode {ep_idx + 1} terminated due to step limit ({max_episode_steps} steps)")
+                else:
+                    print(f"⚠️ Episode {ep_idx + 1} terminated due to step limit ({max_episode_steps} steps)")
 
             # episode‑level tallies
             ret_list.append(ret)
@@ -2626,18 +2643,45 @@ class PPOTrainer:
         final_avg_len = np.mean(len_list) if len_list else 0.0
         final_avg_coverage = np.mean(cover_list) if cover_list else 0.0
         
-        print(f"📊 Evaluation Results:")
-        print(f"   Episodes: {episodes}")
-        print(f"   Time: {eval_time:.1f}s ({eval_time/episodes:.1f}s/ep)")
-        print(f"   Average Return: {final_avg_ret:.3f} ± {np.std(ret_list):.3f}")
-        print(f"   Success Rate: {final_success_rate:.1%}")
-        print(f"   Average Length: {final_avg_len:.1f}")
-        print(f"   Average Coverage: {final_avg_coverage:.1f} positions")
-        if bound_mass_list:
-            print(f"   Skill Entropy: {np.mean(ent_list):.3f}")
-            print(f"   Used Skills: {np.mean(used_skills_list):.1f}")
-            print(f"   Effective K: {np.mean(effK_list):.2f}")
-        print()
+        if logger is not None:
+            logger.info(f"📊 Evaluation Results:")
+            logger.info(f"   Episodes: {episodes}")
+            logger.info(f"   Time: {eval_time:.1f}s ({eval_time/episodes:.1f}s/ep)")
+            logger.info(f"   Average Return: {final_avg_ret:.3f} ± {np.std(ret_list):.3f}")
+            logger.info(f"   Success Rate: {final_success_rate:.1%}")
+            logger.info(f"   Average Length: {final_avg_len:.1f}")
+            logger.info(f"   Average Coverage: {final_avg_coverage:.1f} positions")
+            if bound_mass_list:
+                logger.info(f"   Skill Entropy: {np.mean(ent_list):.3f}")
+                logger.info(f"   Used Skills: {np.mean(used_skills_list):.1f}")
+                logger.info(f"   Effective K: {np.mean(effK_list):.2f}")
+            
+            # Log action usage statistics
+            logger.info(f"🎯 Action Usage Statistics:")
+            logger.info(f"   Unique actions in evaluation: {len(self._actions_used_in_eval)}")
+            logger.info(f"   Unique actions in training: {len(self._actions_used_in_train)}")
+            logger.info(f"   Total unique actions: {len(self._actions_used_in_train | self._actions_used_in_eval)}")
+            logger.info(f"   Action coverage: {len(self._actions_used_in_train | self._actions_used_in_eval)/len(nethack.ACTIONS):.1%}")
+        else:
+            print(f"📊 Evaluation Results:")
+            print(f"   Episodes: {episodes}")
+            print(f"   Time: {eval_time:.1f}s ({eval_time/episodes:.1f}s/ep)")
+            print(f"   Average Return: {final_avg_ret:.3f} ± {np.std(ret_list):.3f}")
+            print(f"   Success Rate: {final_success_rate:.1%}")
+            print(f"   Average Length: {final_avg_len:.1f}")
+            print(f"   Average Coverage: {final_avg_coverage:.1f} positions")
+            if bound_mass_list:
+                print(f"   Skill Entropy: {np.mean(ent_list):.3f}")
+                print(f"   Used Skills: {np.mean(used_skills_list):.1f}")
+                print(f"   Effective K: {np.mean(effK_list):.2f}")
+            
+            # Print action usage statistics
+            print(f"🎯 Action Usage Statistics:")
+            print(f"   Unique actions in evaluation: {len(self._actions_used_in_eval)}")
+            print(f"   Unique actions in training: {len(self._actions_used_in_train)}")
+            print(f"   Total unique actions: {len(self._actions_used_in_train | self._actions_used_in_eval)}")
+            print(f"   Action coverage: {len(self._actions_used_in_train | self._actions_used_in_eval)/len(nethack.ACTIONS):.1%}")
+            print()
 
         # Aggregate & log
         def _p(arr, q): return float(np.percentile(arr, q)) if len(arr) else 0.0
@@ -2651,6 +2695,8 @@ class PPOTrainer:
             "eval/ep_len_mean": float(final_avg_len),
             "eval/ep_len_success_mean": float(np.mean(len_succ_list) if len(len_succ_list) else 0.0),
             "eval/coverage_pos_mean": float(final_avg_coverage),
+            # Action usage statistics
+            "actions/eval_unique_actions": float(len(self._actions_used_in_eval)),
         }
         if bound_mass_list:
             log_dict.update({

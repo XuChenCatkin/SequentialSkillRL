@@ -1014,24 +1014,7 @@ if __name__ == "__main__":
         # Configure PPO based on model mode
         if model_mode == "no_hmm":
             ppo_config.policy_uses_skill = False  # No skill features for policy
-        
-        # HMM Online Learning Configuration (disabled for no_hmm mode)
-        if model_mode == "no_hmm":
-            # Use dummy HMM config (won't be used)
-            hmm_config = HMMOnlineConfig(
-                hmm_update_every=float('inf'),  # Never update
-                hmm_fit_window=1,
-                hmm_max_iters=1,
-                hmm_tol=1e-2,
-                hmm_elbo_drop_tol=1e-2,
-                rho_emission=0.0,
-                rho_transition=None,
-                optimise_pi=False,
-                pi_steps=200,
-                pi_lr=0.05,
-                pi_early_stopping_patience=10,
-                pi_early_stopping_min_delta=1e-5
-            )
+            hmm_config = None
             
             if resume_repo_id is None and resume_local_path is None:
                 # Set VAE repo to VAE-only model
@@ -1092,7 +1075,8 @@ if __name__ == "__main__":
             log_dir=f"./runs/{run_name}",
             save_every=10_000,
             eval_every=10_000,
-            eval_episodes=10
+            eval_episodes=10,
+            use_hmm=(model_mode != "no_hmm")
         )
         
         print(f"\n🔧 Ablation Configuration:")
@@ -1121,22 +1105,21 @@ if __name__ == "__main__":
         # Train with the configured ablation
         try:
             results = train_online_ppo_with_pretrained_models(
-                env_name=train_config.env_id,
-                vae_repo_id=vae_repo_id,
-                hmm_repo_id=hmm_repo_id,
+                vae_repo_id,
+                hmm_repo_id,
+                
+                # Use config objects for full control
+                ppo_config,
+                curiosity_config,
+                hmm_config,
+                vae_config,
+                rnd_config,
+                train_config,
                 
                 # Resume training from existing PPO checkpoint (new!)
                 ppo_repo_id=resume_repo_id,
                 ppo_checkpoint_path=resume_local_path,
                 resume_training=resume_repo_id is not None or resume_local_path is not None,
-                
-                # Use config objects for full control
-                ppo_config=ppo_config,
-                curiosity_config=curiosity_config,
-                hmm_config=hmm_config,
-                vae_config=vae_config,
-                rnd_config=rnd_config,
-                train_config=train_config,
                 
                 # Monitoring and uploading
                 use_wandb=use_wandb_flag,
