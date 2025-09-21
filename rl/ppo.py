@@ -1256,38 +1256,37 @@ class PPOTrainer:
             trunc_t = torch.as_tensor(truncated, dtype=torch.bool, device=self.device)
             done = (term_t | trunc_t).cpu().numpy()
             
-            # For truncated episodes, next_obs contains the actual next state we need for bootstrapping
-            # For terminated episodes, next_obs is just an episode summary and should not be used for bootstrapping
-            if truncated.any():
-                # Store the valid next_obs for truncated environments at the current timestep
-                # This will be used for value bootstrapping in GAE computation
-                truncated_next_obs = {}
-                for key in next_obs.keys():
-                    truncated_next_obs[key] = next_obs[key].copy() if hasattr(next_obs[key], 'copy') else next_obs[key]
+            # Update episode statistics and log completions
+            for env_idx in range(self.ppo_cfg.num_envs):
+                episode_returns[env_idx] += rew[env_idx]
+                episode_lengths[env_idx] += 1
                 
-                truncated_enc = self._encode_obs(truncated_next_obs, self._hero_info)
-                
-                # Store truncated next obs encodings at the current timestep for environments that were truncated
-                for env_idx in range(self.ppo_cfg.num_envs):
+                if done[env_idx]:
+                    
+                    # Reset episode tracking for this environment
+                    episode_returns[env_idx] = 0.0
+                    episode_lengths[env_idx] = 0
+                    
                     if truncated[env_idx]:
                         # Compute bootstrap values for this truncated episode with current RNN state
-                        # (this preserves the sequential RNN state order)
+                        truncated_next_obs_single = info['final_obs'][env_idx]
+                        truncated_enc_single = self._encode_obs(truncated_next_obs_single, [self._hero_info[env_idx]])
                         skill_feat_trunc = None
                         if self.ppo_cfg.policy_uses_skill and self.has_hmm:
                             # Compute skill features for this specific observation
                             trunc_enc_single = {
-                                "z": truncated_enc["z"][env_idx:env_idx+1],
-                                "mu": truncated_enc["mu"][env_idx:env_idx+1],
-                                "logvar": truncated_enc["logvar"][env_idx:env_idx+1]
+                                "z": truncated_enc_single["z"][0:1],
+                                "mu": truncated_enc_single["mu"][0:1],
+                                "logvar": truncated_enc_single["logvar"][0:1]
                             }
-                            if truncated_enc.get("lowrank_factors") is not None:
-                                trunc_enc_single["lowrank_factors"] = truncated_enc["lowrank_factors"][env_idx:env_idx+1]
+                            if truncated_enc_single.get("lowrank_factors") is not None:
+                                trunc_enc_single["lowrank_factors"] = truncated_enc_single["lowrank_factors"][0:1]
                             skill_feat_trunc = self._compute_skill_features(trunc_enc_single)
                             if skill_feat_trunc is not None:
                                 skill_feat_trunc = skill_feat_trunc[0:1]
                         
                         _, v_ext_boot, v_int_boot, _ = self.actor_critic(
-                            truncated_enc["z"][env_idx:env_idx+1], 
+                            truncated_enc_single["z"][0:1], 
                             skill_feat_trunc, 
                             self._rnn_state[env_idx:env_idx+1]
                         )
@@ -1295,30 +1294,6 @@ class PPOTrainer:
                         # Store bootstrap values for this truncated timestep
                         truncated_bootstrap_ext[env_idx] = v_ext_boot[0]
                         truncated_bootstrap_int[env_idx] = v_int_boot[0]
-            
-            # Update episode statistics and log completions
-            for env_idx in range(self.ppo_cfg.num_envs):
-                episode_returns[env_idx] += rew[env_idx]
-                episode_lengths[env_idx] += 1
-                
-                if done[env_idx]:
-                    # Log episode completion
-                    #if logger is not None:
-                        #logger.info(f"🎮 Episode completed (env {env_idx}): return={episode_returns[env_idx]:.2f}, length={episode_lengths[env_idx]}")
-                        
-                    # Extract game message if available
-                    message = ""
-                    if hasattr(next_obs, '__getitem__') and 'message' in next_obs:
-                        try:
-                            message = message_ascii_to_string(next_obs['message'][env_idx])
-                        except:
-                            message = ""
-                    if logger is not None and len(message) > 0:
-                        logger.info(f"💬 Final game message (env {env_idx}): {message[:200]}{'...' if len(message)>200 else ''}")
-                    
-                    # Reset episode tracking for this environment
-                    episode_returns[env_idx] = 0.0
-                    episode_lengths[env_idx] = 0
                     
                     # IMPORTANT: Don't manually reset individual environments during rollout
                     # The vectorized environment will handle resets automatically when stepping
