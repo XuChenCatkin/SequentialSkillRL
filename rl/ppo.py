@@ -242,7 +242,9 @@ class ActorCritic(nn.Module):
         self.fc = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
         self.rnn = nn.GRU(input_size=hidden, hidden_size=rnn_hidden, batch_first=False)
         self.pi_head = nn.Linear(rnn_hidden, n_actions)
-        self.v_head = nn.Linear(rnn_hidden, 1)
+        # Two separate critics: extrinsic & intrinsic
+        self.v_ext_head = nn.Linear(rnn_hidden, 1)
+        self.v_int_head = nn.Linear(rnn_hidden, 1)
         self.rnn_hidden = rnn_hidden
 
     def forward(self, z: torch.Tensor, skill_feat: Optional[torch.Tensor], h: Optional[torch.Tensor]):
@@ -258,8 +260,9 @@ class ActorCritic(nn.Module):
         h_next = h1.squeeze(0)         # [B,H]
         y = out[-1, :, :]              # [B,H]
         logits = self.pi_head(y)       # [B,G]
-        value = self.v_head(y).squeeze(-1)  # [B]
-        return logits, value, h_next
+        v_ext = self.v_ext_head(y).squeeze(-1)  # [B]
+        v_int = self.v_int_head(y).squeeze(-1)  # [B]
+        return logits, v_ext, v_int, h_next
 
     def forward_sequence(self, z_seq: torch.Tensor, skill_seq: Optional[torch.Tensor], dones: torch.Tensor, h0: Optional[torch.Tensor]=None):
         """Sequence forward with resets at episode boundaries.
@@ -274,7 +277,7 @@ class ActorCritic(nn.Module):
             h = torch.zeros(B, self.rnn_hidden, device=x.device, dtype=x.dtype)
         else:
             h = h0
-        logits_list, values_list = [], []
+        logits_list, v_ext_list, v_int_list = [], [], []
         for t in range(T):
             out, h1 = self.rnn(x[t:t+1], h.unsqueeze(0))  # input:[1,B,H], h0:[1,B,H]
             h = h1.squeeze(0)
@@ -285,10 +288,12 @@ class ActorCritic(nn.Module):
                     h = h * (~done_prev).float().unsqueeze(-1)
             y = out.squeeze(0)    # [B,H]
             logits_list.append(self.pi_head(y))           # [B,G]
-            values_list.append(self.v_head(y).squeeze(-1))# [B]
+            v_ext_list.append(self.v_ext_head(y).squeeze(-1))# [B]
+            v_int_list.append(self.v_int_head(y).squeeze(-1))# [B]
         logits = torch.stack(logits_list, dim=0)  # [T,B,G]
-        values = torch.stack(values_list, dim=0)  # [T,B]
-        return logits, values, h
+        v_ext = torch.stack(v_ext_list, dim=0)  # [T,B]
+        v_int = torch.stack(v_int_list, dim=0)  # [T,B]
+        return logits, v_ext, v_int, h
 
 class RNDModule(nn.Module):
     def __init__(self, in_dim: int, proj_dim: int = 128, hidden: int = 256):
@@ -717,8 +722,11 @@ class RolloutBuffer:
         self.actions= torch.zeros(T, num_envs, dtype=torch.long, device=device)
         self.rews_e = torch.zeros(T, num_envs, device=device)  # extrinsic
         self.dones  = torch.zeros(T, num_envs, dtype=torch.bool, device=device)
+        self.terminated  = torch.zeros(T, num_envs, dtype=torch.bool, device=device)
+        self.truncated  = torch.zeros(T, num_envs, dtype=torch.bool, device=device)
         self.mask   = torch.zeros(T, num_envs, device=device)  # validity mask
-        self.val    = torch.zeros(T, num_envs, device=device)
+        self.val_ext= torch.zeros(T, num_envs, device=device)  # extrinsic
+        self.val_int= torch.zeros(T, num_envs, device=device)  # intrinsic
         self.logp   = torch.zeros(T, num_envs, device=device)
         self.skill  = torch.zeros(T, num_envs, skill_dim, device=device) if skill_dim>0 else None
         self.h0 = None # [B, H]
@@ -872,10 +880,13 @@ class RolloutBuffer:
     def get(self):
         # flatten T*B
         T,B = self.T, self.num_envs
-        data = { "mu": self.mu, "logvar": self.logvar, "actions": self.actions, "extrinsic": self.rews_e, "dones": self.dones, "mask": self.mask, "values": self.val, "logp": self.logp }
+        data = { 
+                "mu": self.mu, "logvar": self.logvar, "actions": self.actions, 
+                "extrinsic": self.rews_e, "dones": self.dones, "mask": self.mask, 
+                "values_ext": self.val_ext, "values_int": self.val_int, "logp": self.logp }
         if self.skill is not None: data["skill"] = self.skill
         if self.lowrank_factors is not None: data["lowrank_factors"] = self.lowrank_factors
-        for k in ["mu","logvar","actions","extrinsic","dones","mask","values","logp","skill","lowrank_factors"]:
+        for k in ["mu","logvar","actions","extrinsic","dones","mask","values_ext","values_int","logp","skill","lowrank_factors"]:
             if k in data: data[k] = data[k].reshape(T*B, *data[k].shape[2:])
         return data
 
@@ -928,7 +939,12 @@ class PPOTrainer:
         # Curiosity computer
         curiosity_skill_dim = (hmm.niw.mu.size(0) - 1) if self.has_hmm else getattr(self.vae.world_model, "skill_num", 0)
         self.curiosity = CuriosityComputer(self.vae, self.hmm, self.device, cur_cfg, hmm_cfg, rnd_cfg, z_dim, curiosity_skill_dim)
-
+        self._intrinsic_enabled = bool(
+            (cur_cfg.use_dyn_kl and vae.world_model.enabled) or 
+            cur_cfg.use_skill_entropy or 
+            cur_cfg.use_skill_transition_novelty or 
+            cur_cfg.use_rnd
+        )
         # Storage
         self.buf = RolloutBuffer(ppo_cfg.num_envs, ppo_cfg.rollout_len, z_dim, skill_dim, self.device)
 
@@ -988,9 +1004,9 @@ class PPOTrainer:
     @torch.no_grad()
     def _policy_forward(self, z: torch.Tensor, skill_feat: Optional[torch.Tensor]):
         """Forward through policy; updates internal RNN state"""
-        logits, value, h_next = self.actor_critic(z, skill_feat, self._rnn_state)
+        logits, v_ext, v_int, h_next = self.actor_critic(z, skill_feat, self._rnn_state)
         self._rnn_state = h_next  # persist across steps/environments
-        return logits, value
+        return logits, v_ext, v_int
 
     # --------------------------- rollout -------------------------------------
 
@@ -1175,8 +1191,8 @@ class PPOTrainer:
                 # save initial hidden state per env
                 self.buf.h0 = self._rnn_state.detach().clone()
             # Policy forward (handles recurrent or feed-forward)
-            logits, value = self._policy_forward(z, skill_feat)        # logits: [B,G]
-            
+            logits, v_ext, v_int = self._policy_forward(z, skill_feat)        # logits: [B,G]
+
             masked = self._masked_logits(logits)
             dist = torch.distributions.Categorical(logits=masked)
             a_global = dist.sample()               # [B] global ids in NLE space
@@ -1226,7 +1242,9 @@ class PPOTrainer:
 
             # step
             next_obs, rew, terminated, truncated, info = self.envs.step(a_local.cpu().numpy())
-            done = np.logical_or(terminated, truncated)
+            term_t = torch.as_tensor(terminated, dtype=torch.bool, device=self.device)
+            trunc_t = torch.as_tensor(truncated, dtype=torch.bool, device=self.device)
+            done = (term_t | trunc_t).cpu().numpy()
             
             # Update episode statistics and log completions
             for env_idx in range(self.ppo_cfg.num_envs):
@@ -1267,8 +1285,10 @@ class PPOTrainer:
                          actions=torch.as_tensor(a_global, device=self.device),
                          rews_e=torch.as_tensor(rew, dtype=torch.float32, device=self.device),
                          dones=torch.as_tensor(done, dtype=torch.bool, device=self.device),
+                         terminated=term_t, truncated=trunc_t,
                          mask=step_mask,
-                         val=value, logp=logp,
+                         val_ext=v_ext, val_int=v_int,
+                         logp=logp,
                          skill=skill_feat if (self.buf.skill is not None) else None,
                          obs_batch=obs_batch)
             # reset filter state for envs that terminated; next loop will re-init on new obs
@@ -1468,44 +1488,53 @@ class PPOTrainer:
         return torch.stack(skill_list, dim=0)
 
     @torch.no_grad()
-    def _advantages(self, rews_total: torch.Tensor, values: torch.Tensor, dones: torch.Tensor):
+    def _advantages(self, rews_ext: torch.Tensor, rews_int: torch.Tensor, values_ext: torch.Tensor, values_int: torch.Tensor, terminated: torch.Tensor):
         """
-        Compute GAE advantages with proper episode boundary handling.
+        Compute dual-stream GAE(λ) for extrinsic & intrinsic [T,B] sequences.
         
         Args:
-            rews_total: [T,B] total rewards (extrinsic + intrinsic)
-            values: [T,B] value estimates for each timestep
-            dones: [T,B] episode termination flags
+            rews_ext: [T,B] extrinsic rewards
+            rews_int: [T,B] intrinsic rewards
+            values_ext: [T,B] extrinsic value estimates
+            values_int: [T,B] intrinsic value estimates
+            terminated: [T,B] episode termination flags
         """
-        T, B = rews_total.size()
-        
+        T, B = rews_ext.size()
+        device = rews_ext.device
+
         # Get bootstrap values (value of observation after rollout)
         enc = self._encode_obs(self._obs, self._hero_info)
         skill_feat = self._compute_skill_features(enc)
-        _, bootstrap_values, _ = self.actor_critic(enc["z"], skill_feat, self._rnn_state)
+        _, bootstrap_values_ext, bootstrap_values_int, _ = self.actor_critic(enc["z"], skill_feat, self._rnn_state)
         
         # Extend values with bootstrap
-        extended_values = torch.cat([values, bootstrap_values.unsqueeze(0)], dim=0)  # [T+1, B]
-        
+        extended_values_ext = torch.cat([values_ext, bootstrap_values_ext.unsqueeze(0)], dim=0)  # [T+1, B]
+        extended_values_int = torch.cat([values_int, bootstrap_values_int.unsqueeze(0)], dim=0)  # [T+1, B]
+
         # Compute advantages
-        advantages = torch.zeros_like(rews_total)
-        gae = torch.zeros(B, device=self.device)
-        
+        advantages_ext = torch.zeros_like(rews_ext, device=device)
+        advantages_int = torch.zeros_like(rews_int, device=device)
+        gae_ext = torch.zeros(B, device=self.device)
+        gae_int = torch.zeros(B, device=self.device)
+
         for t in reversed(range(T)):
-            # Episode continues if current step is not done
-            nextnonterminal = (~dones[t]).float()
+            # Episode continues if current step is not terminated
+            nextnonterminal = (~terminated[t]).float()
             
             # TD error
-            delta = rews_total[t] + self.ppo_cfg.gamma * extended_values[t + 1] * nextnonterminal - values[t]
-            
+            delta_ext = rews_ext[t] + self.ppo_cfg.gamma * extended_values_ext[t + 1] * nextnonterminal - values_ext[t]
+            delta_int = rews_int[t] + self.ppo_cfg.gamma * extended_values_int[t + 1] * nextnonterminal - values_int[t]
             # GAE (resets to delta when episode ends)
-            gae = delta + self.ppo_cfg.gamma * self.ppo_cfg.gae_lambda * nextnonterminal * gae
-            advantages[t] = gae
-        
-        returns = advantages + values
-        return advantages, returns
+            gae_ext = delta_ext + self.ppo_cfg.gamma * self.ppo_cfg.gae_lambda * nextnonterminal * gae_ext
+            gae_int = delta_int + self.ppo_cfg.gamma * self.ppo_cfg.gae_lambda * nextnonterminal * gae_int
+            advantages_ext[t] = gae_ext
+            advantages_int[t] = gae_int
 
-    def _ppo_update(self, advantages, returns, skills_for_policy):
+        returns_ext = advantages_ext + values_ext
+        returns_int = advantages_int + values_int
+        return advantages_ext, returns_ext, advantages_int, returns_int
+
+    def _ppo_update(self, adv_e, ret_e, adv_i, ret_i, skills_for_policy):
         """PPO update with GRU policy using sequence mini-batches across environments."""
         T = self.ppo_cfg.rollout_len
         B = self.ppo_cfg.num_envs
@@ -1513,14 +1542,15 @@ class PPOTrainer:
         mu = self.buf.mu            # [T,B,D]
         acts = self.buf.actions     # [T,B]
         old_logp = self.buf.logp    # [T,B]
-        old_val  = self.buf.val     # [T,B]
+        old_val_ext  = self.buf.val_ext     # [T,B]
+        old_val_int  = self.buf.val_int     # [T,B]
         mask     = self.buf.mask    # [T,B]
         dones    = self.buf.dones   # [T,B]
         skill = None
         if skills_for_policy is not None:
             skill = skills_for_policy  # [T,B,K]
         # normalise advantages
-        adv = advantages
+        adv = adv_e + (adv_i if self._intrinsic_enabled else 0.0)
         adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
         # sample env mini-batches
         env_inds = torch.randperm(B, device=self.device)
@@ -1532,15 +1562,17 @@ class PPOTrainer:
                 mu_mb    = mu[:, inds, :]
                 acts_mb  = acts[:, inds]
                 oldlp_mb = old_logp[:, inds]
-                oldv_mb  = old_val[:, inds]
+                oldve_mb  = old_val_ext[:, inds]
+                oldvi_mb  = old_val_int[:, inds]
                 adv_mb   = adv[:, inds]
-                ret_mb   = returns[:, inds]
+                rete_mb   = ret_e[:, inds]
+                reti_mb   = ret_i[:, inds]
                 mask_mb  = mask[:, inds]
                 dones_mb = dones[:, inds]
                 skill_mb = None if skill is None else skill[:, inds, :]
                 h0_mb = self.buf.h0[inds] if hasattr(self.buf, 'h0') and self.buf.h0 is not None else None
                 # forward sequence through policy
-                logits_seq, values_seq, _ = self.actor_critic.forward_sequence(mu_mb, skill_mb, dones_mb, h0=h0_mb)
+                logits_seq, vext_seq, vint_seq, _ = self.actor_critic.forward_sequence(mu_mb, skill_mb, dones_mb, h0=h0_mb)
                 # mask invalid actions
                 masked_logits = logits_seq.masked_fill(~self.action_mask[0].unsqueeze(0).unsqueeze(0), -1e9)  # [T,B,G]
                 dist = torch.distributions.Categorical(logits=masked_logits)
@@ -1551,11 +1583,23 @@ class PPOTrainer:
                 surr1 = ratio * adv_mb
                 surr2 = torch.clamp(ratio, 1.0 - self.ppo_cfg.clip_coef, 1.0 + self.ppo_cfg.clip_coef) * adv_mb
                 pg_loss = -torch.minimum(surr1, surr2)
-                v_pred = values_seq
-                v_pred_clipped = oldv_mb + (v_pred - oldv_mb).clamp(-self.ppo_cfg.clip_coef, self.ppo_cfg.clip_coef)
-                v_loss_unclipped = (v_pred - ret_mb) ** 2
-                v_loss_clipped   = (v_pred_clipped - ret_mb) ** 2
-                v_loss = 0.5 * torch.maximum(v_loss_unclipped, v_loss_clipped)
+                # extrinsic
+                v_pred_ext = vext_seq
+                v_pred_clipped_ext = oldve_mb + (v_pred_ext - oldve_mb).clamp(-self.ppo_cfg.clip_coef, self.ppo_cfg.clip_coef)
+                v_loss_unclipped_ext = (v_pred_ext - rete_mb) ** 2
+                v_loss_clipped_ext   = (v_pred_clipped_ext - rete_mb) ** 2
+                v_loss_ext = 0.5 * torch.maximum(v_loss_unclipped_ext, v_loss_clipped_ext)
+                # intrinsic (optional)
+                if self._intrinsic_enabled:
+                    v_pred_int = vint_seq
+                    v_pred_clipped_int = oldvi_mb + (v_pred_int - oldvi_mb).clamp(-self.ppo_cfg.clip_coef, self.ppo_cfg.clip_coef)
+                    v_loss_unclipped_int = (v_pred_int - reti_mb) ** 2
+                    v_loss_clipped_int   = (v_pred_clipped_int - reti_mb) ** 2
+                    v_loss_int = 0.5 * torch.maximum(v_loss_unclipped_int, v_loss_clipped_int)
+                else:
+                    v_loss_int = torch.zeros_like(v_loss_ext)
+                # combined losses
+                v_loss = v_loss_ext + v_loss_int
                 # mask and average
                 valid = mask_mb > 0.5
                 pg = (pg_loss[valid]).mean()
@@ -2320,9 +2364,11 @@ class PPOTrainer:
             # total reward
             intrinsic = torch.relu(bonuses["dyn"]) + torch.relu(bonuses["hdp"]) + torch.relu(bonuses["trans"]) + torch.relu(bonuses["rnd"])  # [B, T]
             ext = self.buf.rews_e  # [T, B]
-            rews_total = ext + intrinsic.transpose(0, 1)  # [T, B]
-            adv, ret = self._advantages(rews_total, self.buf.val, self.buf.dones)
-            self._ppo_update(adv, ret, skills_for_policy)
+            gate = (ext >= 0).float()  # [T, B]
+            intrinsic = intrinsic.transpose(0, 1) * gate  # [T, B]
+            # ----- dual-stream advantages -----
+            adv_e, ret_e, adv_i, ret_i = self._advantages(ext, intrinsic, self.buf.val_ext, self.buf.val_int, self.buf.terminated)
+            self._ppo_update(adv_e, ret_e, adv_i, ret_i, skills_for_policy)
 
             # optional RND predictor update to keep error scale meaningful
             if self.curiosity.use_rnd:
