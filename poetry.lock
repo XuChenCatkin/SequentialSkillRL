@@ -1379,7 +1379,7 @@ test = ["pytest (>=7.2)", "pytest-cov (>=4.0)"]
 
 [[package]]
 name = "nle"
-version = "1.2.0+998943f"
+version = "1.2.0+e389f6d"
 description = "The NetHack Learning Environment (NLE): a reinforcement learning environment based on NetHack"
 optional = false
 python-versions = ">=3.10"
@@ -3441,4 +3441,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10"
-content-hash = "9b5b465297f9d580bfb0dd979fbc31320c58d983de1fcadf0972d7fd15a101de"
+content-hash = "7ad6742139327eaa64e75cdc2d5d375c883bf879e64e9ec8ec72472bfacf1a31"

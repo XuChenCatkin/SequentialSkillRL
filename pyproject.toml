@@ -34,6 +34,8 @@ pybind11 = {version = "^2.10", optional = true}
 # Additional dev tools for our project
 pre-commit = "^2.0.1"
 
+
+[tool.poetry.dependencies]
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"

@@ -731,6 +731,12 @@ class RolloutBuffer:
         self.skill  = torch.zeros(T, num_envs, skill_dim, device=device) if skill_dim>0 else None
         self.h0 = None # [B, H]
         
+        # Store bootstrap values for GAE computation (computed during collect_rollout to preserve RNN state)
+        self.bootstrap_values_ext = torch.zeros(num_envs, device=device)  # [B] final timestep bootstrap values
+        self.bootstrap_values_int = torch.zeros(num_envs, device=device)  # [B] final timestep bootstrap values
+        self.truncated_bootstrap_values_ext = torch.zeros(T, num_envs, device=device)  # [T, B] mid-sequence truncated bootstrap values  
+        self.truncated_bootstrap_values_int = torch.zeros(T, num_envs, device=device)  # [T, B] mid-sequence truncated bootstrap values
+        
         # Store raw observations for full VAE training
         self.obs_chars = None    # [T, num_envs, 21, 79] - allocated when first obs is added
         self.obs_colors = None   # [T, num_envs, 21, 79] - allocated when first obs is added  
@@ -913,7 +919,7 @@ class PPOTrainer:
                 return gym.make(env_id, max_episode_steps=run_cfg.max_episode_steps_train)
             else:
                 return gym.make(env_id)
-        self.envs = gym.vector.SyncVectorEnv([make_env for _ in range(ppo_cfg.num_envs)])
+        self.envs = gym.vector.SyncVectorEnv([make_env for _ in range(ppo_cfg.num_envs)], autoreset_mode="SameStep")
         obs_space = self.envs.single_observation_space
         # Use the FULL NLE action set so one policy transfers across MiniHack tasks
         self.n_actions = ACTION_DIM
@@ -1181,6 +1187,10 @@ class PPOTrainer:
         episode_lengths = [0] * self.ppo_cfg.num_envs
 
         for t in range(self.ppo_cfg.rollout_len):
+            # Initialize bootstrap value tensors for this timestep
+            truncated_bootstrap_ext = torch.zeros(self.ppo_cfg.num_envs, device=self.device)
+            truncated_bootstrap_int = torch.zeros(self.ppo_cfg.num_envs, device=self.device)
+            
             enc = self._encode_obs(obs, self._hero_info)  # dict of tensors [B,D], etc
             z = enc["z"]  # [B,D]
 
@@ -1246,6 +1256,46 @@ class PPOTrainer:
             trunc_t = torch.as_tensor(truncated, dtype=torch.bool, device=self.device)
             done = (term_t | trunc_t).cpu().numpy()
             
+            # For truncated episodes, next_obs contains the actual next state we need for bootstrapping
+            # For terminated episodes, next_obs is just an episode summary and should not be used for bootstrapping
+            if truncated.any():
+                # Store the valid next_obs for truncated environments at the current timestep
+                # This will be used for value bootstrapping in GAE computation
+                truncated_next_obs = {}
+                for key in next_obs.keys():
+                    truncated_next_obs[key] = next_obs[key].copy() if hasattr(next_obs[key], 'copy') else next_obs[key]
+                
+                truncated_enc = self._encode_obs(truncated_next_obs, self._hero_info)
+                
+                # Store truncated next obs encodings at the current timestep for environments that were truncated
+                for env_idx in range(self.ppo_cfg.num_envs):
+                    if truncated[env_idx]:
+                        # Compute bootstrap values for this truncated episode with current RNN state
+                        # (this preserves the sequential RNN state order)
+                        skill_feat_trunc = None
+                        if self.ppo_cfg.policy_uses_skill and self.has_hmm:
+                            # Compute skill features for this specific observation
+                            trunc_enc_single = {
+                                "z": truncated_enc["z"][env_idx:env_idx+1],
+                                "mu": truncated_enc["mu"][env_idx:env_idx+1],
+                                "logvar": truncated_enc["logvar"][env_idx:env_idx+1]
+                            }
+                            if truncated_enc.get("lowrank_factors") is not None:
+                                trunc_enc_single["lowrank_factors"] = truncated_enc["lowrank_factors"][env_idx:env_idx+1]
+                            skill_feat_trunc = self._compute_skill_features(trunc_enc_single)
+                            if skill_feat_trunc is not None:
+                                skill_feat_trunc = skill_feat_trunc[0:1]
+                        
+                        _, v_ext_boot, v_int_boot, _ = self.actor_critic(
+                            truncated_enc["z"][env_idx:env_idx+1], 
+                            skill_feat_trunc, 
+                            self._rnn_state[env_idx:env_idx+1]
+                        )
+                        
+                        # Store bootstrap values for this truncated timestep
+                        truncated_bootstrap_ext[env_idx] = v_ext_boot[0]
+                        truncated_bootstrap_int[env_idx] = v_int_boot[0]
+            
             # Update episode statistics and log completions
             for env_idx in range(self.ppo_cfg.num_envs):
                 episode_returns[env_idx] += rew[env_idx]
@@ -1269,6 +1319,11 @@ class PPOTrainer:
                     # Reset episode tracking for this environment
                     episode_returns[env_idx] = 0.0
                     episode_lengths[env_idx] = 0
+                    
+                    # IMPORTANT: Don't manually reset individual environments during rollout
+                    # The vectorized environment will handle resets automatically when stepping
+                    # Manual resets can bypass max_episode_steps and other wrappers
+                    # Just let the vectorized env handle it naturally
             
             # Create mask: all collected steps are valid (no padding in rollout)
             step_mask = torch.ones(self.ppo_cfg.num_envs, dtype=torch.float32, device=self.device)
@@ -1290,15 +1345,16 @@ class PPOTrainer:
                          val_ext=v_ext, val_int=v_int,
                          logp=logp,
                          skill=skill_feat if (self.buf.skill is not None) else None,
-                         obs_batch=obs_batch)
-            # reset filter state for envs that terminated; next loop will re-init on new obs
+                         obs_batch=obs_batch,
+                         truncated_bootstrap_values_ext=truncated_bootstrap_ext,
+                         truncated_bootstrap_values_int=truncated_bootstrap_int)
+            # reset filter state for envs that ended (both terminated and truncated)
             if self.ppo_cfg.policy_uses_skill:
                 for b, d in enumerate(done):
                     if d:
                         self._filt_state[b] = None
             
-            # reset RNN hidden for envs that terminated
-            # Mark episode start for environments that terminated (for hero info parsing)
+            # reset RNN hidden for envs that ended and mark episode start
             for b, d in enumerate(done):
                 if d:
                     self._rnn_state[b].zero_()
@@ -1310,6 +1366,10 @@ class PPOTrainer:
             self._update_hero_info_from_obs(obs, self.ppo_cfg.num_envs, self._episode_start, self._hero_info, logger=logger)
             
             self.global_steps += self.ppo_cfg.num_envs
+        
+        # At end of rollout, compute value for final next_obs for bootstrapping
+        # with detached rnn state
+        self._compute_bootstrap_values()
         
         # Store final world model state for next rollout's continuity
         if s_wm is not None:
@@ -1456,6 +1516,41 @@ class PPOTrainer:
         return result_bonuses
 
     @torch.no_grad()
+    def _compute_bootstrap_values(self):
+        """
+        Compute bootstrap values for GAE computation while RNN states are still valid.
+        This must be called at the end of collect_rollout() to preserve the sequential RNN state.
+        
+        Computes:
+        1. Final timestep bootstrap values (stored in self.buf.bootstrap_values_ext/int)
+        2. Mid-sequence truncated bootstrap values (stored in self.buf.truncated_bootstrap_values_ext/int)
+        """
+        T = self.ppo_cfg.rollout_len
+        B = self.ppo_cfg.num_envs
+        
+        # 1. Compute final timestep bootstrap values
+        # CRITICAL: Copy RNN state before computing bootstrap values to avoid corrupting state for next rollout
+        # If we use self._rnn_state directly, it will advance and in next rollout we compute again, causing double advancement
+        rnn_state_copy = self._rnn_state.detach().clone()
+        
+        # For continuing episodes: use current observation after rollout
+        # For terminated episodes: will be masked out by nextnonterminal=0 in GAE
+        # For truncated episodes at final timestep: will be overridden below
+        enc = self._encode_obs(self._obs, self._hero_info)
+        skill_feat = self._compute_skill_features(enc)
+        
+        for env_idx in range(B):
+            if skill_feat is not None:
+                skill_feat_single = skill_feat[env_idx:env_idx+1]
+            else:
+                skill_feat_single = None
+                
+            _, v_ext_curr, v_int_curr, _ = self.actor_critic(enc["z"][env_idx:env_idx+1], skill_feat_single, 
+                                                            rnn_state_copy[env_idx:env_idx+1])
+            self.buf.bootstrap_values_ext[env_idx] = v_ext_curr[0]
+            self.buf.bootstrap_values_int[env_idx] = v_int_curr[0]
+
+    @torch.no_grad()
     def _compute_skill_features(self, enc):
         """Helper to compute skill features for a single batch of observations."""
         if not self.ppo_cfg.policy_uses_skill:
@@ -1488,45 +1583,65 @@ class PPOTrainer:
         return torch.stack(skill_list, dim=0)
 
     @torch.no_grad()
-    def _advantages(self, rews_ext: torch.Tensor, rews_int: torch.Tensor, values_ext: torch.Tensor, values_int: torch.Tensor, terminated: torch.Tensor):
+    def _advantages(self, rews_ext: torch.Tensor, rews_int: torch.Tensor, values_ext: torch.Tensor, values_int: torch.Tensor, terminated: torch.Tensor, truncated: torch.Tensor):
         """
         Compute dual-stream GAE(λ) for extrinsic & intrinsic [T,B] sequences.
+        
+        Key difference between terminated and truncated episodes:
+        - Terminated: Episode truly ended, do NOT bootstrap (next_obs is just a summary)
+        - Truncated: Episode hit time limit, DO bootstrap from stored next_obs (episode continues conceptually)
         
         Args:
             rews_ext: [T,B] extrinsic rewards
             rews_int: [T,B] intrinsic rewards
             values_ext: [T,B] extrinsic value estimates
             values_int: [T,B] intrinsic value estimates
-            terminated: [T,B] episode termination flags
+            terminated: [T,B] episode termination flags (natural ending)
+            truncated: [T,B] episode truncation flags (time limit)
         """
         T, B = rews_ext.size()
         device = rews_ext.device
-
-        # Get bootstrap values (value of observation after rollout)
-        enc = self._encode_obs(self._obs, self._hero_info)
-        skill_feat = self._compute_skill_features(enc)
-        _, bootstrap_values_ext, bootstrap_values_int, _ = self.actor_critic(enc["z"], skill_feat, self._rnn_state)
+        gamma = self.ppo_cfg.gamma
+        lam = self.ppo_cfg.gae_lambda
         
         # Extend values with bootstrap
-        extended_values_ext = torch.cat([values_ext, bootstrap_values_ext.unsqueeze(0)], dim=0)  # [T+1, B]
-        extended_values_int = torch.cat([values_int, bootstrap_values_int.unsqueeze(0)], dim=0)  # [T+1, B]
+        extended_values_ext = torch.cat([values_ext, self.buf.bootstrap_values_ext.unsqueeze(0)], dim=0)  # [T+1, B]
+        extended_values_int = torch.cat([values_int, self.buf.bootstrap_values_int.unsqueeze(0)], dim=0)  # [T+1, B]
 
-        # Compute advantages
+        # Override with pre-computed truncated bootstrap values for all truncated timesteps
+        for t in range(T):
+            for env_idx in range(B):
+                if truncated[t, env_idx].item():
+                    # Use pre-computed bootstrap values for this truncated timestep
+                    extended_values_ext[t + 1, env_idx] = self.buf.truncated_bootstrap_values_ext[t, env_idx]
+                    extended_values_int[t + 1, env_idx] = self.buf.truncated_bootstrap_values_int[t, env_idx]
+
+        # Compute advantages using GAE
         advantages_ext = torch.zeros_like(rews_ext, device=device)
         advantages_int = torch.zeros_like(rews_int, device=device)
-        gae_ext = torch.zeros(B, device=self.device)
-        gae_int = torch.zeros(B, device=self.device)
+        gae_ext = torch.zeros(B, device=device)
+        gae_int = torch.zeros(B, device=device)
 
         for t in reversed(range(T)):
             # Episode continues if current step is not terminated
-            nextnonterminal = (~terminated[t]).float()
+            # Key insight: For GAE, we care about whether to bootstrap from the NEXT state
+            # - If terminated[t]: Episode ended naturally, don't bootstrap (next_obs is summary)
+            # - If truncated[t]: Episode hit limit, DO bootstrap (next_obs is valid next state)
+            # - Otherwise: Normal continuation, bootstrap from next state
             
-            # TD error
-            delta_ext = rews_ext[t] + self.ppo_cfg.gamma * extended_values_ext[t + 1] * nextnonterminal - values_ext[t]
-            delta_int = rews_int[t] + self.ppo_cfg.gamma * extended_values_int[t + 1] * nextnonterminal - values_int[t]
-            # GAE (resets to delta when episode ends)
-            gae_ext = delta_ext + self.ppo_cfg.gamma * self.ppo_cfg.gae_lambda * nextnonterminal * gae_ext
-            gae_int = delta_int + self.ppo_cfg.gamma * self.ppo_cfg.gae_lambda * nextnonterminal * gae_int
+            # Only terminated episodes don't bootstrap
+            nextnonterminal = (~terminated[t]).float()  # 0 for terminated, 1 for continuing/truncated
+            
+            # TD error with proper bootstrapping logic
+            delta_ext = rews_ext[t] + gamma * extended_values_ext[t + 1] * nextnonterminal - values_ext[t]
+            delta_int = rews_int[t] + gamma * extended_values_int[t + 1] * nextnonterminal - values_int[t]
+            
+            # GAE (resets to delta when episode ends - both terminated and truncated)
+            episode_ends = (terminated[t] | truncated[t]).float()
+            gae_continues = 1.0 - episode_ends
+            
+            gae_ext = delta_ext + gamma * lam * gae_continues * gae_ext
+            gae_int = delta_int + gamma * lam * gae_continues * gae_int
             advantages_ext[t] = gae_ext
             advantages_int[t] = gae_int
 
@@ -2367,7 +2482,7 @@ class PPOTrainer:
             gate = (ext >= 0).float()  # [T, B]
             intrinsic = intrinsic.transpose(0, 1) * gate  # [T, B]
             # ----- dual-stream advantages -----
-            adv_e, ret_e, adv_i, ret_i = self._advantages(ext, intrinsic, self.buf.val_ext, self.buf.val_int, self.buf.terminated)
+            adv_e, ret_e, adv_i, ret_i = self._advantages(ext, intrinsic, self.buf.val_ext, self.buf.val_int, self.buf.terminated, self.buf.truncated)
             self._ppo_update(adv_e, ret_e, adv_i, ret_i, skills_for_policy)
 
             # optional RND predictor update to keep error scale meaningful
