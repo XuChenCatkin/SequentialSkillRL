@@ -2552,7 +2552,7 @@ class PPOTrainer:
             self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
             done = False; ret = 0.0; ep_len = 0
             # Use the configured max episode steps for evaluation
-            max_episode_steps = self.run_cfg.max_episode_steps_eval
+            max_episode_steps = self.run_cfg.max_episode_steps_eval if self.run_cfg.max_episode_steps_eval is not None else 999_999_999
             # buffers to run HMM causal filter post‑episode
             mu_seq, logvar_seq, F_seq = [], [], []
             visited = set()
@@ -2600,7 +2600,7 @@ class PPOTrainer:
                 else:
                     F_seq.append(None)
 
-                logits, value, eval_rnn_state = self.actor_critic(enc["z"], skill_feat, eval_rnn_state)
+                logits, v_ext, v_int, eval_rnn_state = self.actor_critic(enc["z"], skill_feat, eval_rnn_state)
                 # For evaluation with single env, use only first row of action mask
                 eval_action_mask = self.action_mask[0]  # [G] 
                 masked = logits.masked_fill(~eval_action_mask, -1e9)
