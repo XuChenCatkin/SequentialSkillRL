@@ -20,8 +20,8 @@ dependencies = [
     "wandb (>=0.21.0,<0.22.0)",
     "pytest (>=5.3,<9.0.0)",
     # NLE installed as editable from local directory
-    "nle @ file:///workspace/SequentialSkillRL/nle",
     "minihack @ file:///workspace/SequentialSkillRL/minihack/dist/minihack-1.0.2%2B95b11cc-py3-none-any.whl",
+    "nle @ file:///workspace/SequentialSkillRL/nle",
 ]
 
 [tool.poetry]

@@ -48,7 +48,11 @@ Commands:
         Options:
             --env ENV_NAME         - Environment (default: MiniHack-Room-5x5-v0)
             --steps N              - Total training steps (default: 1M)
-            --seed N               - Random seed (default: 42)
+            --seed N               - Random seed for both training and evaluation (default: 42)
+            --train_seed N         - Random seed for training environments (default: 42)
+            --eval_seed N          - Random seed for evaluation environments (default: 42)
+            --max_episode_steps_train N    - Max steps per episode during training (default: None, uses env default)
+            --max_episode_steps_eval N     - Max steps per episode during evaluation (default: None, uses env default)
             --wandb                - Enable W&B logging
             --no_upload            - Disable HuggingFace uploads
             --resume REPO_ID       - Resume training from unified HuggingFace repo
@@ -759,7 +763,10 @@ if __name__ == "__main__":
         reward_mode = "full_curiosity"  # default: all intrinsic rewards
         env_name = "MiniHack-Room-Random-15x15-v0"  # default
         total_steps = 1_000_000  # default 1M steps
-        seed = 42  # default
+        train_seed = 42  # default training seed
+        eval_seed = 42   # default evaluation seed
+        max_episode_steps_train = None   # default: use env-specific max_episode_steps
+        max_episode_steps_eval = None    # default: use env-specific max_episode_steps
         use_wandb_flag = False
         disable_upload = False
         resume_repo_id = None  # HuggingFace repo for resuming
@@ -822,7 +829,20 @@ if __name__ == "__main__":
                 total_steps = int(sys.argv[i + 1])
                 i += 2
             elif sys.argv[i] == '--seed' and i + 1 < len(sys.argv):
-                seed = int(sys.argv[i + 1])
+                # Set both seeds to the same value for backward compatibility
+                train_seed = eval_seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--train_seed' and i + 1 < len(sys.argv):
+                train_seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--eval_seed' and i + 1 < len(sys.argv):
+                eval_seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--max_episode_steps_train' and i + 1 < len(sys.argv):
+                max_episode_steps_train = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--max_episode_steps_eval' and i + 1 < len(sys.argv):
+                max_episode_steps_eval = int(sys.argv[i + 1])
                 i += 2
             elif sys.argv[i] == '--wandb':
                 use_wandb_flag = True
@@ -889,7 +909,10 @@ if __name__ == "__main__":
         print(f"   Combined Name: {ablation_name}")
         print(f"🎮 Environment: {env_name}")
         print(f"📊 Total Steps: {total_steps:,}")
-        print(f"🌱 Seed: {seed}")
+        print(f"🌱 Train Seed: {train_seed}")
+        print(f"🌱 Eval Seed: {eval_seed}")
+        print(f"⏰ Max Episode Steps (Train): {max_episode_steps_train if max_episode_steps_train is not None else 'env default'}")
+        print(f"⏰ Max Episode Steps (Eval): {max_episode_steps_eval if max_episode_steps_eval is not None else 'env default'}")
         print(f"📊 W&B Logging: {use_wandb_flag}")
         print(f"☁️  HF Upload: {not disable_upload}")
         
@@ -1070,7 +1093,10 @@ if __name__ == "__main__":
         run_name = f"ablation_{ablation_name}_{env_name.replace('-', '_')}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         train_config = TrainConfig(
             env_id=env_name,
-            seed=seed,
+            train_seed=train_seed,
+            eval_seed=eval_seed,
+            max_episode_steps_train=max_episode_steps_train,
+            max_episode_steps_eval=max_episode_steps_eval,
             device='cuda' if torch.cuda.is_available() else 'cpu',
             log_dir=f"./runs/{run_name}",
             save_every=10_000,

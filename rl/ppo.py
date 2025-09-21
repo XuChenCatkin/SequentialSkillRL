@@ -142,7 +142,8 @@ class RNDConfig:
 @dataclass
 class TrainConfig:
     env_id: str = "MiniHack-Quest-Hard-v0"
-    seed: int = 42
+    train_seed: int = 42  # Seed for training environments
+    eval_seed: int = 42   # Seed for evaluation environments (can be different from train_seed)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     log_dir: str = "./runs/minihack_ppo"
     save_every: int = 50_000  # env steps
@@ -150,6 +151,8 @@ class TrainConfig:
     eval_episodes: int = 10
     use_hmm: bool = True
     test_mode: bool = False  # if True, run one eval and exit
+    max_episode_steps_train: Optional[int] = None  # Max steps per episode during training (None = use env default)
+    max_episode_steps_eval: Optional[int] = None  # Max steps per episode during evaluation (None = use env default)
 
 # --------------------------------------------------------------------------------------
 # Utilities
@@ -895,7 +898,10 @@ class PPOTrainer:
 
         # Vec env
         def make_env():
-            return gym.make(env_id)
+            if run_cfg.max_episode_steps_train is not None:
+                return gym.make(env_id, max_episode_steps=run_cfg.max_episode_steps_train)
+            else:
+                return gym.make(env_id)
         self.envs = gym.vector.SyncVectorEnv([make_env for _ in range(ppo_cfg.num_envs)])
         obs_space = self.envs.single_observation_space
         # Use the FULL NLE action set so one policy transfers across MiniHack tasks
@@ -2269,10 +2275,10 @@ class PPOTrainer:
     # --------------------------- main train loop -----------------------------
 
     def train(self, logger: Optional[logging.Logger] = None):
-        set_seed(self.run_cfg.seed)
+        set_seed(self.run_cfg.train_seed)
         # Reset environments only once at the beginning of training
         # After this, collect_rollout() will continue from the current state
-        obs, _ = self.envs.reset(seed=self.run_cfg.seed)
+        obs, _ = self.envs.reset(seed=self.run_cfg.train_seed)
         
         # Parse hero info from initial observations (episode start)
         self._episode_start = [True for _ in range(self.ppo_cfg.num_envs)]
@@ -2289,7 +2295,8 @@ class PPOTrainer:
         print(f"   Steps per update: {steps_per_update}")
         print(f"   Total environment steps: {total_env_steps:,}")
         print(f"   Environment: {self.env_id}")
-        print(f"   Seed: {self.run_cfg.seed}")
+        print(f"   Train seed: {self.run_cfg.train_seed}")
+        print(f"   Max episode steps (train): {self.run_cfg.max_episode_steps_train if self.run_cfg.max_episode_steps_train is not None else 'env default'}")
         print()
         
         # Create progress bar for training updates
@@ -2431,6 +2438,8 @@ class PPOTrainer:
             if (self.global_steps % self.run_cfg.eval_every) < (self.ppo_cfg.num_envs * self.ppo_cfg.rollout_len):
                 pbar.write(f"🧪 Running evaluation at step {self.global_steps:,}...")
                 self.evaluate(self.run_cfg.eval_episodes, logger)
+                # Restore training seed after evaluation to maintain reproducibility
+                set_seed(self.run_cfg.train_seed)
             if (self.global_steps % self.run_cfg.save_every) < (self.ppo_cfg.num_envs * self.ppo_cfg.rollout_len):
                 pbar.write(f"💾 Saving checkpoint at step {self.global_steps:,}...")
                 self._save_ckpt()
@@ -2454,11 +2463,21 @@ class PPOTrainer:
         """
         if logger is not None:
             logger.info(f"🧪 Starting evaluation with {episodes} episodes...")
+            logger.info(f"   Eval seed: {self.run_cfg.eval_seed}")
+            logger.info(f"   Max episode steps (eval): {self.run_cfg.max_episode_steps_eval if self.run_cfg.max_episode_steps_eval is not None else 'env default'}")
         else:
             print(f"🧪 Starting evaluation with {episodes} episodes...")
+            print(f"   Eval seed: {self.run_cfg.eval_seed}")
+            print(f"   Max episode steps (eval): {self.run_cfg.max_episode_steps_eval if self.run_cfg.max_episode_steps_eval is not None else 'env default'}")
         start_time = time.time()
         
-        env = gym.make(self.env_id)
+        # Set evaluation seed
+        set_seed(self.run_cfg.eval_seed)
+        
+        if self.run_cfg.max_episode_steps_eval is not None:
+            env = gym.make(self.env_id, max_episode_steps=self.run_cfg.max_episode_steps_eval)
+        else:
+            env = gym.make(self.env_id)
         episode_start = [True]
         hero_info = [None]  # single env
         eval_filt_state = None  # single env HMM filter state
@@ -2481,12 +2500,13 @@ class PPOTrainer:
 
         for ep_idx in eval_pbar:
             ep_start_time = time.time()
-            o, _ = env.reset()
+            o, _ = env.reset(seed=self.run_cfg.eval_seed + ep_idx)  # Use different seed for each episode
             episode_start = [True]
             eval_filt_state = None  # Reset filter state for new episode
             self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
             done = False; ret = 0.0; ep_len = 0
-            max_episode_steps = 10000  # Maximum steps per episode to prevent hanging
+            # Use the configured max episode steps for evaluation
+            max_episode_steps = self.run_cfg.max_episode_steps_eval
             # buffers to run HMM causal filter post‑episode
             mu_seq, logvar_seq, F_seq = [], [], []
             visited = set()

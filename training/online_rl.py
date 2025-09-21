@@ -283,7 +283,8 @@ def train_online_ppo_with_pretrained_models(
                     "vae_repo_id": vae_repo_id,
                     "hmm_repo_id": hmm_repo_id,
                     "device": str(device),
-                    "seed": train_config.seed,
+                    "train_seed": train_config.train_seed,
+                    "eval_seed": train_config.eval_seed,
                     # PPO Configuration
                     "ppo": {
                         "num_envs": ppo_config.num_envs,
@@ -342,7 +343,10 @@ def train_online_ppo_with_pretrained_models(
                     # Training Configuration
                     "training": {
                         "env_id": train_config.env_id,
-                        "seed": train_config.seed,
+                        "train_seed": train_config.train_seed,
+                        "eval_seed": train_config.eval_seed,
+                        "max_episode_steps_train": train_config.max_episode_steps_train,
+                        "max_episode_steps_eval": train_config.max_episode_steps_eval,
                         "device": train_config.device,
                         "log_dir": train_config.log_dir,
                         "save_every": train_config.save_every,
@@ -729,7 +733,8 @@ results = train_online_ppo_with_pretrained_models(
 - **Learning Rate**: {ppo_config.learning_rate}
 - **Training Time**: {training_time:.2f} seconds
 - **Device**: {device}
-- **Seed**: {train_config.seed}
+- **Train Seed**: {train_config.train_seed}
+- **Eval Seed**: {train_config.eval_seed}
 
 ## Performance
 
@@ -779,7 +784,10 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                             'rnd_lr': rnd_config.lr if use_rnd and rnd_config else None,
                             'rnd_coef': curiosity_config.eta0_rnd if use_rnd else None,
                             'device': str(device),
-                            'seed': train_config.seed,
+                            'train_seed': train_config.train_seed,
+                            'eval_seed': train_config.eval_seed,
+                            'max_episode_steps_train': train_config.max_episode_steps_train,
+                            'max_episode_steps_eval': train_config.max_episode_steps_eval,
                             'training_time': training_time
                         },
                         'model_sources': {
