@@ -1185,6 +1185,15 @@ class PPOTrainer:
         # Track episode statistics for logging
         episode_returns = [0.0] * self.ppo_cfg.num_envs
         episode_lengths = [0] * self.ppo_cfg.num_envs
+        
+        # Track episode completion types for logging
+        episodes_completed = 0
+        episodes_terminated = 0  # Natural termination (agent reached goal/died)
+        episodes_truncated = 0   # Time limit truncation
+        
+        # Store completed episode statistics for logging
+        completed_episode_returns = []
+        completed_episode_lengths = []
 
         for t in range(self.ppo_cfg.rollout_len):
             # Initialize bootstrap value tensors for this timestep
@@ -1260,45 +1269,39 @@ class PPOTrainer:
             for env_idx in range(self.ppo_cfg.num_envs):
                 episode_returns[env_idx] += rew[env_idx]
                 episode_lengths[env_idx] += 1
+                    
+                if truncated[env_idx]:
+                    # Compute bootstrap values for this truncated episode with current RNN state
+                    truncated_next_obs_single = info['final_obs'][env_idx]
+                    truncated_enc_single = self._encode_obs(truncated_next_obs_single, [self._hero_info[env_idx]])
+                    skill_feat_trunc = None
+                    if self.ppo_cfg.policy_uses_skill and self.has_hmm:
+                        # Compute skill features for this specific observation
+                        trunc_enc_single = {
+                            "z": truncated_enc_single["z"][0:1],
+                            "mu": truncated_enc_single["mu"][0:1],
+                            "logvar": truncated_enc_single["logvar"][0:1]
+                        }
+                        if truncated_enc_single.get("lowrank_factors") is not None:
+                            trunc_enc_single["lowrank_factors"] = truncated_enc_single["lowrank_factors"][0:1]
+                        skill_feat_trunc = self._compute_skill_features(trunc_enc_single)
+                        if skill_feat_trunc is not None:
+                            skill_feat_trunc = skill_feat_trunc[0:1]
+                    
+                    _, v_ext_boot, v_int_boot, _ = self.actor_critic(
+                        truncated_enc_single["z"][0:1], 
+                        skill_feat_trunc, 
+                        self._rnn_state[env_idx:env_idx+1]
+                    )
+                    
+                    # Store bootstrap values for this truncated timestep
+                    truncated_bootstrap_ext[env_idx] = v_ext_boot[0]
+                    truncated_bootstrap_int[env_idx] = v_int_boot[0]
                 
-                if done[env_idx]:
-                    
-                    # Reset episode tracking for this environment
-                    episode_returns[env_idx] = 0.0
-                    episode_lengths[env_idx] = 0
-                    
-                    if truncated[env_idx]:
-                        # Compute bootstrap values for this truncated episode with current RNN state
-                        truncated_next_obs_single = info['final_obs'][env_idx]
-                        truncated_enc_single = self._encode_obs(truncated_next_obs_single, [self._hero_info[env_idx]])
-                        skill_feat_trunc = None
-                        if self.ppo_cfg.policy_uses_skill and self.has_hmm:
-                            # Compute skill features for this specific observation
-                            trunc_enc_single = {
-                                "z": truncated_enc_single["z"][0:1],
-                                "mu": truncated_enc_single["mu"][0:1],
-                                "logvar": truncated_enc_single["logvar"][0:1]
-                            }
-                            if truncated_enc_single.get("lowrank_factors") is not None:
-                                trunc_enc_single["lowrank_factors"] = truncated_enc_single["lowrank_factors"][0:1]
-                            skill_feat_trunc = self._compute_skill_features(trunc_enc_single)
-                            if skill_feat_trunc is not None:
-                                skill_feat_trunc = skill_feat_trunc[0:1]
-                        
-                        _, v_ext_boot, v_int_boot, _ = self.actor_critic(
-                            truncated_enc_single["z"][0:1], 
-                            skill_feat_trunc, 
-                            self._rnn_state[env_idx:env_idx+1]
-                        )
-                        
-                        # Store bootstrap values for this truncated timestep
-                        truncated_bootstrap_ext[env_idx] = v_ext_boot[0]
-                        truncated_bootstrap_int[env_idx] = v_int_boot[0]
-                    
-                    # IMPORTANT: Don't manually reset individual environments during rollout
-                    # The vectorized environment will handle resets automatically when stepping
-                    # Manual resets can bypass max_episode_steps and other wrappers
-                    # Just let the vectorized env handle it naturally
+                # IMPORTANT: Don't manually reset individual environments during rollout
+                # The vectorized environment will handle resets automatically when stepping
+                # Manual resets can bypass max_episode_steps and other wrappers
+                # Just let the vectorized env handle it naturally
             
             # Create mask: all collected steps are valid (no padding in rollout)
             step_mask = torch.ones(self.ppo_cfg.num_envs, dtype=torch.float32, device=self.device)
@@ -1334,6 +1337,21 @@ class PPOTrainer:
                 if d:
                     self._rnn_state[b].zero_()
                     self._episode_start[b] = True
+                    
+                    # Track episode completion type
+                    episodes_completed += 1
+                    if terminated[b]:
+                        episodes_terminated += 1
+                    elif truncated[b]:
+                        episodes_truncated += 1
+                    
+                    # Store completed episode statistics before resetting
+                    completed_episode_returns.append(episode_returns[b])
+                    completed_episode_lengths.append(episode_lengths[b])
+                    
+                    # Reset episode tracking for this environment
+                    episode_returns[b] = 0.0
+                    episode_lengths[b] = 0
 
             obs = next_obs
             
@@ -1411,6 +1429,28 @@ class PPOTrainer:
                     self.replay_obs_blstats.append(obs_blstats_bt)
                     self.replay_obs_message.append(obs_message_bt)
                     self.replay_obs_hero_info.append(obs_hero_info_bt)
+        
+        # Log episode completion statistics
+        if episodes_completed > 0:
+            termination_rate = episodes_terminated / episodes_completed
+            truncation_rate = episodes_truncated / episodes_completed
+            
+            # Calculate episode statistics
+            avg_return = np.mean(completed_episode_returns) if completed_episode_returns else 0.0
+            avg_length = np.mean(completed_episode_lengths) if completed_episode_lengths else 0.0
+            
+            if logger is not None:
+                logger.info(f"📊 Rollout episode completions: {episodes_completed} total, "
+                           f"{episodes_terminated} terminated ({termination_rate:.1%}), "
+                           f"{episodes_truncated} truncated ({truncation_rate:.1%})")
+                logger.info(f"📈 Episode stats: avg return = {avg_return:.2f}, avg length = {avg_length:.1f}")
+            else:
+                print(f"📊 Rollout episode completions: {episodes_completed} total, "
+                      f"{episodes_terminated} terminated ({termination_rate:.1%}), "
+                      f"{episodes_truncated} truncated ({truncation_rate:.1%})")
+                print(f"📈 Episode stats: avg return = {avg_return:.2f}, avg length = {avg_length:.1f}")
+        
+        return episodes_completed, episodes_terminated, episodes_truncated, completed_episode_returns, completed_episode_lengths
 
     # --------------------------- compute advantages --------------------------
 
@@ -2447,7 +2487,7 @@ class PPOTrainer:
         while self.global_steps < total_env_steps:
             update_start_time = time.time()
             
-            self.collect_rollout(logger)
+            episodes_completed, episodes_terminated, episodes_truncated, episode_returns, episode_lengths = self.collect_rollout(logger)
             bonuses = self._compute_intrinsic_for_buffer()
             # skills for policy (concat to z) during PPO update: use the SAME features we acted with
             skills_for_policy = self.buf.skill if (self.ppo_cfg.policy_uses_skill and self.buf.skill is not None) else None  # [T,B,K]
@@ -2502,6 +2542,16 @@ class PPOTrainer:
                 # Add raw (always positive) vs normalized comparisons
                 "int/dyn_raw_mean": float(bonuses["dyn_raw"].mean().item()),
                 "int/hdp_raw_mean": float(bonuses["hdp_raw"].mean().item()),
+                # Episode completion statistics
+                "rollout/episodes_completed": float(episodes_completed),
+                "rollout/episodes_terminated": float(episodes_terminated),
+                "rollout/episodes_truncated": float(episodes_truncated),
+                "rollout/termination_rate": float(episodes_terminated / max(1, episodes_completed)),
+                # Episode return and length statistics
+                "rollout/episode_return_mean": float(np.mean(episode_returns) if episode_returns else 0.0),
+                "rollout/episode_return_std": float(np.std(episode_returns) if len(episode_returns) > 1 else 0.0),
+                "rollout/episode_length_mean": float(np.mean(episode_lengths) if episode_lengths else 0.0),
+                "rollout/episode_length_std": float(np.std(episode_lengths) if len(episode_lengths) > 1 else 0.0),
                 "int/trans_raw_mean": float(bonuses["trans_raw"].mean().item()),
                 "int/rnd_raw_mean": float(bonuses["rnd_raw"].mean().item()),
                 # Track negative ratio to monitor normalization impact
@@ -2624,6 +2674,10 @@ class PPOTrainer:
         # HMM‑centric diagnostics
         bound_mass_list, bound_bool_list, ent_list = [], [], []
         used_skills_list, effK_list = [], []
+        
+        # Track episode completion types
+        episodes_terminated = 0  # Natural termination
+        episodes_truncated = 0   # Time limit truncation
 
         # Create progress bar for evaluation episodes
         eval_pbar = tqdm(
@@ -2640,14 +2694,13 @@ class PPOTrainer:
             episode_start = [True]
             eval_filt_state = None  # Reset filter state for new episode
             self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
-            done = False; ret = 0.0; ep_len = 0
-            # Use the configured max episode steps for evaluation
-            max_episode_steps = self.run_cfg.max_episode_steps_eval if self.run_cfg.max_episode_steps_eval is not None else 999_999_999
+            term = trunc = False
+            done = (term | trunc); ret = 0.0; ep_len = 0
             # buffers to run HMM causal filter post‑episode
             mu_seq, logvar_seq, F_seq = [], [], []
             visited = set()
 
-            while not done and ep_len < max_episode_steps:
+            while not done:
                 # coverage proxy from blstats (x,y)
                 if isinstance(o, dict) and "blstats" in o:
                     bl = o["blstats"]
@@ -2661,7 +2714,7 @@ class PPOTrainer:
                 
                 # ---- Causal skill filtering (per-env, current frame) ----
                 skill_feat = None
-                if self.ppo_cfg.policy_uses_skill:
+                if self.ppo_cfg.policy_uses_skill and self.has_hmm:
                     # Use single-environment version of the training logic
                     Kp1 = self.hmm.niw.mu.size(0)
                     mu_b = enc["mu"]  # [1, D] since we have single env batch
@@ -2708,23 +2761,32 @@ class PPOTrainer:
                 
                 o, r, term, trunc, _ = env.step(int(a_local.item()))
                 done = term or trunc
-                episode_start = [done]
-                if done:
-                    eval_filt_state = None  # Reset HMM filter state at episode end (same as training)
-                self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
                 ret += float(r); ep_len += 1
+                
+                # Reset states and update hero info only when episode ends/starts
+                if done:
+                    # Track episode completion type
+                    if term:
+                        episodes_terminated += 1
+                    elif trunc:
+                        episodes_truncated += 1
+                        
+                    if self.has_hmm:
+                        eval_filt_state = None  # Reset HMM filter state at episode end (same as training)
+                    eval_rnn_state = torch.zeros(1, self.ppo_cfg.rnn_hidden_size, device=self.device)
+                    # Hero info will be updated at the start of next episode in the next iteration
 
             # Check if episode was terminated due to step limit
-            if ep_len >= max_episode_steps and not done:
+            if trunc:
                 if logger is not None:
-                    logger.warning(f"⚠️ Episode {ep_idx + 1} terminated due to step limit ({max_episode_steps} steps)")
+                    logger.warning(f"⚠️ Episode {ep_idx + 1} terminated due to step limit.")
                 else:
-                    print(f"⚠️ Episode {ep_idx + 1} terminated due to step limit ({max_episode_steps} steps)")
+                    print(f"⚠️ Episode {ep_idx + 1} terminated due to step limit.")
 
             # episode‑level tallies
             ret_list.append(ret)
             len_list.append(ep_len)
-            succ = 1.0 if ret > 0.0 else 0.0
+            succ = 1.0 if term else 0.0
             succ_list.append(succ)
             if succ > 0.5:
                 len_succ_list.append(ep_len)
@@ -2744,7 +2806,7 @@ class PPOTrainer:
             })
 
             # ---------- HMM filter over the episode ----------
-            if self.ppo_cfg.policy_uses_skill:
+            if self.ppo_cfg.policy_uses_skill and self.has_hmm:
                 mu_t = torch.stack(mu_seq, dim=0).to(self.device)           # [T,D]
                 logvar_t = torch.stack(logvar_seq, dim=0).to(self.device)   # [T,D]
                 diag_var_t = torch.exp(logvar_t)
@@ -2788,6 +2850,13 @@ class PPOTrainer:
                 ent_list.append(ent_mean)
                 used_skills_list.append(int(used))
                 effK_list.append(effK)
+            else:
+                # If no HMM or skill policy disabled, add placeholder values
+                bound_mass_list.append(0.0)
+                bound_bool_list.append(0.0)
+                ent_list.append(0.0)
+                used_skills_list.append(0)
+                effK_list.append(0.0)
 
         eval_pbar.close()
         env.close()
@@ -2799,6 +2868,11 @@ class PPOTrainer:
         final_avg_len = np.mean(len_list) if len_list else 0.0
         final_avg_coverage = np.mean(cover_list) if cover_list else 0.0
         
+        # Calculate episode completion statistics
+        total_episodes_completed = episodes_terminated + episodes_truncated
+        termination_rate = episodes_terminated / max(1, total_episodes_completed)
+        truncation_rate = episodes_truncated / max(1, total_episodes_completed)
+        
         if logger is not None:
             logger.info(f"📊 Evaluation Results:")
             logger.info(f"   Episodes: {episodes}")
@@ -2807,6 +2881,8 @@ class PPOTrainer:
             logger.info(f"   Success Rate: {final_success_rate:.1%}")
             logger.info(f"   Average Length: {final_avg_len:.1f}")
             logger.info(f"   Average Coverage: {final_avg_coverage:.1f} positions")
+            logger.info(f"   Episode Completions: {episodes_terminated} terminated ({termination_rate:.1%}), "
+                       f"{episodes_truncated} truncated ({truncation_rate:.1%})")
             if bound_mass_list:
                 logger.info(f"   Skill Entropy: {np.mean(ent_list):.3f}")
                 logger.info(f"   Used Skills: {np.mean(used_skills_list):.1f}")
@@ -2826,6 +2902,8 @@ class PPOTrainer:
             print(f"   Success Rate: {final_success_rate:.1%}")
             print(f"   Average Length: {final_avg_len:.1f}")
             print(f"   Average Coverage: {final_avg_coverage:.1f} positions")
+            print(f"   Episode Completions: {episodes_terminated} terminated ({termination_rate:.1%}), "
+                  f"{episodes_truncated} truncated ({truncation_rate:.1%})")
             if bound_mass_list:
                 print(f"   Skill Entropy: {np.mean(ent_list):.3f}")
                 print(f"   Used Skills: {np.mean(used_skills_list):.1f}")
@@ -2851,6 +2929,10 @@ class PPOTrainer:
             "eval/ep_len_mean": float(final_avg_len),
             "eval/ep_len_success_mean": float(np.mean(len_succ_list) if len(len_succ_list) else 0.0),
             "eval/coverage_pos_mean": float(final_avg_coverage),
+            # Episode completion statistics
+            "eval/episodes_terminated": float(episodes_terminated),
+            "eval/episodes_truncated": float(episodes_truncated),
+            "eval/termination_rate": float(termination_rate),
             # Action usage statistics
             "actions/eval_unique_actions": float(len(self._actions_used_in_eval)),
         }
