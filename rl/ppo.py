@@ -1087,7 +1087,7 @@ class PPOTrainer:
         b = obs_to_device(obs_dict, self.device, hero_info=hero_info_batch)
         enc = self.vae.encode(b["game_chars"], b["game_colors"], b["blstats"], b["message_chars"], b["hero_info"])
         mu = enc["mu"]; logvar = enc["logvar"]; F = enc["lowrank_factors"]  # tensors [B,D], [B,D], [B,D,R] or None
-        z  = self.vae.reparameterize(mu, logvar, F)  # [B,D]
+        z  = self.vae._reparameterise(mu, logvar, F)  # [B,D]
         return {"z": z, "mu": mu, "logvar": logvar, "F": F}
 
     def _update_hero_info_from_obs(self, obs_dict: dict, num_envs: int, episode_start_flags: list, hero_info_list: list, logger: Optional[logging.Logger] = None):
