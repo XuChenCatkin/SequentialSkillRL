@@ -1840,11 +1840,9 @@ class PPOTrainer:
                     v_loss_int = torch.zeros_like(v_loss_ext)
                 # combined losses
                 v_loss = v_loss_ext + v_loss_int
-                # mask and average
-                valid = mask_mb > 0.5
-                pg = (pg_loss[valid]).mean()
-                vl = (v_loss[valid]).mean()
-                ent = (entropy[valid]).mean()
+                pg = pg_loss.mean()
+                vl = v_loss.mean()
+                ent = entropy.mean()
                 loss = pg + self.ppo_cfg.vf_coef * vl - self.ppo_cfg.ent_coef * ent
                 # optimise
                 self.opt.zero_grad(set_to_none=True)
