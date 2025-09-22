@@ -995,6 +995,7 @@ class PPOTrainer:
         self.replay_obs_hero_info = []
         self.replay_rewards = []
         self.replay_dones = []
+        self.replay_masks = []  # Store validity masks including negative reward masking
         
         # --- Skill usage tracking for diagnostics ---
         if self.has_hmm:
@@ -1194,6 +1195,10 @@ class PPOTrainer:
         # Store completed episode statistics for logging
         completed_episode_returns = []
         completed_episode_lengths = []
+        
+        # Track environments with negative rewards from previous timestep
+        # These environments should have their next observation masked to prevent learning duplicate states
+        prev_negative_reward_mask = torch.zeros(self.ppo_cfg.num_envs, dtype=torch.bool, device=self.device)
 
         for t in range(self.ppo_cfg.rollout_len):
             # Initialize bootstrap value tensors for this timestep
@@ -1203,7 +1208,10 @@ class PPOTrainer:
             enc = self._encode_obs(obs, self._hero_info)  # dict of tensors [B,D], etc
             z = enc["z"]  # [B,D]
 
-            skill_feat = self._compute_skill_features(enc)  # [B,K] or None
+            # Compute skill features, but skip HMM filter updates for environments that had negative rewards
+            # in the previous timestep (those observations are likely duplicates)
+            skill_mask = ~prev_negative_reward_mask  # True for environments that should be processed normally
+            skill_feat = self._compute_skill_features(enc, mask=skill_mask)  # [B,K] or None
 
             # Store initial RNN hidden at the first step of the rollout
             if t == 0:
@@ -1284,7 +1292,11 @@ class PPOTrainer:
                         }
                         if truncated_enc_single.get("lowrank_factors") is not None:
                             trunc_enc_single["lowrank_factors"] = truncated_enc_single["lowrank_factors"][0:1]
-                        skill_feat_trunc = self._compute_skill_features(trunc_enc_single)
+                        
+                        # Mask final observation if the truncating action had negative reward
+                        # This prevents learning from duplicate observations when agent hits wall and episode truncates
+                        trunc_mask = None if rew[env_idx] >= 0 else torch.zeros(1, dtype=torch.float32, device=self.device)
+                        skill_feat_trunc = self._compute_skill_features(trunc_enc_single, mask=trunc_mask)
                         if skill_feat_trunc is not None:
                             skill_feat_trunc = skill_feat_trunc[0:1]
                     
@@ -1303,8 +1315,34 @@ class PPOTrainer:
                 # Manual resets can bypass max_episode_steps and other wrappers
                 # Just let the vectorized env handle it naturally
             
-            # Create mask: all collected steps are valid (no padding in rollout)
+            # Create mask: mask out observations from environments that:
+            # 1. Had negative rewards in the previous timestep (duplicate state from invalid action)
+            # 2. Will have negative rewards after the current action (current invalid action)
             step_mask = torch.ones(self.ppo_cfg.num_envs, dtype=torch.float32, device=self.device)
+            
+            # Mask environments that had negative rewards in the previous timestep
+            # These observations are likely duplicates due to invalid actions not changing the state
+            step_mask[prev_negative_reward_mask] = 0.0
+            
+            # Also prepare to track current negative rewards for next timestep
+            reward_tensor = torch.as_tensor(rew, dtype=torch.float32, device=self.device)
+            current_negative_reward_mask = reward_tensor < 0.0  # True for negative rewards (invalid actions)
+            
+            # Log masking behavior occasionally for debugging
+            if t == 0 and self.global_steps % 50000 < self.ppo_cfg.num_envs:  # Log every ~50k steps
+                prev_masked_count = prev_negative_reward_mask.sum().item()
+                current_negative_count = current_negative_reward_mask.sum().item()
+                if prev_masked_count > 0 or current_negative_count > 0:
+                    if logger is not None:
+                        logger.info(f"🚫 Negative Reward Masking (step {self.global_steps:,}, timestep {t}):")
+                        logger.info(f"   Environments masked due to prev negative rewards: {prev_masked_count}/{self.ppo_cfg.num_envs}")
+                        logger.info(f"   Environments with current negative rewards: {current_negative_count}/{self.ppo_cfg.num_envs}")
+                        logger.info(f"   Rewards: {rew}")
+                    else:
+                        print(f"🚫 Negative Reward Masking: prev_masked={prev_masked_count}, current_negative={current_negative_count}")
+            
+            # Update the tracking for next timestep
+            prev_negative_reward_mask = current_negative_reward_mask
             
             # Prepare observation batch for storage
             hero_info_batch = torch.stack([
@@ -1337,6 +1375,9 @@ class PPOTrainer:
                 if d:
                     self._rnn_state[b].zero_()
                     self._episode_start[b] = True
+                    
+                    # Reset negative reward tracking for this environment since episode ended
+                    prev_negative_reward_mask[b] = False
                     
                     # Track episode completion type
                     episodes_completed += 1
@@ -1377,6 +1418,7 @@ class PPOTrainer:
             logvar_bt = self.buf.logvar.transpose(0,1)  # [B,T,D]
             lowrank_bt = self.buf.lowrank_factors.transpose(0,1) if self.buf.lowrank_factors is not None else None  # [B,T,D,R] or None
             acts_bt = self.buf.actions.transpose(0,1)   # [B,T]
+            mask_bt = self.buf.mask.transpose(0,1)      # [B,T] - includes negative reward masking
             
             obs_chars_bt = self.buf.obs_chars.transpose(0,1) if self.buf.obs_chars is not None else None      # [B,T,21,79]
             obs_colors_bt = self.buf.obs_colors.transpose(0,1) if self.buf.obs_colors is not None else None  # [B,T,21,79]
@@ -1410,6 +1452,7 @@ class PPOTrainer:
                 self.replay_actions = [acts_bt]
                 self.replay_rewards = [rewards_bt]
                 self.replay_dones = [dones_bt]
+                self.replay_masks = [mask_bt]
 
                 if obs_chars_bt is not None:
                     self.replay_obs_chars = [obs_chars_bt]
@@ -1422,6 +1465,7 @@ class PPOTrainer:
                 self.replay_actions.append(acts_bt)
                 self.replay_rewards.append(rewards_bt)
                 self.replay_dones.append(dones_bt)
+                self.replay_masks.append(mask_bt)
 
                 if obs_chars_bt is not None:
                     self.replay_obs_chars.append(obs_chars_bt)
@@ -1540,7 +1584,6 @@ class PPOTrainer:
         1. Final timestep bootstrap values (stored in self.buf.bootstrap_values_ext/int)
         2. Mid-sequence truncated bootstrap values (stored in self.buf.truncated_bootstrap_values_ext/int)
         """
-        T = self.ppo_cfg.rollout_len
         B = self.ppo_cfg.num_envs
         
         # 1. Compute final timestep bootstrap values
@@ -1552,7 +1595,18 @@ class PPOTrainer:
         # For terminated episodes: will be masked out by nextnonterminal=0 in GAE
         # For truncated episodes at final timestep: will be overridden below
         enc = self._encode_obs(self._obs, self._hero_info)
-        skill_feat = self._compute_skill_features(enc)
+        
+        # Check if we should mask skill features based on final rollout action rewards
+        # If the last action had negative reward, the current observation might be a duplicate
+        last_rewards = self.buf.rews_e[self.buf.ptr - 1]  # Last timestep rewards [B]
+        bootstrap_mask = None
+        if torch.any(last_rewards < 0):
+            # Create mask: False for environments where last action had negative reward
+            bootstrap_mask = torch.where(last_rewards < 0, 
+                                       torch.zeros(B, dtype=torch.float32, device=self.device),
+                                       torch.ones(B, dtype=torch.float32, device=self.device))
+        
+        skill_feat = self._compute_skill_features(enc, mask=bootstrap_mask)
         
         for env_idx in range(B):
             if skill_feat is not None:
@@ -1566,8 +1620,15 @@ class PPOTrainer:
             self.buf.bootstrap_values_int[env_idx] = v_int_curr[0]
 
     @torch.no_grad()
-    def _compute_skill_features(self, enc):
-        """Helper to compute skill features for a single batch of observations."""
+    def _compute_skill_features(self, enc, mask=None):
+        """
+        Helper to compute skill features for a single batch of observations.
+        
+        Args:
+            enc: Encoded observations dict with 'z', 'mu', 'logvar', 'lowrank_factors'
+            mask: Optional boolean mask [B] - if False, emission likelihood is zeroed out
+                  This causes HMM filter to rely purely on transition dynamics without observation
+        """
         if not self.ppo_cfg.policy_uses_skill:
             return None
             
@@ -1576,8 +1637,14 @@ class PPOTrainer:
         dv = enc["logvar"].exp()
         F = enc.get("lowrank_factors", None)
         use_sample = self.hmm_cfg.student_t_use_sample and (self.global_steps < self.hmm_cfg.emission_sample_warmup_steps)
+        
+        # Convert boolean mask to float for HMM (True -> 1.0, False -> 0.0)
+        emission_mask = mask.float() if mask is not None else None
+        
+        # Pass mask to make_logB_for_filter - masked observations will have logB = 0
+        # This causes the HMM filter to ignore the emission and rely purely on transition dynamics
         logB = self.hmm.make_logB_for_filter(
-            mu, dv, F, None, self.hmm_cfg.emission_mode, use_sample, self.hmm_cfg.student_t_scale_temp
+            mu, dv, F, emission_mask, self.hmm_cfg.emission_mode, use_sample, self.hmm_cfg.student_t_scale_temp
         )  # [B, Kp1]
         Kp1 = self.hmm.niw.mu.size(0)
         skill_list = []
@@ -1590,10 +1657,17 @@ class PPOTrainer:
                 alpha_b = torch.exp(st.log_alpha.to(torch.float32))  # [Kp1]
             else:
                 # one causal update (uses cached ElogA)
+                # When logB[b] ≈ 0 (masked), this relies purely on transition prediction
                 st, alpha_b, _, _, _ = self.hmm.filter_step(st, logB[b], self._logA)
 
             self._filt_state[b] = st
             skill_list.append(alpha_b[:Kp1-1])  # Drop remainder state
+        
+        # Log masking statistics occasionally
+        if mask is not None and self.global_steps % 100000 < B:  # Log every ~100k steps
+            masked_count = (~mask).sum().item()
+            if masked_count > 0:
+                print(f"🎯 HMM skill filtering: {masked_count}/{B} environments masked due to negative rewards")
         
         return torch.stack(skill_list, dim=0)
 
@@ -1771,6 +1845,7 @@ class PPOTrainer:
             combined_actions = torch.cat(self.replay_actions, dim=1)
             combined_rewards = torch.cat(self.replay_rewards, dim=1)  # Extrinsic rewards
             combined_dones = torch.cat(self.replay_dones, dim=1)      # Done flags
+            combined_masks = torch.cat(self.replay_masks, dim=1)      # Validity masks (includes negative reward masking)
             
             combined_obs_chars = torch.cat(self.replay_obs_chars, dim=1) if len(self.replay_obs_chars) > 0 else None
             combined_obs_colors = torch.cat(self.replay_obs_colors, dim=1) if len(self.replay_obs_colors) > 0 else None
@@ -1778,7 +1853,7 @@ class PPOTrainer:
             combined_obs_message = torch.cat(self.replay_obs_message, dim=1) if len(self.replay_obs_message) > 0 else None
             combined_obs_hero_info = torch.cat(self.replay_obs_hero_info, dim=1) if len(self.replay_obs_hero_info) > 0 else None
             
-            # Crop to window size for all replay buffers (no mask needed - all steps are valid)
+            # Crop to window size for all replay buffers (respecting masks for valid data)
             current_window_size = combined_actions.size(1)
             if self.has_hmm and current_window_size > self.hmm_cfg.hmm_fit_window:
                 s = current_window_size - self.hmm_cfg.hmm_fit_window
@@ -1788,6 +1863,7 @@ class PPOTrainer:
                 combined_actions = combined_actions[:, s:]
                 combined_rewards = combined_rewards[:, s:] 
                 combined_dones = combined_dones[:, s:]
+                combined_masks = combined_masks[:, s:]  # Include mask in window cropping
                 
                 # Crop observations too
                 if combined_obs_chars is not None:
@@ -1797,9 +1873,18 @@ class PPOTrainer:
                     combined_obs_message = combined_obs_message[:, s:, :]
                     combined_obs_hero_info = combined_obs_hero_info[:, s:, :]
             
-            # Create a valid mask for the entire window (all steps are valid in PPO online training)
+            # Use the stored masks which include negative reward masking
             B, T = combined_actions.shape
-            valid_mask = torch.ones(B, T, device=self.device, dtype=torch.bool)
+            valid_mask = combined_masks.bool()  # Convert to boolean mask for model training
+            
+            # Log masking statistics
+            total_timesteps = B * T
+            masked_timesteps = (~valid_mask).sum().item()
+            if masked_timesteps > 0 and logger is not None:
+                logger.info(f"🚫 Model training masking: {masked_timesteps}/{total_timesteps} timesteps masked "
+                           f"({masked_timesteps/total_timesteps:.1%}) due to negative rewards (invalid actions)")
+            elif masked_timesteps > 0:
+                print(f"🚫 Model training: {masked_timesteps}/{total_timesteps} timesteps masked due to negative rewards")
 
             # HMM update (uses latent representations that we already have)
             if hmm_ready and combined_mu is not None:
@@ -1848,6 +1933,7 @@ class PPOTrainer:
         self.replay_actions = []
         self.replay_rewards = []
         self.replay_dones = []
+        self.replay_masks = []  # Reset mask buffer
         self.replay_obs_chars = []
         self.replay_obs_colors = []
         self.replay_obs_blstats = []
