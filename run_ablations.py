@@ -390,10 +390,8 @@ def main():
                 save_progress(args.progress_file, results, current_run, total_runs)
             
             if not success and not args.dry_run:
-                response = input(f"❓ Continue with remaining runs? [y/N]: ")
-                if response.lower() not in ['y', 'yes']:
-                    print("🛑 Aborted remaining runs")
-                    break
+                print(f"❌ Run failed: {mode} (seed={seed}) - continuing with remaining runs")
+                # Log failure but continue automatically instead of prompting user
     
     # Summary
     total_time = time.time() - start_time
