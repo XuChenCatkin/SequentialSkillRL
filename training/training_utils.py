@@ -772,9 +772,11 @@ def upload_training_artifacts_to_huggingface(
         
         # Loss plot
         plt.subplot(1, 2, 1)
-        epochs = range(1, len(train_losses) + 1)
-        plt.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
-        plt.plot(epochs, test_losses, 'r-', label='Test Loss', linewidth=2)
+        train_epochs = range(1, len(train_losses) + 1)
+        test_epochs = range(1, len(test_losses) + 1)
+        
+        plt.plot(train_epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
+        plt.plot(test_epochs, test_losses, 'r-', label='Test Loss', linewidth=2)
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.title('Training and Test Loss')
@@ -785,14 +787,17 @@ def upload_training_artifacts_to_huggingface(
         plt.subplot(1, 2, 2)
         if len(train_losses) > 1:
             train_improvement = [(train_losses[0] - loss) / train_losses[0] * 100 for loss in train_losses]
+            plt.plot(train_epochs, train_improvement, 'b-', label='Training Improvement (%)', linewidth=2)
+            
+        if len(test_losses) > 1:
             test_improvement = [(test_losses[0] - loss) / test_losses[0] * 100 for loss in test_losses]
-            plt.plot(epochs, train_improvement, 'b-', label='Training Improvement (%)', linewidth=2)
-            plt.plot(epochs, test_improvement, 'r-', label='Test Improvement (%)', linewidth=2)
-            plt.xlabel('Epoch')
-            plt.ylabel('Improvement (%)')
-            plt.title('Loss Improvement Over Time')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
+            plt.plot(test_epochs, test_improvement, 'r-', label='Test Improvement (%)', linewidth=2)
+            
+        plt.xlabel('Epoch')
+        plt.ylabel('Improvement (%)')
+        plt.title('Loss Improvement Over Time')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.savefig("training_curves.png", dpi=150, bbox_inches='tight')

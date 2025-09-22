@@ -944,7 +944,7 @@ if __name__ == "__main__":
             total_updates=ppo_updates,
             minibatch_envs=4,
             epochs_per_update=4,
-            gamma=0.999,
+            gamma=0.99,
             gae_lambda=0.95,
             clip_coef=0.2,
             ent_coef=0.01,
@@ -963,14 +963,8 @@ if __name__ == "__main__":
                 use_skill_entropy=True,    # Skill entropy with boundary gating
                 use_skill_transition_novelty=True,  # Skill transition novelty
                 use_rnd=False,
-                # Standard annealing
-                eta0_dyn=0.25, tau_dyn=3e6,
-                eta0_hdp=0.25, tau_hdp=3e6,
-                eta0_stn=0.25, tau_stn=3e6,
                 # Skill boundary gating
-                use_skill_boundary_gate=True,
-                gate_delta_eps=1e-3,
-                ema_beta=0.99, eps=1e-8
+                use_skill_boundary_gate=True
             )
             reward_description = "full curiosity (dynamics + skill entropy + transition novelty)"
             
@@ -979,9 +973,7 @@ if __name__ == "__main__":
                 use_dyn_kl=True,           # Only dynamics surprise
                 use_skill_entropy=False,
                 use_skill_transition_novelty=False,
-                use_rnd=False,
-                eta0_dyn=0.25, tau_dyn=3e6,
-                ema_beta=0.99, eps=1e-8
+                use_rnd=False
             )
             reward_description = "dynamics curiosity only"
             
@@ -991,10 +983,7 @@ if __name__ == "__main__":
                 use_skill_entropy=True,    # Only skill entropy
                 use_skill_transition_novelty=False,
                 use_rnd=False,
-                eta0_hdp=0.25, tau_hdp=3e6,
-                use_skill_boundary_gate=True,
-                gate_delta_eps=1e-3,
-                ema_beta=0.99, eps=1e-8
+                use_skill_boundary_gate=True
             )
             reward_description = "skill entropy curiosity only"
             
@@ -1003,9 +992,7 @@ if __name__ == "__main__":
                 use_dyn_kl=False,
                 use_skill_entropy=False,
                 use_skill_transition_novelty=True,  # Only skill transition novelty
-                use_rnd=False,
-                eta0_stn=0.25, tau_stn=3e6,
-                ema_beta=0.99, eps=1e-8
+                use_rnd=False
             )
             reward_description = "skill transition novelty only"
             
@@ -1014,9 +1001,7 @@ if __name__ == "__main__":
                 use_dyn_kl=False,          # Disable curiosity components
                 use_skill_entropy=False,
                 use_skill_transition_novelty=False,
-                use_rnd=True,              # Enable RND
-                eta0_rnd=0.25, tau_rnd=3e6,
-                ema_beta=0.99, eps=1e-8
+                use_rnd=True              # Enable RND
             )
             reward_description = "RND intrinsic motivation"
             
@@ -1025,8 +1010,7 @@ if __name__ == "__main__":
                 use_dyn_kl=False,          # Disable all intrinsic rewards
                 use_skill_entropy=False,
                 use_skill_transition_novelty=False,
-                use_rnd=False,
-                ema_beta=0.99, eps=1e-8
+                use_rnd=False
             )
             reward_description = "no intrinsic rewards (extrinsic only)"
         
@@ -1078,7 +1062,7 @@ if __name__ == "__main__":
             vae_update_growth=1.05,       # Same growth pattern as HMM
             vae_update_every_cap=12_000,  # Same cap as HMM
             vae_lr=1e-4,                  # Learning rate for VAE updates
-            vae_steps_per_call=16,        # Number of gradient steps per VAE update
+            vae_steps_per_call=8,        # Number of gradient steps per VAE update
         )
         
         # RND Configuration (used only for RND ablation)

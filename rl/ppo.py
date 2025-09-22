@@ -57,14 +57,14 @@ class CuriosityConfig:
     use_rnd: bool = False         # RND baseline (set True for baseline run)
 
     # Annealing: eta(t) = eta0 * exp(-t / tau)
-    eta0_dyn: float = 1.0
-    tau_dyn: float = 3e6
-    eta0_hdp: float = 1.0         # for boundary-gated skill entropy
-    tau_hdp: float = 3e6
-    eta0_stn: float = 1.0         # anneal multiplier for skill‑transition novelty
-    tau_stn: float = 3e6
-    eta0_rnd: float = 0.25        # keep smaller by default
-    tau_rnd: float = 3e6
+    eta0_dyn: float = 0.02
+    tau_dyn: float = 4e5
+    eta0_hdp: float = 0.01         # for boundary-gated skill entropy
+    tau_hdp: float = 8e5
+    eta0_stn: float = 0.005         # anneal multiplier for skill‑transition novelty
+    tau_stn: float = 1.3e6
+    eta0_rnd: float = 0.01        # keep smaller by default
+    tau_rnd: float = 2.8e5
 
     # EMA norm for each raw term
     ema_beta: float = 0.99
@@ -1008,9 +1008,46 @@ class PPOTrainer:
         self._actions_used_in_train = set()  # Set of global action indices used during train()
         self._actions_used_in_eval = set()   # Set of global action indices used during evaluate()
         
+        # --- Action bincount tracking for detailed analysis ---
+        self._action_bincount_train = torch.zeros(ACTION_DIM, dtype=torch.long, device=self.device)  # Count of each action in training
+        self._action_bincount_eval = torch.zeros(ACTION_DIM, dtype=torch.long, device=self.device)   # Count of each action in evaluation
+        
         # --- Per-environment episode tracking (persistent across rollouts) ---
         self._episode_returns = [0.0] * ppo_cfg.num_envs  # Current cumulative return per environment
         self._episode_lengths = [0] * ppo_cfg.num_envs    # Current episode length per environment
+        
+    def _compute_action_entropy(self, bincount: torch.Tensor) -> float:
+        """Compute entropy of action distribution from bincount."""
+        total = bincount.sum().item()
+        if total == 0:
+            return 0.0
+        probs = bincount.float() / total
+        # Filter out zero probabilities to avoid log(0)
+        probs = probs[probs > 0]
+        entropy = -(probs * torch.log(probs)).sum().item()
+        return entropy
+        
+    def _get_top_actions(self, bincount: torch.Tensor, top_k: int = 3) -> List[Tuple[int, int]]:
+        """Get top-k most used actions with their counts.
+        
+        Returns:
+            List of (action_index, count) tuples sorted by count (descending)
+        """
+        if bincount.sum().item() == 0:
+            return []
+        
+        # Get top-k indices and their counts
+        values, indices = torch.topk(bincount, min(top_k, bincount.numel()))
+        
+        # Filter out zero counts and convert to list of tuples
+        top_actions = []
+        for i, (idx, count) in enumerate(zip(indices.cpu().numpy(), values.cpu().numpy())):
+            if count > 0:
+                top_actions.append((int(idx), int(count)))
+            else:
+                break
+        
+        return top_actions
         
     @torch.no_grad()
     def _policy_forward(self, z: torch.Tensor, skill_feat: Optional[torch.Tensor]):
@@ -1094,7 +1131,7 @@ class PPOTrainer:
                         # Keep previous hero info or use zeros as fallback
                         if hero_info_list[env_idx] is None:
                             hero_info_list[env_idx] = torch.zeros(4, dtype=torch.int32)
-                            if logger: logger.warning(f"⚠️ Environment {env_idx}: Could not parse hero info from message: '{message_str[:100]}...'")
+                            #if logger: logger.warning(f"⚠️ Environment {env_idx}: Could not parse hero info from message: '{message_str[:100]}...'")
                     
                 except Exception as e:
                     # Fallback to zeros if anything goes wrong
@@ -1227,6 +1264,7 @@ class PPOTrainer:
             # Track global actions used during training
             for action_id in a_global.cpu().numpy():
                 self._actions_used_in_train.add(int(action_id))
+                self._action_bincount_train[int(action_id)] += 1
 
             # Map to per-env local indices for stepping vectorized env
             a_local = self.global2local.gather(1, a_global.view(-1,1)).squeeze(1)  # [B]
@@ -1478,9 +1516,19 @@ class PPOTrainer:
             if logger is not None:
                 logger.info(f"📊 Episodes completed this rollout: {num_episodes_completed_this_rollout}")
                 logger.info(f"📈 Episode stats: avg return = {avg_return:.2f}, avg length = {avg_length:.1f}")
+                # Log top 3 actions used in training during this rollout
+                top_train_actions = self._get_top_actions(self._action_bincount_train, top_k=3)
+                if top_train_actions:
+                    action_strs = [f"#{action}({count})" for action, count in top_train_actions]
+                    logger.info(f"🎯 Top 3 training actions: {', '.join(action_strs)}")
             else:
                 print(f"📊 Episodes completed this rollout: {num_episodes_completed_this_rollout}")
                 print(f"📈 Episode stats: avg return = {avg_return:.2f}, avg length = {avg_length:.1f}")
+                # Log top 3 actions used in training during this rollout
+                top_train_actions = self._get_top_actions(self._action_bincount_train, top_k=3)
+                if top_train_actions:
+                    action_strs = [f"#{action}({count})" for action, count in top_train_actions]
+                    print(f"🎯 Top 3 training actions: {', '.join(action_strs)}")
         
         return completed_episode_returns, completed_episode_lengths, completed_episode_terminated
 
@@ -2666,6 +2714,13 @@ class PPOTrainer:
                 "actions/train_unique_count": float(len(self._actions_used_in_train)),
                 "actions/eval_unique_count": float(len(self._actions_used_in_eval)),
                 "actions/total_unique_count": float(len(self._actions_used_in_train | self._actions_used_in_eval)),
+                # Action frequency statistics
+                "actions/train_total_count": float(self._action_bincount_train.sum().item()),
+                "actions/eval_total_count": float(self._action_bincount_eval.sum().item()),
+                "actions/train_max_count": float(self._action_bincount_train.max().item()),
+                "actions/eval_max_count": float(self._action_bincount_eval.max().item()),
+                "actions/train_entropy": float(self._compute_action_entropy(self._action_bincount_train)),
+                "actions/eval_entropy": float(self._compute_action_entropy(self._action_bincount_eval)),
                 # Synchronized model training diagnostics
                 "learning_cycle/hmm_training_gap": float(self.global_steps - self.last_hmm_refresh),
                 "learning_cycle/vae_training_gap": float(self.global_steps - self.last_vae_refresh),
@@ -2857,6 +2912,7 @@ class PPOTrainer:
                 
                 # Track global actions used during evaluation
                 self._actions_used_in_eval.add(int(a_global.item()))
+                self._action_bincount_eval[int(a_global.item())] += 1
                 
                 # Convert global action to local action for single environment
                 # Use first row of global2local mapping
@@ -2998,6 +3054,19 @@ class PPOTrainer:
             logger.info(f"   Unique actions in training: {len(self._actions_used_in_train)}")
             logger.info(f"   Total unique actions: {len(self._actions_used_in_train | self._actions_used_in_eval)}")
             logger.info(f"   Action coverage: {len(self._actions_used_in_train | self._actions_used_in_eval)/len(nethack.ACTIONS):.1%}")
+            logger.info(f"   Train action count: {self._action_bincount_train.sum().item()}")
+            logger.info(f"   Eval action count: {self._action_bincount_eval.sum().item()}")
+            logger.info(f"   Train action entropy: {self._compute_action_entropy(self._action_bincount_train):.3f}")
+            logger.info(f"   Eval action entropy: {self._compute_action_entropy(self._action_bincount_eval):.3f}")
+            # Log top 3 actions for both training and evaluation
+            top_train_actions = self._get_top_actions(self._action_bincount_train, top_k=3)
+            top_eval_actions = self._get_top_actions(self._action_bincount_eval, top_k=3)
+            if top_train_actions:
+                train_action_strs = [f"#{action}({count})" for action, count in top_train_actions]
+                logger.info(f"   Top 3 train actions: {', '.join(train_action_strs)}")
+            if top_eval_actions:
+                eval_action_strs = [f"#{action}({count})" for action, count in top_eval_actions]
+                logger.info(f"   Top 3 eval actions: {', '.join(eval_action_strs)}")
         else:
             print(f"📊 Evaluation Results:")
             print(f"   Episodes: {episodes}")
@@ -3019,6 +3088,19 @@ class PPOTrainer:
             print(f"   Unique actions in training: {len(self._actions_used_in_train)}")
             print(f"   Total unique actions: {len(self._actions_used_in_train | self._actions_used_in_eval)}")
             print(f"   Action coverage: {len(self._actions_used_in_train | self._actions_used_in_eval)/len(nethack.ACTIONS):.1%}")
+            print(f"   Train action count: {self._action_bincount_train.sum().item()}")
+            print(f"   Eval action count: {self._action_bincount_eval.sum().item()}")
+            print(f"   Train action entropy: {self._compute_action_entropy(self._action_bincount_train):.3f}")
+            print(f"   Eval action entropy: {self._compute_action_entropy(self._action_bincount_eval):.3f}")
+            # Print top 3 actions for both training and evaluation
+            top_train_actions = self._get_top_actions(self._action_bincount_train, top_k=3)
+            top_eval_actions = self._get_top_actions(self._action_bincount_eval, top_k=3)
+            if top_train_actions:
+                train_action_strs = [f"#{action}({count})" for action, count in top_train_actions]
+                print(f"   Top 3 train actions: {', '.join(train_action_strs)}")
+            if top_eval_actions:
+                eval_action_strs = [f"#{action}({count})" for action, count in top_eval_actions]
+                print(f"   Top 3 eval actions: {', '.join(eval_action_strs)}")
             print()
 
         # Aggregate & log
@@ -3039,6 +3121,8 @@ class PPOTrainer:
             "eval/termination_rate": float(termination_rate),
             # Action usage statistics
             "actions/eval_unique_actions": float(len(self._actions_used_in_eval)),
+            "actions/eval_total_actions": float(self._action_bincount_eval.sum().item()),
+            "actions/eval_action_entropy": float(self._compute_action_entropy(self._action_bincount_eval)),
         }
         if bound_mass_list:
             log_dict.update({
