@@ -2,8 +2,24 @@
 """
 Automated ablation study runner for SequentialSkillRL.
 
-This script runs multiple ablation studies in sequence to compare different
-configurations of VAE+HMM+PPO training.
+This script runs a systematic ablation study comparing HMM vs no-HMM configurations
+with different intrinsic reward setups for VAE+PPO training.
+
+Ablation Study Design:
+1. Base configurations (no intrinsic rewards):
+   - no_hmm_no_intrinsic: VAE+PPO (baseline)
+   - hmm_no_intrinsic: VAE+HMM+PPO (test HMM contribution)
+
+2. Intrinsic rewards without HMM:
+   - no_hmm_dyn_only: VAE+PPO with dynamics curiosity
+   - no_hmm_rnd: VAE+PPO with RND
+
+3. Intrinsic rewards with HMM:
+   - hmm_dyn_only: VAE+HMM+PPO with dynamics curiosity only
+   - hmm_skill_only: VAE+HMM+PPO with skill entropy only
+   - hmm_trans_only: VAE+HMM+PPO with transition novelty only
+   - hmm_full_curiosity: VAE+HMM+PPO with all curiosity components
+   - hmm_rnd: VAE+HMM+PPO with RND
 
 Usage:
     python run_ablations.py [options]
@@ -17,9 +33,17 @@ Options:
     --modes MODE1,MODE2,... Specific modes to run (default: all)
     --dry_run               Print commands without running
     --resume_from PREFIX    Resume ablation studies from existing checkpoints
-                            (looks for repos like: PREFIX-baseline, PREFIX-no_hmm, etc.)
     --resume_local_dir DIR  Resume from local checkpoint directory
-    --checkpoint_every N    Steps between checkpoints (default: same as --steps)
+
+Examples:
+    # Run full systematic ablation study
+    python run_ablations.py --wandb --steps 2000000
+    
+    # Run only specific comparisons
+    python run_ablations.py --modes "no_hmm_no_intrinsic,hmm_no_intrinsic,hmm_full_curiosity"
+    
+    # Test run with shorter steps
+    python run_ablations.py --steps 100000 --seeds 42 --dry_run
 """
 
 import argparse
@@ -32,15 +56,22 @@ from datetime import datetime
 from typing import List, Optional, Dict
 from pathlib import Path
 
-# Default ablation modes
+# Default ablation modes - systematic study of HMM vs no-HMM with different intrinsic rewards
 DEFAULT_MODES = [
-    "baseline",              # VAE+HMM+PPO with full curiosity
-    "no_hmm",               # VAE+PPO (no HMM)
-    "rnd",                  # VAE+HMM+PPO with RND
-    "no_intrinsic",         # VAE+HMM+PPO with no intrinsic rewards
-    "curiosity_dyn_only",   # VAE+HMM+PPO with dynamics only
-    "curiosity_skill_only", # VAE+HMM+PPO with skill entropy only
-    "curiosity_trans_only", # VAE+HMM+PPO with transition novelty only
+    # Base configurations (no intrinsic rewards)
+    "no_hmm_no_intrinsic",     # 1. VAE+PPO (no HMM, no intrinsic) - baseline
+    "hmm_no_intrinsic",        # 3. VAE+HMM+PPO (no intrinsic) - test HMM contribution without intrinsic rewards
+    
+    # Intrinsic reward configurations without HMM
+    "no_hmm_dyn_only",         # 2a. VAE+PPO with dynamics curiosity only
+    "no_hmm_rnd",              # 5. VAE+PPO with RND
+    
+    # Intrinsic reward configurations with HMM  
+    "hmm_dyn_only",            # 4a. VAE+HMM+PPO with dynamics curiosity only
+    "hmm_skill_only",          # 4b. VAE+HMM+PPO with skill entropy only (HDP)
+    "hmm_trans_only",          # 4c. VAE+HMM+PPO with transition novelty only
+    "hmm_full_curiosity",      # 4d. VAE+HMM+PPO with dynamics + skill entropy + transition novelty (full)
+    "hmm_rnd",                 # 6. VAE+HMM+PPO with RND
 ]
 
 def save_progress(progress_file: str, results: List[Dict], current_run: int, total_runs: int):
@@ -140,8 +171,35 @@ def run_ablation(
     dry_run: bool = False
 ) -> bool:
     """Run a single ablation study."""
+    
+    # Map ablation modes to main.py rl command arguments
+    mode_mapping = {
+        # Base configurations (no intrinsic rewards)
+        "no_hmm_no_intrinsic": ["no_hmm", "no_intrinsic"],
+        "hmm_no_intrinsic": ["baseline", "no_intrinsic"],
+        
+        # Intrinsic reward configurations without HMM
+        "no_hmm_dyn_only": ["no_hmm", "curiosity_dyn_only"],
+        "no_hmm_rnd": ["no_hmm", "rnd"],
+        
+        # Intrinsic reward configurations with HMM
+        "hmm_dyn_only": ["baseline", "curiosity_dyn_only"],
+        "hmm_skill_only": ["baseline", "curiosity_skill_only"],
+        "hmm_trans_only": ["baseline", "curiosity_trans_only"],
+        "hmm_full_curiosity": ["baseline", "full_curiosity"],
+        "hmm_rnd": ["baseline", "rnd"],
+    }
+    
+    if mode not in mode_mapping:
+        print(f"❌ Unknown ablation mode: {mode}")
+        print(f"   Valid modes: {', '.join(mode_mapping.keys())}")
+        return False
+    
+    # Build command with mapped arguments
+    cmd_args = mode_mapping[mode]
     cmd = [
-        "python", "main.py", "rl", mode,
+        "python", "main.py", "rl"
+    ] + cmd_args + [
         "--env", env,
         "--steps", str(steps),
         "--seed", str(seed)

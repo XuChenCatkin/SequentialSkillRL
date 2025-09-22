@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """
-Analyze and compare results from SequentialSkillRL ablation studies.
+Analyze and compare results from SequentialSkillRL systematic ablation studies.
 
-This script helps analyze training logs and checkpoints from ablation studies
-to compare performance across different configurations.
+This script analyzes the systematic comparison of HMM vs no-HMM configurations
+with different intrinsic reward setups to understand:
+
+1. HMM contribution: Compare no_hmm_no_intrinsic vs hmm_no_intrinsic
+2. Intrinsic reward impact: Compare no_intrinsic vs intrinsic variants
+3. Curiosity component analysis: Compare individual vs combined curiosity terms
+4. RND baseline comparison: Compare curiosity-driven vs RND exploration
+
+Key Analyses:
+- Performance comparison (evaluation returns, success rates)
+- Exploration metrics (coverage, episode length)
+- Skill learning diagnostics (HMM-based modes only)
+- Action diversity and entropy analysis
+- Intrinsic reward contribution breakdown
 
 Usage:
     python analyze_ablations.py [options]
@@ -51,7 +63,14 @@ def parse_log_file(log_path: str) -> Dict:
         'vae_raw_loss': [],
         'vae_mi_beta': [],
         'vae_tc_beta': [],
-        'vae_dw_beta': []
+        'vae_dw_beta': [],
+        # Action diversity metrics
+        'actions_train_unique_count': [],
+        'actions_eval_unique_count': [],
+        'actions_train_total_count': [],
+        'actions_eval_total_count': [],
+        'actions_train_entropy': [],
+        'actions_eval_entropy': [],
     }
     
     try:
@@ -109,6 +128,20 @@ def parse_log_file(log_path: str) -> Dict:
                         metrics['vae_tc_beta'].append(data['vae/tc_beta'])
                     if 'vae/dw_beta' in data:
                         metrics['vae_dw_beta'].append(data['vae/dw_beta'])
+                    
+                    # Action diversity metrics
+                    if 'actions/train_unique_count' in data:
+                        metrics['actions_train_unique_count'].append(data['actions/train_unique_count'])
+                    if 'actions/eval_unique_count' in data:
+                        metrics['actions_eval_unique_count'].append(data['actions/eval_unique_count'])
+                    if 'actions/train_total_count' in data:
+                        metrics['actions_train_total_count'].append(data['actions/train_total_count'])
+                    if 'actions/eval_total_count' in data:
+                        metrics['actions_eval_total_count'].append(data['actions/eval_total_count'])
+                    if 'actions/train_entropy' in data:
+                        metrics['actions_train_entropy'].append(data['actions/train_entropy'])
+                    if 'actions/eval_entropy' in data:
+                        metrics['actions_eval_entropy'].append(data['actions/eval_entropy'])
                         
                 except json.JSONDecodeError:
                     continue
@@ -177,6 +210,14 @@ def analyze_logs_directory(logs_dir: str) -> pd.DataFrame:
         # Calculate VAE training metrics
         mean_vae_loss = np.mean(metrics['vae_total_loss']) if metrics['vae_total_loss'] else 0
         
+        # Calculate action diversity metrics
+        mean_train_unique_actions = np.mean(metrics['actions_train_unique_count']) if metrics['actions_train_unique_count'] else 0
+        mean_eval_unique_actions = np.mean(metrics['actions_eval_unique_count']) if metrics['actions_eval_unique_count'] else 0
+        mean_train_action_entropy = np.mean(metrics['actions_train_entropy']) if metrics['actions_train_entropy'] else 0
+        mean_eval_action_entropy = np.mean(metrics['actions_eval_entropy']) if metrics['actions_eval_entropy'] else 0
+        final_train_total_actions = metrics['actions_train_total_count'][-1] if metrics['actions_train_total_count'] else 0
+        final_eval_total_actions = metrics['actions_eval_total_count'][-1] if metrics['actions_eval_total_count'] else 0
+        
         total_steps = metrics['steps'][-1] if metrics['steps'] else 0
         
         runs_data.append({
@@ -201,7 +242,13 @@ def analyze_logs_directory(logs_dir: str) -> pd.DataFrame:
             'mean_used_skills': mean_used_skills,
             'mean_effective_K': mean_effective_K,
             'mean_boundary_mass': mean_boundary_mass,
-            'mean_vae_loss': mean_vae_loss
+            'mean_vae_loss': mean_vae_loss,
+            'mean_train_unique_actions': mean_train_unique_actions,
+            'mean_eval_unique_actions': mean_eval_unique_actions,
+            'mean_train_action_entropy': mean_train_action_entropy,
+            'mean_eval_action_entropy': mean_eval_action_entropy,
+            'final_train_total_actions': final_train_total_actions,
+            'final_eval_total_actions': final_eval_total_actions
         })
     
     return pd.DataFrame(runs_data)
@@ -215,7 +262,133 @@ def generate_comparison_plots(df: pd.DataFrame, output_dir: str):
     plt.style.use('default')
     sns.set_palette("husl")
     
-    # 1. Final evaluation returns by mode
+    # === SYSTEMATIC ABLATION COMPARISONS ===
+    
+    # 1. HMM Contribution Analysis (no intrinsic rewards)
+    baseline_modes = ['no_hmm_no_intrinsic', 'hmm_no_intrinsic']
+    baseline_data = df[df['mode'].isin(baseline_modes)]
+    
+    if len(baseline_data) > 0:
+        plt.figure(figsize=(10, 6))
+        sns.barplot(data=baseline_data, x='mode', y='final_eval_return', ci=95)
+        plt.title('HMM Contribution Analysis (No Intrinsic Rewards)')
+        plt.xlabel('Configuration')
+        plt.ylabel('Final Evaluation Return')
+        plt.xticks([0, 1], ['VAE+PPO\n(No HMM)', 'VAE+HMM+PPO\n(No Intrinsic)'])
+        plt.tight_layout()
+        plt.savefig(output_path / 'hmm_contribution_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # 2. Intrinsic Reward Impact (no HMM vs dynamics only)
+    no_hmm_comparison = ['no_hmm_no_intrinsic', 'no_hmm_dyn_only']
+    no_hmm_data = df[df['mode'].isin(no_hmm_comparison)]
+    
+    if len(no_hmm_data) > 0:
+        plt.figure(figsize=(10, 6))
+        sns.barplot(data=no_hmm_data, x='mode', y='final_eval_return', ci=95)
+        plt.title('Intrinsic Reward Impact (VAE+PPO)')
+        plt.xlabel('Configuration')
+        plt.ylabel('Final Evaluation Return')
+        plt.xticks([0, 1], ['No Intrinsic\nRewards', 'Dynamics\nCuriosity'])
+        plt.tight_layout()
+        plt.savefig(output_path / 'intrinsic_impact_no_hmm.png', dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # 3. Curiosity Component Analysis (HMM-enabled)
+    hmm_curiosity_modes = ['hmm_no_intrinsic', 'hmm_dyn_only', 'hmm_skill_only', 'hmm_trans_only', 'hmm_full_curiosity']
+    hmm_curiosity_data = df[df['mode'].isin(hmm_curiosity_modes)]
+    
+    if len(hmm_curiosity_data) > 0:
+        plt.figure(figsize=(14, 6))
+        sns.barplot(data=hmm_curiosity_data, x='mode', y='final_eval_return', ci=95)
+        plt.title('Curiosity Component Analysis (VAE+HMM+PPO)')
+        plt.xlabel('Curiosity Configuration')
+        plt.ylabel('Final Evaluation Return')
+        mode_labels = ['No Intrinsic', 'Dynamics\nOnly', 'Skill Entropy\nOnly', 'Transition\nNovelty Only', 'Full\nCuriosity']
+        plt.xticks(range(len(mode_labels)), mode_labels, rotation=45)
+        plt.tight_layout()
+        plt.savefig(output_path / 'curiosity_component_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # 4. RND vs Curiosity Comparison
+    rnd_comparison_modes = ['no_hmm_dyn_only', 'no_hmm_rnd', 'hmm_full_curiosity', 'hmm_rnd']
+    rnd_data = df[df['mode'].isin(rnd_comparison_modes)]
+    
+    if len(rnd_data) > 0:
+        plt.figure(figsize=(12, 6))
+        sns.barplot(data=rnd_data, x='mode', y='final_eval_return', ci=95)
+        plt.title('RND vs Curiosity-Driven Exploration')
+        plt.xlabel('Exploration Method')
+        plt.ylabel('Final Evaluation Return')
+        rnd_labels = ['VAE+PPO\nDynamics', 'VAE+PPO\nRND', 'VAE+HMM+PPO\nFull Curiosity', 'VAE+HMM+PPO\nRND']
+        plt.xticks(range(len(rnd_labels)), rnd_labels, rotation=45)
+        plt.tight_layout()
+        plt.savefig(output_path / 'rnd_vs_curiosity_comparison.png', dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # 5. Action Diversity Comparison
+    if 'mean_train_action_entropy' in df.columns and df['mean_train_action_entropy'].sum() > 0:
+        plt.figure(figsize=(14, 6))
+        sns.boxplot(data=df, x='mode', y='mean_train_action_entropy')
+        plt.title('Action Diversity by Configuration (Training)')
+        plt.xlabel('Configuration')
+        plt.ylabel('Action Entropy')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(output_path / 'action_diversity_by_mode.png', dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # 6. Overall Performance Matrix
+    plt.figure(figsize=(16, 10))
+    
+    # Create a more comprehensive comparison
+    performance_metrics = ['final_eval_return', 'mean_coverage', 'mean_train_action_entropy']
+    if all(col in df.columns for col in performance_metrics):
+        # Normalize metrics for comparison
+        df_norm = df.copy()
+        for metric in performance_metrics:
+            if df_norm[metric].std() > 0:
+                df_norm[f'{metric}_norm'] = (df_norm[metric] - df_norm[metric].mean()) / df_norm[metric].std()
+            else:
+                df_norm[f'{metric}_norm'] = 0
+        
+        # Create grouped comparison
+        mode_order = ['no_hmm_no_intrinsic', 'no_hmm_dyn_only', 'no_hmm_rnd', 
+                     'hmm_no_intrinsic', 'hmm_dyn_only', 'hmm_skill_only', 'hmm_trans_only', 'hmm_full_curiosity', 'hmm_rnd']
+        available_modes = [mode for mode in mode_order if mode in df['mode'].values]
+        
+        plot_data = []
+        for mode in available_modes:
+            mode_data = df_norm[df_norm['mode'] == mode]
+            if len(mode_data) > 0:
+                plot_data.append({
+                    'mode': mode,
+                    'return': mode_data['final_eval_return_norm'].mean(),
+                    'coverage': mode_data['mean_coverage_norm'].mean() if 'mean_coverage_norm' in mode_data else 0,
+                    'action_entropy': mode_data['mean_train_action_entropy_norm'].mean() if 'mean_train_action_entropy_norm' in mode_data else 0
+                })
+        
+        if plot_data:
+            plot_df = pd.DataFrame(plot_data)
+            x = np.arange(len(plot_df))
+            width = 0.25
+            
+            plt.bar(x - width, plot_df['return'], width, label='Evaluation Return', alpha=0.8)
+            plt.bar(x, plot_df['coverage'], width, label='Spatial Coverage', alpha=0.8)
+            plt.bar(x + width, plot_df['action_entropy'], width, label='Action Diversity', alpha=0.8)
+            
+            plt.xlabel('Configuration')
+            plt.ylabel('Normalized Performance')
+            plt.title('Comprehensive Performance Comparison (Normalized)')
+            plt.xticks(x, [mode.replace('_', '\n') for mode in plot_df['mode']], rotation=45, ha='right')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(output_path / 'comprehensive_performance_comparison.png', dpi=300, bbox_inches='tight')
+            plt.close()
+    
+    # === GENERAL COMPARISON PLOTS ===
+    
+    # 7. Final evaluation returns by mode
     plt.figure(figsize=(12, 6))
     sns.boxplot(data=df, x='mode', y='final_eval_return')
     plt.title('Final Evaluation Returns by Ablation Mode')
@@ -370,29 +543,186 @@ def generate_summary_report(df: pd.DataFrame, output_dir: str):
     
     with open(output_path / 'ablation_summary.txt', 'w') as f:
         f.write("=" * 80 + "\n")
-        f.write(" " * 25 + "ABLATION STUDY SUMMARY\n")
+        f.write(" " * 15 + "SYSTEMATIC ABLATION STUDY SUMMARY\n")
         f.write("=" * 80 + "\n\n")
         
         # Basic statistics
         f.write(f"Total experiments: {len(df)}\n")
-        f.write(f"Unique modes: {df['mode'].nunique()}\n")
-        f.write(f"Modes tested: {', '.join(df['mode'].unique())}\n\n")
+        f.write(f"Unique configurations: {df['mode'].nunique()}\n")
+        f.write(f"Configurations tested: {', '.join(sorted(df['mode'].unique()))}\n\n")
+        
+        # === SYSTEMATIC COMPARISONS ===
+        
+        # 1. HMM Contribution Analysis
+        f.write("-" * 25 + " HMM CONTRIBUTION ANALYSIS " + "-" * 27 + "\n\n")
+        baseline_modes = ['no_hmm_no_intrinsic', 'hmm_no_intrinsic']
+        baseline_data = df[df['mode'].isin(baseline_modes)]
+        
+        if len(baseline_data) > 0:
+            f.write("Comparison: VAE+PPO vs VAE+HMM+PPO (no intrinsic rewards)\n")
+            for mode in baseline_modes:
+                if mode in baseline_data['mode'].values:
+                    mode_data = baseline_data[baseline_data['mode'] == mode]['final_eval_return']
+                    label = "VAE+PPO (No HMM)" if mode == 'no_hmm_no_intrinsic' else "VAE+HMM+PPO"
+                    f.write(f"  {label:20}: {mode_data.mean():8.4f} ± {mode_data.std():6.4f}\n")
+            
+            if len(baseline_data['mode'].unique()) == 2:
+                no_hmm_mean = baseline_data[baseline_data['mode'] == 'no_hmm_no_intrinsic']['final_eval_return'].mean()
+                hmm_mean = baseline_data[baseline_data['mode'] == 'hmm_no_intrinsic']['final_eval_return'].mean()
+                if not pd.isna(no_hmm_mean) and not pd.isna(hmm_mean) and no_hmm_mean != 0:
+                    improvement = ((hmm_mean - no_hmm_mean) / abs(no_hmm_mean)) * 100
+                    f.write(f"  HMM Contribution: {improvement:+.1f}% improvement\n")
+        else:
+            f.write("No baseline comparison data available.\n")
+        f.write("\n")
+        
+        # 2. Intrinsic Reward Impact (No HMM)
+        f.write("-" * 22 + " INTRINSIC REWARD IMPACT (NO HMM) " + "-" * 24 + "\n\n")
+        no_hmm_modes = ['no_hmm_no_intrinsic', 'no_hmm_dyn_only', 'no_hmm_rnd']
+        no_hmm_data = df[df['mode'].isin(no_hmm_modes)]
+        
+        if len(no_hmm_data) > 0:
+            f.write("VAE+PPO configurations:\n")
+            mode_labels = {
+                'no_hmm_no_intrinsic': 'No Intrinsic Rewards',
+                'no_hmm_dyn_only': 'Dynamics Curiosity',
+                'no_hmm_rnd': 'RND Exploration'
+            }
+            for mode in no_hmm_modes:
+                if mode in no_hmm_data['mode'].values:
+                    mode_data = no_hmm_data[no_hmm_data['mode'] == mode]['final_eval_return']
+                    f.write(f"  {mode_labels[mode]:20}: {mode_data.mean():8.4f} ± {mode_data.std():6.4f}\n")
+        else:
+            f.write("No VAE+PPO comparison data available.\n")
+        f.write("\n")
+        
+        # 3. Curiosity Component Analysis (HMM)
+        f.write("-" * 20 + " CURIOSITY COMPONENT ANALYSIS (HMM) " + "-" * 22 + "\n\n")
+        hmm_curiosity_modes = ['hmm_no_intrinsic', 'hmm_dyn_only', 'hmm_skill_only', 'hmm_trans_only', 'hmm_full_curiosity']
+        hmm_curiosity_data = df[df['mode'].isin(hmm_curiosity_modes)]
+        
+        if len(hmm_curiosity_data) > 0:
+            f.write("VAE+HMM+PPO configurations:\n")
+            hmm_mode_labels = {
+                'hmm_no_intrinsic': 'No Intrinsic Rewards',
+                'hmm_dyn_only': 'Dynamics Only',
+                'hmm_skill_only': 'Skill Entropy Only',
+                'hmm_trans_only': 'Transition Novelty Only',
+                'hmm_full_curiosity': 'Full Curiosity (All)'
+            }
+            for mode in hmm_curiosity_modes:
+                if mode in hmm_curiosity_data['mode'].values:
+                    mode_data = hmm_curiosity_data[hmm_curiosity_data['mode'] == mode]['final_eval_return']
+                    f.write(f"  {hmm_mode_labels[mode]:22}: {mode_data.mean():8.4f} ± {mode_data.std():6.4f}\n")
+        else:
+            f.write("No VAE+HMM+PPO curiosity comparison data available.\n")
+        f.write("\n")
+        
+        # 4. RND vs Curiosity Comparison
+        f.write("-" * 25 + " RND VS CURIOSITY COMPARISON " + "-" * 24 + "\n\n")
+        rnd_modes = ['no_hmm_dyn_only', 'no_hmm_rnd', 'hmm_full_curiosity', 'hmm_rnd']
+        rnd_data = df[df['mode'].isin(rnd_modes)]
+        
+        if len(rnd_data) > 0:
+            f.write("Exploration method comparison:\n")
+            rnd_mode_labels = {
+                'no_hmm_dyn_only': 'VAE+PPO Dynamics',
+                'no_hmm_rnd': 'VAE+PPO RND',
+                'hmm_full_curiosity': 'VAE+HMM+PPO Curiosity',
+                'hmm_rnd': 'VAE+HMM+PPO RND'
+            }
+            for mode in rnd_modes:
+                if mode in rnd_data['mode'].values:
+                    mode_data = rnd_data[rnd_data['mode'] == mode]['final_eval_return']
+                    f.write(f"  {rnd_mode_labels[mode]:22}: {mode_data.mean():8.4f} ± {mode_data.std():6.4f}\n")
+        else:
+            f.write("No RND comparison data available.\n")
+        f.write("\n")
+        
+        # === GENERAL PERFORMANCE ANALYSIS ===
         
         # Performance Summary
-        f.write("-" * 40 + " PERFORMANCE " + "-" * 29 + "\n\n")
+        f.write("-" * 30 + " OVERALL PERFORMANCE " + "-" * 29 + "\n\n")
         perf_summary = df.groupby('mode').agg({
             'final_eval_return': ['mean', 'std', 'max', 'min'],
             'mean_ext_return': ['mean', 'std']
         }).round(4)
         
         f.write("Final Evaluation Returns by Mode:\n")
-        for mode in df['mode'].unique():
+        for mode in sorted(df['mode'].unique()):
             mode_data = df[df['mode'] == mode]['final_eval_return']
-            f.write(f"  {mode:15}: {mode_data.mean():8.4f} ± {mode_data.std():6.4f} "
+            f.write(f"  {mode:20}: {mode_data.mean():8.4f} ± {mode_data.std():6.4f} "
                    f"(min: {mode_data.min():6.4f}, max: {mode_data.max():6.4f})\n")
         f.write("\n")
         
-        # Success rates (if available)
+        # Action Diversity Analysis
+        if 'actions_train_unique_count' in df.columns:
+            f.write("-" * 30 + " ACTION DIVERSITY " + "-" * 29 + "\n\n")
+            
+            f.write("Action Diversity by Mode:\n")
+            for mode in sorted(df['mode'].unique()):
+                mode_data = df[df['mode'] == mode]
+                if not mode_data.empty:
+                    f.write(f"\n  {mode}:\n")
+                    
+                    if 'actions_train_unique_count' in mode_data.columns:
+                        train_unique = mode_data['actions_train_unique_count'].mean()
+                        train_entropy = mode_data['actions_train_entropy'].mean()
+                        f.write(f"    Training - Unique Actions: {train_unique:6.2f}, Entropy: {train_entropy:6.4f}\n")
+                    
+                    if 'actions_eval_unique_count' in mode_data.columns:
+                        eval_unique = mode_data['actions_eval_unique_count'].mean()
+                        eval_entropy = mode_data['actions_eval_entropy'].mean()
+                        f.write(f"    Evaluation - Unique Actions: {eval_unique:6.2f}, Entropy: {eval_entropy:6.4f}\n")
+            f.write("\n")
+        
+        # Top performing configurations
+        f.write("-" * 25 + " TOP PERFORMING CONFIGURATIONS " + "-" * 23 + "\n\n")
+        if 'final_eval_return' in df.columns:
+            top_configs = df.nlargest(5, 'final_eval_return')[['mode', 'final_eval_return', 'run_id']]
+            f.write("Top 5 Individual Runs by Final Evaluation Return:\n")
+            for idx, row in top_configs.iterrows():
+                f.write(f"  {row['mode']:20} - Return: {row['final_eval_return']:8.4f} (Run: {row['run_id']})\n")
+        
+        # Best average performance by mode
+        f.write("\nBest Average Performance by Mode:\n")
+        mode_averages = df.groupby('mode')['final_eval_return'].mean().sort_values(ascending=False)
+        for mode, avg_return in mode_averages.head(5).items():
+            count = len(df[df['mode'] == mode])
+            std = df[df['mode'] == mode]['final_eval_return'].std()
+            f.write(f"  {mode:20} - Average: {avg_return:8.4f} ± {std:6.4f} ({count} runs)\n")
+        
+        # Summary recommendations
+        f.write("\n" + "=" * 80 + "\n")
+        f.write(" " * 25 + "KEY FINDINGS & RECOMMENDATIONS\n")
+        f.write("=" * 80 + "\n\n")
+        
+        # Find best HMM vs no-HMM comparison
+        if 'no_hmm_no_intrinsic' in df['mode'].values and 'hmm_no_intrinsic' in df['mode'].values:
+            no_hmm_perf = df[df['mode'] == 'no_hmm_no_intrinsic']['final_eval_return'].mean()
+            hmm_perf = df[df['mode'] == 'hmm_no_intrinsic']['final_eval_return'].mean()
+            if hmm_perf > no_hmm_perf:
+                f.write("✓ HMM provides performance improvement over standard VAE+PPO\n")
+            else:
+                f.write("⚠ HMM does not improve performance over standard VAE+PPO\n")
+        
+        # Best curiosity mechanism
+        curiosity_modes = [m for m in df['mode'].unique() if any(x in m for x in ['dyn', 'rnd', 'curiosity'])]
+        if curiosity_modes:
+            curiosity_performance = {mode: df[df['mode'] == mode]['final_eval_return'].mean() 
+                                   for mode in curiosity_modes}
+            best_curiosity = max(curiosity_performance, key=curiosity_performance.get)
+            f.write(f"✓ Best exploration method: {best_curiosity} (Return: {curiosity_performance[best_curiosity]:.4f})\n")
+        
+        # Overall best configuration
+        best_mode = df.groupby('mode')['final_eval_return'].mean().idxmax()
+        best_return = df.groupby('mode')['final_eval_return'].mean().max()
+        f.write(f"✓ Overall best configuration: {best_mode} (Average Return: {best_return:.4f})\n")
+        
+        f.write("\n" + "=" * 80 + "\n")
+        f.write("Report generated at: " + str(pd.Timestamp.now()) + "\n\n")
+        
+        # === DETAILED METRICS ===
         if 'final_success_rate' in df.columns and df['final_success_rate'].sum() > 0:
             f.write("Success Rates by Mode:\n")
             for mode in df['mode'].unique():
@@ -506,55 +836,73 @@ def generate_summary_report(df: pd.DataFrame, output_dir: str):
     print(f"📊 Summary report saved to: {output_path / 'ablation_summary.txt'}")
 
 def print_summary_table(df: pd.DataFrame):
-    """Print a summary table of results."""
+    """Print a summary table of all experiments with systematic focus."""
     if df.empty:
         print("❌ No data to summarize")
         return
     
-    print(f"\n📊 ABLATION STUDY RESULTS SUMMARY")
-    print(f"{'='*80}")
+    print("\n" + "=" * 120)
+    print(" " * 40 + "SYSTEMATIC ABLATION STUDY RESULTS")
+    print("=" * 120)
     
-    # Group by mode and calculate statistics
+    # Group by mode and calculate summary statistics
     summary = df.groupby('mode').agg({
-        'final_eval_return': ['count', 'mean', 'std'],
-        'mean_ext_return': ['mean', 'std'],
-        'total_intrinsic': ['mean', 'std'],
-        'total_steps': 'mean'
-    }).round(3)
+        'final_eval_return': ['count', 'mean', 'std', 'min', 'max'],
+        'final_episode_length': ['mean', 'std'],
+        'final_entropy': ['mean', 'std']
+    }).round(4)
     
-    # Flatten column names
-    summary.columns = ['_'.join(col).strip() for col in summary.columns.values]
+    print(f"\n{'Mode':<20} {'Runs':<5} {'Final Return':<20} {'Episode Len':<15} {'Policy Entropy':<18}")
+    print(f"{'':20} {'':5} {'Mean ± Std':<20} {'Mean ± Std':<15} {'Mean ± Std':<18}")
+    print("-" * 120)
     
-    print(summary)
+    # Sort by average performance
+    mode_performance = df.groupby('mode')['final_eval_return'].mean().sort_values(ascending=False)
     
-    # Find best performing mode
-    best_mode = df.loc[df['final_eval_return'].idxmax()]
-    print(f"\n🏆 Best performing run:")
-    print(f"   Mode: {best_mode['mode']}")
-    print(f"   Final eval return: {best_mode['final_eval_return']:.3f}")
-    print(f"   Log file: {best_mode['log_file']}")
-    
-    # Compare VAE+HMM vs VAE-only if both present
-    if 'baseline' in df['mode'].values and 'no_hmm' in df['mode'].values:
-        baseline_mean = df[df['mode'] == 'baseline']['final_eval_return'].mean()
-        no_hmm_mean = df[df['mode'] == 'no_hmm']['final_eval_return'].mean()
-        improvement = ((baseline_mean - no_hmm_mean) / abs(no_hmm_mean)) * 100
+    for mode in mode_performance.index:
+        mode_data = df[df['mode'] == mode]
+        count = len(mode_data)
         
-        print(f"\n🔍 VAE+HMM vs VAE-only comparison:")
-        print(f"   VAE+HMM (baseline): {baseline_mean:.3f}")
-        print(f"   VAE-only (no_hmm): {no_hmm_mean:.3f}")
-        print(f"   Improvement: {improvement:+.1f}%")
-    
-    # Compare curiosity vs RND if both present
-    if 'baseline' in df['mode'].values and 'rnd' in df['mode'].values:
-        curiosity_mean = df[df['mode'] == 'baseline']['final_eval_return'].mean()
-        rnd_mean = df[df['mode'] == 'rnd']['final_eval_return'].mean()
-        improvement = ((curiosity_mean - rnd_mean) / abs(rnd_mean)) * 100
+        # Performance metrics
+        return_mean = mode_data['final_eval_return'].mean()
+        return_std = mode_data['final_eval_return'].std()
         
-        print(f"\n🧠 Curiosity vs RND comparison:")
-        print(f"   Curiosity (baseline): {curiosity_mean:.3f}")
-        print(f"   RND: {rnd_mean:.3f}")
-        print(f"   Improvement: {improvement:+.1f}%")
+        length_mean = mode_data['final_episode_length'].mean() if 'final_episode_length' in mode_data.columns else 0
+        length_std = mode_data['final_episode_length'].std() if 'final_episode_length' in mode_data.columns else 0
+        
+        entropy_mean = mode_data['final_entropy'].mean() if 'final_entropy' in mode_data.columns else 0
+        entropy_std = mode_data['final_entropy'].std() if 'final_entropy' in mode_data.columns else 0
+        
+        print(f"{mode:<20} {count:<5} {return_mean:7.4f} ± {return_std:6.4f}   "
+              f"{length_mean:6.2f} ± {length_std:5.2f}   {entropy_mean:6.4f} ± {entropy_std:6.4f}")
+    
+    print("-" * 120)
+    
+    # Systematic comparisons summary
+    print("\nSYSTEMATIC COMPARISONS:")
+    print("-" * 40)
+    
+    # HMM contribution
+    if 'no_hmm_no_intrinsic' in df['mode'].values and 'hmm_no_intrinsic' in df['mode'].values:
+        no_hmm_mean = df[df['mode'] == 'no_hmm_no_intrinsic']['final_eval_return'].mean()
+        hmm_mean = df[df['mode'] == 'hmm_no_intrinsic']['final_eval_return'].mean()
+        improvement = ((hmm_mean - no_hmm_mean) / abs(no_hmm_mean)) * 100 if no_hmm_mean != 0 else 0
+        print(f"HMM Contribution (baseline): {improvement:+.1f}% improvement")
+    
+    # Best curiosity mechanism
+    curiosity_modes = [m for m in df['mode'].unique() if any(x in m for x in ['dyn', 'rnd', 'curiosity'])]
+    if curiosity_modes:
+        curiosity_performance = {mode: df[df['mode'] == mode]['final_eval_return'].mean() 
+                               for mode in curiosity_modes}
+        best_curiosity = max(curiosity_performance, key=curiosity_performance.get)
+        print(f"Best Exploration Method: {best_curiosity} ({curiosity_performance[best_curiosity]:.4f})")
+    
+    # Overall best
+    best_mode = mode_performance.index[0]
+    best_return = mode_performance.iloc[0]
+    print(f"Best Overall Configuration: {best_mode} ({best_return:.4f})")
+    
+    print("=" * 120)
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze SequentialSkillRL ablation study results")
