@@ -1008,6 +1008,10 @@ class PPOTrainer:
         self._actions_used_in_train = set()  # Set of global action indices used during train()
         self._actions_used_in_eval = set()   # Set of global action indices used during evaluate()
         
+        # --- Per-environment episode tracking (persistent across rollouts) ---
+        self._episode_returns = [0.0] * ppo_cfg.num_envs  # Current cumulative return per environment
+        self._episode_lengths = [0] * ppo_cfg.num_envs    # Current episode length per environment
+        
     @torch.no_grad()
     def _policy_forward(self, z: torch.Tensor, skill_feat: Optional[torch.Tensor]):
         """Forward through policy; updates internal RNN state"""
@@ -1183,18 +1187,13 @@ class PPOTrainer:
         else:
             s_wm = self.vae.world_model.initial_state(self.ppo_cfg.num_envs, device=self.device) if self.vae.world_model.enabled else None
 
-        # Track episode statistics for logging
-        episode_returns = [0.0] * self.ppo_cfg.num_envs
-        episode_lengths = [0] * self.ppo_cfg.num_envs
+        # Track episode statistics for logging (using persistent per-env episode tracking)
+        # episode_returns and episode_lengths are now persistent in self._episode_returns/lengths
         
-        # Track episode completion types for logging
-        episodes_completed = 0
-        episodes_terminated = 0  # Natural termination (agent reached goal/died)
-        episodes_truncated = 0   # Time limit truncation
-        
-        # Store completed episode statistics for logging
+        # Store completed episode statistics for this rollout only
         completed_episode_returns = []
         completed_episode_lengths = []
+        completed_episode_terminated = []  # Track if each completed episode was terminated (True) or truncated (False)
         
         # Track environments with negative rewards from previous timestep
         # These environments should have their next observation masked to prevent learning duplicate states
@@ -1275,8 +1274,8 @@ class PPOTrainer:
             
             # Update episode statistics and log completions
             for env_idx in range(self.ppo_cfg.num_envs):
-                episode_returns[env_idx] += rew[env_idx]
-                episode_lengths[env_idx] += 1
+                self._episode_returns[env_idx] += rew[env_idx]
+                self._episode_lengths[env_idx] += 1
                     
                 if truncated[env_idx]:
                     # Compute bootstrap values for this truncated episode with current RNN state
@@ -1379,20 +1378,14 @@ class PPOTrainer:
                     # Reset negative reward tracking for this environment since episode ended
                     prev_negative_reward_mask[b] = False
                     
-                    # Track episode completion type
-                    episodes_completed += 1
-                    if terminated[b]:
-                        episodes_terminated += 1
-                    elif truncated[b]:
-                        episodes_truncated += 1
-                    
                     # Store completed episode statistics before resetting
-                    completed_episode_returns.append(episode_returns[b])
-                    completed_episode_lengths.append(episode_lengths[b])
+                    completed_episode_returns.append(self._episode_returns[b])
+                    completed_episode_lengths.append(self._episode_lengths[b])
+                    completed_episode_terminated.append(terminated[b])  # True if terminated, False if truncated
                     
                     # Reset episode tracking for this environment
-                    episode_returns[b] = 0.0
-                    episode_lengths[b] = 0
+                    self._episode_returns[b] = 0.0
+                    self._episode_lengths[b] = 0
 
             obs = next_obs
             
@@ -1474,27 +1467,22 @@ class PPOTrainer:
                     self.replay_obs_message.append(obs_message_bt)
                     self.replay_obs_hero_info.append(obs_hero_info_bt)
         
-        # Log episode completion statistics
-        if episodes_completed > 0:
-            termination_rate = episodes_terminated / episodes_completed
-            truncation_rate = episodes_truncated / episodes_completed
-            
+        # Calculate episode statistics for this rollout only
+        num_episodes_completed_this_rollout = len(completed_episode_returns)
+        
+        if num_episodes_completed_this_rollout > 0:
             # Calculate episode statistics
-            avg_return = np.mean(completed_episode_returns) if completed_episode_returns else 0.0
-            avg_length = np.mean(completed_episode_lengths) if completed_episode_lengths else 0.0
+            avg_return = np.mean(completed_episode_returns)
+            avg_length = np.mean(completed_episode_lengths)
             
             if logger is not None:
-                logger.info(f"📊 Rollout episode completions: {episodes_completed} total, "
-                           f"{episodes_terminated} terminated ({termination_rate:.1%}), "
-                           f"{episodes_truncated} truncated ({truncation_rate:.1%})")
+                logger.info(f"📊 Episodes completed this rollout: {num_episodes_completed_this_rollout}")
                 logger.info(f"📈 Episode stats: avg return = {avg_return:.2f}, avg length = {avg_length:.1f}")
             else:
-                print(f"📊 Rollout episode completions: {episodes_completed} total, "
-                      f"{episodes_terminated} terminated ({termination_rate:.1%}), "
-                      f"{episodes_truncated} truncated ({truncation_rate:.1%})")
+                print(f"📊 Episodes completed this rollout: {num_episodes_completed_this_rollout}")
                 print(f"📈 Episode stats: avg return = {avg_return:.2f}, avg length = {avg_length:.1f}")
         
-        return episodes_completed, episodes_terminated, episodes_truncated, completed_episode_returns, completed_episode_lengths
+        return completed_episode_returns, completed_episode_lengths, completed_episode_terminated
 
     # --------------------------- compute advantages --------------------------
 
@@ -2544,6 +2532,10 @@ class PPOTrainer:
         self._episode_start = [True for _ in range(self.ppo_cfg.num_envs)]
         self._update_hero_info_from_obs(obs, self.ppo_cfg.num_envs, self._episode_start, self._hero_info, logger=logger)
         
+        # Reset per-environment episode tracking at the start of training
+        self._episode_returns = [0.0] * self.ppo_cfg.num_envs
+        self._episode_lengths = [0] * self.ppo_cfg.num_envs
+        
         self._obs = obs
 
         # Calculate total training parameters for progress tracking
@@ -2570,10 +2562,31 @@ class PPOTrainer:
         update_count = 0
         start_time = time.time()
         
+        # Track episode completion statistics across all rollouts (persistent)
+        total_episodes_completed = 0
+        total_episodes_terminated = 0  # Natural termination (agent reached goal/died)
+        total_episodes_truncated = 0   # Time limit truncation
+        all_episode_returns = []  # All completed episode returns across training
+        all_episode_lengths = []  # All completed episode lengths across training
+        
         while self.global_steps < total_env_steps:
             update_start_time = time.time()
             
-            episodes_completed, episodes_terminated, episodes_truncated, episode_returns, episode_lengths = self.collect_rollout(logger)
+            episode_returns, episode_lengths, episode_terminated = self.collect_rollout(logger)
+            
+            # Update persistent episode statistics with completed episodes from this rollout
+            episodes_completed_this_rollout = len(episode_returns)
+            if episodes_completed_this_rollout > 0:
+                total_episodes_completed += episodes_completed_this_rollout
+                all_episode_returns.extend(episode_returns)
+                all_episode_lengths.extend(episode_lengths)
+                
+                # Count terminated vs truncated episodes
+                episodes_terminated_this_rollout = sum(episode_terminated)
+                episodes_truncated_this_rollout = episodes_completed_this_rollout - episodes_terminated_this_rollout
+                total_episodes_terminated += episodes_terminated_this_rollout
+                total_episodes_truncated += episodes_truncated_this_rollout
+            
             bonuses = self._compute_intrinsic_for_buffer()
             # skills for policy (concat to z) during PPO update: use the SAME features we acted with
             skills_for_policy = self.buf.skill if (self.ppo_cfg.policy_uses_skill and self.buf.skill is not None) else None  # [T,B,K]
@@ -2628,16 +2641,21 @@ class PPOTrainer:
                 # Add raw (always positive) vs normalized comparisons
                 "int/dyn_raw_mean": float(bonuses["dyn_raw"].mean().item()),
                 "int/hdp_raw_mean": float(bonuses["hdp_raw"].mean().item()),
-                # Episode completion statistics
-                "rollout/episodes_completed": float(episodes_completed),
-                "rollout/episodes_terminated": float(episodes_terminated),
-                "rollout/episodes_truncated": float(episodes_truncated),
-                "rollout/termination_rate": float(episodes_terminated / max(1, episodes_completed)),
-                # Episode return and length statistics
+                # Episode completion statistics (using persistent counters across all rollouts)
+                "rollout/episodes_completed": float(total_episodes_completed),
+                "rollout/episodes_terminated": float(total_episodes_terminated),
+                "rollout/episodes_truncated": float(total_episodes_truncated),
+                "rollout/termination_rate": float(total_episodes_terminated / max(1, total_episodes_completed)),
+                # Episode return and length statistics (from this rollout only)
                 "rollout/episode_return_mean": float(np.mean(episode_returns) if episode_returns else 0.0),
                 "rollout/episode_return_std": float(np.std(episode_returns) if len(episode_returns) > 1 else 0.0),
                 "rollout/episode_length_mean": float(np.mean(episode_lengths) if episode_lengths else 0.0),
                 "rollout/episode_length_std": float(np.std(episode_lengths) if len(episode_lengths) > 1 else 0.0),
+                # Overall episode statistics (across all training)
+                "training/total_episode_return_mean": float(np.mean(all_episode_returns) if all_episode_returns else 0.0),
+                "training/total_episode_return_std": float(np.std(all_episode_returns) if len(all_episode_returns) > 1 else 0.0),
+                "training/total_episode_length_mean": float(np.mean(all_episode_lengths) if all_episode_lengths else 0.0),
+                "training/total_episode_length_std": float(np.std(all_episode_lengths) if len(all_episode_lengths) > 1 else 0.0),
                 "int/trans_raw_mean": float(bonuses["trans_raw"].mean().item()),
                 "int/rnd_raw_mean": float(bonuses["rnd_raw"].mean().item()),
                 # Track negative ratio to monitor normalization impact
