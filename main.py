@@ -953,7 +953,7 @@ if __name__ == "__main__":
             learning_rate=3e-4,
             vf_learning_rate=None,  # Use same as learning_rate
             policy_uses_skill=True,  # Will be overridden for no_hmm mode
-            deterministic_eval=True
+            deterministic_eval=False
         )
         
         # Configure curiosity and RND based on reward mode
@@ -1032,17 +1032,17 @@ if __name__ == "__main__":
         else:
             hmm_config = HMMOnlineConfig(
                 hmm_update_every=5_120,   # Update HMM every ~5 rollouts
-                hmm_update_growth=1.05,    # Growth factor for update interval
+                hmm_update_growth=1.2,    # Growth factor for update interval
                 hmm_update_every_cap=12_000, # Cap for update interval
                 hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
-                hmm_max_iters=5,          # Up to 5 iterations per update
+                hmm_max_iters=5,           # Up to 5 iterations per update
                 hmm_tol=1e-2,
                 hmm_elbo_drop_tol=1e-2,
                 rho_emission=0.05,        # Streaming blend rate
                 rho_transition=None,       # Use same as emission
                 optimise_pi=True,
-                pi_steps=10,               # π optimization steps
-                pi_lr=5e-4,                # π optimization learning rate
+                pi_steps=10,                # π optimization steps
+                pi_lr=5e-4,                 # π optimization learning rate
                 pi_early_stopping_patience=1,    # Early stopping patience
                 pi_early_stopping_min_delta=1e-2, # Early stopping min delta
                 emission_mode = "student_t",          # "sample" or "mean" or "expected" or "student_t"
@@ -1059,10 +1059,10 @@ if __name__ == "__main__":
         # VAE Online Configuration - synchronized with HMM updates
         vae_config = VAEOnlineConfig(
             vae_update_every=5_120,       # Match HMM update frequency
-            vae_update_growth=1.05,       # Same growth pattern as HMM
+            vae_update_growth=1.2,        # Same growth pattern as HMM
             vae_update_every_cap=12_000,  # Same cap as HMM
-            vae_lr=1e-4,                  # Learning rate for VAE updates
-            vae_steps_per_call=8,        # Number of gradient steps per VAE update
+            vae_lr=3e-5,                  # Learning rate for VAE updates
+            vae_steps_per_call=4,        # Number of gradient steps per VAE update
         )
         
         # RND Configuration (used only for RND ablation)
@@ -1085,7 +1085,7 @@ if __name__ == "__main__":
             log_dir=f"./runs/{run_name}",
             save_every=10_000,
             eval_every=10_000,
-            eval_episodes=10,
+            eval_episodes=50,
             use_hmm=(model_mode != "no_hmm")
         )
         

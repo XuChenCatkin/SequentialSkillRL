@@ -57,13 +57,13 @@ class CuriosityConfig:
     use_rnd: bool = False         # RND baseline (set True for baseline run)
 
     # Annealing: eta(t) = eta0 * exp(-t / tau)
-    eta0_dyn: float = 0.02
+    eta0_dyn: float = 0.3
     tau_dyn: float = 4e5
-    eta0_hdp: float = 0.01         # for boundary-gated skill entropy
+    eta0_hdp: float = 0.2         # for boundary-gated skill entropy
     tau_hdp: float = 8e5
-    eta0_stn: float = 0.005         # anneal multiplier for skill‑transition novelty
+    eta0_stn: float = 0.05         # anneal multiplier for skill‑transition novelty
     tau_stn: float = 1.3e6
-    eta0_rnd: float = 0.01        # keep smaller by default
+    eta0_rnd: float = 0.1        # keep smaller by default
     tau_rnd: float = 2.8e5
 
     # EMA norm for each raw term
@@ -1012,6 +1012,13 @@ class PPOTrainer:
         self._action_bincount_train = torch.zeros(ACTION_DIM, dtype=torch.long, device=self.device)  # Count of each action in training
         self._action_bincount_eval = torch.zeros(ACTION_DIM, dtype=torch.long, device=self.device)   # Count of each action in evaluation
         
+        # --- Total evaluation statistics (persistent across all evaluations) ---
+        self._total_eval_episodes_completed = 0    # Total episodes completed across all evaluations
+        self._total_eval_episodes_terminated = 0   # Total episodes naturally terminated (reached goal/died)
+        self._total_eval_episodes_truncated = 0    # Total episodes truncated by time limit
+        self._all_eval_episode_returns = []        # All completed episode returns across all evaluations
+        self._all_eval_episode_lengths = []        # All completed episode lengths across all evaluations
+        
         # --- Per-environment episode tracking (persistent across rollouts) ---
         self._episode_returns = [0.0] * ppo_cfg.num_envs  # Current cumulative return per environment
         self._episode_lengths = [0] * ppo_cfg.num_envs    # Current episode length per environment
@@ -1080,7 +1087,7 @@ class PPOTrainer:
         b = obs_to_device(obs_dict, self.device, hero_info=hero_info_batch)
         enc = self.vae.encode(b["game_chars"], b["game_colors"], b["blstats"], b["message_chars"], b["hero_info"])
         mu = enc["mu"]; logvar = enc["logvar"]; F = enc["lowrank_factors"]  # tensors [B,D], [B,D], [B,D,R] or None
-        z  = mu  # use mean latent for policy input
+        z  = self.vae.reparameterize(mu, logvar, F)  # [B,D]
         return {"z": z, "mu": mu, "logvar": logvar, "F": F}
 
     def _update_hero_info_from_obs(self, obs_dict: dict, num_envs: int, episode_start_flags: list, hero_info_list: list, logger: Optional[logging.Logger] = None):
@@ -1779,7 +1786,7 @@ class PPOTrainer:
         T = self.ppo_cfg.rollout_len
         B = self.ppo_cfg.num_envs
         # reshape buffer tensors to [T,B,...]
-        mu = self.buf.mu            # [T,B,D]
+        z = self.buf.z            # [T,B,D]
         acts = self.buf.actions     # [T,B]
         old_logp = self.buf.logp    # [T,B]
         old_val_ext  = self.buf.val_ext     # [T,B]
@@ -1799,7 +1806,7 @@ class PPOTrainer:
             for start in range(0, B, mb_envs):
                 inds = env_inds[start:start+mb_envs]
                 # slice sequences
-                mu_mb    = mu[:, inds, :]
+                z_mb    = z[:, inds, :]
                 acts_mb  = acts[:, inds]
                 oldlp_mb = old_logp[:, inds]
                 oldve_mb  = old_val_ext[:, inds]
@@ -1812,7 +1819,7 @@ class PPOTrainer:
                 skill_mb = None if skill is None else skill[:, inds, :]
                 h0_mb = self.buf.h0[inds] if hasattr(self.buf, 'h0') and self.buf.h0 is not None else None
                 # forward sequence through policy
-                logits_seq, vext_seq, vint_seq, _ = self.actor_critic.forward_sequence(mu_mb, skill_mb, dones_mb, h0=h0_mb)
+                logits_seq, vext_seq, vint_seq, _ = self.actor_critic.forward_sequence(z_mb, skill_mb, dones_mb, h0=h0_mb)
                 # mask invalid actions
                 masked_logits = logits_seq.masked_fill(~self.action_mask[0].unsqueeze(0).unsqueeze(0), -1e9)  # [T,B,G]
                 dist = torch.distributions.Categorical(logits=masked_logits)
@@ -2691,7 +2698,7 @@ class PPOTrainer:
                 "rollout/episodes_completed": float(total_episodes_completed),
                 "rollout/episodes_terminated": float(total_episodes_terminated),
                 "rollout/episodes_truncated": float(total_episodes_truncated),
-                "rollout/termination_rate": float(total_episodes_terminated / max(1, total_episodes_completed)),
+                "rollout/success_rate": float(total_episodes_terminated / max(1, total_episodes_completed)),
                 # Episode return and length statistics (from this rollout only)
                 "rollout/episode_return_mean": float(np.mean(episode_returns) if episode_returns else 0.0),
                 "rollout/episode_return_std": float(np.std(episode_returns) if len(episode_returns) > 1 else 0.0),
@@ -2855,7 +2862,11 @@ class PPOTrainer:
             done = (term | trunc); ret = 0.0; ep_len = 0
             # buffers to run HMM causal filter post‑episode
             mu_seq, logvar_seq, F_seq = [], [], []
+            mask_seq = []  # Track mask sequence for post-episode HMM processing
             visited = set()
+            
+            # Track negative reward masking for HMM filter (similar to training)
+            prev_negative_reward = False
 
             while not done:
                 # coverage proxy from blstats (x,y)
@@ -2878,8 +2889,16 @@ class PPOTrainer:
                     dv_b = enc["logvar"].exp().clamp_min(1e-6)  # [1, D]
                     F_b = enc.get('lowrank_factors', None)  # [1, D, R] or None
                     
+                    # Apply emission mask if previous reward was negative (similar to training logic)
+                    emission_mask = torch.tensor([0.0 if prev_negative_reward else 1.0], device=self.device)  # [1]
+                    
+                    # Log masking occasionally during evaluation
+                    if prev_negative_reward and ep_len % 50 == 0:  # Log every 50 steps when masking occurs
+                        if logger is not None:
+                            logger.debug(f"🎯 Eval HMM masking: step {ep_len} masked due to negative reward")
+                    
                     logB_b = self.hmm.make_logB_for_filter(
-                        mu_b, dv_b, F_b, None, ('mean' if self.hmm_cfg.emission_mode != 'student_t' else 'student_t'), False, self.hmm_cfg.student_t_scale_temp
+                        mu_b, dv_b, F_b, emission_mask, ('mean' if self.hmm_cfg.emission_mode != 'student_t' else 'student_t'), False, self.hmm_cfg.student_t_scale_temp
                     ).squeeze(0)  # [Kp1] - always use deterministic mean for eval
 
                     if eval_filt_state is None:
@@ -2888,6 +2907,7 @@ class PPOTrainer:
                         alpha_b = torch.exp(eval_filt_state.log_alpha.to(torch.float32))  # [Kp1]
                     else:
                         # One causal update (same as training)
+                        # When logB_b ≈ 0 (masked), this relies purely on transition prediction
                         eval_filt_state, alpha_b, _xi, _bound, _sent = self.hmm.filter_step(eval_filt_state, logB_b, self._logA)
                     
                     # Drop remainder state for policy features (same as training)
@@ -2899,6 +2919,9 @@ class PPOTrainer:
                     F_seq.append(enc["lowrank_factors"].squeeze(0).cpu())
                 else:
                     F_seq.append(None)
+                
+                # Store the mask for this timestep (True = not masked, False = masked due to negative reward)
+                mask_seq.append(not prev_negative_reward)
 
                 logits, v_ext, v_int, eval_rnn_state = self.actor_critic(enc["z"], skill_feat, eval_rnn_state)
                 # For evaluation with single env, use only first row of action mask
@@ -2921,6 +2944,9 @@ class PPOTrainer:
                 done = term or trunc
                 ret += float(r); ep_len += 1
                 
+                # Update negative reward tracking for next timestep HMM filtering
+                prev_negative_reward = (r < 0.0)
+                
                 # Reset states and update hero info only when episode ends/starts
                 if done:
                     # Track episode completion type
@@ -2932,6 +2958,8 @@ class PPOTrainer:
                     if self.has_hmm:
                         eval_filt_state = None  # Reset HMM filter state at episode end (same as training)
                     eval_rnn_state = torch.zeros(1, self.ppo_cfg.rnn_hidden_size, device=self.device)
+                    # Reset negative reward tracking at episode end
+                    prev_negative_reward = False
                     # Hero info will be updated at the start of next episode in the next iteration
 
             # Check if episode was terminated due to step limit
@@ -2949,6 +2977,15 @@ class PPOTrainer:
             if succ > 0.5:
                 len_succ_list.append(ep_len)
             cover_list.append(len(visited))
+            
+            # Update total evaluation statistics (persistent across all evaluations)
+            self._total_eval_episodes_completed += 1
+            self._all_eval_episode_returns.append(ret)
+            self._all_eval_episode_lengths.append(ep_len)
+            if term:
+                self._total_eval_episodes_terminated += 1
+            elif trunc:
+                self._total_eval_episodes_truncated += 1
             
             # Update progress bar with episode stats
             ep_time = time.time() - ep_start_time
@@ -2969,13 +3006,16 @@ class PPOTrainer:
                 logvar_t = torch.stack(logvar_seq, dim=0).to(self.device)   # [T,D]
                 diag_var_t = torch.exp(logvar_t)
                 F_t = torch.stack(F_seq, dim=0).to(self.device) if F_seq[0] is not None else None  # [T,D,R] or None
+                
+                # Convert mask sequence to tensor for HMM processing
+                mask_t = torch.tensor(mask_seq, dtype=torch.float32, device=self.device)  # [T] - True->1.0, False->0.0
 
-                # Emission potentials and causal filter
+                # Emission potentials and causal filter with mask
                 logB = self.hmm.make_logB_for_filter(
                     mu_t.unsqueeze(0), 
                     diag_var_t.unsqueeze(0), 
                     F_t.unsqueeze(0) if F_t is not None else None, 
-                    None, 
+                    mask_t.unsqueeze(0),  # [1,T] - apply mask to post-episode processing
                     ('mean' if self.hmm_cfg.emission_mode != 'student_t' else 'student_t'), 
                     False,
                     self.hmm_cfg.student_t_scale_temp
@@ -3019,20 +3059,26 @@ class PPOTrainer:
         eval_pbar.close()
         env.close()
         
-        # Calculate evaluation summary
+        # Calculate evaluation summary (current round)
         eval_time = time.time() - start_time
         final_avg_ret = np.mean(ret_list) if ret_list else 0.0
         final_success_rate = np.mean(succ_list) if succ_list else 0.0
         final_avg_len = np.mean(len_list) if len_list else 0.0
         final_avg_coverage = np.mean(cover_list) if cover_list else 0.0
         
-        # Calculate episode completion statistics
+        # Calculate episode completion statistics (current round)
         total_episodes_completed = episodes_terminated + episodes_truncated
         termination_rate = episodes_terminated / max(1, total_episodes_completed)
         truncation_rate = episodes_truncated / max(1, total_episodes_completed)
         
+        # Calculate total evaluation statistics (all evaluations)
+        total_eval_termination_rate = self._total_eval_episodes_terminated / max(1, self._total_eval_episodes_completed)
+        total_eval_truncation_rate = self._total_eval_episodes_truncated / max(1, self._total_eval_episodes_completed)
+        total_eval_avg_return = np.mean(self._all_eval_episode_returns) if self._all_eval_episode_returns else 0.0
+        total_eval_avg_length = np.mean(self._all_eval_episode_lengths) if self._all_eval_episode_lengths else 0.0
+        
         if logger is not None:
-            logger.info(f"📊 Evaluation Results:")
+            logger.info(f"📊 Evaluation Results (Current Round):")
             logger.info(f"   Episodes: {episodes}")
             logger.info(f"   Time: {eval_time:.1f}s ({eval_time/episodes:.1f}s/ep)")
             logger.info(f"   Average Return: {final_avg_ret:.3f} ± {np.std(ret_list):.3f}")
@@ -3041,6 +3087,15 @@ class PPOTrainer:
             logger.info(f"   Average Coverage: {final_avg_coverage:.1f} positions")
             logger.info(f"   Episode Completions: {episodes_terminated} terminated ({termination_rate:.1%}), "
                        f"{episodes_truncated} truncated ({truncation_rate:.1%})")
+            
+            # Log total evaluation statistics
+            logger.info(f"📈 Total Evaluation Statistics:")
+            logger.info(f"   Total Episodes: {self._total_eval_episodes_completed}")
+            logger.info(f"   Total Average Return: {total_eval_avg_return:.3f} ± {np.std(self._all_eval_episode_returns):.3f}")
+            logger.info(f"   Total Average Length: {total_eval_avg_length:.1f} ± {np.std(self._all_eval_episode_lengths):.1f}")
+            logger.info(f"   Total Completions: {self._total_eval_episodes_terminated} terminated ({total_eval_termination_rate:.1%}), "
+                       f"{self._total_eval_episodes_truncated} truncated ({total_eval_truncation_rate:.1%})")
+            
             if bound_mass_list:
                 logger.info(f"   Skill Entropy: {np.mean(ent_list):.3f}")
                 logger.info(f"   Used Skills: {np.mean(used_skills_list):.1f}")
@@ -3066,7 +3121,7 @@ class PPOTrainer:
                 eval_action_strs = [f"#{action}({count})" for action, count in top_eval_actions]
                 logger.info(f"   Top 3 eval actions: {', '.join(eval_action_strs)}")
         else:
-            print(f"📊 Evaluation Results:")
+            print(f"📊 Evaluation Results (Current Round):")
             print(f"   Episodes: {episodes}")
             print(f"   Time: {eval_time:.1f}s ({eval_time/episodes:.1f}s/ep)")
             print(f"   Average Return: {final_avg_ret:.3f} ± {np.std(ret_list):.3f}")
@@ -3075,6 +3130,15 @@ class PPOTrainer:
             print(f"   Average Coverage: {final_avg_coverage:.1f} positions")
             print(f"   Episode Completions: {episodes_terminated} terminated ({termination_rate:.1%}), "
                   f"{episodes_truncated} truncated ({truncation_rate:.1%})")
+            
+            # Print total evaluation statistics
+            print(f"📈 Total Evaluation Statistics:")
+            print(f"   Total Episodes: {self._total_eval_episodes_completed}")
+            print(f"   Total Average Return: {total_eval_avg_return:.3f} ± {np.std(self._all_eval_episode_returns):.3f}")
+            print(f"   Total Average Length: {total_eval_avg_length:.1f} ± {np.std(self._all_eval_episode_lengths):.1f}")
+            print(f"   Total Completions: {self._total_eval_episodes_terminated} terminated ({total_eval_termination_rate:.1%}), "
+                  f"{self._total_eval_episodes_truncated} truncated ({total_eval_truncation_rate:.1%})")
+            
             if bound_mass_list:
                 print(f"   Skill Entropy: {np.mean(ent_list):.3f}")
                 print(f"   Used Skills: {np.mean(used_skills_list):.1f}")
@@ -3104,6 +3168,7 @@ class PPOTrainer:
         # Aggregate & log
         def _p(arr, q): return float(np.percentile(arr, q)) if len(arr) else 0.0
         log_dict = {
+            # Current round statistics
             "eval/return_mean": float(final_avg_ret),
             "eval/return_median": float(_p(ret_list, 50)),
             "eval/return_10th": float(_p(ret_list, 10)),
@@ -3113,10 +3178,20 @@ class PPOTrainer:
             "eval/ep_len_mean": float(final_avg_len),
             "eval/ep_len_success_mean": float(np.mean(len_succ_list) if len(len_succ_list) else 0.0),
             "eval/coverage_pos_mean": float(final_avg_coverage),
-            # Episode completion statistics
+            # Current round episode completion statistics
             "eval/episodes_terminated": float(episodes_terminated),
             "eval/episodes_truncated": float(episodes_truncated),
             "eval/termination_rate": float(termination_rate),
+            # Total evaluation statistics (across all evaluations)
+            "eval_total/episodes_completed": float(self._total_eval_episodes_completed),
+            "eval_total/episodes_terminated": float(self._total_eval_episodes_terminated),
+            "eval_total/episodes_truncated": float(self._total_eval_episodes_truncated),
+            "eval_total/termination_rate": float(total_eval_termination_rate),
+            "eval_total/truncation_rate": float(total_eval_truncation_rate),
+            "eval_total/return_mean": float(total_eval_avg_return),
+            "eval_total/return_std": float(np.std(self._all_eval_episode_returns) if len(self._all_eval_episode_returns) > 1 else 0.0),
+            "eval_total/ep_len_mean": float(total_eval_avg_length),
+            "eval_total/ep_len_std": float(np.std(self._all_eval_episode_lengths) if len(self._all_eval_episode_lengths) > 1 else 0.0),
             # Action usage statistics
             "actions/eval_unique_actions": float(len(self._actions_used_in_eval)),
             "actions/eval_total_actions": float(self._action_bincount_eval.sum().item()),
