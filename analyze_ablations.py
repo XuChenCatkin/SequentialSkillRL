@@ -193,6 +193,10 @@ def analyze_logs_directory(logs_dir: str) -> pd.DataFrame:
         final_success_rate = metrics['eval_success_rate'][-1] if metrics['eval_success_rate'] else 0
         mean_curiosity_efficiency = np.mean(metrics['curiosity_efficiency']) if metrics['curiosity_efficiency'] else 0
         
+        # Calculate additional summary metrics
+        final_episode_length = metrics['eval_ep_len_mean'][-1] if metrics['eval_ep_len_mean'] else 0
+        final_entropy = metrics['actions_eval_entropy'][-1] if metrics['actions_eval_entropy'] else 0
+        
         # Calculate intrinsic reward contributions
         mean_int_dyn = np.mean(metrics['int_dyn']) if metrics['int_dyn'] else 0
         mean_int_hdp = np.mean(metrics['int_hdp']) if metrics['int_hdp'] else 0
@@ -248,7 +252,9 @@ def analyze_logs_directory(logs_dir: str) -> pd.DataFrame:
             'mean_train_action_entropy': mean_train_action_entropy,
             'mean_eval_action_entropy': mean_eval_action_entropy,
             'final_train_total_actions': final_train_total_actions,
-            'final_eval_total_actions': final_eval_total_actions
+            'final_eval_total_actions': final_eval_total_actions,
+            'final_episode_length': final_episode_length,
+            'final_entropy': final_entropy
         })
     
     return pd.DataFrame(runs_data)
@@ -679,10 +685,10 @@ def generate_summary_report(df: pd.DataFrame, output_dir: str):
         # Top performing configurations
         f.write("-" * 25 + " TOP PERFORMING CONFIGURATIONS " + "-" * 23 + "\n\n")
         if 'final_eval_return' in df.columns:
-            top_configs = df.nlargest(5, 'final_eval_return')[['mode', 'final_eval_return', 'run_id']]
+            top_configs = df.nlargest(5, 'final_eval_return')[['mode', 'final_eval_return', 'timestamp']]
             f.write("Top 5 Individual Runs by Final Evaluation Return:\n")
             for idx, row in top_configs.iterrows():
-                f.write(f"  {row['mode']:20} - Return: {row['final_eval_return']:8.4f} (Run: {row['run_id']})\n")
+                f.write(f"  {row['mode']:20} - Return: {row['final_eval_return']:8.4f} (Run: {row['timestamp']})\n")
         
         # Best average performance by mode
         f.write("\nBest Average Performance by Mode:\n")
@@ -904,6 +910,77 @@ def print_summary_table(df: pd.DataFrame):
     
     print("=" * 120)
 
+def fetch_wandb_results(project_name: str) -> pd.DataFrame:
+    """Fetch results from Weights & Biases project."""
+    try:
+        import wandb
+        
+        print(f"📊 Fetching results from W&B project: {project_name}")
+        
+        # Initialize wandb API
+        api = wandb.Api()
+        
+        # Get all runs from the project
+        runs = api.runs(f"{api.default_entity}/{project_name}")
+        
+        runs_data = []
+        for run in runs:
+            # Extract configuration and summary metrics
+            config = run.config
+            summary = run.summary
+            
+            # Extract mode from run name or config
+            mode = config.get('mode', run.name.split('_')[1] if '_' in run.name else 'unknown')
+            
+            # Extract metrics from summary
+            run_data = {
+                'mode': mode,
+                'timestamp': run.created_at.strftime('%Y%m%d_%H%M%S'),
+                'log_file': f"wandb_{run.id}",
+                'total_steps': summary.get('steps', 0),
+                'final_ext_return': summary.get('return/mean_ext', 0),
+                'mean_ext_return': summary.get('return/mean_ext', 0),
+                'final_eval_return': summary.get('eval/return_mean', 0),
+                'mean_eval_return': summary.get('eval/return_mean', 0),
+                'final_success_rate': summary.get('eval/success_rate', 0),
+                'mean_curiosity_efficiency': summary.get('curiosity/efficiency', 0),
+                'mean_int_dyn': summary.get('int/dyn_mean', 0),
+                'mean_int_hdp': summary.get('int/hdp_mean', 0),
+                'mean_int_trans': summary.get('int/trans_mean', 0),
+                'mean_int_rnd': summary.get('int/rnd_mean', 0),
+                'total_intrinsic': (summary.get('int/dyn_mean', 0) + 
+                                  summary.get('int/hdp_mean', 0) + 
+                                  summary.get('int/trans_mean', 0) + 
+                                  summary.get('int/rnd_mean', 0)),
+                'mean_coverage': summary.get('eval/coverage_pos_mean', 0),
+                'mean_ep_length': summary.get('eval/ep_len_mean', 0),
+                'mean_skill_entropy': summary.get('eval/skill_entropy_mean', 0),
+                'mean_used_skills': summary.get('eval/used_skills_mean', 0),
+                'mean_effective_K': summary.get('eval/effective_K_mean', 0),
+                'mean_boundary_mass': summary.get('eval/skill_boundary_mass_rate', 0),
+                'mean_vae_loss': summary.get('vae/total_loss', 0),
+                'mean_train_unique_actions': summary.get('actions/train_unique_count', 0),
+                'mean_eval_unique_actions': summary.get('actions/eval_unique_count', 0),
+                'mean_train_action_entropy': summary.get('actions/train_entropy', 0),
+                'mean_eval_action_entropy': summary.get('actions/eval_entropy', 0),
+                'final_train_total_actions': summary.get('actions/train_total_count', 0),
+                'final_eval_total_actions': summary.get('actions/eval_total_count', 0),
+                'final_episode_length': summary.get('eval/ep_len_mean', 0),
+                'final_entropy': summary.get('actions/eval_entropy', 0)
+            }
+            
+            runs_data.append(run_data)
+        
+        print(f"✅ Fetched {len(runs_data)} runs from W&B")
+        return pd.DataFrame(runs_data)
+        
+    except ImportError:
+        print("❌ wandb not installed. Install with: pip install wandb")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"❌ Error fetching from W&B: {e}")
+        return pd.DataFrame()
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze SequentialSkillRL ablation study results")
     parser.add_argument("--logs_dir", default="logs", help="Directory containing log files")
@@ -915,10 +992,14 @@ def main():
     args = parser.parse_args()
     
     print(f"🔍 Analyzing ablation study results...")
-    print(f"📁 Logs directory: {args.logs_dir}")
     
-    # Analyze log files
-    df = analyze_logs_directory(args.logs_dir)
+    # Fetch data from W&B if project specified
+    if args.wandb_project:
+        df = fetch_wandb_results(args.wandb_project)
+    else:
+        print(f"📁 Logs directory: {args.logs_dir}")
+        # Analyze log files
+        df = analyze_logs_directory(args.logs_dir)
     
     if df.empty:
         print("❌ No ablation study results found")
