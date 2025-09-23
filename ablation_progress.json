@@ -30,8 +30,8 @@
     {
       "mode": "no_hmm_rnd",
       "seed": 51,
-      "success": false,
-      "timestamp": "2025-09-23T00:47:56.993791",
+      "success": true,
+      "timestamp": "2025-09-22T22:53:31.810633",
       "resume_repo": null,
       "resume_local": null
     },
