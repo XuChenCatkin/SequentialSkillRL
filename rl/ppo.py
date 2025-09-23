@@ -93,6 +93,7 @@ class HMMOnlineConfig:
     hmm_update_growth: float = 1.30         # after each refresh: interval *= growth
     hmm_update_every_cap: int = 60_000      # cap interval to avoid going too sparse
     hmm_fit_window: int = 400_000           # how many most recent steps to re-fit on
+    hmm_max_batch_size: int = 128           # maximum batch size for HMM updates to prevent OOM
     hmm_max_iters: int = 7                  # inner VI iterations
     hmm_tol: float = 1e-2                   # relative ELBO tolerance
     hmm_elbo_drop_tol: float = 1e-2         # relative ELBO drop tolerance for early stopping
@@ -2082,6 +2083,20 @@ class PPOTrainer:
             mu, diag_var, lowrank, mask = self._split_rollouts_by_episode(mu, diag_var, lowrank, mask, replay_dones)
 
         B, T, D = mu.shape
+        
+        # Cap batch size to prevent OOM during HMM training
+        if B > self.hmm_cfg.hmm_max_batch_size:
+            if logger is not None:
+                logger.info(f"🔄 Capping HMM batch size from {B} to {self.hmm_cfg.hmm_max_batch_size} to prevent OOM")
+            
+            # Randomly sample a subset of sequences to keep training diverse
+            indices = torch.randperm(B, device=mu.device)[:self.hmm_cfg.hmm_max_batch_size]
+            mu = mu[indices]
+            diag_var = diag_var[indices]
+            mask = mask[indices]
+            if lowrank is not None:
+                lowrank = lowrank[indices]
+            B = self.hmm_cfg.hmm_max_batch_size
         
         # Log HMM refresh start
         if logger is not None:

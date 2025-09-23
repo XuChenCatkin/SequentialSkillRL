@@ -758,6 +758,11 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "rl":
         print(f"🎮 Reinforcement Learning mode activated")
         
+        # Define valid modes for ablation studies
+        valid_model_modes = ["baseline", "no_hmm"]
+        valid_reward_modes = ["full_curiosity", "curiosity_dyn_only", "curiosity_skill_only", 
+                             "curiosity_trans_only", "rnd", "no_intrinsic"]
+        
         # Parse ablation mode and options
         model_mode = "baseline"  # default: VAE+HMM
         reward_mode = "full_curiosity"  # default: all intrinsic rewards
@@ -777,11 +782,6 @@ if __name__ == "__main__":
         no_hmm_flag = False
         no_intrinsic_flag = False
         
-        # Parse positional arguments (model_mode and/or reward_mode) - order independent!
-        valid_model_modes = ["baseline", "no_hmm"]
-        valid_reward_modes = ["full_curiosity", "curiosity_dyn_only", "skill_entropy_only", 
-                             "skill_transition_only", "rnd_only", "no_intrinsic"]
-        
         positional_args = []
         # Collect all positional arguments (non-flag arguments)
         while i < len(sys.argv) and not sys.argv[i].startswith('--'):
@@ -797,9 +797,10 @@ if __name__ == "__main__":
             else:
                 # Legacy compatibility: try to map old single-mode names
                 legacy_mappings = {
-                    "rnd": ("baseline", "rnd_only"),
-                    "curiosity_skill_only": ("baseline", "skill_entropy_only"),
-                    "curiosity_trans_only": ("baseline", "skill_transition_only"),
+                    "rnd": ("baseline", "rnd"),
+                    "rnd_only": ("baseline", "rnd"),
+                    "skill_entropy_only": ("baseline", "curiosity_skill_only"),
+                    "skill_transition_only": ("baseline", "curiosity_trans_only"),
                 }
                 if arg in legacy_mappings:
                     legacy_model, legacy_reward = legacy_mappings[arg]
@@ -866,38 +867,18 @@ if __name__ == "__main__":
                 print(f"⚠️  Unknown option: {sys.argv[i]}")
                 i += 1
         
-        # Validate model and reward mode combinations
-        valid_model_modes = ["baseline", "no_hmm"]
-        valid_reward_modes = ["full_curiosity", "curiosity_dyn_only", "curiosity_skill_only", 
-                             "curiosity_trans_only", "rnd", "no_intrinsic"]
-        
-        if model_mode not in valid_model_modes:
-            print(f"❌ Invalid model mode: {model_mode}")
-            print(f"   Valid model modes: {', '.join(valid_model_modes)}")
-            sys.exit(1)
-            
-        if reward_mode not in valid_reward_modes:
-            print(f"❌ Invalid reward mode: {reward_mode}")
-            print(f"   Valid reward modes: {', '.join(valid_reward_modes)}")
-            sys.exit(1)
-        
-        # Final validation of parsed modes
-        if model_mode not in valid_model_modes:
-            print(f"❌ Invalid model mode: {model_mode}")
-            print(f"   Valid model modes: {', '.join(valid_model_modes)}")
-            sys.exit(1)
-        
-        if reward_mode not in valid_reward_modes:
-            print(f"❌ Invalid reward mode: {reward_mode}")
-            print(f"   Valid reward modes: {', '.join(valid_reward_modes)}")
-            sys.exit(1)
+        # Smart default: if no_hmm is specified but reward_mode is still default, 
+        # use a compatible reward mode
+        if model_mode == "no_hmm" and reward_mode == "full_curiosity":
+            reward_mode = "curiosity_dyn_only"  # Safe default for no_hmm
+            print(f"🔧 Auto-adjusted: Using '{reward_mode}' reward mode with '{model_mode}' (skill-based rewards require HMM)")
         
         # Validate that skill-based rewards require HMM
-        skill_based_rewards = ["skill_entropy_only", "skill_transition_only", "full_curiosity"]
+        skill_based_rewards = ["curiosity_skill_only", "curiosity_trans_only", "full_curiosity"]
         if model_mode == "no_hmm" and reward_mode in skill_based_rewards:
             print(f"❌ Invalid combination: {reward_mode} requires HMM but model_mode is {model_mode}")
             print(f"   Skill-based rewards (skill entropy, transition novelty) require HMM")
-            print(f"   Use 'curiosity_dyn_only', 'rnd_only', or 'no_intrinsic' with 'no_hmm'")
+            print(f"   Use 'curiosity_dyn_only', 'rnd', or 'no_intrinsic' with 'no_hmm'")
             sys.exit(1)
         
         # Create combined ablation name for logging and identification
@@ -1035,6 +1016,7 @@ if __name__ == "__main__":
                 hmm_update_growth=1.2,    # Growth factor for update interval
                 hmm_update_every_cap=12_000, # Cap for update interval
                 hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
+                hmm_max_batch_size=128,    # Cap batch size to prevent OOM (was causing 20GB allocations)
                 hmm_max_iters=5,           # Up to 5 iterations per update
                 hmm_tol=1e-2,
                 hmm_elbo_drop_tol=1e-2,
