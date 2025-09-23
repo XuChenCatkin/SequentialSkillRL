@@ -1,0 +1,47 @@
+{
+  "timestamp": "2025-09-23T03:17:28.781628",
+  "current_run": 5,
+  "total_runs": 5,
+  "results": [
+    {
+      "mode": "no_hmm_no_intrinsic",
+      "seed": 51,
+      "success": true,
+      "timestamp": "2025-09-22T22:02:36.916654",
+      "resume_repo": null,
+      "resume_local": null
+    },
+    {
+      "mode": "hmm_no_intrinsic",
+      "seed": 51,
+      "success": true,
+      "timestamp": "2025-09-22T23:59:18.924960",
+      "resume_repo": null,
+      "resume_local": null
+    },
+    {
+      "mode": "no_hmm_dyn_only",
+      "seed": 51,
+      "success": true,
+      "timestamp": "2025-09-23T00:47:52.800953",
+      "resume_repo": null,
+      "resume_local": null
+    },
+    {
+      "mode": "no_hmm_rnd",
+      "seed": 51,
+      "success": false,
+      "timestamp": "2025-09-23T00:47:56.993791",
+      "resume_repo": null,
+      "resume_local": null
+    },
+    {
+      "mode": "hmm_dyn_only",
+      "seed": 51,
+      "success": true,
+      "timestamp": "2025-09-23T03:17:28.781605",
+      "resume_repo": null,
+      "resume_local": null
+    }
+  ]
+}
