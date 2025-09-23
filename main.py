@@ -101,6 +101,7 @@ Examples:
     python main.py rl baseline --resume_local ./checkpoints/ppo_policy.pth  # Resume from local PPO, load VAE/HMM separately
 """
 import logging
+import math
 import os
 import sys
 import torch
@@ -945,7 +946,15 @@ if __name__ == "__main__":
                 use_skill_transition_novelty=True,  # Skill transition novelty
                 use_rnd=False,
                 # Skill boundary gating
-                use_skill_boundary_gate=True
+                use_skill_boundary_gate=True,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
             )
             reward_description = "full curiosity (dynamics + skill entropy + transition novelty)"
             
@@ -954,7 +963,15 @@ if __name__ == "__main__":
                 use_dyn_kl=True,           # Only dynamics surprise
                 use_skill_entropy=False,
                 use_skill_transition_novelty=False,
-                use_rnd=False
+                use_rnd=False,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
             )
             reward_description = "dynamics curiosity only"
             
@@ -964,7 +981,15 @@ if __name__ == "__main__":
                 use_skill_entropy=True,    # Only skill entropy
                 use_skill_transition_novelty=False,
                 use_rnd=False,
-                use_skill_boundary_gate=True
+                use_skill_boundary_gate=True,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
             )
             reward_description = "skill entropy curiosity only"
             
@@ -973,7 +998,15 @@ if __name__ == "__main__":
                 use_dyn_kl=False,
                 use_skill_entropy=False,
                 use_skill_transition_novelty=True,  # Only skill transition novelty
-                use_rnd=False
+                use_rnd=False,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
             )
             reward_description = "skill transition novelty only"
             
@@ -982,7 +1015,15 @@ if __name__ == "__main__":
                 use_dyn_kl=False,          # Disable curiosity components
                 use_skill_entropy=False,
                 use_skill_transition_novelty=False,
-                use_rnd=True              # Enable RND
+                use_rnd=True,             # Enable RND
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
             )
             reward_description = "RND intrinsic motivation"
             
@@ -991,7 +1032,15 @@ if __name__ == "__main__":
                 use_dyn_kl=False,          # Disable all intrinsic rewards
                 use_skill_entropy=False,
                 use_skill_transition_novelty=False,
-                use_rnd=False
+                use_rnd=False,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
             )
             reward_description = "no intrinsic rewards (extrinsic only)"
         

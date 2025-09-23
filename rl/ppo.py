@@ -57,13 +57,13 @@ class CuriosityConfig:
     use_rnd: bool = False         # RND baseline (set True for baseline run)
 
     # Annealing: eta(t) = eta0 * exp(-t / tau)
-    eta0_dyn: float = 0.3
+    eta0_dyn: float = 0.003
     tau_dyn: float = 4e5
-    eta0_hdp: float = 0.2         # for boundary-gated skill entropy
+    eta0_hdp: float = 0.002         # for boundary-gated skill entropy
     tau_hdp: float = 8e5
-    eta0_stn: float = 0.05         # anneal multiplier for skill‑transition novelty
+    eta0_stn: float = 0.0005         # anneal multiplier for skill‑transition novelty
     tau_stn: float = 1.3e6
-    eta0_rnd: float = 0.1        # keep smaller by default
+    eta0_rnd: float = 0.01        # keep smaller by default
     tau_rnd: float = 2.8e5
 
     # EMA norm for each raw term
@@ -415,7 +415,7 @@ class CuriosityComputer:
         pchg = torch.zeros(B, T, device=self.device, dtype=mu_seq.dtype)
         use_sample = self.hmm_cfg.student_t_use_sample and self.global_step < self.hmm_cfg.emission_sample_warmup_steps
         logB = self.hmm.make_logB_for_filter(
-                    mu_seq, diagvar_seq, F_seq, None, self.hmm_cfg.emission_mode, use_sample, self.hmm_cfg.student_t_scale_temp
+                    mu_seq, diagvar_seq, F_seq, mask, self.hmm_cfg.emission_mode, use_sample, self.hmm_cfg.student_t_scale_temp
                 )
 
         for b in range(B):
@@ -427,36 +427,8 @@ class CuriosityComputer:
                     # Previous step was terminal, start new HMM chain
                     st = None
                     prev_valid = False
-                
-                if mask is not None and not bool(mask[b, t].item()):
-                    # Invalid observation: transition through without emission update
-                    if st is not None and prev_valid:
-                        # Apply transition-only step to maintain chain continuity
-                        # Use prior transition probabilities to update state
-                        log_alpha_pred = st.log_alpha.unsqueeze(1) + logA  # [Kp1, Kp1]
-                        st.log_alpha = torch.logsumexp(log_alpha_pred, dim=0)  # [Kp1]
-                        # Set outputs to NaN/zero for invalid timesteps
-                        alpha[b, t] = torch.full((Kp1,), float('nan'), device=self.device)
-                        H[b, t] = float('nan')
-                        pchg[b, t] = float('nan')
-                    else:
-                        # No previous state to transition from
-                        alpha[b, t] = torch.full((Kp1,), float('nan'), device=self.device)
-                        H[b, t] = float('nan')
-                        pchg[b, t] = float('nan')
-                    continue
-                
+                    
                 logB_t = logB[b, t]  # [Kp1]
-                
-                # Diagnostic: Check for extreme logB_t values that might cause uniform posterior
-                # if t % 1000 == 0 and b == 0:  # Log occasionally
-                #     logB_range = logB_t.max() - logB_t.min()
-                #     unused_skills = (self.hmm.niw.nu <= 106.1).float().sum().item()  # Count near-prior skills
-                #     used_skills = (self.hmm.niw.nu > 106.1).float().sum().item()
-                #     print(f"🔍 logB_t at t={t}: range={logB_range:.2f}, "
-                #           f"unused_skills={unused_skills}, used_skills={used_skills}")
-                #     print(f"   logB_t[unused] ≈ {logB_t[self.hmm.niw.nu <= 106.1].mean():.2f}, "
-                #           f"logB_t[used] ≈ {logB_t[self.hmm.niw.nu > 106.1].mean():.2f}")
                 
                 if not prev_valid or st is None:
                     # Initialize new HMM chain (start of episode or after invalid step)
