@@ -522,7 +522,7 @@ class CuriosityComputer:
                     # xi is [B, T-1, Kp1, Kp1] - pairwise posteriors ξ_{t-1,t}
                     xi = filted["xi"]      # [B,T-1,Kp1,Kp1]
                     logA = self.hmm.make_logA_for_filter(self.hmm_cfg.transition_mode, self.hmm_cfg.transition_temperature) 
-                    neg_logA = (-logA).clamp_min(0.0)            # [Kp1,Kp1]
+                    neg_logA = (-logA).clamp(min=0.0, max=8.0)            # [Kp1,Kp1]
                     neg_logA.fill_diagonal_(0.0)                  # ignore self-transitions
                     for t in range(1, T):  # start from t=1 since xi[t-1] exists
                         # Don't compute transition novelty across episode boundaries
