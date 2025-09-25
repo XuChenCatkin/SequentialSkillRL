@@ -634,6 +634,7 @@ def load_model_from_huggingface(
     token: Optional[str] = None,
     device: str = "cpu",
     filename: str = "pytorch_model.bin",  # Allow custom filename
+    fallback_to_checkpoint_config: bool = True,  # New option to enable fallback
     **model_kwargs
 ) -> tuple[MultiModalHackVAE, VAEConfig]:
     """
@@ -645,6 +646,7 @@ def load_model_from_huggingface(
         token: HuggingFace token (if needed for private repos)
         device: Device to load the model on
         filename: Model file name in the repo (default: "pytorch_model.bin")
+        fallback_to_checkpoint_config: If True, try to extract config from .pth file when config.json is missing
         **model_kwargs: Additional arguments for model initialization (override config)
         
     Returns:
@@ -659,9 +661,11 @@ def load_model_from_huggingface(
         login(token=token)
     
     api = HfApi()
+    config = None
+    config_from_json = False
     
     try:
-        # Download config
+        # Try to download config.json first
         print(f"📥 Downloading model config from {repo_name}...")
         config_path = hf_hub_download(
             repo_id=repo_name,
@@ -673,29 +677,84 @@ def load_model_from_huggingface(
         with open(config_path, "r") as f:
             config = json.load(f)
         
-        print(f"📋 Model config loaded: {config}")
+        print(f"📋 Model config loaded from config.json: {config}")
+        config_from_json = True
         
-        # Download model file
-        print(f"📥 Downloading model weights from {repo_name}...")
-        model_path = hf_hub_download(
-            repo_id=repo_name,
-            filename=filename,  # Use the provided filename
-            repo_type="model",
-            revision=revision_name
-        )
+    except Exception as config_error:
+        print(f"⚠️  Could not load config.json: {config_error}")
+        
+        if fallback_to_checkpoint_config:
+            print(f"🔄 Attempting to extract config from model checkpoint...")
+            try:
+                # Download model file first to try extracting config
+                model_path = hf_hub_download(
+                    repo_id=repo_name,
+                    filename=filename,
+                    repo_type="model",
+                    revision=revision_name
+                )
+                
+                # Load checkpoint and try to extract config
+                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+                
+                if 'config' in checkpoint:
+                    # Config found in checkpoint
+                    config = checkpoint['config']
+                    if hasattr(config, '__dict__'):
+                        # Convert VAEConfig object to dict for consistency
+                        config = config.__dict__
+                    print(f"📋 Model config extracted from checkpoint: {config}")
+                    config_from_json = False
+                else:
+                    print(f"⚠️  No config found in checkpoint either")
+                    config = None
+                    
+            except Exception as checkpoint_error:
+                print(f"❌ Could not extract config from checkpoint: {checkpoint_error}")
+                config = None
+        else:
+            print(f"🚫 Fallback to checkpoint config disabled")
+            config = None
+
+    try:
+        # Download model file if not already downloaded
+        if 'model_path' not in locals():
+            print(f"📥 Downloading model weights from {repo_name}...")
+            model_path = hf_hub_download(
+                repo_id=repo_name,
+                filename=filename,  # Use the provided filename
+                repo_type="model",
+                revision=revision_name
+            )
         
         # Load checkpoint to check format
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        
-        # Check if we have a modern VAEConfig in the config or checkpoint
+        if 'checkpoint' not in locals():
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         if 'config' in checkpoint and hasattr(checkpoint['config'], 'latent_dim'):
             # Modern checkpoint with VAEConfig
             vae_config = checkpoint['config']
             print(f"🏗️  Using saved VAEConfig from checkpoint")
+        elif config_from_json and config:
+            # Use config from config.json
+            vae_config = VAEConfig()
+            # Apply config from JSON
+            for key, value in config.items():
+                if hasattr(vae_config, key):
+                    setattr(vae_config, key, value)
+            print(f"🏗️  Using VAEConfig from config.json")
+            
+        elif config and not config_from_json:
+            # Config extracted from checkpoint as dict
+            vae_config = VAEConfig()
+            for key, value in config.items():
+                if hasattr(vae_config, key):
+                    setattr(vae_config, key, value)
+            print(f"🏗️  Using VAEConfig extracted from checkpoint")
+            
         else:
             # Create default VAEConfig
             vae_config = VAEConfig()
-            print(f"🏗️  No config in checkpoint. Created default VAEConfig")
+            print(f"🏗️  No config found. Created default VAEConfig")
         
         # Apply any overrides from model_kwargs
         if model_kwargs:
@@ -1208,21 +1267,24 @@ def load_hmm_from_huggingface(
         login(token=token)
     
     try:
-        # Download config first
-        print(f"📥 Downloading HMM config from {repo_name}...")
-        config_path = hf_hub_download(
-            repo_id=repo_name,
-            filename="config.json",
-            repo_type="model",
-            revision=revision_name
-        )
-        
-        with open(config_path, "r") as f:
-            config_data = json.load(f)
-        
-        # Determine which round to load
-        if round_num is None:
-            round_num = config_data.get('round', 1)
+        try:
+            # Download config first
+            print(f"📥 Downloading HMM config from {repo_name}...")
+            config_path = hf_hub_download(
+                repo_id=repo_name,
+                filename="config.json",
+                repo_type="model",
+                revision=revision_name
+            )
+            
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+            
+            # Determine which round to load
+            if round_num is None:
+                round_num = config_data.get('round', 1)
+        except Exception as e:
+            round_num = 4 if round_num is None else round_num
         
         # Determine filename
         if filename is not None:
@@ -1247,6 +1309,7 @@ def load_hmm_from_huggingface(
         config = hmm_checkpoint['config']
         hmm_params = hmm_checkpoint['hmm_params'] 
         niw_prior = hmm_checkpoint['niw_prior']
+        phi_prior = hmm_checkpoint.get('phi_prior', None)  # Optional
         hmm_posterior_params = hmm_checkpoint['hmm_posterior_params']
         rho_emission = hmm_checkpoint['rho_emission']
         rho_transition = hmm_checkpoint['rho_transition']
@@ -1257,7 +1320,8 @@ def load_hmm_from_huggingface(
             p=hmm_params,
             niw_prior=niw_prior,
             rho_emission=rho_emission,
-            rho_transition=rho_transition
+            rho_transition=rho_transition,
+            phi_prior=phi_prior
         )
         
         # Load posterior parameters instead of state_dict

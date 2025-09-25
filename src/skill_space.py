@@ -119,7 +119,8 @@ class StickyHDPHMMVI(nn.Module):
         p: StickyHDPHMMParams,
         niw_prior: NIWPrior,
         rho_emission: float = 0.05,
-        rho_transition: Optional[float] = None
+        rho_transition: Optional[float] = None,
+        phi_prior: Optional[torch.Tensor] = None  # [Kp1,Kp1] or None
     ):
         super().__init__()
         self.p = p
@@ -161,7 +162,7 @@ class StickyHDPHMMVI(nn.Module):
         
         # Store phi prior for transitions (updated by set_posterior_as_prior)
         self.phi_prior_init = self._phi_prior_init()
-        self.register_buffer("phi_prior", self.phi_prior_init)  # [Kp1, Kp1]
+        self.register_buffer("phi_prior", self.phi_prior_init if phi_prior is None else phi_prior.to(device=dev, dtype=dt))  # [Kp1, Kp1]
 
         # Streaming defaults + lazy buffers
         self.stream_rho_niw = float(rho_emission)
@@ -1414,6 +1415,17 @@ class StickyHDPHMMVI(nn.Module):
             "phi": self.dir.phi.detach(),      # [Kp1,Kp1]
             "beta_u": self.u_beta.detach(),    # [K]
         }
+        
+    def get_niw_prior_params(self) -> NIWPrior:
+        return NIWPrior(
+            mu0=self.mu0.detach(),          # [Kp1,D]
+            kappa0=self.kappa0.detach(),    # [Kp1]
+            Psi0=self.Psi0.detach(),        # [Kp1,D,D]
+            nu0=self.nu0.detach()           # [Kp1]
+        )
+
+    def get_phi_prior_params(self) -> Dict[str, torch.Tensor]:
+        return self.phi_prior.detach()    # [Kp1,Kp1]
 
     def get_emission_expectations(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.niw.mu, self._get_E_Lambda(), self._get_E_logdet_Lambda()

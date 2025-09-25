@@ -165,7 +165,8 @@ def train_online_ppo_with_pretrained_models(
                             repo_name=unified_repo,
                             filename=vae_filename,
                             token=hf_token,
-                            device=str(device)
+                            device=str(device),
+                            fallback_to_checkpoint_config=True  # Enable fallback for unified repos
                         )
                         if logger: logger.info(f"✅ VAE loaded from {vae_filename}")
                         break
@@ -181,7 +182,8 @@ def train_online_ppo_with_pretrained_models(
                 vae_model, config = load_model_from_huggingface(
                     repo_name=vae_repo_id,
                     token=hf_token,
-                    device=str(device)
+                    device=str(device),
+                    fallback_to_checkpoint_config=True  # Enable fallback for VAE repos
                 )
             
             # Load HMM from unified repo (if HMM is being used)
@@ -223,7 +225,8 @@ def train_online_ppo_with_pretrained_models(
             vae_model, config = load_model_from_huggingface(
                 repo_name=vae_repo_id,
                 token=hf_token,
-                device=str(device)
+                device=str(device),
+                fallback_to_checkpoint_config=True  # Enable fallback for VAE repos
             )
             
             # Load HMM from dedicated HMM repo (if specified)
@@ -646,15 +649,24 @@ def train_online_ppo_with_pretrained_models(
                 if logger: logger.info("📤 Uploading HMM model...")
                 try:
                     # Save HMM model locally first
-                    hmm_save_path = checkpoint_dir / "hmm_model.pth"
-                    torch.save({
-                        'model_state_dict': hmm_model.state_dict() if hasattr(hmm_model, 'state_dict') else hmm_model,
-                        'model_class': hmm_model.__class__.__name__
-                    }, hmm_save_path)
+                    hmm_save_path = checkpoint_dir / "hmm_model.pt"
+                    hmm_save_data = {
+                        'config': config,
+                        'hmm_posterior_params': hmm_model.get_posterior_params(),
+                        'hmm_params': hmm_params,
+                        'niw_prior': hmm_model.get_niw_prior_params(),
+                        'phi_prior': hmm_model.get_phi_prior_params(),
+                        'rho_emission': hmm_model.get_rho_emission().cpu(),
+                        'rho_transition': hmm_model.get_rho_transition().cpu(),
+                        'round': None,
+                        'training_timestamp': datetime.now().isoformat(),
+                        'diagnostics': None
+                    }
+                    torch.save(hmm_save_data, hmm_save_path)
                     
                     upload_file(
                         path_or_fileobj=str(hmm_save_path),
-                        path_in_repo="hmm_model.pth",
+                        path_in_repo="hmm_model.pt",
                         repo_id=target_repo,
                         token=hf_token,
                         commit_message=f"Upload HMM model for {wandb_run_name}"
