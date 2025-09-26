@@ -71,7 +71,7 @@ Commands:
         - HMM online learning (update frequency, fitting window)
         - Training setup (environment, device, logging, checkpointing)
     
-    vae_analysis <repo_name>       - Run VAE analysis and visualization
+    vae_analysis <repo_name> [revision] [save_dir] [seed] [hmm_repo] [hmm_revision] - Run VAE analysis and visualization
     bin_count_analysis [top_k]     - Analyze glyph character/color distributions  
     hmm_analysis <repo_name>       - Run HMM analysis and visualization
     plot_bin_count <data_path>     - Plot from saved bin count data
@@ -99,6 +99,19 @@ Examples:
     # Continue training from existing checkpoints
     python main.py rl baseline --resume CatkinChen/nethack-ppo-unified     # Resume from unified repo (VAE+HMM+PPO)
     python main.py rl baseline --resume_local ./checkpoints/ppo_policy.pth  # Resume from local PPO, load VAE/HMM separately
+    
+    # VAE Analysis Examples
+    python main.py vae_analysis CatkinChen/nethack-vae                           # Default analysis (save_dir="vae_analysis", seed=50)
+    python main.py vae_analysis CatkinChen/nethack-vae main custom_output        # Use main revision, save to custom_output/
+    python main.py vae_analysis CatkinChen/nethack-vae main results 42           # Custom save dir and seed for reproducibility
+    python main.py vae_analysis CatkinChen/nethack-vae main results 42 CatkinChen/nethack-hmm       # With HMM from separate repo
+    python main.py vae_analysis CatkinChen/nethack-vae main results 42 CatkinChen/nethack-hmm v2.0  # With HMM repo and revision
+    
+    Note for vae_analysis:
+    - If config.prior_mode == 'hmm' or hmm_repo is specified, β-KL will be calculated against HMM prior instead of N(0,I)
+    - Random seed affects batch shuffling and latent space analysis sampling
+    - HMM can be loaded from a separate repository (common setup: VAE and HMM trained separately)
+    - If HMM loading fails, analysis will fallback to standard Normal prior with a warning
 """
 import logging
 import math
@@ -126,12 +139,24 @@ if __name__ == "__main__":
     
     
     if len(sys.argv) > 1 and sys.argv[1] == "vae_analysis":
-        # Demo mode: python train.py vae_analysis <repo_name> [revision_name]
+        # Demo mode: python main.py vae_analysis <repo_name> [revision_name] [save_dir] [seed] [hmm_repo_name] [hmm_revision_name]
         repo_name = sys.argv[2] if len(sys.argv) > 2 else "CatkinChen/nethack-vae"
         revision_name = sys.argv[3] if len(sys.argv) > 3 else None
+        save_dir = sys.argv[4] if len(sys.argv) > 4 else "vae_analysis"
+        analysis_seed = int(sys.argv[5]) if len(sys.argv) > 5 else 50
+        hmm_repo_name = sys.argv[6] if len(sys.argv) > 6 else None
+        hmm_revision_name = sys.argv[7] if len(sys.argv) > 7 else None
         
         print(f"🚀 Running VAE Analysis Demo")
-        print(f"📦 Repository: {repo_name}")
+        print(f"📦 VAE Repository: {repo_name}")
+        if revision_name:
+            print(f"   VAE Revision: {revision_name}")
+        if hmm_repo_name:
+            print(f"🧠 HMM Repository: {hmm_repo_name}")
+            if hmm_revision_name:
+                print(f"   HMM Revision: {hmm_revision_name}")
+        print(f"📁 Save Directory: {save_dir}")
+        print(f"🎲 Analysis Seed: {analysis_seed}")
         
         # Create both training and test data
         print(f"📊 Preparing training and test data...")
@@ -170,12 +195,14 @@ if __name__ == "__main__":
                 train_dataset=train_dataset,
                 test_dataset=test_dataset,
                 revision_name=revision_name,
+                hmm_repo_name=hmm_repo_name,
+                hmm_revision_name=hmm_revision_name,
                 device="cpu",  # Use CPU for demo
                 num_samples=10,
                 max_latent_samples=1000,  # More samples since we have both datasets
-                save_dir="vae_analysis",
+                save_dir=save_dir,
                 random_sampling=True,  # Enable random sampling
-                random_seed=50,  # For reproducible results
+                random_seed=analysis_seed,  # For reproducible results
                 use_mean=True,  # Use mean for latent space
                 map_occ_thresh=0.5,
                 bag_presence_thresh=0.5,

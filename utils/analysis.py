@@ -18,6 +18,7 @@ import math
 
 from src.model import bag_presence_to_glyph_sets, make_pair_bag, MapDecoder
 from src.skill_space import StickyHDPHMMVI
+from utils.math_utils import kl_gaussian_lowrank_to_fixed_gaussians
 
 # Import NetHackCategory from data_collection
 try:
@@ -850,6 +851,9 @@ def analyze_latent_space(
     dataset_labels=None,
     tsne_on_pca=True,
     jitter_eps=1e-5,
+    random_seed=None,
+    config=None,
+    hmm=None,
 ):
     """
     Balanced latent-space analysis with MI/TC/DW that includes posterior noise.
@@ -865,6 +869,15 @@ def analyze_latent_space(
 
     model.eval()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # Set random seed for reproducibility if provided
+    if random_seed is not None:
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(random_seed)
+        print(f"🎲 Set random seed to {random_seed} for latent space analysis")
 
     if dataset_labels is None:
         dataset_labels = ['train'] * len(dataset)  # default to train
@@ -890,9 +903,10 @@ def analyze_latent_space(
 
     # containers
     mu_list, logvar_list, lowrank_list, ds_list = [], [], [], []
+    mu_k_list, E_Lambda_list, logdet_Sigma_k, r_hat_list = [], [], [], []
 
     def _pull_from_batches(batches, target, tag):
-        nonlocal mu_list, logvar_list, lowrank_list, ds_list
+        nonlocal mu_list, logvar_list, lowrank_list, ds_list, mu_k_list, E_Lambda_list, logdet_Sigma_k, r_hat_list
         got = 0
         with torch.no_grad():
             for batch in batches:
@@ -910,11 +924,15 @@ def analyze_latent_space(
                             BT = B * T if BT is None else BT
                         flat[k] = v
                 valid = flat.get('valid_screen')
+                flat['original_batch_shape'] = (B, T)
+                if hmm is not None: flat['sticky_hmm'] = hmm
                 if valid is None:
                     # assume everything valid
                     N = next(iter(flat.values())).shape[0]
                     valid = torch.ones(N, dtype=torch.bool, device=device)
 
+                out = model(flat)
+                
                 idx = torch.where(valid)[0]
                 if idx.numel() == 0:
                     continue
@@ -925,23 +943,24 @@ def analyze_latent_space(
                 perm = torch.randperm(idx.numel(), device=device)[:need]
                 idx = idx[perm]
 
-                feed = {
-                    'game_chars':    flat['game_chars'][idx],
-                    'game_colors':   flat['game_colors'][idx],
-                    'blstats':       flat['blstats'][idx],
-                    'message_chars': flat['message_chars'][idx],
-                    'hero_info':     flat['hero_info'][idx],
-                }
-                out = model(feed)
-                mu      = out['mu']                        # [n,D]
-                logvar  = out.get('logvar', None)          # [n,D]
+                mu      = out['mu'][idx]                        # [n,D]
+                logvar  = out['logvar'][idx]          # [n,D]
                 lowrank = out.get('lowrank_factors', None) # [n,D,R] or None
+                hmm_cache = flat.get('hmm_cache', None)
+                if lowrank is not None:
+                    lowrank = lowrank[idx]
+                if hmm_cache is not None:
+                    hmm_cache = hmm_cache[idx]
 
                 mu_list.append(mu.detach().cpu().numpy())
-                if logvar is not None:
-                    logvar_list.append(logvar.detach().cpu().numpy())
+                logvar_list.append(logvar.detach().cpu().numpy())
                 if lowrank is not None:
                     lowrank_list.append(lowrank.detach().cpu().numpy())
+                if hmm_cache is not None:
+                    mu_k_list.append(hmm_cache['mu_k'].detach().cpu().numpy())
+                    E_Lambda_list.append(hmm_cache['E_Lambda'].detach().cpu().numpy())
+                    logdet_Sigma_k.append(hmm_cache['logdet_Sigma_k'].detach().cpu().numpy())
+                    r_hat_list.append(hmm_cache['r_hat_flat'].detach().cpu().numpy())
                 ds_list.extend([tag] * mu.shape[0])
                 got += mu.shape[0]
         return got
@@ -953,10 +972,14 @@ def analyze_latent_space(
         raise RuntimeError("No valid samples collected. Check valid_screen and inputs.")
 
     # --- stack
-    mu_all = np.vstack(mu_list)                            # [N,D]
+    mu_all = torch.stack(mu_list, dim=0)                            # [N,D]
     D = mu_all.shape[1]
-    logvar_all  = np.vstack(logvar_list) if logvar_list else None
-    lowrank_all = np.vstack(lowrank_list) if lowrank_list else None  # shape: [N,D,R] collapsed ok
+    logvar_all  = torch.stack(logvar_list, dim=0) if logvar_list else None
+    lowrank_all = torch.stack(lowrank_list, dim=0) if lowrank_list else None  # shape: [N,D,R]
+    mu_k_all   = torch.stack(mu_k_list, dim=0) if mu_k_list else None  # shape: [N,D]
+    E_Lambda_all = torch.stack(E_Lambda_list, dim=0) if E_Lambda_list else None  # shape: [N,D]
+    logdet_Sigma_k_all = torch.stack(logdet_Sigma_k, dim=0) if logdet_Sigma_k else None  # shape: [N]
+    r_hat_all = torch.stack(r_hat_list, dim=0) if r_hat_list else None  # shape: [N]
 
     # --- compute aggregated posterior covariance: Var[mu] + E[diag(var)] + E[FF^T]
     mu_mean = mu_all.mean(axis=0)                          # [D]
@@ -1009,21 +1032,64 @@ def analyze_latent_space(
         print(f"[t-SNE warning] {e} — falling back to first two PCs.")
         latent_tsne = None
 
-    # --- KL decomposition (Gaussian assumption): KL(q(z)||N(0,I)) = MI + TC + DW
-    # Total KL with full Σ_agg and mean_total
-    ekl = _mean_ekl_diag_or_lowrank(mu_all, logvar_all, lowrank_all)  # E_x KL(q(z|x)||N(0,I))
+    # --- KL decomposition: KL(q(z)||p(z)) = MI + TC + DW
+    # Choose appropriate prior based on config
+    use_hmm_prior = (config is not None and hasattr(config, 'prior_mode') and 
+                     config.prior_mode == 'hmm' and hmm is not None)
+    
+    if use_hmm_prior:
+        print(f"🧠 Using HMM prior for β-KL calculation (K={hmm.niw.mu.shape[0]} skills)")
+        # Total KL with HMM prior using proper forward-backward: E_x KL(q(z|x)||p(z|HMM))
+        kl_bk = kl_gaussian_lowrank_to_fixed_gaussians(mu_q=mu_all, diagvar_q=logvar_all.exp().clamp(min=jitter_eps), F_q=lowrank_all,
+                                                     mu_p=mu_k_all, Lambda_p=E_Lambda_all, logdet_Sigma_p=logdet_Sigma_k_all)
+        kl_per_sample = (kl_bk * r_hat_all).sum(dim=1)
+        ekl = kl_per_sample.mean()
+        kl_prior_type = 'HMM'
+    else:
+        # Total KL with standard Normal prior: E_x KL(q(z|x)||N(0,I))
+        ekl = _mean_ekl_diag_or_lowrank(mu_all, logvar_all, lowrank_all)
+        kl_prior_type = 'N(0,I)'
 
-    # Dimension-wise KL: sum_i KL(q(z_i)||N(0,1)) with Var(z_i)=var_total_i, mean=mean_total_i
-    dw_kl = 0.5 * np.sum(var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
+    if use_hmm_prior:
+        # HMM decomposition: approximate using skill-averaged statistics
+        # Note: This is a simplification - true HMM decomposition would be more complex
+        
+        # Convert torch tensors to numpy for consistency with rest of analysis
+        mu_k_np = mu_k_all.detach().cpu().numpy()  # [N,D] skill means for each sample
+        r_hat_np = r_hat_all.detach().cpu().numpy()  # [N,K] responsibilities for each sample
+        
+        # Skill-weighted prior statistics
+        mu_prior = (r_hat_np[:, :, np.newaxis] * mu_k_np[:, np.newaxis, :]).sum(axis=1)  # [N,D] weighted skill means
+        mu_prior_bar = mu_prior.mean(axis=0)  # [D] average skill-weighted prior mean
+        
+        # Approximate DWKL using skill-weighted prior
+        diag_S_bar = np.clip(var_total, jitter_eps, None)  # [D] diagonal of aggregated covariance
+        dwkl_per_dim = 0.5 * (diag_S_bar + (mean_total - mu_prior_bar)**2 - 1.0 - np.log(diag_S_bar))  # [D]
+        dw_kl = np.sum(dwkl_per_dim)
+        
+        # Approximate TC (same computation but relative to skill-weighted prior)
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(diag_S_bar))  # [D,D]
+        R = D_sqrt_inv @ Sigma_agg @ D_sqrt_inv
+        R = 0.5 * (R + R.T) + jitter_eps * np.eye(D)
+        sign, logdetR = np.linalg.slogdet(R)
+        if not np.all(sign > 0):
+            print("Warning: Covariance matrix R is not positive definite for HMM prior.")
+            logdetR = 0.0
+        tc = -0.5 * logdetR
+        
+        mi = float(ekl - tc - dw_kl)
+    else:
+        # Dimension-wise KL: sum_i KL(q(z_i)||N(0,1)) with Var(z_i)=var_total_i, mean=mean_total_i
+        dw_kl = 0.5 * np.sum(var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
 
-    # Total correlation: -0.5 * log det( R ),  R = D^{-1/2} Σ D^{-1/2}
-    Dinv2 = np.diag(1.0 / np.sqrt(np.clip(var_total, jitter_eps, None)))
-    R = Dinv2 @ Sigma_agg @ Dinv2
-    R = 0.5 * (R + R.T) + jitter_eps * np.eye(D)
-    _, logdetR = np.linalg.slogdet(R)
-    tc = -0.5 * logdetR
+        # Total correlation: -0.5 * log det( R ),  R = D^{-1/2} Σ D^{-1/2}
+        Dinv2 = np.diag(1.0 / np.sqrt(np.clip(var_total, jitter_eps, None)))
+        R = Dinv2 @ Sigma_agg @ Dinv2
+        R = 0.5 * (R + R.T) + jitter_eps * np.eye(D)
+        _, logdetR = np.linalg.slogdet(R)
+        tc = -0.5 * logdetR
 
-    mi = float(ekl - tc - dw_kl)
+        mi = float(ekl - tc - dw_kl)
 
     # --- Visualization
     import matplotlib.pyplot as plt
@@ -1094,7 +1160,7 @@ def analyze_latent_space(
     metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL']
     vals = [mi, tc, dw_kl, ekl]
     bars = axes[2,2].bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
-    axes[2,2].set_ylabel('nats'); axes[2,2].set_title('KL = MI + TC + DW')
+    axes[2,2].set_ylabel('nats'); axes[2,2].set_title(f'KL = MI + TC + DW\n(Prior: {kl_prior_type})')
     for b, v in zip(bars, vals):
         axes[2,2].text(b.get_x() + b.get_width()/2., v * 1.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
     plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.show()
@@ -1151,6 +1217,8 @@ def analyze_latent_space(
         'pca_model': pca,
         'tsne_components': latent_tsne,
         'metrics': {'kl_total': float(ekl), 'mi': float(mi), 'tc': float(tc), 'dw_kl': float(dw_kl)},
+        'prior_type': kl_prior_type,
+        'use_hmm_prior': use_hmm_prior,
         'dataset_labels': ds_list,
         'plot_path': save_path,
         'tty_grid_path': tty_save_path,
@@ -1163,6 +1231,8 @@ def create_visualization_demo(
     train_dataset: Optional[List[Dict]] = None,
     test_dataset: Optional[List[Dict]] = None,
     revision_name: Optional[str] = None,
+    hmm_repo_name: Optional[str] = None,
+    hmm_revision_name: Optional[str] = None,
     token: Optional[str] = None,
     device: str = "cpu",
     num_samples: int = 4,
@@ -1200,9 +1270,12 @@ def create_visualization_demo(
     Complete demo function that loads a model from HuggingFace and creates visualizations
     
     Args:
-        repo_name: HuggingFace repository name
+        repo_name: HuggingFace repository name for the VAE model
         train_dataset: Training dataset from NetHackDataCollector (optional)
         test_dataset: Test dataset from NetHackDataCollector (optional)
+        revision_name: Specific revision for the VAE model (optional)
+        hmm_repo_name: HuggingFace repository name for the HMM model (optional, e.g., "CatkinChen/nethack-hmm")
+        hmm_revision_name: Specific revision for the HMM model (optional)
         token: HuggingFace token (optional)
         device: Device to run on
         num_samples: Number of reconstruction samples
@@ -1262,11 +1335,33 @@ def create_visualization_demo(
     # Load model from HuggingFace with local fallback
     print(f"\n1️⃣ Loading model from HuggingFace...")
     model = None
+    config = None
+    hmm = None
     
     try:
         # Import here to avoid circular dependency
-        from training.train import load_model_from_huggingface
-        model, _ = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
+        from training.training_utils import load_model_from_huggingface
+        model, config = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
+        
+        # Try to load HMM if the model was trained with HMM prior or if explicitly specified
+        if (config is not None and hasattr(config, 'prior_mode') and config.prior_mode in ['hmm', 'blend']) or hmm_repo_name is not None:
+            try:
+                # Use explicit HMM repository if provided, otherwise try the same repository as VAE
+                hmm_repo = hmm_repo_name if hmm_repo_name is not None else repo_name
+                hmm_rev = hmm_revision_name if hmm_revision_name is not None else revision_name
+                
+                print(f"🧠 Attempting to load HMM from '{hmm_repo}' (revision: {hmm_rev})...")
+                if config is not None and hasattr(config, 'prior_mode'):
+                    print(f"   Model prior_mode: '{config.prior_mode}'")
+                
+                # Try to load HMM from the specified repository
+                from training.training_utils import load_hmm_from_huggingface
+                hmm, _, _, _, _ = load_hmm_from_huggingface(hmm_repo, token=token, device=device, revision_name=hmm_rev)
+                print(f"✅ Successfully loaded HMM with {hmm.niw.mu.shape[0]} skills")
+            except Exception as hmm_e:
+                print(f"⚠️ Could not load HMM from '{hmm_repo}': {hmm_e}")
+                print(f"🔄 Will use standard Normal prior for β-KL calculation")
+                hmm = None
     except Exception as e:
         print(f"⚠️  Failed to load from HuggingFace: {e}")
         print(f"🔄 Attempting to load from local checkpoints...")
@@ -1302,9 +1397,50 @@ def create_visualization_demo(
         if local_checkpoint_path is not None:
             try:
                 # Import here to avoid circular dependency
-                from training.train import load_model_from_local
-                model = load_model_from_local(local_checkpoint_path, device=device)
+                from training.training_utils import load_model_from_local
+                model_result = load_model_from_local(local_checkpoint_path, device=device)
+                if isinstance(model_result, tuple):
+                    model, config = model_result
+                else:
+                    model, config = model_result, None
                 print(f"✅ Successfully loaded model from local checkpoint")
+                
+                # Try to load HMM if the model was trained with HMM prior
+                if config is not None and hasattr(config, 'prior_mode') and config.prior_mode in ['hmm', 'blend']:
+                    try:
+                        print(f"🧠 Attempting to load HMM for prior_mode='{config.prior_mode}'...")
+                        # Look for HMM checkpoint in same directory or common locations
+                        hmm_paths = [
+                            local_checkpoint_path.replace('.pth', '_hmm.pth'),
+                            local_checkpoint_path.replace('vae', 'hmm'),
+                            "checkpoints_hmm/sticky_hdp_hmm_final.pth",
+                            "checkpoints/hmm.pth"
+                        ]
+                        
+                        hmm_loaded = False
+                        for hmm_path in hmm_paths:
+                            if os.path.exists(hmm_path):
+                                print(f"📁 Found HMM checkpoint: {hmm_path}")
+                                # Load HMM from local file
+                                hmm_checkpoint = torch.load(hmm_path, map_location=device)
+                                if 'hmm' in hmm_checkpoint:
+                                    hmm = hmm_checkpoint['hmm']
+                                elif 'model' in hmm_checkpoint:
+                                    hmm = hmm_checkpoint['model']
+                                else:
+                                    hmm = hmm_checkpoint  # Assume the checkpoint is the HMM directly
+                                print(f"✅ Successfully loaded HMM with {hmm.niw.mu.shape[0]} skills")
+                                hmm_loaded = True
+                                break
+                        
+                        if not hmm_loaded:
+                            print(f"⚠️ No HMM checkpoint found in expected locations")
+                            hmm = None
+                            
+                    except Exception as hmm_e:
+                        print(f"⚠️ Could not load HMM: {hmm_e}")
+                        print(f"🔄 Will use standard Normal prior for β-KL calculation")
+                        hmm = None
             except Exception as local_e:
                 print(f"❌ Failed to load from local checkpoint: {local_e}")
                 raise RuntimeError(f"Failed to load model from both HuggingFace ({e}) and local checkpoint ({local_e})")
@@ -1398,6 +1534,16 @@ def create_visualization_demo(
     # Analyze latent space (use combined dataset or available one)
     print(f"\n3️⃣ Analyzing latent space...")
     
+    # Print information about prior mode for KL calculation
+    if config is not None and hasattr(config, 'prior_mode'):
+        print(f"🎯 Model prior mode: {config.prior_mode}")
+        if config.prior_mode in ['hmm', 'blend'] and hmm is not None:
+            print(f"✅ HMM loaded - β-KL will be calculated against HMM prior")
+        elif config.prior_mode in ['hmm', 'blend'] and hmm is None:
+            print(f"⚠️ HMM not available - β-KL will use standard Normal prior as fallback")
+    else:
+        print(f"🎯 No prior mode specified - β-KL will use standard Normal prior")
+    
     # Combine datasets for latent analysis or use what's available
     analysis_datasets = []
     dataset_labels = []
@@ -1415,7 +1561,10 @@ def create_visualization_demo(
         model, analysis_datasets, device, 
         save_path=latent_path, 
         max_samples=max_latent_samples,
-        dataset_labels=dataset_labels
+        dataset_labels=dataset_labels,
+        random_seed=random_seed,
+        config=config,
+        hmm=hmm
     )
     
     results['latent_analysis_path'] = latent_path
@@ -2181,7 +2330,7 @@ def visualize_hmm_after_estep(
     xs = np.arange(len(pi_hat))
     plt.bar(xs, pi_hat)
     plt.xlabel("Skill k")
-    plt.ylabel("Occupancy $\hat{\\pi}_k$")
+    plt.ylabel(r"Occupancy $\hat{\pi}_k$")
     plt.title(f"Round {round_idx}: Skill occupancy (effK={diags['effective_K']:.2f})")
     plt.tight_layout()
     path_pi = os.path.join(round_dir, f"round{round_idx:02d}_pi_bar.png")
