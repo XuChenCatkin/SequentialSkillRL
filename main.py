@@ -59,6 +59,8 @@ Commands:
                                      (loads VAE, HMM, and PPO from same repo)
             --resume_local PATH    - Resume training from local PPO checkpoint file
                                      (loads VAE/HMM from separate repos)
+            --vae_revision REV     - HuggingFace revision for VAE model (branch/tag/commit)
+            --hmm_revision REV     - HuggingFace revision for HMM model (branch/tag/commit)
                                     
         Model Loading Patterns:
         - Fresh Training: VAE from vae_repo_id, HMM from hmm_repo_id (separate repos)
@@ -112,6 +114,10 @@ Examples:
     - Random seed affects batch shuffling and latent space analysis sampling
     - HMM can be loaded from a separate repository (common setup: VAE and HMM trained separately)
     - If HMM loading fails, analysis will fallback to standard Normal prior with a warning
+    
+    # Load specific model revisions
+    python main.py rl baseline --vae_revision v1.0 --hmm_revision main      # Use VAE v1.0 and latest HMM
+    python main.py rl no_hmm --vae_revision experimental                    # Use experimental VAE branch
 """
 import logging
 import math
@@ -804,6 +810,8 @@ if __name__ == "__main__":
         disable_upload = False
         resume_repo_id = None  # HuggingFace repo for resuming
         resume_local_path = None  # Local checkpoint path for resuming
+        vae_revision = None  # HuggingFace VAE model revision
+        hmm_revision = None  # HuggingFace HMM model revision
         
         # Parse command line arguments
         i = 2
@@ -891,6 +899,12 @@ if __name__ == "__main__":
             elif sys.argv[i] == '--resume_local' and i + 1 < len(sys.argv):
                 resume_local_path = sys.argv[i + 1]
                 i += 2
+            elif sys.argv[i] == '--vae_revision' and i + 1 < len(sys.argv):
+                vae_revision = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--hmm_revision' and i + 1 < len(sys.argv):
+                hmm_revision = sys.argv[i + 1]
+                i += 2
             else:
                 print(f"⚠️  Unknown option: {sys.argv[i]}")
                 i += 1
@@ -924,6 +938,10 @@ if __name__ == "__main__":
         print(f"⏰ Max Episode Steps (Eval): {max_episode_steps_eval if max_episode_steps_eval is not None else 'env default'}")
         print(f"📊 W&B Logging: {use_wandb_flag}")
         print(f"☁️  HF Upload: {not disable_upload}")
+        if vae_revision:
+            print(f"🎨 VAE Revision: {vae_revision}")
+        if hmm_revision:
+            print(f"🧠 HMM Revision: {hmm_revision}")
         
         # Set up logging with file output
         os.makedirs("logs", exist_ok=True)  # Create logs directory
@@ -1183,6 +1201,10 @@ if __name__ == "__main__":
                 vae_config,
                 rnd_config,
                 train_config,
+                
+                # Model revision control
+                vae_revision=vae_revision,
+                hmm_revision=hmm_revision,
                 
                 # Resume training from existing PPO checkpoint (new!)
                 ppo_repo_id=resume_repo_id,

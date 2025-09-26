@@ -67,6 +67,9 @@ def train_online_ppo_with_pretrained_models(
     vae_config: VAEOnlineConfig,
     rnd_config: Optional[RNDConfig],
     train_config: TrainConfig,
+    # Model revision control
+    vae_revision: Optional[str] = None,  # HuggingFace model revision for VAE
+    hmm_revision: Optional[str] = None,  # HuggingFace model revision for HMM
     # PPO checkpoint loading for continuation
     ppo_repo_id: Optional[str] = None,  # HuggingFace repo with existing PPO checkpoint
     ppo_checkpoint_path: Optional[str] = None,  # Local path to PPO checkpoint
@@ -101,6 +104,10 @@ def train_online_ppo_with_pretrained_models(
         rnd_config: Random Network Distillation configuration.
         train_config: General training configuration.
         
+        # Model revision control
+        vae_revision: HuggingFace model revision/branch/tag for VAE model (e.g., "main", "v1.0", specific commit hash)
+        hmm_revision: HuggingFace model revision/branch/tag for HMM model (e.g., "main", "v1.0", specific commit hash)
+        
         # PPO checkpoint loading for continuation training
         ppo_repo_id: HuggingFace repository ID containing existing PPO checkpoint
         ppo_checkpoint_path: Local file path to existing PPO checkpoint (.pth file)
@@ -130,7 +137,11 @@ def train_online_ppo_with_pretrained_models(
         logger.info(f"Starting Online PPO Training with Pretrained Models")
         logger.info(f"Environment: {train_config.env_id}")
         logger.info(f"VAE Repository: {vae_repo_id}")
+        if vae_revision:
+            logger.info(f"VAE Revision: {vae_revision}")
         logger.info(f"HMM Repository: {hmm_repo_id}")
+        if hmm_revision:
+            logger.info(f"HMM Revision: {hmm_revision}")
         logger.info(f"Total Timesteps: {ppo_config.total_updates:,}")
         logger.info("=" * 80)
     
@@ -164,6 +175,7 @@ def train_online_ppo_with_pretrained_models(
                         vae_model, config = load_model_from_huggingface(
                             repo_name=unified_repo,
                             filename=vae_filename,
+                            revision_name=vae_revision,
                             token=hf_token,
                             device=str(device),
                             fallback_to_checkpoint_config=True  # Enable fallback for unified repos
@@ -181,6 +193,7 @@ def train_online_ppo_with_pretrained_models(
                 if logger: logger.info(f"🔄 Falling back to separate VAE repo: {vae_repo_id}")
                 vae_model, config = load_model_from_huggingface(
                     repo_name=vae_repo_id,
+                    revision_name=vae_revision,
                     token=hf_token,
                     device=str(device),
                     fallback_to_checkpoint_config=True  # Enable fallback for VAE repos
@@ -198,6 +211,7 @@ def train_online_ppo_with_pretrained_models(
                                 repo_name=unified_repo,
                                 filename=hmm_filename,
                                 round_num=None,
+                                revision_name=hmm_revision,
                                 device=str(device)
                             )
                             if logger: logger.info(f"✅ HMM loaded from {hmm_filename}")
@@ -214,6 +228,7 @@ def train_online_ppo_with_pretrained_models(
                     hmm_model, loaded_config, hmm_params, niw, metadata = load_hmm_from_huggingface(
                         repo_name=hmm_repo_id,
                         round_num=None,
+                        revision_name=hmm_revision,
                         device=str(device)
                     )
         else:
@@ -224,6 +239,7 @@ def train_online_ppo_with_pretrained_models(
             if logger: logger.info("🎨 Loading pretrained VAE model...")
             vae_model, config = load_model_from_huggingface(
                 repo_name=vae_repo_id,
+                revision_name=vae_revision,
                 token=hf_token,
                 device=str(device),
                 fallback_to_checkpoint_config=True  # Enable fallback for VAE repos
@@ -236,6 +252,7 @@ def train_online_ppo_with_pretrained_models(
                 hmm_model, loaded_config, hmm_params, niw, metadata = load_hmm_from_huggingface(
                     repo_name=hmm_repo_id,
                     round_num=None,  # None means latest
+                    revision_name=hmm_revision,
                     device=str(device)
                 )
         
@@ -409,7 +426,7 @@ def train_online_ppo_with_pretrained_models(
                         filename="ppo_policy.pth",
                         token=hf_token
                     )
-                    checkpoint_data = torch.load(ppo_path, map_location=device)
+                    checkpoint_data = torch.load(ppo_path, map_location=device, weights_only=False)
                     if logger: logger.info(f"✅ PPO checkpoint loaded from HuggingFace")
                     
                 except Exception as e:
@@ -423,7 +440,7 @@ def train_online_ppo_with_pretrained_models(
             if not checkpoint_data and ppo_checkpoint_path:
                 try:
                     if logger: logger.info(f"📥 Loading PPO checkpoint from local file: {ppo_checkpoint_path}")
-                    checkpoint_data = torch.load(ppo_checkpoint_path, map_location=device)
+                    checkpoint_data = torch.load(ppo_checkpoint_path, map_location=device, weights_only=False)
                     if logger: logger.info(f"✅ PPO checkpoint loaded from local file")
                     
                 except Exception as e:
@@ -749,9 +766,9 @@ from training.online_rl import train_online_ppo_with_pretrained_models
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Load individual components
-ppo_checkpoint = torch.load('ppo_policy.pth', map_location=device)
-vae_data = torch.load('vae_model.pth', map_location=device)
-hmm_data = torch.load('hmm_model.pth', map_location=device)
+ppo_checkpoint = torch.load('ppo_policy.pth', map_location=device, weights_only=False)
+vae_data = torch.load('vae_model.pth', map_location=device, weights_only=False)
+hmm_data = torch.load('hmm_model.pth', map_location=device, weights_only=False)
 
 # Use for inference or continued training
 results = train_online_ppo_with_pretrained_models(
