@@ -444,6 +444,15 @@ def train_online_ppo_with_pretrained_models(
                     trainer.opt.load_state_dict(checkpoint_data['opt'])
                     if logger: logger.info("✅ Optimizer state restored")
                 
+                # Load RND components if they exist in checkpoint and in trainer
+                if 'rnd' in checkpoint_data and hasattr(trainer.curiosity, 'rnd') and trainer.curiosity.rnd is not None:
+                    trainer.curiosity.rnd.load_state_dict(checkpoint_data['rnd'])
+                    if logger: logger.info("✅ RND model state restored")
+                
+                if 'rnd_opt' in checkpoint_data and hasattr(trainer.curiosity, 'rnd_opt') and trainer.curiosity.rnd_opt is not None:
+                    trainer.curiosity.rnd_opt.load_state_dict(checkpoint_data['rnd_opt'])
+                    if logger: logger.info("✅ RND optimizer state restored")
+                
                 # Load training step count if available
                 if 'global_steps' in checkpoint_data:
                     trainer.global_steps = checkpoint_data['global_steps']
@@ -538,7 +547,9 @@ def train_online_ppo_with_pretrained_models(
         # Use trainer's save method to create final checkpoint
         if logger: logger.info("💾 Saving final PPO checkpoint...")
         final_checkpoint_path = os.path.join(checkpoint_dir, "ppo_policy.pth")
-        torch.save({
+        
+        # Prepare checkpoint data
+        checkpoint_data = {
             "actor_critic": trainer.actor_critic.state_dict(),
             "opt": trainer.opt.state_dict(),
             "global_steps": trainer.global_steps,
@@ -547,6 +558,7 @@ def train_online_ppo_with_pretrained_models(
                 "curiosity_config": curiosity_config.__dict__,
                 "hmm_config": hmm_config.__dict__ if hmm_config else None,
                 "vae_config": vae_config.__dict__ if vae_config else None,
+                "rnd_config": rnd_config.__dict__ if rnd_config else None,
                 "train_config": train_config.__dict__
             },
             "training_metadata": {
@@ -555,7 +567,18 @@ def train_online_ppo_with_pretrained_models(
                 "final_step": trainer.global_steps,
                 "timestamp": datetime.now().isoformat()
             }
-        }, final_checkpoint_path)
+        }
+        
+        # Add RND components if they exist
+        if hasattr(trainer.curiosity, 'rnd') and trainer.curiosity.rnd is not None:
+            checkpoint_data["rnd"] = trainer.curiosity.rnd.state_dict()
+            if logger: logger.info("💾 Including RND model state in checkpoint")
+        
+        if hasattr(trainer.curiosity, 'rnd_opt') and trainer.curiosity.rnd_opt is not None:
+            checkpoint_data["rnd_opt"] = trainer.curiosity.rnd_opt.state_dict()
+            if logger: logger.info("💾 Including RND optimizer state in checkpoint")
+        
+        torch.save(checkpoint_data, final_checkpoint_path)
         if logger: logger.info(f"💾 Final checkpoint saved: {final_checkpoint_path}")
         
         use_curiosity = (curiosity_config.use_dyn_kl or 
