@@ -1510,14 +1510,15 @@ def analyze_latent_space(
         elif plot_name == 'kl_decomposition':
             ax_individual.clear()
             if use_hmm_prior and argmax_r_hat is not None:
-                metrics = ['Mutual\nInformation', 'Total\nCorrelation', r'KL$(q \parallel p_{\mathrm{HMM}})$', 'Total KL']
-                vals = [mi, tc, kl_q_p_hmm, ekl]
+                metrics = ['Mutual\nInformation', 'Total\nCorrelation', r'KL$(q \parallel p_{\mathrm{HMM}})$']
+                vals = [mi, tc, kl_q_p_hmm]
+                ax_individual.set_title(f'KL components\n(Prior: {kl_prior_type})')
             else:
                 metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL']
                 vals = [mi, tc, dw_kl, ekl]
+                ax_individual.set_title(f'KL = MI + TC + DW\n(Prior: {kl_prior_type})')
             bars = ax_individual.bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
             ax_individual.set_ylabel('nats')
-            ax_individual.set_title(f'KL = MI + TC + DW\n(Prior: {kl_prior_type})')
             for b, v in zip(bars, vals):
                 ax_individual.text(b.get_x() + b.get_width()/2., v * 1.01, f'{v:.3f}', 
                                  ha='center', va='bottom', fontsize=9)
