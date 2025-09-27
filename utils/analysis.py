@@ -1166,7 +1166,7 @@ def analyze_latent_space(
     individual_plots = {}
 
     # Prepare dataset coloring variables (used later in code regardless of HMM)
-    palette = ['turquoise', 'lightcoral', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
+    palette = ['blue', 'lightcoral', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
     ds_unique = sorted(set(ds_list))
     ds_to_color = {ds: palette[i % len(palette)] for i, ds in enumerate(ds_unique)}
     ds_mask = {ds: np.array([d == ds for d in ds_list]) for ds in ds_unique}
