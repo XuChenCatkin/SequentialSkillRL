@@ -1327,7 +1327,16 @@ def load_hmm_from_huggingface(
         # Load posterior parameters instead of state_dict
         hmm.load_posterior_params(hmm_posterior_params)
         hmm.seed_streaming_from_posterior()
+        
+        # Ensure HMM and all its components are moved to target device
         hmm = hmm.to(device)
+        
+        # Explicitly move all internal tensors to the target device
+        hmm.niw.mu = hmm.niw.mu.to(device)
+        hmm.niw.kappa = hmm.niw.kappa.to(device)
+        hmm.niw.Psi = hmm.niw.Psi.to(device)
+        hmm.niw.nu = hmm.niw.nu.to(device)
+        hmm.dir.phi = hmm.dir.phi.to(device)
         
         print(f"✅ HMM loaded successfully from HuggingFace: {repo_name}")
         print(f"🎯 Round: {round_num}, Device: {device}")

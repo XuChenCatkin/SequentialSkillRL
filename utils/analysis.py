@@ -903,10 +903,19 @@ def analyze_latent_space(
 
     # containers
     mu_list, logvar_list, lowrank_list, ds_list = [], [], [], []
-    mu_k_list, E_Lambda_list, logdet_Sigma_k, r_hat_list = [], [], [], []
+    r_hat_list = []
+    if hmm is not None:
+        mu_k, E_Lambda, _ = hmm.get_emission_expectations()
+        L = torch.linalg.cholesky(E_Lambda)            # [Kp1,D,D]
+        logdet_E_Lambda = 2.0 * torch.log(torch.diagonal(L,  dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
+        logdet_Sigma_k = -logdet_E_Lambda                           # [Kp1]
+    else:
+        mu_k = None
+        E_Lambda = None
+        logdet_Sigma_k = None
 
     def _pull_from_batches(batches, target, tag):
-        nonlocal mu_list, logvar_list, lowrank_list, ds_list, mu_k_list, E_Lambda_list, logdet_Sigma_k, r_hat_list
+        nonlocal mu_list, logvar_list, lowrank_list, ds_list, r_hat_list
         got = 0
         with torch.no_grad():
             for batch in batches:
@@ -925,7 +934,10 @@ def analyze_latent_space(
                         flat[k] = v
                 valid = flat.get('valid_screen')
                 flat['original_batch_shape'] = (B, T)
-                if hmm is not None: flat['sticky_hmm'] = hmm
+                if hmm is not None: 
+                    # Make sure HMM is on the correct device
+                    hmm_on_device = hmm.to(device)
+                    flat['sticky_hmm'] = hmm_on_device
                 if valid is None:
                     # assume everything valid
                     N = next(iter(flat.values())).shape[0]
@@ -941,26 +953,22 @@ def analyze_latent_space(
                 if need <= 0:
                     break
                 perm = torch.randperm(idx.numel(), device=device)[:need]
-                idx = idx[perm]
 
-                mu      = out['mu'][idx]                        # [n,D]
-                logvar  = out['logvar'][idx]          # [n,D]
+                mu      = out['mu'][valid][perm]                        # [n,D]
+                logvar  = out['logvar'][valid][perm]          # [n,D]
                 lowrank = out.get('lowrank_factors', None) # [n,D,R] or None
                 hmm_cache = flat.get('hmm_cache', None)
                 if lowrank is not None:
-                    lowrank = lowrank[idx]
+                    lowrank = lowrank[valid][perm]
                 if hmm_cache is not None:
-                    hmm_cache = hmm_cache[idx]
+                    hmm_cache['r_hat_flat'] = hmm_cache['r_hat_flat'][perm]
 
-                mu_list.append(mu.detach().cpu().numpy())
-                logvar_list.append(logvar.detach().cpu().numpy())
+                mu_list.append(mu.detach().cpu())
+                logvar_list.append(logvar.detach().cpu())
                 if lowrank is not None:
-                    lowrank_list.append(lowrank.detach().cpu().numpy())
+                    lowrank_list.append(lowrank.detach().cpu())
                 if hmm_cache is not None:
-                    mu_k_list.append(hmm_cache['mu_k'].detach().cpu().numpy())
-                    E_Lambda_list.append(hmm_cache['E_Lambda'].detach().cpu().numpy())
-                    logdet_Sigma_k.append(hmm_cache['logdet_Sigma_k'].detach().cpu().numpy())
-                    r_hat_list.append(hmm_cache['r_hat_flat'].detach().cpu().numpy())
+                    r_hat_list.append(hmm_cache['r_hat_flat'].detach().cpu())
                 ds_list.extend([tag] * mu.shape[0])
                 got += mu.shape[0]
         return got
@@ -971,62 +979,67 @@ def analyze_latent_space(
     if total == 0:
         raise RuntimeError("No valid samples collected. Check valid_screen and inputs.")
 
-    # --- stack
-    mu_all = torch.stack(mu_list, dim=0)                            # [N,D]
+    # --- concatenate (not stack, since each item in the list represents multiple samples)
+    mu_all = torch.cat(mu_list, dim=0)                            # [N,D]
     D = mu_all.shape[1]
-    logvar_all  = torch.stack(logvar_list, dim=0) if logvar_list else None
-    lowrank_all = torch.stack(lowrank_list, dim=0) if lowrank_list else None  # shape: [N,D,R]
-    mu_k_all   = torch.stack(mu_k_list, dim=0) if mu_k_list else None  # shape: [N,D]
-    E_Lambda_all = torch.stack(E_Lambda_list, dim=0) if E_Lambda_list else None  # shape: [N,D]
-    logdet_Sigma_k_all = torch.stack(logdet_Sigma_k, dim=0) if logdet_Sigma_k else None  # shape: [N]
-    r_hat_all = torch.stack(r_hat_list, dim=0) if r_hat_list else None  # shape: [N]
+    logvar_all  = torch.cat(logvar_list, dim=0) if logvar_list else None
+    lowrank_all = torch.cat(lowrank_list, dim=0) if lowrank_list else None  # shape: [N,D,R]
+    r_hat_all = torch.cat(r_hat_list, dim=0) if r_hat_list else None  # shape: [N, K]
 
     # --- compute aggregated posterior covariance: Var[mu] + E[diag(var)] + E[FF^T]
-    mu_mean = mu_all.mean(axis=0)                          # [D]
+    mu_mean = mu_all.mean(dim=0)                          # [D]
     mu_centered = mu_all - mu_mean
     cov_between = (mu_centered.T @ mu_centered) / (mu_all.shape[0] - 1 + 1e-6)  # Var_x[mu_x]  [D,D]
 
     if logvar_all is not None:
-        E_diag = np.exp(logvar_all).mean(axis=0)           # [D]
+        E_diag = torch.exp(logvar_all).mean(dim=0)           # [D]
     else:
-        E_diag = np.zeros(D, dtype=np.float64)
+        E_diag = torch.zeros(D, dtype=torch.float64)
 
     if lowrank_all is not None:
         # lowrank_all: [N, D, R] -> average FF^T over samples (R is small, so this is cheap for ~100 samples)
         N, D_, R = lowrank_all.shape
         assert D_ == D
-        E_FFt = np.zeros((D, D), dtype=np.float64)
+        E_FFt = torch.zeros((D, D), dtype=torch.float64)
         for i in range(N):
             F = lowrank_all[i]                             # [D,R]
             E_FFt += F @ F.T
         E_FFt /= N
     else:
-        E_FFt = np.zeros((D, D), dtype=np.float64)
+        E_FFt = torch.zeros((D, D), dtype=torch.float64)
 
-    Sigma_agg = cov_between + np.diag(E_diag) + E_FFt      # [D,D]
+    Sigma_agg = cov_between + torch.diag(E_diag) + E_FFt      # [D,D]
     # numerical shrinkage
     Sigma_agg = 0.5 * (Sigma_agg + Sigma_agg.T)
-    Sigma_agg += jitter_eps * np.eye(D)
+    Sigma_agg += jitter_eps * torch.eye(D, dtype=torch.float64)
 
     # --- per-dim stats for plots
-    var_total = np.diag(Sigma_agg)                         # Var(z_i)
+    var_total = torch.diag(Sigma_agg)                         # Var(z_i)
     mean_total = mu_mean                                   # E[z_i]
 
     # --- PCA (for plots & grid)
-    pca = PCA(n_components=min(10, D), svd_solver='auto', random_state=42)
-    latent_pca = pca.fit_transform(mu_all)                 # PCA of means for viz
+    pca = PCA(n_components=min(50, D), svd_solver='auto', random_state=42)
+    latent_pca = pca.fit_transform(mu_all.numpy())                 # PCA of means for viz
     pca_expl = pca.explained_variance_ratio_
 
-    # --- TSNE (on PCA-10 for stability / speed)
+    # --- TSNE (on PCA-50 for stability / speed)
     n = mu_all.shape[0]
     if tsne_on_pca:
         tsne_input = latent_pca
     else:
-        tsne_input = mu_all
+        tsne_input = mu_all.numpy()
     # clamp perplexity
-    perpl = max(5, min(30, n - 1, n // 4 if n >= 24 else 5))
+    perpl = max(10, min(50, (n // 10)))
     try:
-        tsne = TSNE(n_components=2, random_state=42, perplexity=perpl, init='pca', learning_rate='auto')
+        tsne = TSNE(
+            n_components=2,
+            perplexity=perpl,     # ~ neighborhood size
+            early_exaggeration=30.0,    # spread clusters
+            max_iter=3000,
+            learning_rate=max(200, n // 12),
+            init="pca",
+            random_state=42,
+        )
         latent_tsne = tsne.fit_transform(tsne_input)
     except Exception as e:
         print(f"[t-SNE warning] {e} — falling back to first two PCs.")
@@ -1041,7 +1054,7 @@ def analyze_latent_space(
         print(f"🧠 Using HMM prior for β-KL calculation (K={hmm.niw.mu.shape[0]} skills)")
         # Total KL with HMM prior using proper forward-backward: E_x KL(q(z|x)||p(z|HMM))
         kl_bk = kl_gaussian_lowrank_to_fixed_gaussians(mu_q=mu_all, diagvar_q=logvar_all.exp().clamp(min=jitter_eps), F_q=lowrank_all,
-                                                     mu_p=mu_k_all, Lambda_p=E_Lambda_all, logdet_Sigma_p=logdet_Sigma_k_all)
+                                                     mu_p=mu_k, Lambda_p=E_Lambda, logdet_Sigma_p=logdet_Sigma_k)
         kl_per_sample = (kl_bk * r_hat_all).sum(dim=1)
         ekl = kl_per_sample.mean()
         kl_prior_type = 'HMM'
@@ -1055,21 +1068,24 @@ def analyze_latent_space(
         # Note: This is a simplification - true HMM decomposition would be more complex
         
         # Convert torch tensors to numpy for consistency with rest of analysis
-        mu_k_np = mu_k_all.detach().cpu().numpy()  # [N,D] skill means for each sample
+        mu_k_np = mu_k.detach().cpu().numpy()  # [K,D] skill means for each sample
         r_hat_np = r_hat_all.detach().cpu().numpy()  # [N,K] responsibilities for each sample
         
         # Skill-weighted prior statistics
-        mu_prior = (r_hat_np[:, :, np.newaxis] * mu_k_np[:, np.newaxis, :]).sum(axis=1)  # [N,D] weighted skill means
+        mu_prior = (r_hat_np[:, :, np.newaxis] * mu_k_np[np.newaxis, :, :]).sum(axis=1)  # [N,D] weighted skill means
         mu_prior_bar = mu_prior.mean(axis=0)  # [D] average skill-weighted prior mean
         
         # Approximate DWKL using skill-weighted prior
-        diag_S_bar = np.clip(var_total, jitter_eps, None)  # [D] diagonal of aggregated covariance
-        dwkl_per_dim = 0.5 * (diag_S_bar + (mean_total - mu_prior_bar)**2 - 1.0 - np.log(diag_S_bar))  # [D]
+        var_total_np = var_total.numpy()
+        mean_total_np = mean_total.numpy()
+        diag_S_bar = np.clip(var_total_np, jitter_eps, None)  # [D] diagonal of aggregated covariance
+        dwkl_per_dim = 0.5 * (diag_S_bar + (mean_total_np - mu_prior_bar)**2 - 1.0 - np.log(diag_S_bar))  # [D]
         dw_kl = np.sum(dwkl_per_dim)
         
         # Approximate TC (same computation but relative to skill-weighted prior)
         D_sqrt_inv = np.diag(1.0 / np.sqrt(diag_S_bar))  # [D,D]
-        R = D_sqrt_inv @ Sigma_agg @ D_sqrt_inv
+        Sigma_agg_np = Sigma_agg.numpy()
+        R = D_sqrt_inv @ Sigma_agg_np @ D_sqrt_inv
         R = 0.5 * (R + R.T) + jitter_eps * np.eye(D)
         sign, logdetR = np.linalg.slogdet(R)
         if not np.all(sign > 0):
@@ -1080,11 +1096,14 @@ def analyze_latent_space(
         mi = float(ekl - tc - dw_kl)
     else:
         # Dimension-wise KL: sum_i KL(q(z_i)||N(0,1)) with Var(z_i)=var_total_i, mean=mean_total_i
-        dw_kl = 0.5 * np.sum(var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
+        var_total_np = var_total.numpy()
+        mean_total_np = mean_total.numpy()
+        dw_kl = 0.5 * np.sum(var_total_np + mean_total_np**2 - 1.0 - np.log(np.clip(var_total_np, jitter_eps, None)))
 
         # Total correlation: -0.5 * log det( R ),  R = D^{-1/2} Σ D^{-1/2}
-        Dinv2 = np.diag(1.0 / np.sqrt(np.clip(var_total, jitter_eps, None)))
-        R = Dinv2 @ Sigma_agg @ Dinv2
+        Dinv2 = np.diag(1.0 / np.sqrt(np.clip(var_total_np, jitter_eps, None)))
+        Sigma_agg_np = Sigma_agg.numpy()
+        R = Dinv2 @ Sigma_agg_np @ Dinv2
         R = 0.5 * (R + R.T) + jitter_eps * np.eye(D)
         _, logdetR = np.linalg.slogdet(R)
         tc = -0.5 * logdetR
@@ -1121,11 +1140,13 @@ def analyze_latent_space(
         axes[0,1].set_title('Fallback: PC1 vs PC2'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
 
     # (0,2) per-dim variance (from Σ_agg diagonal)
-    axes[0,2].bar(range(D), var_total)
+    var_total_np = var_total.numpy() if isinstance(var_total, torch.Tensor) else var_total
+    axes[0,2].bar(range(D), var_total_np)
     axes[0,2].set_title('Variance per Latent (Σ_agg diag)'); axes[0,2].set_xlabel('dim'); axes[0,2].grid(alpha=0.3)
 
     # (1,0) per-dim mean
-    axes[1,0].bar(range(D), mean_total)
+    mean_total_np = mean_total.numpy() if isinstance(mean_total, torch.Tensor) else mean_total
+    axes[1,0].bar(range(D), mean_total_np)
     axes[1,0].set_title('Mean per Latent'); axes[1,0].set_xlabel('dim'); axes[1,0].grid(alpha=0.3)
 
     # (1,1) PC1 distribution by dataset
@@ -1138,14 +1159,17 @@ def analyze_latent_space(
 
     # (1,2) correlation of first 10 raw dims using Σ_agg
     k = min(10, D)
-    Sigma_k = Sigma_agg[:k,:k]
+    Sigma_agg_np = Sigma_agg.numpy() if isinstance(Sigma_agg, torch.Tensor) else Sigma_agg
+    Sigma_k = Sigma_agg_np[:k,:k]
     d = np.sqrt(np.clip(np.diag(Sigma_k), jitter_eps, None))
     Rk = (Sigma_k / d[:,None]) / d[None,:]
     im = axes[1,2].imshow(Rk, vmin=-1, vmax=1, cmap='RdBu_r')
     axes[1,2].set_title('Correlation (first 10 dims)'); fig.colorbar(im, ax=axes[1,2], label='corr')
 
     # (2,0) per-dim KL
-    per_dim_kl = 0.5 * (var_total + mean_total**2 - 1.0 - np.log(np.clip(var_total, jitter_eps, None)))
+    var_total_plot = var_total_np if 'var_total_np' in locals() else var_total.numpy()
+    mean_total_plot = mean_total_np if 'mean_total_np' in locals() else mean_total.numpy()
+    per_dim_kl = 0.5 * (var_total_plot + mean_total_plot**2 - 1.0 - np.log(np.clip(var_total_plot, jitter_eps, None)))
     axes[2,0].bar(range(D), per_dim_kl)
     axes[2,0].axhline(0.05, color='r', ls='--', alpha=0.7, label='0.05 nats'); axes[2,0].legend()
     axes[2,0].set_title('Per-dim KL'); axes[2,0].grid(alpha=0.3)
@@ -1536,6 +1560,7 @@ def create_visualization_demo(
     
     # Print information about prior mode for KL calculation
     if config is not None and hasattr(config, 'prior_mode'):
+        config.prior_mode = 'hmm' if config.prior_mode in ['hmm', 'blend'] else 'standard'
         print(f"🎯 Model prior mode: {config.prior_mode}")
         if config.prior_mode in ['hmm', 'blend'] and hmm is not None:
             print(f"✅ HMM loaded - β-KL will be calculated against HMM prior")

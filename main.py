@@ -73,7 +73,13 @@ Commands:
         - HMM online learning (update frequency, fitting window)
         - Training setup (environment, device, logging, checkpointing)
     
-    vae_analysis <repo_name> [revision] [save_dir] [seed] [hmm_repo] [hmm_revision] - Run VAE analysis and visualization
+    vae_analysis [repo_name] [options] - Run VAE analysis and visualization
+        Options:
+            --revision REV          - VAE model revision (default: None/latest)
+            --save_dir DIR          - Save directory (default: vae_analysis)
+            --seed N                - Analysis seed (default: 50)
+            --hmm_repo REPO         - HMM repository (default: None)
+            --hmm_revision REV      - HMM model revision (default: None/latest)
     bin_count_analysis [top_k]     - Analyze glyph character/color distributions  
     hmm_analysis <repo_name>       - Run HMM analysis and visualization
     plot_bin_count <data_path>     - Plot from saved bin count data
@@ -103,11 +109,12 @@ Examples:
     python main.py rl baseline --resume_local ./checkpoints/ppo_policy.pth  # Resume from local PPO, load VAE/HMM separately
     
     # VAE Analysis Examples
-    python main.py vae_analysis CatkinChen/nethack-vae                           # Default analysis (save_dir="vae_analysis", seed=50)
-    python main.py vae_analysis CatkinChen/nethack-vae main custom_output        # Use main revision, save to custom_output/
-    python main.py vae_analysis CatkinChen/nethack-vae main results 42           # Custom save dir and seed for reproducibility
-    python main.py vae_analysis CatkinChen/nethack-vae main results 42 CatkinChen/nethack-hmm       # With HMM from separate repo
-    python main.py vae_analysis CatkinChen/nethack-vae main results 42 CatkinChen/nethack-hmm v2.0  # With HMM repo and revision
+    python main.py vae_analysis                                                   # Default analysis with default repo
+    python main.py vae_analysis CatkinChen/nethack-vae                           # Specify VAE repo
+    python main.py vae_analysis CatkinChen/nethack-vae --revision main           # Use specific revision
+    python main.py vae_analysis --save_dir custom_output --seed 42               # Custom save dir and seed
+    python main.py vae_analysis --hmm_repo CatkinChen/nethack-hmm                # With HMM from separate repo
+    python main.py vae_analysis --revision v1.0 --hmm_repo CatkinChen/nethack-hmm --hmm_revision v2.0  # Full specification
     
     Note for vae_analysis:
     - If config.prior_mode == 'hmm' or hmm_repo is specified, β-KL will be calculated against HMM prior instead of N(0,I)
@@ -145,13 +152,41 @@ if __name__ == "__main__":
     
     
     if len(sys.argv) > 1 and sys.argv[1] == "vae_analysis":
-        # Demo mode: python main.py vae_analysis <repo_name> [revision_name] [save_dir] [seed] [hmm_repo_name] [hmm_revision_name]
-        repo_name = sys.argv[2] if len(sys.argv) > 2 else "CatkinChen/nethack-vae"
-        revision_name = sys.argv[3] if len(sys.argv) > 3 else None
-        save_dir = sys.argv[4] if len(sys.argv) > 4 else "vae_analysis"
-        analysis_seed = int(sys.argv[5]) if len(sys.argv) > 5 else 50
-        hmm_repo_name = sys.argv[6] if len(sys.argv) > 6 else None
-        hmm_revision_name = sys.argv[7] if len(sys.argv) > 7 else None
+        # Parse vae_analysis command with flag-based arguments
+        # Usage: python main.py vae_analysis [repo_name] [options]
+        repo_name = "CatkinChen/nethack-vae"  # default
+        revision_name = None
+        save_dir = "vae_analysis"
+        analysis_seed = 50
+        hmm_repo_name = None
+        hmm_revision_name = None
+        
+        # Parse positional repo_name (if not starting with --)
+        i = 2
+        if i < len(sys.argv) and not sys.argv[i].startswith('--'):
+            repo_name = sys.argv[i]
+            i += 1
+        
+        # Parse flag-based arguments
+        while i < len(sys.argv):
+            if sys.argv[i] == '--revision' and i + 1 < len(sys.argv):
+                revision_name = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--save_dir' and i + 1 < len(sys.argv):
+                save_dir = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--seed' and i + 1 < len(sys.argv):
+                analysis_seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--hmm_repo' and i + 1 < len(sys.argv):
+                hmm_repo_name = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--hmm_revision' and i + 1 < len(sys.argv):
+                hmm_revision_name = sys.argv[i + 1]
+                i += 2
+            else:
+                print(f"⚠️  Unknown option: {sys.argv[i]}")
+                i += 1
         
         print(f"🚀 Running VAE Analysis Demo")
         print(f"📦 VAE Repository: {repo_name}")
