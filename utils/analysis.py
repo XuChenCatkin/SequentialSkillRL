@@ -985,6 +985,10 @@ def analyze_latent_space(
     logvar_all  = torch.cat(logvar_list, dim=0) if logvar_list else None
     lowrank_all = torch.cat(lowrank_list, dim=0) if lowrank_list else None  # shape: [N,D,R]
     r_hat_all = torch.cat(r_hat_list, dim=0) if r_hat_list else None  # shape: [N, K]
+    if r_hat_all is not None:
+        argmax_r_hat = r_hat_all.argmax(dim=1)  # [N]
+    else:
+        argmax_r_hat = None
 
     # --- compute aggregated posterior covariance: Var[mu] + E[diag(var)] + E[FF^T]
     mu_mean = mu_all.mean(dim=0)                          # [D]
@@ -1064,36 +1068,80 @@ def analyze_latent_space(
         kl_prior_type = 'N(0,I)'
 
     if use_hmm_prior:
-        # HMM decomposition: approximate using skill-averaged statistics
-        # Note: This is a simplification - true HMM decomposition would be more complex
-        
-        # Convert torch tensors to numpy for consistency with rest of analysis
-        mu_k_np = mu_k.detach().cpu().numpy()  # [K,D] skill means for each sample
-        r_hat_np = r_hat_all.detach().cpu().numpy()  # [N,K] responsibilities for each sample
-        
-        # Skill-weighted prior statistics
-        mu_prior = (r_hat_np[:, :, np.newaxis] * mu_k_np[np.newaxis, :, :]).sum(axis=1)  # [N,D] weighted skill means
-        mu_prior_bar = mu_prior.mean(axis=0)  # [D] average skill-weighted prior mean
-        
-        # Approximate DWKL using skill-weighted prior
-        var_total_np = var_total.numpy()
-        mean_total_np = mean_total.numpy()
-        diag_S_bar = np.clip(var_total_np, jitter_eps, None)  # [D] diagonal of aggregated covariance
-        dwkl_per_dim = 0.5 * (diag_S_bar + (mean_total_np - mu_prior_bar)**2 - 1.0 - np.log(diag_S_bar))  # [D]
-        dw_kl = np.sum(dwkl_per_dim)
-        
-        # Approximate TC (same computation but relative to skill-weighted prior)
-        D_sqrt_inv = np.diag(1.0 / np.sqrt(diag_S_bar))  # [D,D]
-        Sigma_agg_np = Sigma_agg.numpy()
-        R = D_sqrt_inv @ Sigma_agg_np @ D_sqrt_inv
-        R = 0.5 * (R + R.T) + jitter_eps * np.eye(D)
+        def gauss_kl(mu1, S1, mu2, S2):
+            # all torch, float64
+            D = mu1.shape[-1]
+            L2 = torch.linalg.cholesky(S2)
+            invS2 = torch.cholesky_inverse(L2)
+            logdetS2 = 2.0 * torch.log(torch.diagonal(L2, dim1=-2, dim2=-1)).sum()
+            L1 = torch.linalg.cholesky(S1)
+            logdetS1 = 2.0 * torch.log(torch.diagonal(L1, dim1=-2, dim2=-1)).sum()
+            tr = torch.einsum('ij,ij->', invS2, S1)
+            d = (mu2 - mu1).unsqueeze(-1)
+            quad = torch.einsum('bij,ij,bjk->b', d.transpose(-1,-2), invS2, d) if d.dim()==3 else (d.transpose(-1,-2) @ invS2 @ d).squeeze()
+            return 0.5 * (logdetS2 - logdetS1 - D + tr + quad)
+
+        mu_bar = mu_all.double().mean(dim=0)                     # [D]
+        Sigma_agg_t = Sigma_agg.double()                         # [D,D]
+
+        # build per-sample Σ_x
+        N = mu_all.shape[0]
+        mi_vals = []
+        for i in range(N):
+            Sigma_i = torch.diag_embed(logvar_all[i].exp().double())
+            if lowrank_all is not None:
+                Fi = lowrank_all[i].double()                    # [D,R]
+                Sigma_i = Sigma_i + Fi @ Fi.T
+            mi_vals.append(gauss_kl(mu_all[i].double(), Sigma_i, mu_bar, Sigma_agg_t).unsqueeze(0))
+        mi = torch.cat(mi_vals, dim=0).mean().item()            # scalar ≥ 0
+
+        # 3) TC from Σ_agg (prior-free)
+        var_total_np = torch.diag(Sigma_agg_t).cpu().numpy()
+        Sigma_agg_np = Sigma_agg_t.cpu().numpy()
+        Dinv2 = np.diag(1.0 / np.sqrt(np.clip(var_total_np, jitter_eps, None)))
+        R = Dinv2 @ Sigma_agg_np @ Dinv2
+        R = 0.5 * (R + R.T) + jitter_eps * np.eye(R.shape[0])
         sign, logdetR = np.linalg.slogdet(R)
-        if not np.all(sign > 0):
-            print("Warning: Covariance matrix R is not positive definite for HMM prior.")
+        if sign <= 0:
             logdetR = 0.0
-        tc = -0.5 * logdetR
-        
-        mi = float(ekl - tc - dw_kl)
+        tc = float(-0.5 * logdetR)
+
+        # q(z) ≈ N(mu_bar, Sigma_agg)
+        mu_bar = mu_all.double().mean(0)          # [D]
+        Sigma_agg_t = Sigma_agg.double()          # [D,D]
+        L_q = torch.linalg.cholesky(Sigma_agg_t)  # Cholesky
+
+        def logN_from_chol(z, mu, L):             # z: [M,D], mu: [D], L: [D,D]
+            D = z.size(-1)
+            diff = z - mu
+            sol  = torch.cholesky_solve(diff.unsqueeze(-1), L).squeeze(-1)   # [M,D]
+            maha = (diff * sol).sum(dim=-1)
+            logdet = 2.0 * torch.log(torch.diagonal(L)).sum()
+            return -0.5 * (D * torch.log(torch.tensor(2.0*torch.pi, dtype=L.dtype)) + logdet + maha)
+
+        # Use ALL components (incl. remainder) and double precision for stability
+        pi = hmm._Epi().double()                        # [Kp1]
+        mu_k = hmm.niw.mu.double()                      # [Kp1, D]
+        E_Lambda = hmm._get_E_Lambda().double()         # [Kp1, D, D]
+
+        # log N(z; μ, Σ) expressed with precision Λ = E[Λ]
+        def log_mix_prec(z):                            # z: [M, D]
+            D = z.size(-1)
+            diff = z.unsqueeze(1) - mu_k.unsqueeze(0)   # [M,Kp1,D]
+            maha = torch.einsum('mkd,kde,mke->mk', diff, E_Lambda, diff)
+            # log |Λ| via Cholesky (SPD guarantee)
+            L = torch.linalg.cholesky(E_Lambda)         # [Kp1,D,D]
+            logdet_Lambda = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
+            log_comp = 0.5*(logdet_Lambda - D*torch.log(torch.tensor(2.0*torch.pi, dtype=z.dtype)) - maha)  # [M,Kp1]
+            return torch.logsumexp(torch.log(pi).unsqueeze(0) + log_comp, dim=1)  # [M]
+
+        # Monte-Carlo
+        M = 8192
+        eps = torch.randn(M, mu_bar.numel(), dtype=mu_bar.dtype)
+        z = mu_bar + eps @ L_q.T
+        logq = logN_from_chol(z, mu_bar, L_q)
+        logp = log_mix_prec(z)
+        kl_q_p_hmm = (logq - logp).mean().item()            # ≥ 0 up to MC error
     else:
         # Dimension-wise KL: sum_i KL(q(z_i)||N(0,1)) with Var(z_i)=var_total_i, mean=mean_total_i
         var_total_np = var_total.numpy()
@@ -1113,31 +1161,103 @@ def analyze_latent_space(
     # --- Visualization
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(3, 3, figsize=(18, 18))
+    
+    # Initialize individual plots dictionary
+    individual_plots = {}
 
-    # dataset palette (avoid shadowing)
+    # Prepare dataset coloring variables (used later in code regardless of HMM)
     palette = ['turquoise', 'lightcoral', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
     ds_unique = sorted(set(ds_list))
     ds_to_color = {ds: palette[i % len(palette)] for i, ds in enumerate(ds_unique)}
     ds_mask = {ds: np.array([d == ds for d in ds_list]) for ds in ds_unique}
 
-    # (0,0) PCA scatter
-    for ds in ds_unique:
-        m = ds_mask[ds]
-        axes[0,0].scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
-    axes[0,0].set_title('PCA of Latent Means (by dataset)')
-    axes[0,0].set_xlabel(f'PC1 ({pca_expl[0]:.1%})'); axes[0,0].set_ylabel(f'PC2 ({pca_expl[1]:.1%})'); axes[0,0].legend(); axes[0,0].grid(alpha=0.3)
+    # Choose coloring scheme based on HMM availability
+    if use_hmm_prior and argmax_r_hat is not None:
+        # Color by skill assignments (argmax of HMM responsibilities)
+        argmax_r_hat_np = argmax_r_hat.numpy()
+        
+        # Find unique skills that actually appear in the data
+        unique_skills = np.unique(argmax_r_hat_np)
+        num_unique_skills = len(unique_skills)
+        total_skills = int(r_hat_all.shape[1])
+        
+        print(f"🎨 Found {num_unique_skills} distinct skills in data (out of {total_skills} total skills)")
+        print(f"   Active skills: {sorted(unique_skills.tolist())}")
+        
+        # Create discrete colormap only for active skills
+        import matplotlib.colors as mcolors
+        if num_unique_skills <= 20:
+            # Use tab20 colors directly
+            cmap_base = plt.cm.tab20
+            colors = [cmap_base(i) for i in range(num_unique_skills)]
+        else:
+            # For more skills, use multiple colormaps
+            cmap1 = plt.cm.tab20  # 20 colors
+            cmap2 = plt.cm.Set3   # 12 more colors
+            colors = [cmap1(i % 20) for i in range(min(num_unique_skills, 20))]
+            if num_unique_skills > 20:
+                colors.extend([cmap2(i % 12) for i in range(num_unique_skills - 20)])
+        
+        # Create mapping from skill ID to color index
+        skill_to_color_idx = {skill: idx for idx, skill in enumerate(unique_skills)}
+        # Map data to color indices
+        color_indices = np.array([skill_to_color_idx[skill] for skill in argmax_r_hat_np])
+        
+        # Create discrete colormap
+        discrete_cmap = mcolors.ListedColormap(colors)
+        # Set color normalization to discrete values
+        norm = mcolors.BoundaryNorm(boundaries=np.arange(num_unique_skills + 1) - 0.5, ncolors=num_unique_skills)
+        
+        # (0,0) PCA scatter colored by skills
+        scatter = axes[0,0].scatter(latent_pca[:,0], latent_pca[:,1], s=20, alpha=0.7, 
+                                  c=color_indices, cmap=discrete_cmap, norm=norm)
+        axes[0,0].set_title(f'PCA of Latent Means (by HMM Skills, {num_unique_skills}/{total_skills} active)')
+        axes[0,0].set_xlabel(f'PC1 ({pca_expl[0]:.1%})'); axes[0,0].set_ylabel(f'PC2 ({pca_expl[1]:.1%})')
+        cbar = plt.colorbar(scatter, ax=axes[0,0])
+        cbar.set_label('Skill ID')
+        # Set discrete ticks on colorbar showing actual skill IDs
+        cbar.set_ticks(range(num_unique_skills))
+        cbar.set_ticklabels([str(skill) for skill in unique_skills])
+        axes[0,0].grid(alpha=0.3)
 
-    # (0,1) t-SNE
-    if latent_tsne is not None:
-        for ds in ds_unique:
-            m = ds_mask[ds]
-            axes[0,1].scatter(latent_tsne[m,0], latent_tsne[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
-        axes[0,1].set_title(f't-SNE (perplexity={perpl})'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
+        # (0,1) t-SNE colored by skills
+        if latent_tsne is not None:
+            scatter = axes[0,1].scatter(latent_tsne[:,0], latent_tsne[:,1], s=20, alpha=0.7, 
+                                      c=color_indices, cmap=discrete_cmap, norm=norm)
+            axes[0,1].set_title(f't-SNE (perplexity={perpl}, by HMM Skills)')
+            cbar = plt.colorbar(scatter, ax=axes[0,1])
+            cbar.set_label('Skill ID')
+            cbar.set_ticks(range(num_unique_skills))
+            cbar.set_ticklabels([str(skill) for skill in unique_skills])
+        else:
+            scatter = axes[0,1].scatter(latent_pca[:,0], latent_pca[:,1], s=20, alpha=0.7, 
+                                      c=color_indices, cmap=discrete_cmap, norm=norm)
+            axes[0,1].set_title('Fallback: PC1 vs PC2 (by HMM Skills)')
+            cbar = plt.colorbar(scatter, ax=axes[0,1])
+            cbar.set_label('Skill ID')
+            cbar.set_ticks(range(num_unique_skills))
+            cbar.set_ticklabels([str(skill) for skill in unique_skills])
+        axes[0,1].grid(alpha=0.3)
     else:
+        # Fallback to dataset coloring
+        # (0,0) PCA scatter
         for ds in ds_unique:
             m = ds_mask[ds]
-            axes[0,1].scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
-        axes[0,1].set_title('Fallback: PC1 vs PC2'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
+            axes[0,0].scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+        axes[0,0].set_title('PCA of Latent Means (by dataset)')
+        axes[0,0].set_xlabel(f'PC1 ({pca_expl[0]:.1%})'); axes[0,0].set_ylabel(f'PC2 ({pca_expl[1]:.1%})'); axes[0,0].legend(); axes[0,0].grid(alpha=0.3)
+
+        # (0,1) t-SNE
+        if latent_tsne is not None:
+            for ds in ds_unique:
+                m = ds_mask[ds]
+                axes[0,1].scatter(latent_tsne[m,0], latent_tsne[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+            axes[0,1].set_title(f't-SNE (perplexity={perpl})'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
+        else:
+            for ds in ds_unique:
+                m = ds_mask[ds]
+                axes[0,1].scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+            axes[0,1].set_title('Fallback: PC1 vs PC2'); axes[0,1].legend(); axes[0,1].grid(alpha=0.3)
 
     # (0,2) per-dim variance (from Σ_agg diagonal)
     var_total_np = var_total.numpy() if isinstance(var_total, torch.Tensor) else var_total
@@ -1149,13 +1269,34 @@ def analyze_latent_space(
     axes[1,0].bar(range(D), mean_total_np)
     axes[1,0].set_title('Mean per Latent'); axes[1,0].set_xlabel('dim'); axes[1,0].grid(alpha=0.3)
 
-    # (1,1) PC1 distribution by dataset
-    for ds in ds_unique:
-        m = ds_mask[ds]
-        if m.any():
-            axes[1,1].hist(latent_pca[m,0], bins=30, alpha=0.6, density=True, label=ds, color=ds_to_color[ds])
+    # (1,1) PC1 distribution by skills or dataset
+    if use_hmm_prior and argmax_r_hat is not None:
+        # Color by skills
+        for skill_idx, skill in enumerate(unique_skills):
+            skill_mask = argmax_r_hat_np == skill
+            if skill_mask.any():
+                axes[1,1].hist(latent_pca[skill_mask,0], bins=30, alpha=0.6, density=True, 
+                             label=f'Skill {skill}', color=colors[skill_idx])
+        axes[1,1].set_title(f'PC1 Distribution (by HMM Skills, {num_unique_skills}/{total_skills} active)')
+    else:
+        # Fallback to dataset coloring, but ensure we always show something
+        print(f"📊 PC1 Distribution: ds_unique={ds_unique}, ds_list length={len(ds_list)}")
+        plotted_any = False
+        for ds in ds_unique:
+            m = ds_mask[ds]
+            print(f"   Dataset '{ds}': {m.sum()} samples")
+            if m.any():
+                axes[1,1].hist(latent_pca[m,0], bins=30, alpha=0.6, density=True, label=ds, color=ds_to_color[ds])
+                plotted_any = True
+        
+        # If no datasets were plotted (shouldn't happen), plot everything
+        if not plotted_any:
+            print("   ⚠️ No datasets found, plotting all PC1 values")
+            axes[1,1].hist(latent_pca[:,0], bins=30, alpha=0.6, density=True, label='All Data', color='skyblue')
+        
+        axes[1,1].set_title('PC1 Distribution (by dataset)')
     axes[1,1].axvline(0, color='k', ls='--', alpha=0.7)
-    axes[1,1].set_title('PC1 Distribution'); axes[1,1].legend(); axes[1,1].grid(alpha=0.3)
+    axes[1,1].legend(); axes[1,1].grid(alpha=0.3)
 
     # (1,2) correlation of first 10 raw dims using Σ_agg
     k = min(10, D)
@@ -1181,13 +1322,221 @@ def analyze_latent_space(
     axes[2,1].set_yscale('log'); axes[2,1].set_title('Eigenvalues of Σ_agg (log)'); axes[2,1].grid(alpha=0.3)
 
     # (2,2) KL decomposition
-    metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL']
-    vals = [mi, tc, dw_kl, ekl]
-    bars = axes[2,2].bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
-    axes[2,2].set_ylabel('nats'); axes[2,2].set_title(f'KL = MI + TC + DW\n(Prior: {kl_prior_type})')
-    for b, v in zip(bars, vals):
-        axes[2,2].text(b.get_x() + b.get_width()/2., v * 1.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
-    plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.show()
+    if use_hmm_prior and argmax_r_hat is not None:
+        metrics = ['Mutual\nInformation', 'Total\nCorrelation', r'KL$(q \| p_{\mathrm{HMM}})$', 'Total KL']
+        vals    = [mi, tc, kl_q_p_hmm, ekl]
+        bars = axes[2,2].bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
+        axes[2,2].set_ylabel('nats'); axes[2,2].set_title(f'KL components\n(Prior: {kl_prior_type})')
+        for b, v in zip(bars, vals):
+            axes[2,2].text(b.get_x() + b.get_width()/2., v * 1.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+        plt.tight_layout()
+    else:
+        metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL']
+        vals = [mi, tc, dw_kl, ekl]
+        bars = axes[2,2].bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
+        axes[2,2].set_ylabel('nats'); axes[2,2].set_title(f'KL = MI + TC + DW\n(Prior: {kl_prior_type})')
+        for b, v in zip(bars, vals):
+            axes[2,2].text(b.get_x() + b.get_width()/2., v * 1.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+        plt.tight_layout()
+    
+    # Save the combined figure (moved outside conditional blocks)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    
+    # Save individual plots
+    print(f"📊 Saving individual plots...")
+    base_path = save_path.replace('.png', '')
+    
+    # Ensure we have the necessary variables for individual plots
+    var_total_plot = var_total_np if 'var_total_np' in locals() else var_total.numpy()
+    mean_total_plot = mean_total_np if 'mean_total_np' in locals() else mean_total.numpy()
+    per_dim_kl = 0.5 * (var_total_plot + mean_total_plot**2 - 1.0 - np.log(np.clip(var_total_plot, jitter_eps, None)))
+    evals = np.linalg.eigvalsh(Sigma_agg.numpy() if isinstance(Sigma_agg, torch.Tensor) else Sigma_agg)
+    evals = np.clip(evals, jitter_eps, None)
+    
+    # Define plot names and their corresponding axes
+    plot_info = [
+            ('pca_scatter', axes[0,0], 'PCA Scatter'),
+            ('tsne_scatter', axes[0,1], 't-SNE Scatter'),
+            ('variance_per_dim', axes[0,2], 'Variance per Dimension'),
+            ('mean_per_dim', axes[1,0], 'Mean per Dimension'),
+            ('pc1_distribution', axes[1,1], 'PC1 Distribution'),
+            ('correlation_matrix', axes[1,2], 'Correlation Matrix'),
+            ('per_dim_kl', axes[2,0], 'Per-dimension KL'),
+            ('eigenvalues', axes[2,1], 'Eigenvalue Spectrum'),
+            ('kl_decomposition', axes[2,2], 'KL Decomposition')
+        ]
+    
+    for plot_name, ax, plot_title in plot_info:
+        # Create a new figure for this subplot
+        fig_individual = plt.figure(figsize=(8, 6))
+        ax_individual = fig_individual.add_subplot(111)
+        
+        # Copy the content from the original subplot
+        # Get all the artists (lines, patches, collections, etc.) from the original axis
+        for child in ax.get_children():
+            if hasattr(child, 'get_paths'):  # For collections (scatter plots, bar plots)
+                # Handle scatter plots and bar plots
+                if hasattr(child, '_facecolors'):  # Scatter plot
+                    ax_individual.scatter(child.get_offsets()[:, 0], child.get_offsets()[:, 1],
+                                        c=child._facecolors, s=child.get_sizes(), alpha=child.get_alpha())
+                elif hasattr(child, 'get_height'):  # Bar plot - this won't work directly
+                    continue  # We'll handle bar plots separately below
+            elif hasattr(child, 'get_data'):  # For lines
+                line_data = child.get_data()
+                ax_individual.plot(line_data[0], line_data[1], 
+                                 color=child.get_color(), 
+                                 linewidth=child.get_linewidth(),
+                                 linestyle=child.get_linestyle(),
+                                 alpha=child.get_alpha())
+        
+        # Copy axis properties
+        ax_individual.set_xlim(ax.get_xlim())
+        ax_individual.set_ylim(ax.get_ylim())
+        ax_individual.set_xlabel(ax.get_xlabel())
+        ax_individual.set_ylabel(ax.get_ylabel())
+        ax_individual.set_title(ax.get_title())
+        
+        # Handle special cases for complex plots
+        if plot_name == 'correlation_matrix' and hasattr(ax, 'images') and ax.images:
+            # Copy image data for correlation matrix
+            im = ax.images[0]
+            ax_individual.imshow(im.get_array(), 
+                               extent=im.get_extent(),
+                               cmap=im.get_cmap(),
+                               vmin=im.get_clim()[0],
+                               vmax=im.get_clim()[1])
+            plt.colorbar(ax_individual.images[0], ax=ax_individual, label='corr')
+        
+        # Handle specific plot types that need recreation
+        if plot_name == 'pca_scatter':
+            ax_individual.clear()
+            if use_hmm_prior and argmax_r_hat is not None:
+                # Recreate PCA scatter with skill coloring and colorbar
+                scatter = ax_individual.scatter(latent_pca[:,0], latent_pca[:,1], s=20, alpha=0.7, 
+                                              c=color_indices, cmap=discrete_cmap, norm=norm)
+                ax_individual.set_title(f'PCA of Latent Means (by HMM Skills, {num_unique_skills}/{total_skills} active)')
+                ax_individual.set_xlabel(f'PC1 ({pca_expl[0]:.1%})')
+                ax_individual.set_ylabel(f'PC2 ({pca_expl[1]:.1%})')
+                cbar = plt.colorbar(scatter, ax=ax_individual)
+                cbar.set_label('Skill ID')
+                cbar.set_ticks(range(num_unique_skills))
+                cbar.set_ticklabels([str(skill) for skill in unique_skills])
+            else:
+                # Fallback to dataset coloring
+                for ds in ds_unique:
+                    m = ds_mask[ds]
+                    ax_individual.scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+                ax_individual.set_title('PCA of Latent Means (by dataset)')
+                ax_individual.set_xlabel(f'PC1 ({pca_expl[0]:.1%})')
+                ax_individual.set_ylabel(f'PC2 ({pca_expl[1]:.1%})')
+                ax_individual.legend()
+            ax_individual.grid(alpha=0.3)
+        elif plot_name == 'tsne_scatter':
+            ax_individual.clear()
+            if use_hmm_prior and argmax_r_hat is not None:
+                # Recreate t-SNE scatter with skill coloring and colorbar
+                if latent_tsne is not None:
+                    scatter = ax_individual.scatter(latent_tsne[:,0], latent_tsne[:,1], s=20, alpha=0.7, 
+                                                  c=color_indices, cmap=discrete_cmap, norm=norm)
+                    ax_individual.set_title(f't-SNE (perplexity={perpl}, by HMM Skills)')
+                else:
+                    scatter = ax_individual.scatter(latent_pca[:,0], latent_pca[:,1], s=20, alpha=0.7, 
+                                                  c=color_indices, cmap=discrete_cmap, norm=norm)
+                    ax_individual.set_title('Fallback: PC1 vs PC2 (by HMM Skills)')
+                cbar = plt.colorbar(scatter, ax=ax_individual)
+                cbar.set_label('Skill ID')
+                cbar.set_ticks(range(num_unique_skills))
+                cbar.set_ticklabels([str(skill) for skill in unique_skills])
+            else:
+                # Fallback to dataset coloring
+                if latent_tsne is not None:
+                    for ds in ds_unique:
+                        m = ds_mask[ds]
+                        ax_individual.scatter(latent_tsne[m,0], latent_tsne[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+                    ax_individual.set_title(f't-SNE (perplexity={perpl})')
+                else:
+                    for ds in ds_unique:
+                        m = ds_mask[ds]
+                        ax_individual.scatter(latent_pca[m,0], latent_pca[m,1], s=20, alpha=0.6, c=ds_to_color[ds], label=ds)
+                    ax_individual.set_title('Fallback: PC1 vs PC2')
+                ax_individual.legend()
+            ax_individual.grid(alpha=0.3)
+        elif plot_name == 'variance_per_dim':
+            ax_individual.clear()
+            ax_individual.bar(range(D), var_total_plot)
+            ax_individual.set_title('Variance per Latent (Σ_agg diag)')
+            ax_individual.set_xlabel('dim')
+            ax_individual.grid(alpha=0.3)
+        elif plot_name == 'mean_per_dim':
+            ax_individual.clear()
+            ax_individual.bar(range(D), mean_total_plot)
+            ax_individual.set_title('Mean per Latent')
+            ax_individual.set_xlabel('dim')
+            ax_individual.grid(alpha=0.3)
+        elif plot_name == 'per_dim_kl':
+            ax_individual.clear()
+            ax_individual.bar(range(D), per_dim_kl)
+            ax_individual.axhline(0.05, color='r', ls='--', alpha=0.7, label='0.05 nats')
+            ax_individual.legend()
+            ax_individual.set_title('Per-dim KL')
+            ax_individual.grid(alpha=0.3)
+        elif plot_name == 'pc1_distribution':
+            ax_individual.clear()
+            # Recreate the PC1 distribution histogram
+            if use_hmm_prior and argmax_r_hat is not None:
+                # Color by skills
+                for skill_idx, skill in enumerate(unique_skills):
+                    skill_mask = argmax_r_hat_np == skill
+                    if skill_mask.any():
+                        ax_individual.hist(latent_pca[skill_mask,0], bins=30, alpha=0.6, density=True, 
+                                         label=f'Skill {skill}', color=colors[skill_idx])
+                ax_individual.set_title(f'PC1 Distribution (by HMM Skills, {num_unique_skills}/{total_skills} active)')
+            else:
+                # Fallback to dataset coloring
+                for ds in ds_unique:
+                    m = ds_mask[ds]
+                    if m.any():
+                        ax_individual.hist(latent_pca[m,0], bins=30, alpha=0.6, density=True, label=ds, color=ds_to_color[ds])
+                ax_individual.set_title('PC1 Distribution (by dataset)')
+            ax_individual.axvline(0, color='k', ls='--', alpha=0.7)
+            ax_individual.legend()
+            ax_individual.grid(alpha=0.3)
+        elif plot_name == 'eigenvalues':
+            ax_individual.clear()
+            ax_individual.bar(range(D), np.sort(evals)[::-1])
+            ax_individual.set_yscale('log')
+            ax_individual.set_title('Eigenvalues of Σ_agg (log)')
+            ax_individual.grid(alpha=0.3)
+        elif plot_name == 'kl_decomposition':
+            ax_individual.clear()
+            if use_hmm_prior and argmax_r_hat is not None:
+                metrics = ['Mutual\nInformation', 'Total\nCorrelation', r'KL$(q \parallel p_{\mathrm{HMM}})$', 'Total KL']
+                vals = [mi, tc, kl_q_p_hmm, ekl]
+            else:
+                metrics = ['Mutual\nInformation', 'Total\nCorrelation', 'Dimension-wise\nKL', 'Total KL']
+                vals = [mi, tc, dw_kl, ekl]
+            bars = ax_individual.bar(metrics, vals, color=['skyblue','lightcoral','lightgreen','gold'])
+            ax_individual.set_ylabel('nats')
+            ax_individual.set_title(f'KL = MI + TC + DW\n(Prior: {kl_prior_type})')
+            for b, v in zip(bars, vals):
+                ax_individual.text(b.get_x() + b.get_width()/2., v * 1.01, f'{v:.3f}', 
+                                 ha='center', va='bottom', fontsize=9)
+        
+        # Set grid for all plots
+        ax_individual.grid(alpha=0.3)
+        
+        # Save individual plot
+        individual_path = f"{base_path}_{plot_name}.png"
+        plt.figure(fig_individual.number)
+        plt.tight_layout()
+        plt.savefig(individual_path, dpi=150, bbox_inches='tight')
+        plt.close(fig_individual)
+        individual_plots[plot_name] = individual_path
+            
+        print(f"✅ Saved {len(individual_plots)} individual plots")
+        
+        # Show the main combined figure
+        plt.show()
 
     # --- PCA grid decode
     print("\n🎮 Generating TTY visualization grid using PCA space...")
@@ -1229,7 +1578,7 @@ def analyze_latent_space(
     # --- reporting
     print(f"\n📊 Enhanced Latent Space Analysis")
     print(f"  - Samples: {total} ({got_train} train, {got_test} test), D={D}")
-    print(f"  - KL total={ekl:.3f}, MI={mi:.3f}, TC={tc:.3f}, DW={dw_kl:.3f}")
+    print(f"  - KL total={ekl:.3f}, MI={mi:.3f}, TC={tc:.3f}")
     print(f"  - PCA first 5 explained: {pca_expl[:5]} (cum {np.cumsum(pca_expl[:5])})")
 
     return {
@@ -1240,12 +1589,13 @@ def analyze_latent_space(
         'pca_components': latent_pca,
         'pca_model': pca,
         'tsne_components': latent_tsne,
-        'metrics': {'kl_total': float(ekl), 'mi': float(mi), 'tc': float(tc), 'dw_kl': float(dw_kl)},
+        'metrics': {'kl_total': float(ekl), 'mi': float(mi), 'tc': float(tc)},
         'prior_type': kl_prior_type,
         'use_hmm_prior': use_hmm_prior,
         'dataset_labels': ds_list,
         'plot_path': save_path,
         'tty_grid_path': tty_save_path,
+        'individual_plots': individual_plots,  # Dictionary mapping plot names to file paths
     }
 
 
@@ -1368,11 +1718,11 @@ def create_visualization_demo(
         model, config = load_model_from_huggingface(repo_name, token=token, device=device, revision_name=revision_name)
         
         # Try to load HMM if the model was trained with HMM prior or if explicitly specified
-        if (config is not None and hasattr(config, 'prior_mode') and config.prior_mode in ['hmm', 'blend']) or hmm_repo_name is not None:
+        if (config is not None and hasattr(config, 'prior_mode') and config.prior_mode in ['hmm', 'blend']) and hmm_repo_name is not None:
             try:
                 # Use explicit HMM repository if provided, otherwise try the same repository as VAE
-                hmm_repo = hmm_repo_name if hmm_repo_name is not None else repo_name
-                hmm_rev = hmm_revision_name if hmm_revision_name is not None else revision_name
+                hmm_repo = hmm_repo_name
+                hmm_rev = hmm_revision_name
                 
                 print(f"🧠 Attempting to load HMM from '{hmm_repo}' (revision: {hmm_rev})...")
                 if config is not None and hasattr(config, 'prior_mode'):

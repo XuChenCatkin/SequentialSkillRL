@@ -1655,7 +1655,9 @@ class StickyHDPHMMVI(nn.Module):
             "p_stay": p_stay,
             "expected_dwell_length_per_state": mean_geo,
             "empirical_dwell_length_per_state": emp_mean,
-            "all_lengths": all_lens
+            "all_lengths": all_lens,
+            "r_hat": r_all,
+            "viterbi_paths": paths
         }
 
     # -----------------------------------------------------------------------

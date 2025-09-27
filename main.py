@@ -234,7 +234,7 @@ if __name__ == "__main__":
             results = create_visualization_demo(
                 repo_name=repo_name,
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
+                test_dataset=None,
                 revision_name=revision_name,
                 hmm_repo_name=hmm_repo_name,
                 hmm_revision_name=hmm_revision_name,
