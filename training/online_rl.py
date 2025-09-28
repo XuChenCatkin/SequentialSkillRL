@@ -74,6 +74,7 @@ def train_online_ppo_with_pretrained_models(
     ppo_repo_id: Optional[str] = None,  # HuggingFace repo with existing PPO checkpoint
     ppo_checkpoint_path: Optional[str] = None,  # Local path to PPO checkpoint
     resume_training: bool = False,  # Whether to continue from existing PPO checkpoint
+    reset_global_steps: bool = False,  # Whether to reset global step counter when resuming
     # Weights & Biases monitoring parameters
     use_wandb: bool = False,
     wandb_project: str = "SequentialSkillRL",
@@ -114,6 +115,8 @@ def train_online_ppo_with_pretrained_models(
         resume_training: Whether to load and continue from existing PPO checkpoint
             - If True, requires either ppo_repo_id or ppo_checkpoint_path
             - If False, starts fresh PPO training (default behavior)
+            
+        reset_global_steps: Whether to reset the global step counter when resuming training
         
         # Monitoring and uploading
         use_wandb: Enable Weights & Biases logging
@@ -474,6 +477,9 @@ def train_online_ppo_with_pretrained_models(
                 if 'global_steps' in checkpoint_data:
                     trainer.global_steps = checkpoint_data['global_steps']
                     if logger: logger.info(f"✅ Training resumed from step {trainer.global_steps:,}")
+                    if reset_global_steps:
+                        trainer.global_steps = 0
+                        if logger: logger.info("🔄 Global step counter reset to 0 as requested")
                 
                 # Load training configuration for validation
                 if 'config' in checkpoint_data:

@@ -845,6 +845,7 @@ if __name__ == "__main__":
         disable_upload = False
         resume_repo_id = None  # HuggingFace repo for resuming
         resume_local_path = None  # Local checkpoint path for resuming
+        reset_global_steps = False  # Whether to reset global step when resuming
         vae_revision = None  # HuggingFace VAE model revision
         hmm_revision = None  # HuggingFace HMM model revision
         
@@ -940,6 +941,9 @@ if __name__ == "__main__":
             elif sys.argv[i] == '--hmm_revision' and i + 1 < len(sys.argv):
                 hmm_revision = sys.argv[i + 1]
                 i += 2
+            elif sys.argv[i] == '--reset_step':
+                reset_global_steps = True
+                i += 1
             else:
                 print(f"⚠️  Unknown option: {sys.argv[i]}")
                 i += 1
@@ -1245,6 +1249,7 @@ if __name__ == "__main__":
                 ppo_repo_id=resume_repo_id,
                 ppo_checkpoint_path=resume_local_path,
                 resume_training=resume_repo_id is not None or resume_local_path is not None,
+                reset_global_steps=reset_global_steps,
                 
                 # Monitoring and uploading
                 use_wandb=use_wandb_flag,
