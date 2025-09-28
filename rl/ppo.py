@@ -2797,6 +2797,15 @@ class PPOTrainer:
         Evaluation with richer diagnostics to support:
           (1) VAE+HMM+PPO vs VAE+PPO (task returns, success, sample-efficiency)
           (2) Curiosity vs RND (decomposition & exploration proxies)
+        
+        Returns:
+            Dict containing:
+                - successful_trajectories: List of (obs, actions, rewards) for successful episodes
+                - successful_viterbi_paths: List of Viterbi skill paths for successful episodes  
+                - success_rate: Success rate across all episodes
+                - successful_returns: List of returns for successful episodes only
+                - successful_lengths: List of episode lengths for successful episodes only
+                - <other evaluation metrics>
         """
         if logger is not None:
             logger.info(f"🧪 Starting evaluation with {episodes} episodes...")
@@ -2829,6 +2838,12 @@ class PPOTrainer:
         # Track episode completion types
         episodes_terminated = 0  # Natural termination
         episodes_truncated = 0   # Time limit truncation
+        
+        # Track successful episodes data
+        successful_trajectories = []  # List of (obs_trajectory, actions_trajectory, rewards_trajectory) 
+        successful_viterbi_paths = []  # List of Viterbi skill paths for successful episodes
+        successful_returns = []  # Returns for successful episodes only
+        successful_lengths = []  # Lengths for successful episodes only
 
         # Create progress bar for evaluation episodes
         eval_pbar = tqdm(
@@ -2852,10 +2867,18 @@ class PPOTrainer:
             mask_seq = []  # Track mask sequence for post-episode HMM processing
             visited = set()
             
+            # Track trajectory data for potential successful episodes
+            obs_trajectory = []  # Store raw observations
+            actions_trajectory = []  # Store global actions taken
+            rewards_trajectory = []  # Store rewards received
+            
             # Track negative reward masking for HMM filter (similar to training)
             prev_negative_reward = False
 
             while not done:
+                # Store current observation for trajectory
+                obs_trajectory.append(o.copy() if isinstance(o, dict) else o)
+                
                 # coverage proxy from blstats (x,y)
                 if isinstance(o, dict) and "blstats" in o:
                     bl = o["blstats"]
@@ -2927,9 +2950,15 @@ class PPOTrainer:
                 eval_global2local = self.global2local[0]  # [G]
                 a_local = eval_global2local[a_global.item()]
                 
+                # Store action in trajectory (use global action for consistency)
+                actions_trajectory.append(int(a_global.item()))
+                
                 o, r, term, trunc, _ = env.step(int(a_local.item()))
                 done = term or trunc
                 ret += float(r); ep_len += 1
+                
+                # Store reward in trajectory
+                rewards_trajectory.append(float(r))
                 
                 # Update negative reward tracking for next timestep HMM filtering
                 prev_negative_reward = (r < 0.0)
@@ -2964,6 +2993,55 @@ class PPOTrainer:
             if succ > 0.5:
                 len_succ_list.append(ep_len)
             cover_list.append(len(visited))
+            
+            # Process successful episodes (terminated, not truncated)
+            if term:  # Episode succeeded
+                # Store trajectory data for successful episode
+                successful_trajectories.append({
+                    'observations': obs_trajectory,
+                    'actions': actions_trajectory, 
+                    'rewards': rewards_trajectory
+                })
+                successful_returns.append(ret)
+                successful_lengths.append(ep_len)
+                
+                # Compute Viterbi path for successful episode if HMM is available
+                if self.has_hmm and len(mu_seq) > 0:
+                    try:
+                        # Prepare data for Viterbi decoding
+                        mu_t = torch.stack(mu_seq, dim=0).to(self.device).unsqueeze(0)  # [1, T, D]
+                        logvar_t = torch.stack(logvar_seq, dim=0).to(self.device).unsqueeze(0)  # [1, T, D]
+                        diag_var_t = torch.exp(logvar_t)  # [1, T, D]
+                        
+                        # Handle lowrank factors if present
+                        F_t = None
+                        if F_seq and F_seq[0] is not None:
+                            F_t = torch.stack(F_seq, dim=0).to(self.device).unsqueeze(0)  # [1, T, D, R]
+                        
+                        # Convert mask sequence to tensor
+                        mask_t = torch.tensor(mask_seq, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1, T]
+                        
+                        # Compute Viterbi path using HMM
+                        viterbi_paths = self.hmm.viterbi_paths(mu_t.squeeze(0), diag_var_t.squeeze(0), 
+                                                             F_t.squeeze(0) if F_t is not None else None, 
+                                                             mask_t.squeeze(0))
+                        
+                        # Store the path (should be a list with one element for single episode)
+                        if len(viterbi_paths) > 0:
+                            successful_viterbi_paths.append(viterbi_paths[0].cpu().numpy())
+                        else:
+                            successful_viterbi_paths.append(None)
+                            
+                    except Exception as e:
+                        # If Viterbi computation fails, store None and log warning
+                        successful_viterbi_paths.append(None)
+                        if logger is not None:
+                            logger.warning(f"Failed to compute Viterbi path for successful episode {ep_idx}: {e}")
+                        else:
+                            print(f"⚠️ Failed to compute Viterbi path for successful episode {ep_idx}: {e}")
+                else:
+                    # No HMM available or no sequence data
+                    successful_viterbi_paths.append(None)
             
             # Update total evaluation statistics (persistent across all evaluations)
             self._total_eval_episodes_completed += 1
@@ -3053,6 +3131,12 @@ class PPOTrainer:
         final_avg_len = np.mean(len_list) if len_list else 0.0
         final_avg_coverage = np.mean(cover_list) if cover_list else 0.0
         
+        # Calculate successful episode statistics
+        num_successful = len(successful_returns)
+        successful_avg_return = np.mean(successful_returns) if successful_returns else 0.0
+        successful_avg_length = np.mean(successful_lengths) if successful_lengths else 0.0
+        viterbi_paths_computed = sum(1 for path in successful_viterbi_paths if path is not None)
+        
         # Calculate episode completion statistics (current round)
         total_episodes_completed = episodes_terminated + episodes_truncated
         termination_rate = episodes_terminated / max(1, total_episodes_completed)
@@ -3074,6 +3158,15 @@ class PPOTrainer:
             logger.info(f"   Average Coverage: {final_avg_coverage:.1f} positions")
             logger.info(f"   Episode Completions: {episodes_terminated} terminated ({termination_rate:.1%}), "
                        f"{episodes_truncated} truncated ({truncation_rate:.1%})")
+            
+            # Log successful episode statistics
+            logger.info(f"🎯 Successful Episode Analysis:")
+            logger.info(f"   Successful Episodes: {num_successful}/{episodes}")
+            if num_successful > 0:
+                logger.info(f"   Successful Avg Return: {successful_avg_return:.3f} ± {np.std(successful_returns):.3f}")
+                logger.info(f"   Successful Avg Length: {successful_avg_length:.1f} ± {np.std(successful_lengths):.1f}")
+                logger.info(f"   Viterbi Paths Computed: {viterbi_paths_computed}/{num_successful}")
+                logger.info(f"   Trajectory Data Collected: {len(successful_trajectories)} episodes")
             
             # Log total evaluation statistics
             logger.info(f"📈 Total Evaluation Statistics:")
@@ -3117,6 +3210,15 @@ class PPOTrainer:
             print(f"   Average Coverage: {final_avg_coverage:.1f} positions")
             print(f"   Episode Completions: {episodes_terminated} terminated ({termination_rate:.1%}), "
                   f"{episodes_truncated} truncated ({truncation_rate:.1%})")
+            
+            # Print successful episode statistics
+            print(f"🎯 Successful Episode Analysis:")
+            print(f"   Successful Episodes: {num_successful}/{episodes}")
+            if num_successful > 0:
+                print(f"   Successful Avg Return: {successful_avg_return:.3f} ± {np.std(successful_returns):.3f}")
+                print(f"   Successful Avg Length: {successful_avg_length:.1f} ± {np.std(successful_lengths):.1f}")
+                print(f"   Viterbi Paths Computed: {viterbi_paths_computed}/{num_successful}")
+                print(f"   Trajectory Data Collected: {len(successful_trajectories)} episodes")
             
             # Print total evaluation statistics
             print(f"📈 Total Evaluation Statistics:")
@@ -3193,6 +3295,32 @@ class PPOTrainer:
                 "eval/effective_K_mean": float(np.mean(effK_list)),
             })
         self._log_scalar(log_dict)
+        
+        # Return evaluation results with successful episode data
+        return {
+            # Successful episode data (main requested outputs)
+            'successful_trajectories': successful_trajectories,
+            'successful_viterbi_paths': successful_viterbi_paths,
+            'success_rate': float(final_success_rate),
+            'successful_returns': successful_returns,
+            'successful_lengths': successful_lengths,
+            
+            # Additional evaluation metrics
+            'all_returns': ret_list,
+            'all_lengths': len_list,
+            'all_success_indicators': succ_list,
+            'coverage_stats': cover_list,
+            'episodes_terminated': episodes_terminated,
+            'episodes_truncated': episodes_truncated,
+            'evaluation_time': eval_time,
+            
+            # HMM/skill-related metrics (if available)
+            'skill_boundary_mass_rates': bound_mass_list if bound_mass_list else None,
+            'skill_boundary_bool_rates': bound_bool_list if bound_bool_list else None,
+            'skill_entropies': ent_list if ent_list else None,
+            'used_skills_counts': used_skills_list if used_skills_list else None,
+            'effective_K_values': effK_list if effK_list else None,
+        }
 
     def _log_scalar(self, d: Dict[str, float]):
         # Always log to JSON file
