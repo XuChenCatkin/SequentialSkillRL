@@ -209,3 +209,4 @@ checkpoints/
 models/
 wandb/
 tmp/
+runs_eval/

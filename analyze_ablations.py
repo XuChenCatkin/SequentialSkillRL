@@ -153,8 +153,9 @@ def parse_log_file(log_path: str) -> Dict:
 
 def extract_run_info(filename: str) -> Optional[Dict]:
     """Extract run information from filename."""
-    # Pattern: rl_MODE_TIMESTAMP.log
-    pattern = r'rl_([^_]+)_(\d{8}_\d{6})\.log'
+    # Pattern: rl_MODE_TIMESTAMP.log (where MODE can contain underscores)
+    # Match everything between 'rl_' and the timestamp
+    pattern = r'rl_(.+)_(\d{8}_\d{6})\.log'
     match = re.match(pattern, filename)
     
     if match:
@@ -164,25 +165,47 @@ def extract_run_info(filename: str) -> Optional[Dict]:
         }
     return None
 
-def analyze_logs_directory(logs_dir: str) -> pd.DataFrame:
-    """Analyze all log files in a directory."""
-    logs_path = Path(logs_dir)
-    if not logs_path.exists():
-        print(f"❌ Logs directory not found: {logs_dir}")
+def analyze_runs_directory(runs_dir: str) -> pd.DataFrame:
+    """Analyze all metrics files in run directories."""
+    runs_path = Path(runs_dir)
+    if not runs_path.exists():
+        print(f"❌ Runs directory not found: {runs_dir}")
         return pd.DataFrame()
     
     runs_data = []
     
-    for log_file in logs_path.glob("rl_*.log"):
-        run_info = extract_run_info(log_file.name)
-        if not run_info:
+    # Look for metrics.jsonl files in subdirectories
+    for run_dir in runs_path.iterdir():
+        if not run_dir.is_dir():
             continue
+            
+        metrics_file = run_dir / "metrics.jsonl"
+        if not metrics_file.exists():
+            continue
+            
+        # Extract mode from directory name (e.g., ablation_baseline_full_curiosity_...)
+        dir_name = run_dir.name
+        if dir_name.startswith("ablation_"):
+            # Extract mode part: ablation_MODE_ENV_TIMESTAMP
+            parts = dir_name.split("_")
+            if len(parts) >= 3:
+                # Join the middle parts as the mode (skip 'ablation' and environment/timestamp parts)
+                mode_parts = []
+                for i, part in enumerate(parts[1:]):  # Skip 'ablation'
+                    if part in ['MiniHack', 'NetHack'] or (part.isdigit() and len(part) == 8):  # Stop at environment or timestamp
+                        break
+                    mode_parts.append(part)
+                mode = "_".join(mode_parts) if mode_parts else "unknown"
+            else:
+                mode = "unknown"
+        else:
+            mode = "unknown"
         
-        print(f"📊 Analyzing: {log_file.name}")
-        metrics = parse_log_file(str(log_file))
+        print(f"📊 Analyzing: {metrics_file.name} (mode: {mode})")
+        metrics = parse_log_file(str(metrics_file))
         
         if not metrics['steps']:
-            print(f"⚠️  No metrics found in {log_file.name}")
+            print(f"⚠️  No metrics found in {metrics_file}")
             continue
         
         # Calculate summary statistics
@@ -224,10 +247,13 @@ def analyze_logs_directory(logs_dir: str) -> pd.DataFrame:
         
         total_steps = metrics['steps'][-1] if metrics['steps'] else 0
         
+        # Extract timestamp from directory name
+        timestamp = dir_name.split("_")[-1] if "_" in dir_name else "unknown"
+        
         runs_data.append({
-            'mode': run_info['mode'],
-            'timestamp': run_info['timestamp'],
-            'log_file': log_file.name,
+            'mode': mode,
+            'timestamp': timestamp,
+            'log_file': metrics_file.name,
             'total_steps': total_steps,
             'final_ext_return': final_ext_return,
             'mean_ext_return': mean_ext_return,
@@ -997,9 +1023,9 @@ def main():
     if args.wandb_project:
         df = fetch_wandb_results(args.wandb_project)
     else:
-        print(f"📁 Logs directory: {args.logs_dir}")
-        # Analyze log files
-        df = analyze_logs_directory(args.logs_dir)
+        print(f"📁 Runs directory: {args.runs_dir}")
+        # Analyze metrics files
+        df = analyze_runs_directory(args.runs_dir)
     
     if df.empty:
         print("❌ No ablation study results found")
