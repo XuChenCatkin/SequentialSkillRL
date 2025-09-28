@@ -59,9 +59,9 @@ class CuriosityConfig:
     # Annealing: eta(t) = eta0 * exp(-t / tau)
     eta0_dyn: float = 0.03
     tau_dyn: float = 4e5
-    eta0_hdp: float = 0.002         # for boundary-gated skill entropy
+    eta0_hdp: float = 0.2         # for boundary-gated skill entropy
     tau_hdp: float = 8e5
-    eta0_stn: float = 0.0005         # anneal multiplier for skill‑transition novelty
+    eta0_stn: float = 0.05         # anneal multiplier for skill‑transition novelty
     tau_stn: float = 1.3e6
     eta0_rnd: float = 0.002        # keep smaller by default
     tau_rnd: float = 2.8e5
