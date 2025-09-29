@@ -1,0 +1,1958 @@
+2025-09-28 04:23:05,042 - __main__ - INFO - ================================================================================
+2025-09-28 04:23:05,042 - __main__ - INFO - Starting Online PPO Training with Pretrained Models
+2025-09-28 04:23:05,042 - __main__ - INFO - Environment: MiniHack-River-Narrow-v0
+2025-09-28 04:23:05,042 - __main__ - INFO - VAE Repository: None
+2025-09-28 04:23:05,042 - __main__ - INFO - VAE Revision: v2.0
+2025-09-28 04:23:05,042 - __main__ - INFO - HMM Repository: None
+2025-09-28 04:23:05,042 - __main__ - INFO - HMM Revision: v2.0
+2025-09-28 04:23:05,042 - __main__ - INFO - Total Timesteps: 195
+2025-09-28 04:23:05,042 - __main__ - INFO - ================================================================================
+2025-09-28 04:23:05,042 - __main__ - INFO - 🔧 Using device: cuda
+2025-09-28 04:23:05,042 - __main__ - INFO - 🔄 Resume mode: Loading all models from unified repo: CatkinChen/nethack-ppo-ablation-no_hmm_no_intrinsic
+2025-09-28 04:23:05,042 - __main__ - INFO - 🎨 Loading VAE from unified repo...
+2025-09-28 04:23:07,298 - __main__ - INFO - ✅ VAE loaded from vae_model.pth
+2025-09-28 04:23:07,299 - __main__ - INFO - ✅ VAE model loaded successfully
+2025-09-28 04:23:07,299 - __main__ - INFO -    - Latent dimension: 96
+2025-09-28 04:23:07,299 - __main__ - INFO -    - Skills: 40
+2025-09-28 04:23:07,299 - __main__ - INFO - ℹ️  No HMM model loaded (HMM integration disabled)
+2025-09-28 04:23:07,299 - __main__ - INFO - 🎮 Creating environment: MiniHack-River-Narrow-v0
+2025-09-28 04:23:07,299 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:07,315 - __main__ - INFO -    - Observation space: Dict('blstats': Box(-2147483648, 2147483647, (27,), int64), 'chars': Box(0, 255, (21, 79), uint8), 'chars_crop': Box(0, 255, (9, 9), uint8), 'colors': Box(0, 15, (21, 79), uint8), 'colors_crop': Box(0, 15, (9, 9), uint8), 'glyphs': Box(0, 5976, (21, 79), int16), 'glyphs_crop': Box(0, 5976, (9, 9), int16), 'message': Box(0, 255, (256,), uint8), 'specials': Box(0, 255, (21, 79), uint8), 'specials_crop': Box(0, 255, (9, 9), uint8))
+2025-09-28 04:23:07,315 - __main__ - INFO -    - Action space: Discrete(8)
+2025-09-28 04:23:07,315 - __main__ - INFO - 🔄 Using provided VAE config
+2025-09-28 04:23:07,315 - __main__ - INFO -    - VAE prior mode set to 'standard' for online training without HMM
+2025-09-28 04:23:08,254 - __main__ - INFO - 📊 W&B initialized with run name: ablation_no_hmm_no_intrinsic_MiniHack_River_Narrow_v0_20250928-042305
+2025-09-28 04:23:08,254 - __main__ - INFO - 🚀 Initializing PPO trainer...
+2025-09-28 04:23:08,254 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:08,272 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:08,286 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:08,302 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:08,320 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:08,334 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:08,348 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:08,362 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:23:09,270 - __main__ - INFO - ✅ PPO trainer initialized successfully
+2025-09-28 04:23:09,271 - __main__ - INFO - 🔄 Loading existing PPO checkpoint for continuation...
+2025-09-28 04:23:09,271 - __main__ - INFO - 📥 Loading PPO checkpoint from HuggingFace: CatkinChen/nethack-ppo-ablation-no_hmm_no_intrinsic
+2025-09-28 04:23:10,927 - __main__ - INFO - ✅ PPO checkpoint loaded from HuggingFace
+2025-09-28 04:23:10,927 - __main__ - INFO - ✅ Actor-critic model state restored
+2025-09-28 04:23:10,927 - __main__ - INFO - ✅ Optimizer state restored
+2025-09-28 04:23:10,928 - __main__ - INFO - ✅ Training resumed from step 199,680
+2025-09-28 04:23:10,928 - __main__ - INFO - 🔄 Global step counter reset to 0 as requested
+2025-09-28 04:23:10,928 - __main__ - INFO - ℹ️  Loaded training configuration from checkpoint
+2025-09-28 04:23:10,928 - __main__ - WARNING - ⚠️  Environment changed: None → MiniHack-River-Narrow-v0
+2025-09-28 04:23:10,928 - __main__ - INFO - 🎯 PPO checkpoint restoration completed successfully
+2025-09-28 04:23:10,928 - __main__ - INFO - 🏋️  Starting PPO training...
+2025-09-28 04:23:11,336 - __main__ - INFO - 🎮 Action Mapping Debug (step 0, timestep 0):
+2025-09-28 04:23:11,337 - __main__ - INFO -    Global actions sampled: [3 4 2 1 1 3 4 4]
+2025-09-28 04:23:11,337 - __main__ - INFO -    Local actions mapped:   [3 4 2 1 1 3 4 4]
+2025-09-28 04:23:11,337 - __main__ - INFO -    Available env actions:  (<CompassDirection.N: 107>, <CompassDirection.E: 108>, <CompassDirection.S: 106>, <CompassDirection.W: 104>, <CompassDirection.NE: 117>, <CompassDirection.SE: 110>, <CompassDirection.SW: 98>, <CompassDirection.NW: 121>)
+2025-09-28 04:23:11,337 - __main__ - INFO -    Action mapping:         ['local_0->global_0(107)', 'local_1->global_1(108)', 'local_2->global_2(106)', 'local_3->global_3(104)', 'local_4->global_4(117)', 'local_5->global_5(110)', 'local_6->global_6(98)', 'local_7->global_7(121)']
+2025-09-28 04:23:11,338 - __main__ - INFO -    Valid global indices:   [0 1 2 3 4 5 6 7] (total: 8)
+2025-09-28 04:23:11,338 - __main__ - INFO -    Global->Local mapping:  ['env0:g3->l3', 'env1:g4->l4', 'env2:g2->l2', 'env3:g1->l1', 'env4:g1->l1', 'env5:g3->l3', 'env6:g4->l4', 'env7:g4->l4']
+2025-09-28 04:23:11,344 - __main__ - INFO - 🚫 Negative Reward Masking (step 0, timestep 0):
+2025-09-28 04:23:11,344 - __main__ - INFO -    Environments masked due to prev negative rewards: 0/8
+2025-09-28 04:23:11,344 - __main__ - INFO -    Environments with current negative rewards: 1/8
+2025-09-28 04:23:11,344 - __main__ - INFO -    Rewards: [ 0.    0.    0.    0.    0.   -0.01  0.    0.  ]
+2025-09-28 04:23:16,002 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:23:16,002 - __main__ - INFO - 📈 Episode stats: avg return = 0.89, avg length = 167.0
+2025-09-28 04:23:16,024 - __main__ - INFO - 🎯 Top 3 training actions: #4(497), #2(430), #3(300)
+2025-09-28 04:23:18,832 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:23:18,832 - __main__ - INFO - 📈 Episode stats: avg return = 0.20, avg length = 326.7
+2025-09-28 04:23:18,833 - __main__ - INFO - 🎯 Top 3 training actions: #4(751), #2(661), #3(435)
+2025-09-28 04:23:21,649 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:23:21,650 - __main__ - INFO - 📈 Episode stats: avg return = 0.67, avg length = 178.5
+2025-09-28 04:23:21,650 - __main__ - INFO - 🎯 Top 3 training actions: #4(1032), #2(857), #3(539)
+2025-09-28 04:23:24,408 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:23:24,408 - __main__ - INFO - 📈 Episode stats: avg return = 0.71, avg length = 143.4
+2025-09-28 04:23:24,408 - __main__ - INFO - 🎯 Top 3 training actions: #4(1293), #2(1074), #3(647)
+2025-09-28 04:23:25,348 - __main__ - INFO - 🔄 Synchronized model update at step 5,120
+2025-09-28 04:23:25,348 - __main__ - INFO -    HMM interval: inf, VAE interval: 5,120
+2025-09-28 04:23:25,349 - __main__ - INFO - 🚫 Model training masking: 285/5120 timesteps masked (5.6%) due to negative rewards (invalid actions)
+2025-09-28 04:23:25,349 - __main__ - INFO - 🔄 VAE refresh starting at step 5,120 with replay size 8x640
+2025-09-28 04:23:25,350 - __main__ - INFO -    Using span sampling (5120 timesteps, too large for full buffer)
+2025-09-28 04:23:46,707 - __main__ - INFO -    VAE refresh complete: final_loss=1714.3309, avg_loss=1734.3165, steps=4/4, trend=improving, total_timesteps=5120, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:23:46,709 - __main__ - INFO -    ✅ VAE updated (next in 6,144 steps)
+2025-09-28 04:23:48,457 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:23:48,457 - __main__ - INFO - 📈 Episode stats: avg return = 0.86, avg length = 284.0
+2025-09-28 04:23:48,458 - __main__ - INFO - 🎯 Top 3 training actions: #4(1532), #2(1277), #3(759)
+2025-09-28 04:23:51,225 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:23:51,225 - __main__ - INFO - 📈 Episode stats: avg return = 0.10, avg length = 334.8
+2025-09-28 04:23:51,225 - __main__ - INFO - 🎯 Top 3 training actions: #4(1814), #2(1457), #1(943)
+2025-09-28 04:23:54,001 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:23:54,002 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 192.6
+2025-09-28 04:23:54,002 - __main__ - INFO - 🎯 Top 3 training actions: #4(2088), #2(1598), #1(1151)
+2025-09-28 04:23:56,765 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:23:56,765 - __main__ - INFO - 📈 Episode stats: avg return = 0.43, avg length = 220.8
+2025-09-28 04:23:56,765 - __main__ - INFO - 🎯 Top 3 training actions: #4(2367), #2(1734), #1(1310)
+2025-09-28 04:23:59,557 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:23:59,557 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 206.2
+2025-09-28 04:23:59,558 - __main__ - INFO - 🎯 Top 3 training actions: #4(2690), #2(1830), #1(1481)
+2025-09-28 04:24:00,524 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:24:00,524 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:24:00,524 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:24:00,525 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:24:04,364 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:24:07,703 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 04:24:11,058 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 04:24:14,381 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:24:17,721 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 04:24:21,724 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:24:25,133 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:24:28,578 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 04:24:31,922 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:24:36,123 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 04:24:39,461 - __main__ - WARNING - ⚠️ Episode 14 terminated due to step limit.
+2025-09-28 04:24:42,864 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:24:46,196 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:24:49,506 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 04:24:52,868 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:24:56,552 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:24:59,970 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:25:03,441 - __main__ - WARNING - ⚠️ Episode 22 terminated due to step limit.
+2025-09-28 04:25:06,868 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 04:25:11,208 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:25:15,312 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:25:18,601 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 04:25:21,906 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:25:26,575 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 04:25:29,884 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:25:34,290 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 04:25:38,064 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 04:25:42,969 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:25:46,868 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 04:25:50,285 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:25:53,646 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:25:56,961 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 04:26:00,274 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:26:03,601 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:26:06,928 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 04:26:06,930 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:26:06,931 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:26:06,931 - __main__ - INFO -    Time: 126.4s (2.5s/ep)
+2025-09-28 04:26:06,931 - __main__ - INFO -    Average Return: 0.180 ± 0.509
+2025-09-28 04:26:06,931 - __main__ - INFO -    Success Rate: 30.0%
+2025-09-28 04:26:06,931 - __main__ - INFO -    Average Length: 262.9
+2025-09-28 04:26:06,931 - __main__ - INFO -    Average Coverage: 27.4 positions
+2025-09-28 04:26:06,931 - __main__ - INFO -    Episode Completions: 15 terminated (30.0%), 35 truncated (70.0%)
+2025-09-28 04:26:06,931 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:26:06,931 - __main__ - INFO -    Total Episodes: 50
+2025-09-28 04:26:06,931 - __main__ - INFO -    Total Average Return: 0.180 ± 0.509
+2025-09-28 04:26:06,931 - __main__ - INFO -    Total Average Length: 262.9 ± 134.5
+2025-09-28 04:26:06,932 - __main__ - INFO -    Total Completions: 15 terminated (30.0%), 35 truncated (70.0%)
+2025-09-28 04:26:06,932 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:26:06,932 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:26:06,932 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:26:06,932 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:26:06,932 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:26:06,932 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:26:06,932 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:26:06,932 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:26:06,932 - __main__ - INFO -    Train action count: 10240
+2025-09-28 04:26:06,932 - __main__ - INFO -    Eval action count: 13144
+2025-09-28 04:26:06,933 - __main__ - INFO -    Train action entropy: 1.929
+2025-09-28 04:26:06,933 - __main__ - INFO -    Eval action entropy: 1.801
+2025-09-28 04:26:06,933 - __main__ - INFO -    Top 3 train actions: #4(2690), #2(1830), #1(1481)
+2025-09-28 04:26:06,933 - __main__ - INFO -    Top 3 eval actions: #4(3990), #5(2798), #1(2425)
+2025-09-28 04:26:08,817 - __main__ - INFO - 📊 Episodes completed this rollout: 8
+2025-09-28 04:26:08,817 - __main__ - INFO - 📈 Episode stats: avg return = 0.39, avg length = 213.0
+2025-09-28 04:26:08,818 - __main__ - INFO - 🎯 Top 3 training actions: #4(3019), #2(1924), #1(1661)
+2025-09-28 04:26:09,823 - __main__ - INFO - 🔄 Synchronized model update at step 11,264
+2025-09-28 04:26:09,824 - __main__ - INFO -    HMM interval: inf, VAE interval: 6,144
+2025-09-28 04:26:09,824 - __main__ - INFO - 🚫 Model training masking: 318/6144 timesteps masked (5.2%) due to negative rewards (invalid actions)
+2025-09-28 04:26:09,824 - __main__ - INFO - 🔄 VAE refresh starting at step 11,264 with replay size 8x768
+2025-09-28 04:26:09,825 - __main__ - INFO -    Using span sampling (6144 timesteps, too large for full buffer)
+2025-09-28 04:26:30,633 - __main__ - INFO -    VAE refresh complete: final_loss=1719.8759, avg_loss=1738.2933, steps=4/4, trend=improving, total_timesteps=6144, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:26:30,636 - __main__ - INFO -    ✅ VAE updated (next in 7,372 steps)
+2025-09-28 04:26:32,475 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:26:32,476 - __main__ - INFO - 📈 Episode stats: avg return = 0.16, avg length = 278.3
+2025-09-28 04:26:32,476 - __main__ - INFO - 🎯 Top 3 training actions: #4(3333), #2(2019), #1(1873)
+2025-09-28 04:26:35,280 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:26:35,281 - __main__ - INFO - 📈 Episode stats: avg return = 0.90, avg length = 106.0
+2025-09-28 04:26:35,281 - __main__ - INFO - 🎯 Top 3 training actions: #4(3611), #2(2107), #1(2099)
+2025-09-28 04:26:38,114 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:26:38,114 - __main__ - INFO - 📈 Episode stats: avg return = 0.21, avg length = 251.7
+2025-09-28 04:26:38,114 - __main__ - INFO - 🎯 Top 3 training actions: #4(3900), #1(2326), #2(2198)
+2025-09-28 04:26:40,980 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:26:40,980 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 201.5
+2025-09-28 04:26:40,981 - __main__ - INFO - 🎯 Top 3 training actions: #4(4128), #1(2591), #5(2325)
+2025-09-28 04:26:43,802 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:26:43,803 - __main__ - INFO - 📈 Episode stats: avg return = 0.54, avg length = 171.0
+2025-09-28 04:26:43,803 - __main__ - INFO - 🎯 Top 3 training actions: #4(4352), #1(2800), #5(2555)
+2025-09-28 04:26:46,639 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 04:26:46,639 - __main__ - INFO - 📈 Episode stats: avg return = 0.37, avg length = 215.3
+2025-09-28 04:26:46,639 - __main__ - INFO - 🎯 Top 3 training actions: #4(4561), #1(3018), #5(2810)
+2025-09-28 04:26:49,417 - __main__ - INFO - 📊 Episodes completed this rollout: 1
+2025-09-28 04:26:49,417 - __main__ - INFO - 📈 Episode stats: avg return = 0.97, avg length = 55.0
+2025-09-28 04:26:49,418 - __main__ - INFO - 🎯 Top 3 training actions: #4(4819), #1(3216), #5(3039)
+2025-09-28 04:26:52,242 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:26:52,242 - __main__ - INFO - 📈 Episode stats: avg return = -0.07, avg length = 350.0
+2025-09-28 04:26:52,242 - __main__ - INFO - 🎯 Top 3 training actions: #4(5034), #1(3459), #5(3245)
+2025-09-28 04:26:53,209 - __main__ - INFO - 🔄 Synchronized model update at step 19,456
+2025-09-28 04:26:53,210 - __main__ - INFO -    HMM interval: inf, VAE interval: 7,372
+2025-09-28 04:26:53,210 - __main__ - INFO - 🚫 Model training masking: 232/8192 timesteps masked (2.8%) due to negative rewards (invalid actions)
+2025-09-28 04:26:53,210 - __main__ - INFO - 🔄 VAE refresh starting at step 19,456 with replay size 8x1024
+2025-09-28 04:26:53,211 - __main__ - INFO -    Using span sampling (8192 timesteps, too large for full buffer)
+2025-09-28 04:27:14,371 - __main__ - INFO -    VAE refresh complete: final_loss=1697.1044, avg_loss=1732.1817, steps=4/4, trend=improving, total_timesteps=8192, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:27:14,373 - __main__ - INFO -    ✅ VAE updated (next in 8,846 steps)
+2025-09-28 04:27:16,234 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:27:16,235 - __main__ - INFO - 📈 Episode stats: avg return = 0.09, avg length = 288.4
+2025-09-28 04:27:16,235 - __main__ - INFO - 🎯 Top 3 training actions: #4(5222), #1(3740), #5(3431)
+2025-09-28 04:27:17,211 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:27:17,211 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:27:17,211 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:27:17,211 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:27:20,579 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 04:27:23,971 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:27:27,349 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 04:27:31,241 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:27:34,590 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 04:27:38,330 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:27:41,823 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:27:46,017 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:27:51,009 - __main__ - WARNING - ⚠️ Episode 14 terminated due to step limit.
+2025-09-28 04:27:54,508 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:27:59,365 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 04:28:02,713 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:28:06,079 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:28:09,402 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:28:12,725 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:28:16,203 - __main__ - WARNING - ⚠️ Episode 22 terminated due to step limit.
+2025-09-28 04:28:25,100 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:28:28,427 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 04:28:31,745 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:28:35,064 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:28:38,401 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 04:28:41,900 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 04:28:46,955 - __main__ - WARNING - ⚠️ Episode 36 terminated due to step limit.
+2025-09-28 04:28:50,329 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 04:28:55,171 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 04:29:00,227 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:29:03,572 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 04:29:08,226 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:29:12,167 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:29:16,315 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 04:29:16,318 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:29:16,318 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:29:16,318 - __main__ - INFO -    Time: 119.1s (2.4s/ep)
+2025-09-28 04:29:16,318 - __main__ - INFO -    Average Return: 0.306 ± 0.490
+2025-09-28 04:29:16,318 - __main__ - INFO -    Success Rate: 40.0%
+2025-09-28 04:29:16,318 - __main__ - INFO -    Average Length: 246.6
+2025-09-28 04:29:16,318 - __main__ - INFO -    Average Coverage: 28.7 positions
+2025-09-28 04:29:16,318 - __main__ - INFO -    Episode Completions: 20 terminated (40.0%), 30 truncated (60.0%)
+2025-09-28 04:29:16,318 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:29:16,318 - __main__ - INFO -    Total Episodes: 100
+2025-09-28 04:29:16,319 - __main__ - INFO -    Total Average Return: 0.243 ± 0.503
+2025-09-28 04:29:16,319 - __main__ - INFO -    Total Average Length: 254.8 ± 132.4
+2025-09-28 04:29:16,319 - __main__ - INFO -    Total Completions: 35 terminated (35.0%), 65 truncated (65.0%)
+2025-09-28 04:29:16,319 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:29:16,319 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:29:16,319 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:29:16,319 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:29:16,319 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:29:16,319 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:29:16,319 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:29:16,319 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:29:16,320 - __main__ - INFO -    Train action count: 20480
+2025-09-28 04:29:16,320 - __main__ - INFO -    Eval action count: 25476
+2025-09-28 04:29:16,320 - __main__ - INFO -    Train action entropy: 1.893
+2025-09-28 04:29:16,320 - __main__ - INFO -    Eval action entropy: 1.824
+2025-09-28 04:29:16,321 - __main__ - INFO -    Top 3 train actions: #4(5222), #1(3740), #5(3431)
+2025-09-28 04:29:16,321 - __main__ - INFO -    Top 3 eval actions: #4(6706), #1(5427), #5(5124)
+2025-09-28 04:29:18,192 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:29:18,192 - __main__ - INFO - 📈 Episode stats: avg return = 0.44, avg length = 190.8
+2025-09-28 04:29:18,192 - __main__ - INFO - 🎯 Top 3 training actions: #4(5447), #1(3994), #5(3618)
+2025-09-28 04:29:21,039 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:29:21,039 - __main__ - INFO - 📈 Episode stats: avg return = 0.16, avg length = 280.2
+2025-09-28 04:29:21,039 - __main__ - INFO - 🎯 Top 3 training actions: #4(5684), #1(4301), #5(3778)
+2025-09-28 04:29:23,851 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:29:23,851 - __main__ - INFO - 📈 Episode stats: avg return = -0.10, avg length = 350.0
+2025-09-28 04:29:23,851 - __main__ - INFO - 🎯 Top 3 training actions: #4(5896), #1(4591), #5(3998)
+2025-09-28 04:29:26,699 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:29:26,700 - __main__ - INFO - 📈 Episode stats: avg return = 0.33, avg length = 230.0
+2025-09-28 04:29:26,700 - __main__ - INFO - 🎯 Top 3 training actions: #4(6133), #1(4856), #5(4196)
+2025-09-28 04:29:29,558 - __main__ - INFO - 📊 Episodes completed this rollout: 8
+2025-09-28 04:29:29,559 - __main__ - INFO - 📈 Episode stats: avg return = 0.55, avg length = 162.0
+2025-09-28 04:29:29,559 - __main__ - INFO - 🎯 Top 3 training actions: #4(6362), #1(5111), #5(4350)
+2025-09-28 04:29:32,390 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:29:32,390 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 209.8
+2025-09-28 04:29:32,390 - __main__ - INFO - 🎯 Top 3 training actions: #4(6613), #1(5354), #5(4530)
+2025-09-28 04:29:35,222 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:29:35,222 - __main__ - INFO - 📈 Episode stats: avg return = 0.43, avg length = 196.2
+2025-09-28 04:29:35,222 - __main__ - INFO - 🎯 Top 3 training actions: #4(6833), #1(5656), #5(4670)
+2025-09-28 04:29:38,062 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:29:38,062 - __main__ - INFO - 📈 Episode stats: avg return = 0.17, avg length = 272.5
+2025-09-28 04:29:38,062 - __main__ - INFO - 🎯 Top 3 training actions: #4(7001), #1(5967), #5(4842)
+2025-09-28 04:29:39,051 - __main__ - INFO - 🔄 Synchronized model update at step 28,672
+2025-09-28 04:29:39,052 - __main__ - INFO -    HMM interval: inf, VAE interval: 8,846
+2025-09-28 04:29:39,052 - __main__ - INFO - 🚫 Model training masking: 261/9216 timesteps masked (2.8%) due to negative rewards (invalid actions)
+2025-09-28 04:29:39,052 - __main__ - INFO - 🔄 VAE refresh starting at step 28,672 with replay size 8x1152
+2025-09-28 04:29:39,053 - __main__ - INFO -    Using span sampling (9216 timesteps, too large for full buffer)
+2025-09-28 04:30:00,270 - __main__ - INFO -    VAE refresh complete: final_loss=1684.3528, avg_loss=1684.2939, steps=4/4, trend=improving, total_timesteps=9216, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:30:00,272 - __main__ - INFO -    ✅ VAE updated (next in 10,615 steps)
+2025-09-28 04:30:02,129 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:30:02,129 - __main__ - INFO - 📈 Episode stats: avg return = -0.11, avg length = 350.0
+2025-09-28 04:30:02,129 - __main__ - INFO - 🎯 Top 3 training actions: #4(7223), #1(6212), #5(5014)
+2025-09-28 04:30:04,934 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:30:04,934 - __main__ - INFO - 📈 Episode stats: avg return = -0.17, avg length = 350.0
+2025-09-28 04:30:04,935 - __main__ - INFO - 🎯 Top 3 training actions: #4(7445), #1(6499), #5(5146)
+2025-09-28 04:30:05,900 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:30:05,900 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:30:05,900 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:30:05,900 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:30:09,244 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 04:30:12,972 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 04:30:16,298 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 04:30:19,618 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:30:22,976 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 04:30:26,320 - __main__ - WARNING - ⚠️ Episode 7 terminated due to step limit.
+2025-09-28 04:30:29,656 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:30:32,979 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:30:36,800 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:30:40,148 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 04:30:43,488 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 04:30:47,938 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:30:51,266 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 04:30:54,611 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:30:57,944 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:31:01,287 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:31:09,741 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:31:13,114 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:31:16,448 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:31:19,772 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:31:24,159 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:31:27,518 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:31:30,843 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 04:31:36,068 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 04:31:39,425 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:31:46,352 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 04:31:49,722 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:31:53,372 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 04:31:56,806 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:32:00,120 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:32:03,408 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 04:32:06,764 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:32:10,112 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:32:10,886 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:32:10,886 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:32:10,886 - __main__ - INFO -    Time: 125.0s (2.5s/ep)
+2025-09-28 04:32:10,886 - __main__ - INFO -    Average Return: 0.251 ± 0.465
+2025-09-28 04:32:10,886 - __main__ - INFO -    Success Rate: 34.0%
+2025-09-28 04:32:10,886 - __main__ - INFO -    Average Length: 261.9
+2025-09-28 04:32:10,887 - __main__ - INFO -    Average Coverage: 26.0 positions
+2025-09-28 04:32:10,887 - __main__ - INFO -    Episode Completions: 17 terminated (34.0%), 33 truncated (66.0%)
+2025-09-28 04:32:10,887 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:32:10,887 - __main__ - INFO -    Total Episodes: 150
+2025-09-28 04:32:10,887 - __main__ - INFO -    Total Average Return: 0.246 ± 0.491
+2025-09-28 04:32:10,887 - __main__ - INFO -    Total Average Length: 257.1 ± 131.8
+2025-09-28 04:32:10,887 - __main__ - INFO -    Total Completions: 52 terminated (34.7%), 98 truncated (65.3%)
+2025-09-28 04:32:10,887 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:32:10,887 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:32:10,887 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:32:10,888 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:32:10,888 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:32:10,888 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:32:10,888 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:32:10,888 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:32:10,888 - __main__ - INFO -    Train action count: 30720
+2025-09-28 04:32:10,888 - __main__ - INFO -    Eval action count: 38571
+2025-09-28 04:32:10,888 - __main__ - INFO -    Train action entropy: 1.865
+2025-09-28 04:32:10,889 - __main__ - INFO -    Eval action entropy: 1.804
+2025-09-28 04:32:10,889 - __main__ - INFO -    Top 3 train actions: #4(7445), #1(6499), #5(5146)
+2025-09-28 04:32:10,889 - __main__ - INFO -    Top 3 eval actions: #1(9713), #4(9623), #5(6564)
+2025-09-28 04:32:12,765 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:32:12,765 - __main__ - INFO - 📈 Episode stats: avg return = 0.25, avg length = 257.5
+2025-09-28 04:32:12,765 - __main__ - INFO - 🎯 Top 3 training actions: #4(7693), #1(6821), #5(5244)
+2025-09-28 04:32:15,608 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:32:15,608 - __main__ - INFO - 📈 Episode stats: avg return = 0.22, avg length = 312.0
+2025-09-28 04:32:15,609 - __main__ - INFO - 🎯 Top 3 training actions: #4(7933), #1(7205), #5(5357)
+2025-09-28 04:32:18,471 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:32:18,472 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 207.2
+2025-09-28 04:32:18,472 - __main__ - INFO - 🎯 Top 3 training actions: #4(8129), #1(7608), #5(5505)
+2025-09-28 04:32:21,397 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:32:21,397 - __main__ - INFO - 📈 Episode stats: avg return = 0.13, avg length = 296.3
+2025-09-28 04:32:21,397 - __main__ - INFO - 🎯 Top 3 training actions: #4(8313), #1(8038), #5(5684)
+2025-09-28 04:32:24,238 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:32:24,238 - __main__ - INFO - 📈 Episode stats: avg return = 0.94, avg length = 101.7
+2025-09-28 04:32:24,239 - __main__ - INFO - 🎯 Top 3 training actions: #1(8516), #4(8472), #5(5834)
+2025-09-28 04:32:27,172 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:32:27,172 - __main__ - INFO - 📈 Episode stats: avg return = -0.06, avg length = 350.0
+2025-09-28 04:32:27,172 - __main__ - INFO - 🎯 Top 3 training actions: #1(9058), #4(8591), #5(5986)
+2025-09-28 04:32:30,081 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 04:32:30,082 - __main__ - INFO - 📈 Episode stats: avg return = 0.24, avg length = 262.3
+2025-09-28 04:32:30,082 - __main__ - INFO - 🎯 Top 3 training actions: #1(9570), #4(8721), #5(6127)
+2025-09-28 04:32:32,912 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:32:32,912 - __main__ - INFO - 📈 Episode stats: avg return = 0.26, avg length = 248.3
+2025-09-28 04:32:32,912 - __main__ - INFO - 🎯 Top 3 training actions: #1(10142), #4(8829), #5(6264)
+2025-09-28 04:32:35,730 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:32:35,730 - __main__ - INFO - 📈 Episode stats: avg return = 0.22, avg length = 313.7
+2025-09-28 04:32:35,730 - __main__ - INFO - 🎯 Top 3 training actions: #1(10648), #4(8968), #5(6415)
+2025-09-28 04:32:36,693 - __main__ - INFO - 🔄 Synchronized model update at step 39,936
+2025-09-28 04:32:36,693 - __main__ - INFO -    HMM interval: inf, VAE interval: 10,615
+2025-09-28 04:32:36,694 - __main__ - INFO - 🚫 Model training masking: 275/11264 timesteps masked (2.4%) due to negative rewards (invalid actions)
+2025-09-28 04:32:36,694 - __main__ - INFO - 🔄 VAE refresh starting at step 39,936 with replay size 8x1408
+2025-09-28 04:32:36,695 - __main__ - INFO -    Using span sampling (11264 timesteps, too large for full buffer)
+2025-09-28 04:32:57,950 - __main__ - INFO -    VAE refresh complete: final_loss=1640.0623, avg_loss=1657.3213, steps=4/4, trend=improving, total_timesteps=11264, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:32:57,953 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 04:32:59,866 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:32:59,866 - __main__ - INFO - 📈 Episode stats: avg return = 0.22, avg length = 268.0
+2025-09-28 04:32:59,866 - __main__ - INFO - 🎯 Top 3 training actions: #1(11232), #4(9105), #5(6546)
+2025-09-28 04:33:00,832 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:33:00,833 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:33:00,833 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:33:00,833 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:33:04,192 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 04:33:07,586 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:33:10,924 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 04:33:22,894 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:33:26,255 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 04:33:29,607 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 04:33:33,687 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:33:37,049 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:33:40,661 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:33:43,988 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:33:50,281 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:33:54,205 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 04:33:58,608 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:34:02,014 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:34:05,449 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:34:08,807 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 04:34:15,121 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:34:18,496 - __main__ - WARNING - ⚠️ Episode 36 terminated due to step limit.
+2025-09-28 04:34:21,862 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 04:34:25,226 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 04:34:31,111 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 04:34:34,975 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 04:34:38,801 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:34:42,151 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:34:48,180 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:34:51,549 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:34:54,901 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 04:34:54,904 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:34:54,904 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:34:54,904 - __main__ - INFO -    Time: 114.1s (2.3s/ep)
+2025-09-28 04:34:54,904 - __main__ - INFO -    Average Return: 0.350 ± 0.508
+2025-09-28 04:34:54,904 - __main__ - INFO -    Success Rate: 46.0%
+2025-09-28 04:34:54,904 - __main__ - INFO -    Average Length: 237.0
+2025-09-28 04:34:54,904 - __main__ - INFO -    Average Coverage: 24.3 positions
+2025-09-28 04:34:54,905 - __main__ - INFO -    Episode Completions: 23 terminated (46.0%), 27 truncated (54.0%)
+2025-09-28 04:34:54,905 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:34:54,905 - __main__ - INFO -    Total Episodes: 200
+2025-09-28 04:34:54,905 - __main__ - INFO -    Total Average Return: 0.272 ± 0.497
+2025-09-28 04:34:54,905 - __main__ - INFO -    Total Average Length: 252.1 ± 133.1
+2025-09-28 04:34:54,905 - __main__ - INFO -    Total Completions: 75 terminated (37.5%), 125 truncated (62.5%)
+2025-09-28 04:34:54,905 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:34:54,905 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:34:54,905 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:34:54,905 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:34:54,905 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:34:54,905 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:34:54,906 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:34:54,906 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:34:54,906 - __main__ - INFO -    Train action count: 40960
+2025-09-28 04:34:54,906 - __main__ - INFO -    Eval action count: 50422
+2025-09-28 04:34:54,906 - __main__ - INFO -    Train action entropy: 1.819
+2025-09-28 04:34:54,906 - __main__ - INFO -    Eval action entropy: 1.756
+2025-09-28 04:34:54,907 - __main__ - INFO -    Top 3 train actions: #1(11232), #4(9105), #5(6546)
+2025-09-28 04:34:54,907 - __main__ - INFO -    Top 3 eval actions: #1(15725), #4(11087), #5(8220)
+2025-09-28 04:34:56,766 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:34:56,766 - __main__ - INFO - 📈 Episode stats: avg return = 0.39, avg length = 198.2
+2025-09-28 04:34:56,766 - __main__ - INFO - 🎯 Top 3 training actions: #1(11764), #4(9234), #5(6686)
+2025-09-28 04:34:59,604 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:34:59,605 - __main__ - INFO - 📈 Episode stats: avg return = -0.07, avg length = 350.0
+2025-09-28 04:34:59,605 - __main__ - INFO - 🎯 Top 3 training actions: #1(12295), #4(9372), #5(6799)
+2025-09-28 04:35:02,478 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:35:02,478 - __main__ - INFO - 📈 Episode stats: avg return = 0.27, avg length = 244.0
+2025-09-28 04:35:02,478 - __main__ - INFO - 🎯 Top 3 training actions: #1(12837), #4(9492), #5(6911)
+2025-09-28 04:35:05,375 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:35:05,376 - __main__ - INFO - 📈 Episode stats: avg return = 0.32, avg length = 226.2
+2025-09-28 04:35:05,376 - __main__ - INFO - 🎯 Top 3 training actions: #1(13400), #4(9580), #5(7052)
+2025-09-28 04:35:08,250 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:35:08,250 - __main__ - INFO - 📈 Episode stats: avg return = 0.26, avg length = 244.7
+2025-09-28 04:35:08,251 - __main__ - INFO - 🎯 Top 3 training actions: #1(13928), #4(9691), #5(7185)
+2025-09-28 04:35:11,113 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:35:11,113 - __main__ - INFO - 📈 Episode stats: avg return = 0.13, avg length = 276.0
+2025-09-28 04:35:11,113 - __main__ - INFO - 🎯 Top 3 training actions: #1(14427), #4(9825), #5(7305)
+2025-09-28 04:35:13,985 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:35:13,986 - __main__ - INFO - 📈 Episode stats: avg return = 0.33, avg length = 226.4
+2025-09-28 04:35:13,986 - __main__ - INFO - 🎯 Top 3 training actions: #1(14929), #4(9981), #5(7416)
+2025-09-28 04:35:16,869 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:35:16,869 - __main__ - INFO - 📈 Episode stats: avg return = 0.16, avg length = 271.8
+2025-09-28 04:35:16,869 - __main__ - INFO - 🎯 Top 3 training actions: #1(15465), #4(10101), #5(7526)
+2025-09-28 04:35:19,730 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:35:19,731 - __main__ - INFO - 📈 Episode stats: avg return = 0.55, avg length = 158.4
+2025-09-28 04:35:19,731 - __main__ - INFO - 🎯 Top 3 training actions: #1(15926), #4(10240), #5(7636)
+2025-09-28 04:35:20,723 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:35:20,723 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:35:20,723 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:35:20,724 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:35:24,096 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 04:35:27,436 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:35:32,194 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:35:35,551 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 04:35:39,204 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:35:44,857 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 04:35:48,191 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:35:51,521 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 04:35:54,842 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 04:35:58,193 - __main__ - WARNING - ⚠️ Episode 14 terminated due to step limit.
+2025-09-28 04:36:04,994 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:36:08,366 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:36:12,107 - __main__ - WARNING - ⚠️ Episode 24 terminated due to step limit.
+2025-09-28 04:36:18,031 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:36:22,322 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 04:36:25,675 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:36:29,033 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:36:32,375 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 04:36:35,712 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 04:36:39,092 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 04:36:42,914 - __main__ - WARNING - ⚠️ Episode 36 terminated due to step limit.
+2025-09-28 04:36:46,272 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 04:36:49,676 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 04:36:53,079 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 04:36:57,652 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:37:01,007 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 04:37:04,369 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 04:37:07,736 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:37:12,327 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:37:15,777 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 04:37:15,780 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:37:15,780 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:37:15,780 - __main__ - INFO -    Time: 115.1s (2.3s/ep)
+2025-09-28 04:37:15,780 - __main__ - INFO -    Average Return: 0.318 ± 0.512
+2025-09-28 04:37:15,780 - __main__ - INFO -    Success Rate: 40.0%
+2025-09-28 04:37:15,780 - __main__ - INFO -    Average Length: 239.5
+2025-09-28 04:37:15,780 - __main__ - INFO -    Average Coverage: 24.1 positions
+2025-09-28 04:37:15,780 - __main__ - INFO -    Episode Completions: 20 terminated (40.0%), 30 truncated (60.0%)
+2025-09-28 04:37:15,780 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:37:15,780 - __main__ - INFO -    Total Episodes: 250
+2025-09-28 04:37:15,781 - __main__ - INFO -    Total Average Return: 0.281 ± 0.501
+2025-09-28 04:37:15,781 - __main__ - INFO -    Total Average Length: 249.6 ± 135.1
+2025-09-28 04:37:15,781 - __main__ - INFO -    Total Completions: 95 terminated (38.0%), 155 truncated (62.0%)
+2025-09-28 04:37:15,781 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:37:15,781 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:37:15,781 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:37:15,781 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:37:15,781 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:37:15,781 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:37:15,781 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:37:15,782 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:37:15,782 - __main__ - INFO -    Train action count: 50176
+2025-09-28 04:37:15,782 - __main__ - INFO -    Eval action count: 62396
+2025-09-28 04:37:15,782 - __main__ - INFO -    Train action entropy: 1.777
+2025-09-28 04:37:15,782 - __main__ - INFO -    Eval action entropy: 1.731
+2025-09-28 04:37:15,783 - __main__ - INFO -    Top 3 train actions: #1(15926), #4(10240), #5(7636)
+2025-09-28 04:37:15,783 - __main__ - INFO -    Top 3 eval actions: #1(20770), #4(13136), #2(9346)
+2025-09-28 04:37:17,674 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:37:17,674 - __main__ - INFO - 📈 Episode stats: avg return = 0.43, avg length = 236.0
+2025-09-28 04:37:17,675 - __main__ - INFO - 🎯 Top 3 training actions: #1(16385), #4(10425), #5(7699)
+2025-09-28 04:37:20,487 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:37:20,487 - __main__ - INFO - 📈 Episode stats: avg return = 0.24, avg length = 265.3
+2025-09-28 04:37:20,488 - __main__ - INFO - 🎯 Top 3 training actions: #1(16796), #4(10637), #5(7767)
+2025-09-28 04:37:21,453 - __main__ - INFO - 🔄 Synchronized model update at step 52,224
+2025-09-28 04:37:21,453 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 04:37:21,454 - __main__ - INFO - 🚫 Model training masking: 420/12288 timesteps masked (3.4%) due to negative rewards (invalid actions)
+2025-09-28 04:37:21,454 - __main__ - INFO - 🔄 VAE refresh starting at step 52,224 with replay size 8x1536
+2025-09-28 04:37:21,455 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 04:37:42,516 - __main__ - INFO -    VAE refresh complete: final_loss=1571.5067, avg_loss=1608.3719, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:37:42,519 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 04:37:44,394 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:37:44,395 - __main__ - INFO - 📈 Episode stats: avg return = -0.08, avg length = 350.0
+2025-09-28 04:37:44,395 - __main__ - INFO - 🎯 Top 3 training actions: #1(17263), #4(10808), #5(7869)
+2025-09-28 04:37:47,256 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:37:47,256 - __main__ - INFO - 📈 Episode stats: avg return = 0.18, avg length = 285.2
+2025-09-28 04:37:47,256 - __main__ - INFO - 🎯 Top 3 training actions: #1(17733), #4(10989), #5(7974)
+2025-09-28 04:37:50,129 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:37:50,129 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 190.2
+2025-09-28 04:37:50,130 - __main__ - INFO - 🎯 Top 3 training actions: #1(18234), #4(11166), #5(8104)
+2025-09-28 04:37:52,980 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:37:52,980 - __main__ - INFO - 📈 Episode stats: avg return = 0.18, avg length = 270.5
+2025-09-28 04:37:52,981 - __main__ - INFO - 🎯 Top 3 training actions: #1(18660), #4(11394), #5(8203)
+2025-09-28 04:37:55,831 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:37:55,831 - __main__ - INFO - 📈 Episode stats: avg return = 0.35, avg length = 220.4
+2025-09-28 04:37:55,832 - __main__ - INFO - 🎯 Top 3 training actions: #1(19074), #4(11624), #2(8309)
+2025-09-28 04:37:58,696 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:37:58,697 - __main__ - INFO - 📈 Episode stats: avg return = -0.08, avg length = 350.0
+2025-09-28 04:37:58,697 - __main__ - INFO - 🎯 Top 3 training actions: #1(19509), #4(11871), #2(8479)
+2025-09-28 04:38:01,575 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:38:01,575 - __main__ - INFO - 📈 Episode stats: avg return = 0.21, avg length = 268.0
+2025-09-28 04:38:01,575 - __main__ - INFO - 🎯 Top 3 training actions: #1(19931), #4(12139), #2(8658)
+2025-09-28 04:38:04,465 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:38:04,466 - __main__ - INFO - 📈 Episode stats: avg return = 0.25, avg length = 249.0
+2025-09-28 04:38:04,466 - __main__ - INFO - 🎯 Top 3 training actions: #1(20402), #4(12386), #2(8808)
+2025-09-28 04:38:05,472 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:38:05,472 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:38:05,472 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:38:05,473 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:38:08,849 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 04:38:12,203 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:38:15,973 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 04:38:20,971 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:38:24,377 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:38:27,802 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 04:38:31,192 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:38:34,574 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 04:38:39,942 - __main__ - WARNING - ⚠️ Episode 14 terminated due to step limit.
+2025-09-28 04:38:43,320 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:38:46,789 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:38:50,136 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 04:38:53,657 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:38:57,005 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:39:01,781 - __main__ - WARNING - ⚠️ Episode 24 terminated due to step limit.
+2025-09-28 04:39:05,125 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:39:08,477 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:39:11,835 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:39:16,462 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:39:19,857 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:39:23,242 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 04:39:27,153 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 04:39:30,611 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:39:34,376 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 04:39:37,749 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 04:39:41,096 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 04:39:44,448 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 04:39:48,991 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:39:53,015 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 04:39:57,638 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 04:40:00,983 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:40:04,496 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:40:08,078 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 04:40:08,081 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:40:08,081 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:40:08,081 - __main__ - INFO -    Time: 122.6s (2.5s/ep)
+2025-09-28 04:40:08,081 - __main__ - INFO -    Average Return: 0.253 ± 0.457
+2025-09-28 04:40:08,081 - __main__ - INFO -    Success Rate: 34.0%
+2025-09-28 04:40:08,081 - __main__ - INFO -    Average Length: 252.9
+2025-09-28 04:40:08,081 - __main__ - INFO -    Average Coverage: 22.5 positions
+2025-09-28 04:40:08,082 - __main__ - INFO -    Episode Completions: 17 terminated (34.0%), 33 truncated (66.0%)
+2025-09-28 04:40:08,082 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:40:08,082 - __main__ - INFO -    Total Episodes: 300
+2025-09-28 04:40:08,082 - __main__ - INFO -    Total Average Return: 0.276 ± 0.494
+2025-09-28 04:40:08,082 - __main__ - INFO -    Total Average Length: 250.1 ± 135.5
+2025-09-28 04:40:08,082 - __main__ - INFO -    Total Completions: 112 terminated (37.3%), 188 truncated (62.7%)
+2025-09-28 04:40:08,082 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:40:08,082 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:40:08,082 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:40:08,082 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:40:08,083 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:40:08,083 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:40:08,083 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:40:08,083 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:40:08,083 - __main__ - INFO -    Train action count: 60416
+2025-09-28 04:40:08,083 - __main__ - INFO -    Eval action count: 75039
+2025-09-28 04:40:08,083 - __main__ - INFO -    Train action entropy: 1.741
+2025-09-28 04:40:08,084 - __main__ - INFO -    Eval action entropy: 1.703
+2025-09-28 04:40:08,084 - __main__ - INFO -    Top 3 train actions: #1(20402), #4(12386), #2(8808)
+2025-09-28 04:40:08,084 - __main__ - INFO -    Top 3 eval actions: #1(25598), #4(16456), #2(11558)
+2025-09-28 04:40:09,999 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:40:09,999 - __main__ - INFO - 📈 Episode stats: avg return = 0.25, avg length = 252.0
+2025-09-28 04:40:10,000 - __main__ - INFO - 🎯 Top 3 training actions: #1(20788), #4(12653), #2(8992)
+2025-09-28 04:40:12,948 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:40:12,948 - __main__ - INFO - 📈 Episode stats: avg return = 0.57, avg length = 211.0
+2025-09-28 04:40:12,949 - __main__ - INFO - 🎯 Top 3 training actions: #1(21216), #4(12908), #2(9133)
+2025-09-28 04:40:15,887 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 04:40:15,887 - __main__ - INFO - 📈 Episode stats: avg return = 0.37, avg length = 219.1
+2025-09-28 04:40:15,888 - __main__ - INFO - 🎯 Top 3 training actions: #1(21696), #4(13133), #2(9243)
+2025-09-28 04:40:18,825 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:40:18,825 - __main__ - INFO - 📈 Episode stats: avg return = 0.18, avg length = 274.0
+2025-09-28 04:40:18,825 - __main__ - INFO - 🎯 Top 3 training actions: #1(22164), #4(13371), #2(9341)
+2025-09-28 04:40:19,818 - __main__ - INFO - 🔄 Synchronized model update at step 64,512
+2025-09-28 04:40:19,819 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 04:40:19,820 - __main__ - INFO - 🚫 Model training masking: 420/12288 timesteps masked (3.4%) due to negative rewards (invalid actions)
+2025-09-28 04:40:19,820 - __main__ - INFO - 🔄 VAE refresh starting at step 64,512 with replay size 8x1536
+2025-09-28 04:40:19,821 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 04:40:40,754 - __main__ - INFO -    VAE refresh complete: final_loss=1597.7362, avg_loss=1606.9352, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:40:40,756 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 04:40:42,677 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:40:42,677 - __main__ - INFO - 📈 Episode stats: avg return = 0.37, avg length = 232.2
+2025-09-28 04:40:42,677 - __main__ - INFO - 🎯 Top 3 training actions: #1(22641), #4(13584), #2(9453)
+2025-09-28 04:40:45,582 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:40:45,582 - __main__ - INFO - 📈 Episode stats: avg return = 0.38, avg length = 220.0
+2025-09-28 04:40:45,582 - __main__ - INFO - 🎯 Top 3 training actions: #1(23089), #4(13824), #2(9567)
+2025-09-28 04:40:48,444 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:40:48,444 - __main__ - INFO - 📈 Episode stats: avg return = 0.20, avg length = 268.0
+2025-09-28 04:40:48,444 - __main__ - INFO - 🎯 Top 3 training actions: #1(23499), #4(14092), #2(9671)
+2025-09-28 04:40:51,395 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:40:51,395 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 194.5
+2025-09-28 04:40:51,395 - __main__ - INFO - 🎯 Top 3 training actions: #1(23879), #4(14381), #5(9786)
+2025-09-28 04:40:54,281 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:40:54,281 - __main__ - INFO - 📈 Episode stats: avg return = 0.34, avg length = 242.0
+2025-09-28 04:40:54,282 - __main__ - INFO - 🎯 Top 3 training actions: #1(24223), #4(14689), #5(9961)
+2025-09-28 04:40:57,163 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:40:57,164 - __main__ - INFO - 📈 Episode stats: avg return = 0.24, avg length = 232.4
+2025-09-28 04:40:57,164 - __main__ - INFO - 🎯 Top 3 training actions: #1(24591), #4(14964), #5(10154)
+2025-09-28 04:40:58,155 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:40:58,155 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:40:58,155 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:40:58,156 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:41:02,277 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:41:05,646 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 04:41:09,013 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 04:41:12,381 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:41:16,252 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:41:19,598 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:41:22,988 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 04:41:26,355 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:41:29,723 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 04:41:33,718 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:41:37,096 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:41:40,799 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:41:44,174 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:41:47,530 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:41:50,927 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:41:55,082 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 04:41:58,768 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:42:02,135 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:42:05,522 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:42:09,173 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 04:42:12,598 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:42:16,733 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 04:42:28,238 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 04:42:31,625 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 04:42:34,992 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 04:42:38,499 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:42:42,027 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 04:42:46,475 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:42:49,838 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 04:42:53,198 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:42:56,595 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:42:56,746 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:42:56,746 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:42:56,746 - __main__ - INFO -    Time: 118.6s (2.4s/ep)
+2025-09-28 04:42:56,746 - __main__ - INFO -    Average Return: 0.315 ± 0.474
+2025-09-28 04:42:56,746 - __main__ - INFO -    Success Rate: 38.0%
+2025-09-28 04:42:56,746 - __main__ - INFO -    Average Length: 244.5
+2025-09-28 04:42:56,746 - __main__ - INFO -    Average Coverage: 22.8 positions
+2025-09-28 04:42:56,746 - __main__ - INFO -    Episode Completions: 19 terminated (38.0%), 31 truncated (62.0%)
+2025-09-28 04:42:56,746 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:42:56,747 - __main__ - INFO -    Total Episodes: 350
+2025-09-28 04:42:56,747 - __main__ - INFO -    Total Average Return: 0.282 ± 0.491
+2025-09-28 04:42:56,747 - __main__ - INFO -    Total Average Length: 249.3 ± 136.7
+2025-09-28 04:42:56,747 - __main__ - INFO -    Total Completions: 131 terminated (37.4%), 219 truncated (62.6%)
+2025-09-28 04:42:56,747 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:42:56,747 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:42:56,747 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:42:56,747 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:42:56,747 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:42:56,747 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:42:56,747 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:42:56,748 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:42:56,748 - __main__ - INFO -    Train action count: 70656
+2025-09-28 04:42:56,748 - __main__ - INFO -    Eval action count: 87266
+2025-09-28 04:42:56,748 - __main__ - INFO -    Train action entropy: 1.715
+2025-09-28 04:42:56,748 - __main__ - INFO -    Eval action entropy: 1.688
+2025-09-28 04:42:56,749 - __main__ - INFO -    Top 3 train actions: #1(24591), #4(14964), #5(10154)
+2025-09-28 04:42:56,749 - __main__ - INFO -    Top 3 eval actions: #1(30016), #4(19817), #5(12829)
+2025-09-28 04:42:58,625 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:42:58,625 - __main__ - INFO - 📈 Episode stats: avg return = 0.62, avg length = 163.2
+2025-09-28 04:42:58,626 - __main__ - INFO - 🎯 Top 3 training actions: #1(24976), #4(15238), #5(10342)
+2025-09-28 04:43:01,488 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:43:01,488 - __main__ - INFO - 📈 Episode stats: avg return = -0.05, avg length = 350.0
+2025-09-28 04:43:01,489 - __main__ - INFO - 🎯 Top 3 training actions: #1(25314), #4(15511), #5(10581)
+2025-09-28 04:43:04,379 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:43:04,380 - __main__ - INFO - 📈 Episode stats: avg return = 0.15, avg length = 314.8
+2025-09-28 04:43:04,380 - __main__ - INFO - 🎯 Top 3 training actions: #1(25632), #4(15785), #5(10845)
+2025-09-28 04:43:07,211 - __main__ - INFO - 📊 Episodes completed this rollout: 1
+2025-09-28 04:43:07,211 - __main__ - INFO - 📈 Episode stats: avg return = -0.07, avg length = 350.0
+2025-09-28 04:43:07,211 - __main__ - INFO - 🎯 Top 3 training actions: #1(25979), #4(16049), #5(11078)
+2025-09-28 04:43:10,050 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:43:10,051 - __main__ - INFO - 📈 Episode stats: avg return = 0.22, avg length = 278.2
+2025-09-28 04:43:10,051 - __main__ - INFO - 🎯 Top 3 training actions: #1(26311), #4(16308), #5(11277)
+2025-09-28 04:43:12,928 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:43:12,928 - __main__ - INFO - 📈 Episode stats: avg return = 0.31, avg length = 245.8
+2025-09-28 04:43:12,928 - __main__ - INFO - 🎯 Top 3 training actions: #1(26662), #4(16547), #5(11460)
+2025-09-28 04:43:13,911 - __main__ - INFO - 🔄 Synchronized model update at step 76,800
+2025-09-28 04:43:13,912 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 04:43:13,912 - __main__ - INFO - 🚫 Model training masking: 324/12288 timesteps masked (2.6%) due to negative rewards (invalid actions)
+2025-09-28 04:43:13,912 - __main__ - INFO - 🔄 VAE refresh starting at step 76,800 with replay size 8x1536
+2025-09-28 04:43:13,913 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 04:43:35,179 - __main__ - INFO -    VAE refresh complete: final_loss=1537.1398, avg_loss=1553.8943, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:43:35,182 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 04:43:37,027 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:43:37,028 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 208.0
+2025-09-28 04:43:37,028 - __main__ - INFO - 🎯 Top 3 training actions: #1(27009), #4(16784), #5(11596)
+2025-09-28 04:43:39,889 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:43:39,889 - __main__ - INFO - 📈 Episode stats: avg return = 0.29, avg length = 250.0
+2025-09-28 04:43:39,889 - __main__ - INFO - 🎯 Top 3 training actions: #1(27378), #4(17035), #5(11720)
+2025-09-28 04:43:42,826 - __main__ - INFO - 📊 Episodes completed this rollout: 8
+2025-09-28 04:43:42,827 - __main__ - INFO - 📈 Episode stats: avg return = 0.22, avg length = 279.8
+2025-09-28 04:43:42,827 - __main__ - INFO - 🎯 Top 3 training actions: #1(27779), #4(17281), #5(11861)
+2025-09-28 04:43:45,626 - __main__ - INFO - 📊 Episodes completed this rollout: 1
+2025-09-28 04:43:45,626 - __main__ - INFO - 📈 Episode stats: avg return = 0.93, avg length = 127.0
+2025-09-28 04:43:45,627 - __main__ - INFO - 🎯 Top 3 training actions: #1(28160), #4(17553), #5(11971)
+2025-09-28 04:43:46,615 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:43:46,616 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:43:46,616 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:43:46,616 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:43:50,017 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 04:43:53,537 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:43:57,931 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:44:01,344 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 04:44:04,695 - __main__ - WARNING - ⚠️ Episode 7 terminated due to step limit.
+2025-09-28 04:44:08,044 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:44:11,407 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:44:14,767 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 04:44:18,108 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:44:21,453 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 04:44:27,816 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:44:31,217 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:44:34,571 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 04:44:37,999 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:44:41,434 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:44:44,888 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:44:48,327 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:44:51,672 - __main__ - WARNING - ⚠️ Episode 22 terminated due to step limit.
+2025-09-28 04:44:55,035 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 04:44:58,395 - __main__ - WARNING - ⚠️ Episode 24 terminated due to step limit.
+2025-09-28 04:45:01,879 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:45:05,232 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:45:08,640 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:45:11,990 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:45:15,343 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 04:45:19,034 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:45:23,994 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 04:45:27,625 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:45:32,880 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 04:45:36,328 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 04:45:39,772 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 04:45:43,130 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 04:45:47,286 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 04:45:50,658 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:45:54,020 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:45:57,368 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 04:46:00,729 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:46:04,144 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:46:04,398 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:46:04,398 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:46:04,398 - __main__ - INFO -    Time: 137.8s (2.8s/ep)
+2025-09-28 04:46:04,398 - __main__ - INFO -    Average Return: 0.160 ± 0.405
+2025-09-28 04:46:04,398 - __main__ - INFO -    Success Rate: 24.0%
+2025-09-28 04:46:04,399 - __main__ - INFO -    Average Length: 284.5
+2025-09-28 04:46:04,399 - __main__ - INFO -    Average Coverage: 23.3 positions
+2025-09-28 04:46:04,399 - __main__ - INFO -    Episode Completions: 12 terminated (24.0%), 38 truncated (76.0%)
+2025-09-28 04:46:04,399 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:46:04,399 - __main__ - INFO -    Total Episodes: 400
+2025-09-28 04:46:04,399 - __main__ - INFO -    Total Average Return: 0.267 ± 0.483
+2025-09-28 04:46:04,399 - __main__ - INFO -    Total Average Length: 253.7 ± 135.3
+2025-09-28 04:46:04,399 - __main__ - INFO -    Total Completions: 143 terminated (35.8%), 257 truncated (64.2%)
+2025-09-28 04:46:04,399 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:46:04,399 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:46:04,399 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:46:04,400 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:46:04,400 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:46:04,400 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:46:04,400 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:46:04,400 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:46:04,400 - __main__ - INFO -    Train action count: 80896
+2025-09-28 04:46:04,400 - __main__ - INFO -    Eval action count: 101492
+2025-09-28 04:46:04,400 - __main__ - INFO -    Train action entropy: 1.707
+2025-09-28 04:46:04,401 - __main__ - INFO -    Eval action entropy: 1.668
+2025-09-28 04:46:04,401 - __main__ - INFO -    Top 3 train actions: #1(28160), #4(17553), #5(11971)
+2025-09-28 04:46:04,401 - __main__ - INFO -    Top 3 eval actions: #1(36112), #4(23491), #2(14803)
+2025-09-28 04:46:06,288 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:46:06,288 - __main__ - INFO - 📈 Episode stats: avg return = 0.16, avg length = 287.6
+2025-09-28 04:46:06,288 - __main__ - INFO - 🎯 Top 3 training actions: #1(28598), #4(17822), #5(12060)
+2025-09-28 04:46:09,146 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:46:09,146 - __main__ - INFO - 📈 Episode stats: avg return = 0.36, avg length = 226.2
+2025-09-28 04:46:09,147 - __main__ - INFO - 🎯 Top 3 training actions: #1(29040), #4(18112), #5(12133)
+2025-09-28 04:46:11,998 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:46:11,998 - __main__ - INFO - 📈 Episode stats: avg return = 0.39, avg length = 199.5
+2025-09-28 04:46:11,999 - __main__ - INFO - 🎯 Top 3 training actions: #1(29499), #4(18370), #5(12218)
+2025-09-28 04:46:14,852 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:46:14,853 - __main__ - INFO - 📈 Episode stats: avg return = 0.55, avg length = 159.2
+2025-09-28 04:46:14,853 - __main__ - INFO - 🎯 Top 3 training actions: #1(30026), #4(18581), #5(12300)
+2025-09-28 04:46:17,722 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:46:17,722 - __main__ - INFO - 📈 Episode stats: avg return = 0.44, avg length = 212.5
+2025-09-28 04:46:17,723 - __main__ - INFO - 🎯 Top 3 training actions: #1(30475), #4(18833), #5(12391)
+2025-09-28 04:46:20,557 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:46:20,557 - __main__ - INFO - 📈 Episode stats: avg return = -0.06, avg length = 350.0
+2025-09-28 04:46:20,558 - __main__ - INFO - 🎯 Top 3 training actions: #1(30966), #4(19065), #5(12453)
+2025-09-28 04:46:23,416 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:46:23,416 - __main__ - INFO - 📈 Episode stats: avg return = 0.48, avg length = 194.5
+2025-09-28 04:46:23,417 - __main__ - INFO - 🎯 Top 3 training actions: #1(31423), #4(19286), #5(12538)
+2025-09-28 04:46:26,304 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:46:26,304 - __main__ - INFO - 📈 Episode stats: avg return = 0.14, avg length = 295.7
+2025-09-28 04:46:26,304 - __main__ - INFO - 🎯 Top 3 training actions: #1(31885), #4(19507), #5(12639)
+2025-09-28 04:46:27,292 - __main__ - INFO - 🔄 Synchronized model update at step 89,088
+2025-09-28 04:46:27,293 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 04:46:27,293 - __main__ - INFO - 🚫 Model training masking: 72/12288 timesteps masked (0.6%) due to negative rewards (invalid actions)
+2025-09-28 04:46:27,293 - __main__ - INFO - 🔄 VAE refresh starting at step 89,088 with replay size 8x1536
+2025-09-28 04:46:27,294 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 04:46:48,957 - __main__ - INFO -    VAE refresh complete: final_loss=1489.6997, avg_loss=1524.6858, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:46:48,959 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 04:46:50,802 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:46:50,802 - __main__ - INFO - 📈 Episode stats: avg return = 0.73, avg length = 118.8
+2025-09-28 04:46:50,803 - __main__ - INFO - 🎯 Top 3 training actions: #1(32304), #4(19744), #5(12728)
+2025-09-28 04:46:51,768 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:46:51,768 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:46:51,768 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:46:51,769 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:46:55,938 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 04:46:59,268 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 04:47:04,437 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 04:47:07,874 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:47:11,237 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 04:47:16,121 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:47:19,878 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 04:47:23,228 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:47:26,575 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:47:30,020 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:47:33,568 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:47:37,413 - __main__ - WARNING - ⚠️ Episode 24 terminated due to step limit.
+2025-09-28 04:47:40,797 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:47:44,127 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:47:47,461 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:47:50,807 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:47:54,554 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:47:57,898 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:48:01,219 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 04:48:04,556 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 04:48:08,390 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:48:11,816 - __main__ - WARNING - ⚠️ Episode 36 terminated due to step limit.
+2025-09-28 04:48:15,203 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 04:48:18,578 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 04:48:21,923 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 04:48:25,264 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 04:48:28,924 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:48:32,340 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 04:48:35,710 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 04:48:39,043 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:48:42,439 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:48:45,800 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 04:48:49,128 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:48:52,864 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 04:48:52,866 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:48:52,867 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:48:52,867 - __main__ - INFO -    Time: 121.1s (2.4s/ep)
+2025-09-28 04:48:52,867 - __main__ - INFO -    Average Return: 0.299 ± 0.468
+2025-09-28 04:48:52,867 - __main__ - INFO -    Success Rate: 32.0%
+2025-09-28 04:48:52,867 - __main__ - INFO -    Average Length: 251.4
+2025-09-28 04:48:52,867 - __main__ - INFO -    Average Coverage: 22.0 positions
+2025-09-28 04:48:52,867 - __main__ - INFO -    Episode Completions: 16 terminated (32.0%), 34 truncated (68.0%)
+2025-09-28 04:48:52,867 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:48:52,867 - __main__ - INFO -    Total Episodes: 450
+2025-09-28 04:48:52,867 - __main__ - INFO -    Total Average Return: 0.270 ± 0.481
+2025-09-28 04:48:52,868 - __main__ - INFO -    Total Average Length: 253.5 ± 136.3
+2025-09-28 04:48:52,868 - __main__ - INFO -    Total Completions: 159 terminated (35.3%), 291 truncated (64.7%)
+2025-09-28 04:48:52,868 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:48:52,868 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:48:52,868 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:48:52,868 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:48:52,868 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:48:52,868 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:48:52,868 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:48:52,869 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:48:52,869 - __main__ - INFO -    Train action count: 90112
+2025-09-28 04:48:52,869 - __main__ - INFO -    Eval action count: 114064
+2025-09-28 04:48:52,869 - __main__ - INFO -    Train action entropy: 1.689
+2025-09-28 04:48:52,869 - __main__ - INFO -    Eval action entropy: 1.656
+2025-09-28 04:48:52,870 - __main__ - INFO -    Top 3 train actions: #1(32304), #4(19744), #5(12728)
+2025-09-28 04:48:52,870 - __main__ - INFO -    Top 3 eval actions: #1(41595), #4(26145), #2(16894)
+2025-09-28 04:48:54,764 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:48:54,764 - __main__ - INFO - 📈 Episode stats: avg return = 0.18, avg length = 287.8
+2025-09-28 04:48:54,764 - __main__ - INFO - 🎯 Top 3 training actions: #1(32759), #4(19972), #5(12792)
+2025-09-28 04:48:57,646 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:48:57,646 - __main__ - INFO - 📈 Episode stats: avg return = 0.21, avg length = 274.8
+2025-09-28 04:48:57,646 - __main__ - INFO - 🎯 Top 3 training actions: #1(33183), #4(20197), #2(12948)
+2025-09-28 04:49:00,525 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:49:00,526 - __main__ - INFO - 📈 Episode stats: avg return = 0.29, avg length = 250.7
+2025-09-28 04:49:00,526 - __main__ - INFO - 🎯 Top 3 training actions: #1(33636), #4(20441), #2(13111)
+2025-09-28 04:49:03,414 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:49:03,414 - __main__ - INFO - 📈 Episode stats: avg return = 0.27, avg length = 249.0
+2025-09-28 04:49:03,414 - __main__ - INFO - 🎯 Top 3 training actions: #1(34048), #4(20682), #2(13288)
+2025-09-28 04:49:06,261 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:49:06,261 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 207.0
+2025-09-28 04:49:06,261 - __main__ - INFO - 🎯 Top 3 training actions: #1(34430), #4(20945), #2(13495)
+2025-09-28 04:49:09,111 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:49:09,111 - __main__ - INFO - 📈 Episode stats: avg return = -0.03, avg length = 350.0
+2025-09-28 04:49:09,111 - __main__ - INFO - 🎯 Top 3 training actions: #1(34804), #4(21207), #2(13717)
+2025-09-28 04:49:12,028 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 04:49:12,029 - __main__ - INFO - 📈 Episode stats: avg return = 0.41, avg length = 216.6
+2025-09-28 04:49:12,029 - __main__ - INFO - 🎯 Top 3 training actions: #1(35172), #4(21455), #2(13952)
+2025-09-28 04:49:14,935 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:49:14,935 - __main__ - INFO - 📈 Episode stats: avg return = 0.31, avg length = 248.3
+2025-09-28 04:49:14,936 - __main__ - INFO - 🎯 Top 3 training actions: #1(35544), #4(21693), #2(14164)
+2025-09-28 04:49:17,781 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:49:17,781 - __main__ - INFO - 📈 Episode stats: avg return = -0.07, avg length = 350.0
+2025-09-28 04:49:17,782 - __main__ - INFO - 🎯 Top 3 training actions: #1(35887), #4(21953), #2(14401)
+2025-09-28 04:49:20,684 - __main__ - INFO - 📊 Episodes completed this rollout: 10
+2025-09-28 04:49:20,685 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 192.3
+2025-09-28 04:49:20,685 - __main__ - INFO - 🎯 Top 3 training actions: #1(36215), #4(22224), #2(14620)
+2025-09-28 04:49:21,675 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:49:21,675 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:49:21,676 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:49:21,676 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:49:25,053 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 04:49:29,840 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 04:49:33,175 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:49:36,498 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 04:49:40,256 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:49:43,596 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:49:46,976 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 04:49:50,340 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:49:54,276 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 04:49:57,610 - __main__ - WARNING - ⚠️ Episode 14 terminated due to step limit.
+2025-09-28 04:50:00,954 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:50:04,912 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:50:08,240 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:50:11,604 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:50:15,028 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:50:18,495 - __main__ - WARNING - ⚠️ Episode 22 terminated due to step limit.
+2025-09-28 04:50:21,869 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 04:50:25,640 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:50:28,974 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:50:32,331 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:50:35,710 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:50:39,080 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 04:50:42,453 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:50:45,800 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:50:49,199 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 04:50:52,685 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 04:50:56,385 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:50:59,802 - __main__ - WARNING - ⚠️ Episode 36 terminated due to step limit.
+2025-09-28 04:51:03,514 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 04:51:08,157 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 04:51:11,512 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:51:14,853 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 04:51:18,237 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 04:51:21,597 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:51:24,976 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:51:28,717 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:51:29,690 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:51:29,690 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:51:29,690 - __main__ - INFO -    Time: 128.0s (2.6s/ep)
+2025-09-28 04:51:29,691 - __main__ - INFO -    Average Return: 0.249 ± 0.455
+2025-09-28 04:51:29,691 - __main__ - INFO -    Success Rate: 28.0%
+2025-09-28 04:51:29,691 - __main__ - INFO -    Average Length: 265.9
+2025-09-28 04:51:29,691 - __main__ - INFO -    Average Coverage: 25.8 positions
+2025-09-28 04:51:29,691 - __main__ - INFO -    Episode Completions: 14 terminated (28.0%), 36 truncated (72.0%)
+2025-09-28 04:51:29,691 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:51:29,691 - __main__ - INFO -    Total Episodes: 500
+2025-09-28 04:51:29,691 - __main__ - INFO -    Total Average Return: 0.268 ± 0.479
+2025-09-28 04:51:29,691 - __main__ - INFO -    Total Average Length: 254.7 ± 136.2
+2025-09-28 04:51:29,692 - __main__ - INFO -    Total Completions: 173 terminated (34.6%), 327 truncated (65.4%)
+2025-09-28 04:51:29,692 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:51:29,692 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:51:29,692 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:51:29,692 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:51:29,692 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:51:29,692 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:51:29,692 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:51:29,692 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:51:29,692 - __main__ - INFO -    Train action count: 100352
+2025-09-28 04:51:29,693 - __main__ - INFO -    Eval action count: 127359
+2025-09-28 04:51:29,693 - __main__ - INFO -    Train action entropy: 1.680
+2025-09-28 04:51:29,693 - __main__ - INFO -    Eval action entropy: 1.658
+2025-09-28 04:51:29,694 - __main__ - INFO -    Top 3 train actions: #1(36215), #4(22224), #2(14620)
+2025-09-28 04:51:29,694 - __main__ - INFO -    Top 3 eval actions: #1(45739), #4(29621), #2(19675)
+2025-09-28 04:51:31,564 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:51:31,565 - __main__ - INFO - 📈 Episode stats: avg return = 0.65, avg length = 143.7
+2025-09-28 04:51:31,565 - __main__ - INFO - 🎯 Top 3 training actions: #1(36534), #4(22494), #2(14834)
+2025-09-28 04:51:32,542 - __main__ - INFO - 🔄 Synchronized model update at step 101,376
+2025-09-28 04:51:32,542 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 04:51:32,543 - __main__ - INFO - 🚫 Model training masking: 180/12288 timesteps masked (1.5%) due to negative rewards (invalid actions)
+2025-09-28 04:51:32,543 - __main__ - INFO - 🔄 VAE refresh starting at step 101,376 with replay size 8x1536
+2025-09-28 04:51:32,544 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 04:51:54,353 - __main__ - INFO -    VAE refresh complete: final_loss=1485.2310, avg_loss=1504.9775, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:51:54,355 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 04:51:56,214 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:51:56,215 - __main__ - INFO - 📈 Episode stats: avg return = -0.04, avg length = 350.0
+2025-09-28 04:51:56,215 - __main__ - INFO - 🎯 Top 3 training actions: #1(36857), #4(22765), #2(15049)
+2025-09-28 04:51:59,073 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:51:59,073 - __main__ - INFO - 📈 Episode stats: avg return = 0.31, avg length = 246.8
+2025-09-28 04:51:59,073 - __main__ - INFO - 🎯 Top 3 training actions: #1(37190), #4(23024), #2(15259)
+2025-09-28 04:52:01,919 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:52:01,919 - __main__ - INFO - 📈 Episode stats: avg return = -0.05, avg length = 350.0
+2025-09-28 04:52:01,919 - __main__ - INFO - 🎯 Top 3 training actions: #1(37521), #4(23285), #2(15470)
+2025-09-28 04:52:04,720 - __main__ - INFO - 📊 Episodes completed this rollout: 1
+2025-09-28 04:52:04,720 - __main__ - INFO - 📈 Episode stats: avg return = -0.04, avg length = 350.0
+2025-09-28 04:52:04,720 - __main__ - INFO - 🎯 Top 3 training actions: #1(37823), #4(23531), #2(15684)
+2025-09-28 04:52:07,597 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:52:07,598 - __main__ - INFO - 📈 Episode stats: avg return = 0.12, avg length = 293.7
+2025-09-28 04:52:07,598 - __main__ - INFO - 🎯 Top 3 training actions: #1(38124), #4(23805), #2(15915)
+2025-09-28 04:52:10,414 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:52:10,415 - __main__ - INFO - 📈 Episode stats: avg return = -0.04, avg length = 350.0
+2025-09-28 04:52:10,415 - __main__ - INFO - 🎯 Top 3 training actions: #1(38418), #4(24036), #2(16153)
+2025-09-28 04:52:13,240 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:52:13,240 - __main__ - INFO - 📈 Episode stats: avg return = 0.31, avg length = 273.0
+2025-09-28 04:52:13,241 - __main__ - INFO - 🎯 Top 3 training actions: #1(38739), #4(24274), #2(16390)
+2025-09-28 04:52:16,113 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:52:16,114 - __main__ - INFO - 📈 Episode stats: avg return = 0.12, avg length = 306.2
+2025-09-28 04:52:16,114 - __main__ - INFO - 🎯 Top 3 training actions: #1(39027), #4(24547), #2(16635)
+2025-09-28 04:52:18,931 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:52:18,931 - __main__ - INFO - 📈 Episode stats: avg return = 0.54, avg length = 197.7
+2025-09-28 04:52:18,931 - __main__ - INFO - 🎯 Top 3 training actions: #1(39315), #4(24819), #2(16854)
+2025-09-28 04:52:19,905 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:52:19,906 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:52:19,906 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:52:19,906 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:52:23,750 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:52:27,148 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 04:52:30,805 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:52:34,613 - __main__ - WARNING - ⚠️ Episode 7 terminated due to step limit.
+2025-09-28 04:52:39,940 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:52:43,576 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 04:52:47,327 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 04:52:51,412 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:52:54,814 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:52:58,169 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 04:53:01,497 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 04:53:04,904 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:53:08,414 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:53:11,748 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:53:15,971 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:53:19,296 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:53:22,599 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:53:26,049 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:53:29,419 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 04:53:33,427 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:53:37,556 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 04:53:41,105 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 04:53:44,647 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:53:48,381 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 04:53:55,110 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 04:53:58,786 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 04:54:02,129 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 04:54:05,448 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:54:08,809 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:54:12,192 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 04:54:15,579 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:54:19,079 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:54:19,616 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:54:19,616 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:54:19,616 - __main__ - INFO -    Time: 119.7s (2.4s/ep)
+2025-09-28 04:54:19,617 - __main__ - INFO -    Average Return: 0.318 ± 0.477
+2025-09-28 04:54:19,617 - __main__ - INFO -    Success Rate: 36.0%
+2025-09-28 04:54:19,617 - __main__ - INFO -    Average Length: 246.6
+2025-09-28 04:54:19,617 - __main__ - INFO -    Average Coverage: 23.7 positions
+2025-09-28 04:54:19,617 - __main__ - INFO -    Episode Completions: 18 terminated (36.0%), 32 truncated (64.0%)
+2025-09-28 04:54:19,617 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:54:19,617 - __main__ - INFO -    Total Episodes: 550
+2025-09-28 04:54:19,617 - __main__ - INFO -    Total Average Return: 0.273 ± 0.479
+2025-09-28 04:54:19,617 - __main__ - INFO -    Total Average Length: 254.0 ± 136.9
+2025-09-28 04:54:19,617 - __main__ - INFO -    Total Completions: 191 terminated (34.7%), 359 truncated (65.3%)
+2025-09-28 04:54:19,617 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:54:19,618 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:54:19,618 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:54:19,618 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:54:19,618 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:54:19,618 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:54:19,618 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:54:19,618 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:54:19,618 - __main__ - INFO -    Train action count: 110592
+2025-09-28 04:54:19,618 - __main__ - INFO -    Eval action count: 139691
+2025-09-28 04:54:19,619 - __main__ - INFO -    Train action entropy: 1.680
+2025-09-28 04:54:19,619 - __main__ - INFO -    Eval action entropy: 1.660
+2025-09-28 04:54:19,619 - __main__ - INFO -    Top 3 train actions: #1(39315), #4(24819), #2(16854)
+2025-09-28 04:54:19,619 - __main__ - INFO -    Top 3 eval actions: #1(49197), #4(33091), #2(22261)
+2025-09-28 04:54:21,470 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:54:21,470 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 186.5
+2025-09-28 04:54:21,470 - __main__ - INFO - 🎯 Top 3 training actions: #1(39590), #4(25108), #2(17081)
+2025-09-28 04:54:24,310 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 04:54:24,310 - __main__ - INFO - 📈 Episode stats: avg return = 0.39, avg length = 217.7
+2025-09-28 04:54:24,310 - __main__ - INFO - 🎯 Top 3 training actions: #1(39882), #4(25408), #2(17305)
+2025-09-28 04:54:27,160 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:54:27,160 - __main__ - INFO - 📈 Episode stats: avg return = 0.28, avg length = 245.0
+2025-09-28 04:54:27,161 - __main__ - INFO - 🎯 Top 3 training actions: #1(40172), #4(25702), #2(17515)
+2025-09-28 04:54:28,144 - __main__ - INFO - 🔄 Synchronized model update at step 113,664
+2025-09-28 04:54:28,144 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 04:54:28,145 - __main__ - INFO - 🚫 Model training masking: 216/12288 timesteps masked (1.8%) due to negative rewards (invalid actions)
+2025-09-28 04:54:28,145 - __main__ - INFO - 🔄 VAE refresh starting at step 113,664 with replay size 8x1536
+2025-09-28 04:54:28,146 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 04:54:49,676 - __main__ - INFO -    VAE refresh complete: final_loss=1485.8361, avg_loss=1491.9683, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:54:49,678 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 04:54:51,557 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:54:51,557 - __main__ - INFO - 📈 Episode stats: avg return = 0.20, avg length = 294.0
+2025-09-28 04:54:51,558 - __main__ - INFO - 🎯 Top 3 training actions: #1(40472), #4(26003), #2(17711)
+2025-09-28 04:54:54,430 - __main__ - INFO - 📊 Episodes completed this rollout: 9
+2025-09-28 04:54:54,430 - __main__ - INFO - 📈 Episode stats: avg return = 0.63, avg length = 139.8
+2025-09-28 04:54:54,430 - __main__ - INFO - 🎯 Top 3 training actions: #1(40764), #4(26301), #2(17914)
+2025-09-28 04:54:57,245 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:54:57,246 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 223.8
+2025-09-28 04:54:57,246 - __main__ - INFO - 🎯 Top 3 training actions: #1(41058), #4(26590), #2(18110)
+2025-09-28 04:55:00,100 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:55:00,100 - __main__ - INFO - 📈 Episode stats: avg return = 0.66, avg length = 131.2
+2025-09-28 04:55:00,101 - __main__ - INFO - 🎯 Top 3 training actions: #1(41384), #4(26866), #2(18320)
+2025-09-28 04:55:02,971 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:55:02,971 - __main__ - INFO - 📈 Episode stats: avg return = 0.25, avg length = 263.5
+2025-09-28 04:55:02,971 - __main__ - INFO - 🎯 Top 3 training actions: #1(41697), #4(27152), #2(18506)
+2025-09-28 04:55:05,782 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:55:05,782 - __main__ - INFO - 📈 Episode stats: avg return = 0.47, avg length = 191.0
+2025-09-28 04:55:05,782 - __main__ - INFO - 🎯 Top 3 training actions: #1(41974), #4(27435), #2(18710)
+2025-09-28 04:55:08,598 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:55:08,598 - __main__ - INFO - 📈 Episode stats: avg return = -0.04, avg length = 350.0
+2025-09-28 04:55:08,599 - __main__ - INFO - 🎯 Top 3 training actions: #1(42253), #4(27732), #2(18902)
+2025-09-28 04:55:09,567 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:55:09,567 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:55:09,567 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:55:09,568 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:55:12,907 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 04:55:16,206 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 04:55:19,541 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 04:55:22,882 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 04:55:26,192 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 04:55:29,864 - __main__ - WARNING - ⚠️ Episode 7 terminated due to step limit.
+2025-09-28 04:55:33,211 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:55:36,584 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:55:40,132 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 04:55:43,682 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 04:55:47,816 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 04:55:51,238 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:55:55,486 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:56:03,420 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:56:06,774 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 04:56:10,113 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:56:13,415 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 04:56:17,756 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 04:56:21,091 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:56:24,736 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 04:56:28,059 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 04:56:32,243 - __main__ - WARNING - ⚠️ Episode 36 terminated due to step limit.
+2025-09-28 04:56:37,326 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 04:56:40,640 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 04:56:43,974 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 04:56:47,949 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 04:56:51,668 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 04:56:55,070 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:56:59,060 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:57:02,436 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 04:57:05,810 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 04:57:05,813 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:57:05,814 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:57:05,814 - __main__ - INFO -    Time: 116.2s (2.3s/ep)
+2025-09-28 04:57:05,814 - __main__ - INFO -    Average Return: 0.309 ± 0.479
+2025-09-28 04:57:05,814 - __main__ - INFO -    Success Rate: 38.0%
+2025-09-28 04:57:05,814 - __main__ - INFO -    Average Length: 241.6
+2025-09-28 04:57:05,814 - __main__ - INFO -    Average Coverage: 25.8 positions
+2025-09-28 04:57:05,814 - __main__ - INFO -    Episode Completions: 19 terminated (38.0%), 31 truncated (62.0%)
+2025-09-28 04:57:05,814 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:57:05,814 - __main__ - INFO -    Total Episodes: 600
+2025-09-28 04:57:05,814 - __main__ - INFO -    Total Average Return: 0.276 ± 0.479
+2025-09-28 04:57:05,814 - __main__ - INFO -    Total Average Length: 252.9 ± 137.5
+2025-09-28 04:57:05,815 - __main__ - INFO -    Total Completions: 210 terminated (35.0%), 390 truncated (65.0%)
+2025-09-28 04:57:05,815 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:57:05,815 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:57:05,815 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:57:05,815 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:57:05,815 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:57:05,815 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:57:05,815 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:57:05,815 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:57:05,815 - __main__ - INFO -    Train action count: 120832
+2025-09-28 04:57:05,816 - __main__ - INFO -    Eval action count: 151770
+2025-09-28 04:57:05,816 - __main__ - INFO -    Train action entropy: 1.681
+2025-09-28 04:57:05,816 - __main__ - INFO -    Eval action entropy: 1.663
+2025-09-28 04:57:05,816 - __main__ - INFO -    Top 3 train actions: #1(42253), #4(27732), #2(18902)
+2025-09-28 04:57:05,817 - __main__ - INFO -    Top 3 eval actions: #1(52276), #4(36780), #2(24625)
+2025-09-28 04:57:07,716 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:57:07,716 - __main__ - INFO - 📈 Episode stats: avg return = 0.29, avg length = 245.7
+2025-09-28 04:57:07,716 - __main__ - INFO - 🎯 Top 3 training actions: #1(42531), #4(28020), #2(19108)
+2025-09-28 04:57:10,575 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 04:57:10,576 - __main__ - INFO - 📈 Episode stats: avg return = 0.25, avg length = 242.7
+2025-09-28 04:57:10,576 - __main__ - INFO - 🎯 Top 3 training actions: #1(42781), #4(28356), #2(19309)
+2025-09-28 04:57:13,424 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:57:13,424 - __main__ - INFO - 📈 Episode stats: avg return = -0.07, avg length = 350.0
+2025-09-28 04:57:13,424 - __main__ - INFO - 🎯 Top 3 training actions: #1(43025), #4(28705), #2(19526)
+2025-09-28 04:57:16,277 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 04:57:16,277 - __main__ - INFO - 📈 Episode stats: avg return = 0.38, avg length = 214.6
+2025-09-28 04:57:16,277 - __main__ - INFO - 🎯 Top 3 training actions: #1(43301), #4(29001), #2(19711)
+2025-09-28 04:57:19,118 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:57:19,118 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 198.5
+2025-09-28 04:57:19,118 - __main__ - INFO - 🎯 Top 3 training actions: #1(43544), #4(29304), #2(19897)
+2025-09-28 04:57:20,090 - __main__ - INFO - 🔄 Synchronized model update at step 125,952
+2025-09-28 04:57:20,090 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 04:57:20,091 - __main__ - INFO - 🚫 Model training masking: 252/12288 timesteps masked (2.1%) due to negative rewards (invalid actions)
+2025-09-28 04:57:20,091 - __main__ - INFO - 🔄 VAE refresh starting at step 125,952 with replay size 8x1536
+2025-09-28 04:57:20,092 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 04:57:41,546 - __main__ - INFO -    VAE refresh complete: final_loss=1440.4464, avg_loss=1452.8752, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 04:57:41,548 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 04:57:43,368 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:57:43,369 - __main__ - INFO - 📈 Episode stats: avg return = -0.11, avg length = 350.0
+2025-09-28 04:57:43,369 - __main__ - INFO - 🎯 Top 3 training actions: #1(43809), #4(29599), #2(20074)
+2025-09-28 04:57:46,199 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:57:46,200 - __main__ - INFO - 📈 Episode stats: avg return = 0.14, avg length = 286.0
+2025-09-28 04:57:46,200 - __main__ - INFO - 🎯 Top 3 training actions: #1(44071), #4(29859), #2(20280)
+2025-09-28 04:57:49,034 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:57:49,034 - __main__ - INFO - 📈 Episode stats: avg return = 0.16, avg length = 271.0
+2025-09-28 04:57:49,035 - __main__ - INFO - 🎯 Top 3 training actions: #1(44337), #4(30150), #2(20469)
+2025-09-28 04:57:51,908 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 04:57:51,908 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 211.3
+2025-09-28 04:57:51,908 - __main__ - INFO - 🎯 Top 3 training actions: #1(44617), #4(30458), #2(20634)
+2025-09-28 04:57:52,897 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 04:57:52,897 - __main__ - INFO -    Eval seed: 51
+2025-09-28 04:57:52,897 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 04:57:52,898 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 04:57:59,705 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 04:58:03,240 - __main__ - WARNING - ⚠️ Episode 7 terminated due to step limit.
+2025-09-28 04:58:06,787 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 04:58:10,212 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 04:58:14,696 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 04:58:18,713 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 04:58:22,079 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 04:58:26,219 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 04:58:29,530 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 04:58:32,859 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 04:58:36,270 - __main__ - WARNING - ⚠️ Episode 22 terminated due to step limit.
+2025-09-28 04:58:39,700 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 04:58:42,999 - __main__ - WARNING - ⚠️ Episode 24 terminated due to step limit.
+2025-09-28 04:58:46,434 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 04:58:50,343 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 04:58:55,684 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 04:58:59,000 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 04:59:04,443 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 04:59:07,985 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 04:59:11,330 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 04:59:14,640 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 04:59:19,710 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 04:59:24,326 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 04:59:28,422 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 04:59:30,007 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 04:59:30,008 - __main__ - INFO -    Episodes: 50
+2025-09-28 04:59:30,008 - __main__ - INFO -    Time: 97.1s (1.9s/ep)
+2025-09-28 04:59:30,008 - __main__ - INFO -    Average Return: 0.361 ± 0.706
+2025-09-28 04:59:30,008 - __main__ - INFO -    Success Rate: 52.0%
+2025-09-28 04:59:30,008 - __main__ - INFO -    Average Length: 202.1
+2025-09-28 04:59:30,008 - __main__ - INFO -    Average Coverage: 28.2 positions
+2025-09-28 04:59:30,008 - __main__ - INFO -    Episode Completions: 26 terminated (52.0%), 24 truncated (48.0%)
+2025-09-28 04:59:30,008 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 04:59:30,008 - __main__ - INFO -    Total Episodes: 650
+2025-09-28 04:59:30,008 - __main__ - INFO -    Total Average Return: 0.282 ± 0.501
+2025-09-28 04:59:30,009 - __main__ - INFO -    Total Average Length: 249.0 ± 138.8
+2025-09-28 04:59:30,009 - __main__ - INFO -    Total Completions: 236 terminated (36.3%), 414 truncated (63.7%)
+2025-09-28 04:59:30,009 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 04:59:30,009 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 04:59:30,009 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 04:59:30,009 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 04:59:30,009 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 04:59:30,009 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 04:59:30,009 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 04:59:30,009 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 04:59:30,009 - __main__ - INFO -    Train action count: 130048
+2025-09-28 04:59:30,010 - __main__ - INFO -    Eval action count: 161877
+2025-09-28 04:59:30,010 - __main__ - INFO -    Train action entropy: 1.685
+2025-09-28 04:59:30,010 - __main__ - INFO -    Eval action entropy: 1.666
+2025-09-28 04:59:30,010 - __main__ - INFO -    Top 3 train actions: #1(44617), #4(30458), #2(20634)
+2025-09-28 04:59:30,011 - __main__ - INFO -    Top 3 eval actions: #1(55057), #4(40012), #2(26006)
+2025-09-28 04:59:31,870 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:59:31,870 - __main__ - INFO - 📈 Episode stats: avg return = 0.37, avg length = 232.0
+2025-09-28 04:59:31,870 - __main__ - INFO - 🎯 Top 3 training actions: #1(44915), #4(30748), #2(20786)
+2025-09-28 04:59:34,696 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:59:34,696 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 207.5
+2025-09-28 04:59:34,696 - __main__ - INFO - 🎯 Top 3 training actions: #1(45224), #4(30999), #2(20964)
+2025-09-28 04:59:37,522 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 04:59:37,522 - __main__ - INFO - 📈 Episode stats: avg return = 0.33, avg length = 230.2
+2025-09-28 04:59:37,522 - __main__ - INFO - 🎯 Top 3 training actions: #1(45501), #4(31294), #2(21111)
+2025-09-28 04:59:40,307 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:59:40,307 - __main__ - INFO - 📈 Episode stats: avg return = -0.04, avg length = 350.0
+2025-09-28 04:59:40,307 - __main__ - INFO - 🎯 Top 3 training actions: #1(45786), #4(31542), #2(21274)
+2025-09-28 04:59:43,204 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:59:43,204 - __main__ - INFO - 📈 Episode stats: avg return = -0.07, avg length = 350.0
+2025-09-28 04:59:43,204 - __main__ - INFO - 🎯 Top 3 training actions: #1(46083), #4(31793), #2(21426)
+2025-09-28 04:59:46,049 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 04:59:46,050 - __main__ - INFO - 📈 Episode stats: avg return = 0.40, avg length = 226.7
+2025-09-28 04:59:46,050 - __main__ - INFO - 🎯 Top 3 training actions: #1(46363), #4(32051), #2(21567)
+2025-09-28 04:59:48,855 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 04:59:48,856 - __main__ - INFO - 📈 Episode stats: avg return = 0.48, avg length = 186.8
+2025-09-28 04:59:48,856 - __main__ - INFO - 🎯 Top 3 training actions: #1(46634), #4(32305), #2(21733)
+2025-09-28 04:59:51,652 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 04:59:51,652 - __main__ - INFO - 📈 Episode stats: avg return = -0.01, avg length = 350.0
+2025-09-28 04:59:51,652 - __main__ - INFO - 🎯 Top 3 training actions: #1(46931), #4(32523), #2(21885)
+2025-09-28 04:59:52,656 - __main__ - INFO - 🔄 Synchronized model update at step 138,240
+2025-09-28 04:59:52,656 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 04:59:52,657 - __main__ - INFO - 🚫 Model training masking: 36/12288 timesteps masked (0.3%) due to negative rewards (invalid actions)
+2025-09-28 04:59:52,657 - __main__ - INFO - 🔄 VAE refresh starting at step 138,240 with replay size 8x1536
+2025-09-28 04:59:52,658 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 05:00:14,484 - __main__ - INFO -    VAE refresh complete: final_loss=1412.8395, avg_loss=1432.6366, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 05:00:14,486 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 05:00:16,331 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 05:00:16,331 - __main__ - INFO - 📈 Episode stats: avg return = 0.36, avg length = 231.4
+2025-09-28 05:00:16,332 - __main__ - INFO - 🎯 Top 3 training actions: #1(47237), #4(32748), #2(22014)
+2025-09-28 05:00:19,145 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:00:19,145 - __main__ - INFO - 📈 Episode stats: avg return = 0.30, avg length = 250.0
+2025-09-28 05:00:19,145 - __main__ - INFO - 🎯 Top 3 training actions: #1(47530), #4(33025), #2(22149)
+2025-09-28 05:00:20,112 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 05:00:20,112 - __main__ - INFO -    Eval seed: 51
+2025-09-28 05:00:20,112 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 05:00:20,112 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 05:00:23,508 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 05:00:26,856 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 05:00:30,170 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 05:00:33,709 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 05:00:37,061 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 05:00:41,588 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 05:00:44,964 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 05:00:48,310 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 05:00:52,365 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 05:00:56,694 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 05:01:00,132 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 05:01:06,099 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 05:01:10,147 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 05:01:15,006 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 05:01:19,952 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 05:01:23,401 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 05:01:26,748 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 05:01:32,329 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 05:01:36,378 - __main__ - WARNING - ⚠️ Episode 36 terminated due to step limit.
+2025-09-28 05:01:39,791 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 05:01:44,199 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 05:01:47,611 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 05:01:50,935 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 05:01:54,246 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 05:01:57,906 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 05:02:01,216 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 05:02:03,002 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 05:02:03,002 - __main__ - INFO -    Episodes: 50
+2025-09-28 05:02:03,003 - __main__ - INFO -    Time: 102.9s (2.1s/ep)
+2025-09-28 05:02:03,003 - __main__ - INFO -    Average Return: 0.429 ± 0.489
+2025-09-28 05:02:03,003 - __main__ - INFO -    Success Rate: 48.0%
+2025-09-28 05:02:03,003 - __main__ - INFO -    Average Length: 214.1
+2025-09-28 05:02:03,003 - __main__ - INFO -    Average Coverage: 30.3 positions
+2025-09-28 05:02:03,003 - __main__ - INFO -    Episode Completions: 24 terminated (48.0%), 26 truncated (52.0%)
+2025-09-28 05:02:03,003 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 05:02:03,003 - __main__ - INFO -    Total Episodes: 700
+2025-09-28 05:02:03,003 - __main__ - INFO -    Total Average Return: 0.293 ± 0.501
+2025-09-28 05:02:03,003 - __main__ - INFO -    Total Average Length: 246.5 ± 139.5
+2025-09-28 05:02:03,003 - __main__ - INFO -    Total Completions: 260 terminated (37.1%), 440 truncated (62.9%)
+2025-09-28 05:02:03,004 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 05:02:03,004 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 05:02:03,004 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 05:02:03,004 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 05:02:03,004 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 05:02:03,004 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 05:02:03,004 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 05:02:03,004 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 05:02:03,004 - __main__ - INFO -    Train action count: 140288
+2025-09-28 05:02:03,004 - __main__ - INFO -    Eval action count: 172584
+2025-09-28 05:02:03,005 - __main__ - INFO -    Train action entropy: 1.693
+2025-09-28 05:02:03,005 - __main__ - INFO -    Eval action entropy: 1.674
+2025-09-28 05:02:03,005 - __main__ - INFO -    Top 3 train actions: #1(47530), #4(33025), #2(22149)
+2025-09-28 05:02:03,005 - __main__ - INFO -    Top 3 eval actions: #1(58078), #4(42636), #2(27677)
+2025-09-28 05:02:04,838 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:02:04,838 - __main__ - INFO - 📈 Episode stats: avg return = -0.04, avg length = 350.0
+2025-09-28 05:02:04,839 - __main__ - INFO - 🎯 Top 3 training actions: #1(47827), #4(33272), #2(22337)
+2025-09-28 05:02:07,661 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:02:07,661 - __main__ - INFO - 📈 Episode stats: avg return = 0.22, avg length = 281.5
+2025-09-28 05:02:07,661 - __main__ - INFO - 🎯 Top 3 training actions: #1(48091), #4(33529), #2(22504)
+2025-09-28 05:02:10,443 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:02:10,443 - __main__ - INFO - 📈 Episode stats: avg return = 0.28, avg length = 264.3
+2025-09-28 05:02:10,443 - __main__ - INFO - 🎯 Top 3 training actions: #1(48404), #4(33747), #2(22673)
+2025-09-28 05:02:13,221 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:02:13,221 - __main__ - INFO - 📈 Episode stats: avg return = -0.03, avg length = 350.0
+2025-09-28 05:02:13,221 - __main__ - INFO - 🎯 Top 3 training actions: #1(48699), #4(33955), #2(22848)
+2025-09-28 05:02:15,981 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 05:02:15,982 - __main__ - INFO - 📈 Episode stats: avg return = 0.62, avg length = 149.5
+2025-09-28 05:02:15,982 - __main__ - INFO - 🎯 Top 3 training actions: #1(48980), #4(34178), #2(23030)
+2025-09-28 05:02:18,789 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:02:18,790 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 244.8
+2025-09-28 05:02:18,790 - __main__ - INFO - 🎯 Top 3 training actions: #1(49239), #4(34434), #2(23215)
+2025-09-28 05:02:21,561 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:02:21,561 - __main__ - INFO - 📈 Episode stats: avg return = 0.58, avg length = 167.8
+2025-09-28 05:02:21,561 - __main__ - INFO - 🎯 Top 3 training actions: #1(49510), #4(34669), #2(23429)
+2025-09-28 05:02:24,345 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 05:02:24,346 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 217.8
+2025-09-28 05:02:24,346 - __main__ - INFO - 🎯 Top 3 training actions: #1(49795), #4(34893), #2(23624)
+2025-09-28 05:02:27,109 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:02:27,109 - __main__ - INFO - 📈 Episode stats: avg return = 0.47, avg length = 225.5
+2025-09-28 05:02:27,109 - __main__ - INFO - 🎯 Top 3 training actions: #1(50070), #4(35119), #2(23817)
+2025-09-28 05:02:29,918 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 05:02:29,918 - __main__ - INFO - 📈 Episode stats: avg return = 0.28, avg length = 251.2
+2025-09-28 05:02:29,918 - __main__ - INFO - 🎯 Top 3 training actions: #1(50358), #4(35360), #2(24005)
+2025-09-28 05:02:30,879 - __main__ - INFO - 🔄 Synchronized model update at step 150,528
+2025-09-28 05:02:30,880 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 05:02:30,880 - __main__ - INFO - 🚫 Model training masking: 240/12288 timesteps masked (2.0%) due to negative rewards (invalid actions)
+2025-09-28 05:02:30,880 - __main__ - INFO - 🔄 VAE refresh starting at step 150,528 with replay size 8x1536
+2025-09-28 05:02:30,881 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 05:02:52,323 - __main__ - INFO -    VAE refresh complete: final_loss=1380.7731, avg_loss=1379.8076, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 05:02:52,325 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 05:02:52,328 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 05:02:52,328 - __main__ - INFO -    Eval seed: 51
+2025-09-28 05:02:52,328 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 05:02:52,329 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 05:02:56,640 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 05:03:00,015 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 05:03:03,895 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 05:03:08,085 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 05:03:11,406 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 05:03:16,782 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 05:03:20,638 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 05:03:24,014 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 05:03:27,311 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 05:03:30,617 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 05:03:34,396 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 05:03:37,714 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 05:03:41,042 - __main__ - WARNING - ⚠️ Episode 22 terminated due to step limit.
+2025-09-28 05:03:45,567 - __main__ - WARNING - ⚠️ Episode 24 terminated due to step limit.
+2025-09-28 05:03:49,366 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 05:03:54,250 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 05:03:58,192 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 05:04:01,494 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 05:04:04,818 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 05:04:08,157 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 05:04:12,445 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 05:04:17,667 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 05:04:20,955 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 05:04:24,310 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 05:04:27,609 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 05:04:31,141 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 05:04:34,506 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 05:04:37,959 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 05:04:41,353 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 05:04:44,663 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 05:04:45,047 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 05:04:45,048 - __main__ - INFO -    Episodes: 50
+2025-09-28 05:04:45,048 - __main__ - INFO -    Time: 112.7s (2.3s/ep)
+2025-09-28 05:04:45,048 - __main__ - INFO -    Average Return: 0.351 ± 0.499
+2025-09-28 05:04:45,048 - __main__ - INFO -    Success Rate: 40.0%
+2025-09-28 05:04:45,048 - __main__ - INFO -    Average Length: 236.7
+2025-09-28 05:04:45,048 - __main__ - INFO -    Average Coverage: 31.2 positions
+2025-09-28 05:04:45,048 - __main__ - INFO -    Episode Completions: 20 terminated (40.0%), 30 truncated (60.0%)
+2025-09-28 05:04:45,048 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 05:04:45,048 - __main__ - INFO -    Total Episodes: 750
+2025-09-28 05:04:45,048 - __main__ - INFO -    Total Average Return: 0.297 ± 0.501
+2025-09-28 05:04:45,049 - __main__ - INFO -    Total Average Length: 245.9 ± 139.6
+2025-09-28 05:04:45,049 - __main__ - INFO -    Total Completions: 280 terminated (37.3%), 470 truncated (62.7%)
+2025-09-28 05:04:45,049 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 05:04:45,049 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 05:04:45,049 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 05:04:45,049 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 05:04:45,049 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 05:04:45,049 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 05:04:45,049 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 05:04:45,049 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 05:04:45,049 - __main__ - INFO -    Train action count: 150528
+2025-09-28 05:04:45,050 - __main__ - INFO -    Eval action count: 184417
+2025-09-28 05:04:45,050 - __main__ - INFO -    Train action entropy: 1.701
+2025-09-28 05:04:45,050 - __main__ - INFO -    Eval action entropy: 1.679
+2025-09-28 05:04:45,050 - __main__ - INFO -    Top 3 train actions: #1(50358), #4(35360), #2(24005)
+2025-09-28 05:04:45,051 - __main__ - INFO -    Top 3 eval actions: #1(61364), #4(45619), #2(29892)
+2025-09-28 05:04:46,879 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 05:04:46,880 - __main__ - INFO - 📈 Episode stats: avg return = 0.31, avg length = 242.0
+2025-09-28 05:04:46,880 - __main__ - INFO - 🎯 Top 3 training actions: #1(50670), #4(35606), #2(24215)
+2025-09-28 05:04:49,714 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:04:49,715 - __main__ - INFO - 📈 Episode stats: avg return = 0.23, avg length = 271.2
+2025-09-28 05:04:49,715 - __main__ - INFO - 🎯 Top 3 training actions: #1(50957), #4(35866), #2(24410)
+2025-09-28 05:04:52,575 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:04:52,576 - __main__ - INFO - 📈 Episode stats: avg return = -0.03, avg length = 350.0
+2025-09-28 05:04:52,576 - __main__ - INFO - 🎯 Top 3 training actions: #1(51233), #4(36120), #2(24598)
+2025-09-28 05:04:55,400 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 05:04:55,400 - __main__ - INFO - 📈 Episode stats: avg return = 0.39, avg length = 299.0
+2025-09-28 05:04:55,400 - __main__ - INFO - 🎯 Top 3 training actions: #1(51531), #4(36378), #2(24771)
+2025-09-28 05:04:58,223 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:04:58,223 - __main__ - INFO - 📈 Episode stats: avg return = 0.29, avg length = 232.8
+2025-09-28 05:04:58,223 - __main__ - INFO - 🎯 Top 3 training actions: #1(51799), #4(36667), #2(24943)
+2025-09-28 05:05:01,076 - __main__ - INFO - 📊 Episodes completed this rollout: 8
+2025-09-28 05:05:01,076 - __main__ - INFO - 📈 Episode stats: avg return = 0.34, avg length = 231.1
+2025-09-28 05:05:01,076 - __main__ - INFO - 🎯 Top 3 training actions: #1(52065), #4(36914), #2(25090)
+2025-09-28 05:05:03,885 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 05:05:03,886 - __main__ - INFO - 📈 Episode stats: avg return = 0.92, avg length = 62.5
+2025-09-28 05:05:03,886 - __main__ - INFO - 🎯 Top 3 training actions: #1(52331), #4(37176), #2(25271)
+2025-09-28 05:05:06,717 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 05:05:06,718 - __main__ - INFO - 📈 Episode stats: avg return = 0.37, avg length = 257.4
+2025-09-28 05:05:06,718 - __main__ - INFO - 🎯 Top 3 training actions: #1(52589), #4(37425), #2(25428)
+2025-09-28 05:05:09,525 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 05:05:09,525 - __main__ - INFO - 📈 Episode stats: avg return = -0.06, avg length = 350.0
+2025-09-28 05:05:09,525 - __main__ - INFO - 🎯 Top 3 training actions: #1(52881), #4(37642), #2(25585)
+2025-09-28 05:05:12,311 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:05:12,312 - __main__ - INFO - 📈 Episode stats: avg return = 0.64, avg length = 147.3
+2025-09-28 05:05:12,312 - __main__ - INFO - 🎯 Top 3 training actions: #1(53159), #4(37889), #2(25770)
+2025-09-28 05:05:13,300 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 05:05:13,301 - __main__ - INFO -    Eval seed: 51
+2025-09-28 05:05:13,301 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 05:05:13,301 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 05:05:19,441 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 05:05:22,723 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 05:05:26,010 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 05:05:29,703 - __main__ - WARNING - ⚠️ Episode 8 terminated due to step limit.
+2025-09-28 05:05:33,026 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 05:05:36,320 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 05:05:41,560 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 05:05:45,933 - __main__ - WARNING - ⚠️ Episode 14 terminated due to step limit.
+2025-09-28 05:05:49,226 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 05:05:53,865 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 05:05:57,835 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 05:06:01,152 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 05:06:06,855 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 05:06:10,162 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 05:06:13,431 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 05:06:16,704 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 05:06:21,240 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 05:06:24,564 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 05:06:27,886 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 05:06:31,971 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 05:06:35,716 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 05:06:39,721 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 05:06:42,992 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 05:06:46,332 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 05:06:51,101 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 05:06:55,296 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 05:06:58,578 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 05:07:01,899 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 05:07:01,902 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 05:07:01,902 - __main__ - INFO -    Episodes: 50
+2025-09-28 05:07:01,902 - __main__ - INFO -    Time: 108.6s (2.2s/ep)
+2025-09-28 05:07:01,902 - __main__ - INFO -    Average Return: 0.387 ± 0.480
+2025-09-28 05:07:01,902 - __main__ - INFO -    Success Rate: 44.0%
+2025-09-28 05:07:01,902 - __main__ - INFO -    Average Length: 230.2
+2025-09-28 05:07:01,902 - __main__ - INFO -    Average Coverage: 31.8 positions
+2025-09-28 05:07:01,902 - __main__ - INFO -    Episode Completions: 22 terminated (44.0%), 28 truncated (56.0%)
+2025-09-28 05:07:01,903 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 05:07:01,903 - __main__ - INFO -    Total Episodes: 800
+2025-09-28 05:07:01,903 - __main__ - INFO -    Total Average Return: 0.302 ± 0.500
+2025-09-28 05:07:01,903 - __main__ - INFO -    Total Average Length: 244.9 ± 139.6
+2025-09-28 05:07:01,903 - __main__ - INFO -    Total Completions: 302 terminated (37.8%), 498 truncated (62.3%)
+2025-09-28 05:07:01,903 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 05:07:01,903 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 05:07:01,903 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 05:07:01,903 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 05:07:01,903 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 05:07:01,904 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 05:07:01,904 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 05:07:01,904 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 05:07:01,904 - __main__ - INFO -    Train action count: 160768
+2025-09-28 05:07:01,904 - __main__ - INFO -    Eval action count: 195926
+2025-09-28 05:07:01,904 - __main__ - INFO -    Train action entropy: 1.705
+2025-09-28 05:07:01,904 - __main__ - INFO -    Eval action entropy: 1.683
+2025-09-28 05:07:01,905 - __main__ - INFO -    Top 3 train actions: #1(53159), #4(37889), #2(25770)
+2025-09-28 05:07:01,905 - __main__ - INFO -    Top 3 eval actions: #1(64680), #4(48420), #2(31892)
+2025-09-28 05:07:03,780 - __main__ - INFO - 📊 Episodes completed this rollout: 9
+2025-09-28 05:07:03,780 - __main__ - INFO - 📈 Episode stats: avg return = 0.38, avg length = 221.4
+2025-09-28 05:07:03,780 - __main__ - INFO - 🎯 Top 3 training actions: #1(53451), #4(38139), #2(25954)
+2025-09-28 05:07:06,548 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:07:06,548 - __main__ - INFO - 📈 Episode stats: avg return = 0.65, avg length = 144.7
+2025-09-28 05:07:06,549 - __main__ - INFO - 🎯 Top 3 training actions: #1(53788), #4(38356), #2(26144)
+2025-09-28 05:07:07,541 - __main__ - INFO - 🔄 Synchronized model update at step 162,816
+2025-09-28 05:07:07,541 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 05:07:07,542 - __main__ - INFO - 🚫 Model training masking: 120/12288 timesteps masked (1.0%) due to negative rewards (invalid actions)
+2025-09-28 05:07:07,542 - __main__ - INFO - 🔄 VAE refresh starting at step 162,816 with replay size 8x1536
+2025-09-28 05:07:07,543 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 05:07:29,176 - __main__ - INFO -    VAE refresh complete: final_loss=1370.1925, avg_loss=1378.8610, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 05:07:29,178 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 05:07:31,010 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 05:07:31,010 - __main__ - INFO - 📈 Episode stats: avg return = -0.05, avg length = 350.0
+2025-09-28 05:07:31,010 - __main__ - INFO - 🎯 Top 3 training actions: #1(54108), #4(38613), #2(26329)
+2025-09-28 05:07:33,957 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:07:33,957 - __main__ - INFO - 📈 Episode stats: avg return = -0.05, avg length = 350.0
+2025-09-28 05:07:33,957 - __main__ - INFO - 🎯 Top 3 training actions: #1(54404), #4(38897), #2(26494)
+2025-09-28 05:07:36,834 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:07:36,834 - __main__ - INFO - 📈 Episode stats: avg return = 0.48, avg length = 198.2
+2025-09-28 05:07:36,834 - __main__ - INFO - 🎯 Top 3 training actions: #1(54702), #4(39136), #2(26675)
+2025-09-28 05:07:39,646 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:07:39,646 - __main__ - INFO - 📈 Episode stats: avg return = 0.52, avg length = 174.8
+2025-09-28 05:07:39,646 - __main__ - INFO - 🎯 Top 3 training actions: #1(54972), #4(39371), #2(26884)
+2025-09-28 05:07:42,491 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:07:42,491 - __main__ - INFO - 📈 Episode stats: avg return = 0.34, avg length = 274.8
+2025-09-28 05:07:42,491 - __main__ - INFO - 🎯 Top 3 training actions: #1(55245), #4(39631), #2(27104)
+2025-09-28 05:07:45,262 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 05:07:45,262 - __main__ - INFO - 📈 Episode stats: avg return = 0.49, avg length = 195.0
+2025-09-28 05:07:45,262 - __main__ - INFO - 🎯 Top 3 training actions: #1(55485), #4(39916), #2(27310)
+2025-09-28 05:07:48,085 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:07:48,085 - __main__ - INFO - 📈 Episode stats: avg return = -0.04, avg length = 350.0
+2025-09-28 05:07:48,085 - __main__ - INFO - 🎯 Top 3 training actions: #1(55729), #4(40197), #2(27505)
+2025-09-28 05:07:50,928 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:07:50,928 - __main__ - INFO - 📈 Episode stats: avg return = 0.38, avg length = 212.2
+2025-09-28 05:07:50,929 - __main__ - INFO - 🎯 Top 3 training actions: #1(55990), #4(40471), #2(27677)
+2025-09-28 05:07:51,906 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 05:07:51,906 - __main__ - INFO -    Eval seed: 51
+2025-09-28 05:07:51,906 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 05:07:51,906 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 05:07:55,427 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 05:07:58,953 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 05:08:02,455 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 05:08:05,850 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 05:08:13,709 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 05:08:17,500 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 05:08:20,805 - __main__ - WARNING - ⚠️ Episode 14 terminated due to step limit.
+2025-09-28 05:08:28,563 - __main__ - WARNING - ⚠️ Episode 19 terminated due to step limit.
+2025-09-28 05:08:31,882 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 05:08:39,876 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 05:08:43,189 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 05:08:47,028 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 05:08:50,387 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 05:08:53,820 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 05:08:58,551 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 05:09:02,900 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 05:09:06,234 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 05:09:10,718 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 05:09:15,446 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 05:09:18,756 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 05:09:22,066 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 05:09:26,330 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 05:09:30,331 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 05:09:34,136 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 05:09:34,621 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 05:09:34,621 - __main__ - INFO -    Episodes: 50
+2025-09-28 05:09:34,621 - __main__ - INFO -    Time: 102.7s (2.1s/ep)
+2025-09-28 05:09:34,621 - __main__ - INFO -    Average Return: 0.447 ± 0.486
+2025-09-28 05:09:34,621 - __main__ - INFO -    Success Rate: 52.0%
+2025-09-28 05:09:34,622 - __main__ - INFO -    Average Length: 214.1
+2025-09-28 05:09:34,622 - __main__ - INFO -    Average Coverage: 30.6 positions
+2025-09-28 05:09:34,622 - __main__ - INFO -    Episode Completions: 26 terminated (52.0%), 24 truncated (48.0%)
+2025-09-28 05:09:34,622 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 05:09:34,622 - __main__ - INFO -    Total Episodes: 850
+2025-09-28 05:09:34,622 - __main__ - INFO -    Total Average Return: 0.311 ± 0.501
+2025-09-28 05:09:34,622 - __main__ - INFO -    Total Average Length: 243.1 ± 139.9
+2025-09-28 05:09:34,622 - __main__ - INFO -    Total Completions: 328 terminated (38.6%), 522 truncated (61.4%)
+2025-09-28 05:09:34,622 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 05:09:34,622 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 05:09:34,623 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 05:09:34,623 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 05:09:34,623 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 05:09:34,623 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 05:09:34,623 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 05:09:34,623 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 05:09:34,623 - __main__ - INFO -    Train action count: 171008
+2025-09-28 05:09:34,623 - __main__ - INFO -    Eval action count: 206633
+2025-09-28 05:09:34,624 - __main__ - INFO -    Train action entropy: 1.708
+2025-09-28 05:09:34,624 - __main__ - INFO -    Eval action entropy: 1.687
+2025-09-28 05:09:34,624 - __main__ - INFO -    Top 3 train actions: #1(55990), #4(40471), #2(27677)
+2025-09-28 05:09:34,624 - __main__ - INFO -    Top 3 eval actions: #1(67312), #4(51325), #2(33698)
+2025-09-28 05:09:36,478 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 05:09:36,479 - __main__ - INFO - 📈 Episode stats: avg return = -0.04, avg length = 350.0
+2025-09-28 05:09:36,479 - __main__ - INFO - 🎯 Top 3 training actions: #1(56241), #4(40738), #2(27874)
+2025-09-28 05:09:39,368 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:09:39,369 - __main__ - INFO - 📈 Episode stats: avg return = -0.05, avg length = 350.0
+2025-09-28 05:09:39,369 - __main__ - INFO - 🎯 Top 3 training actions: #1(56486), #4(41027), #2(28079)
+2025-09-28 05:09:42,192 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:09:42,192 - __main__ - INFO - 📈 Episode stats: avg return = 0.24, avg length = 251.0
+2025-09-28 05:09:42,192 - __main__ - INFO - 🎯 Top 3 training actions: #1(56732), #4(41312), #2(28282)
+2025-09-28 05:09:44,999 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 05:09:45,000 - __main__ - INFO - 📈 Episode stats: avg return = 0.63, avg length = 157.8
+2025-09-28 05:09:45,000 - __main__ - INFO - 🎯 Top 3 training actions: #1(56984), #4(41580), #2(28467)
+2025-09-28 05:09:45,982 - __main__ - INFO - 🔄 Synchronized model update at step 175,104
+2025-09-28 05:09:45,982 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 05:09:45,983 - __main__ - INFO - 🚫 Model training masking: 228/12288 timesteps masked (1.9%) due to negative rewards (invalid actions)
+2025-09-28 05:09:45,983 - __main__ - INFO - 🔄 VAE refresh starting at step 175,104 with replay size 8x1536
+2025-09-28 05:09:45,984 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 05:10:07,587 - __main__ - INFO -    VAE refresh complete: final_loss=1350.2869, avg_loss=1323.4026, steps=4/4, trend=stable, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 05:10:07,589 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 05:10:09,461 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:10:09,461 - __main__ - INFO - 📈 Episode stats: avg return = 0.35, avg length = 228.8
+2025-09-28 05:10:09,461 - __main__ - INFO - 🎯 Top 3 training actions: #1(57221), #4(41852), #2(28675)
+2025-09-28 05:10:12,269 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:10:12,270 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 218.8
+2025-09-28 05:10:12,270 - __main__ - INFO - 🎯 Top 3 training actions: #1(57472), #4(42108), #2(28863)
+2025-09-28 05:10:15,054 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:10:15,054 - __main__ - INFO - 📈 Episode stats: avg return = 0.36, avg length = 253.2
+2025-09-28 05:10:15,055 - __main__ - INFO - 🎯 Top 3 training actions: #1(57745), #4(42327), #2(29036)
+2025-09-28 05:10:17,843 - __main__ - INFO - 📊 Episodes completed this rollout: 7
+2025-09-28 05:10:17,844 - __main__ - INFO - 📈 Episode stats: avg return = 0.54, avg length = 179.3
+2025-09-28 05:10:17,844 - __main__ - INFO - 🎯 Top 3 training actions: #1(58029), #4(42541), #2(29195)
+2025-09-28 05:10:20,618 - __main__ - INFO - 📊 Episodes completed this rollout: 1
+2025-09-28 05:10:20,618 - __main__ - INFO - 📈 Episode stats: avg return = -0.05, avg length = 350.0
+2025-09-28 05:10:20,618 - __main__ - INFO - 🎯 Top 3 training actions: #1(58304), #4(42778), #2(29352)
+2025-09-28 05:10:21,593 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 05:10:21,593 - __main__ - INFO -    Eval seed: 51
+2025-09-28 05:10:21,593 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 05:10:21,594 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 05:10:24,912 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 05:10:28,670 - __main__ - WARNING - ⚠️ Episode 3 terminated due to step limit.
+2025-09-28 05:10:32,241 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 05:10:35,860 - __main__ - WARNING - ⚠️ Episode 7 terminated due to step limit.
+2025-09-28 05:10:39,469 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 05:10:42,837 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 05:10:46,116 - __main__ - WARNING - ⚠️ Episode 11 terminated due to step limit.
+2025-09-28 05:10:49,387 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 05:10:55,118 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 05:10:58,830 - __main__ - WARNING - ⚠️ Episode 20 terminated due to step limit.
+2025-09-28 05:11:02,587 - __main__ - WARNING - ⚠️ Episode 22 terminated due to step limit.
+2025-09-28 05:11:05,899 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 05:11:09,237 - __main__ - WARNING - ⚠️ Episode 24 terminated due to step limit.
+2025-09-28 05:11:12,543 - __main__ - WARNING - ⚠️ Episode 25 terminated due to step limit.
+2025-09-28 05:11:15,944 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 05:11:21,085 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 05:11:24,473 - __main__ - WARNING - ⚠️ Episode 31 terminated due to step limit.
+2025-09-28 05:11:28,300 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 05:11:31,666 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 05:11:35,863 - __main__ - WARNING - ⚠️ Episode 37 terminated due to step limit.
+2025-09-28 05:11:40,036 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 05:11:43,367 - __main__ - WARNING - ⚠️ Episode 41 terminated due to step limit.
+2025-09-28 05:11:46,712 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 05:11:51,567 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 05:11:55,266 - __main__ - WARNING - ⚠️ Episode 46 terminated due to step limit.
+2025-09-28 05:11:59,986 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 05:12:03,297 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 05:12:03,921 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 05:12:03,921 - __main__ - INFO -    Episodes: 50
+2025-09-28 05:12:03,921 - __main__ - INFO -    Time: 102.3s (2.0s/ep)
+2025-09-28 05:12:03,921 - __main__ - INFO -    Average Return: 0.422 ± 0.495
+2025-09-28 05:12:03,922 - __main__ - INFO -    Success Rate: 46.0%
+2025-09-28 05:12:03,922 - __main__ - INFO -    Average Length: 214.9
+2025-09-28 05:12:03,922 - __main__ - INFO -    Average Coverage: 27.0 positions
+2025-09-28 05:12:03,922 - __main__ - INFO -    Episode Completions: 23 terminated (46.0%), 27 truncated (54.0%)
+2025-09-28 05:12:03,922 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 05:12:03,922 - __main__ - INFO -    Total Episodes: 900
+2025-09-28 05:12:03,922 - __main__ - INFO -    Total Average Return: 0.317 ± 0.501
+2025-09-28 05:12:03,922 - __main__ - INFO -    Total Average Length: 241.5 ± 140.5
+2025-09-28 05:12:03,922 - __main__ - INFO -    Total Completions: 351 terminated (39.0%), 549 truncated (61.0%)
+2025-09-28 05:12:03,922 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 05:12:03,923 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 05:12:03,923 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 05:12:03,923 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 05:12:03,923 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 05:12:03,923 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 05:12:03,923 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 05:12:03,923 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 05:12:03,923 - __main__ - INFO -    Train action count: 180224
+2025-09-28 05:12:03,923 - __main__ - INFO -    Eval action count: 217379
+2025-09-28 05:12:03,924 - __main__ - INFO -    Train action entropy: 1.712
+2025-09-28 05:12:03,924 - __main__ - INFO -    Eval action entropy: 1.692
+2025-09-28 05:12:03,924 - __main__ - INFO -    Top 3 train actions: #1(58304), #4(42778), #2(29352)
+2025-09-28 05:12:03,924 - __main__ - INFO -    Top 3 eval actions: #1(70173), #4(53731), #2(35410)
+2025-09-28 05:12:05,777 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:12:05,777 - __main__ - INFO - 📈 Episode stats: avg return = -0.05, avg length = 350.0
+2025-09-28 05:12:05,777 - __main__ - INFO - 🎯 Top 3 training actions: #1(58574), #4(43035), #2(29523)
+2025-09-28 05:12:08,636 - __main__ - INFO - 📊 Episodes completed this rollout: 8
+2025-09-28 05:12:08,637 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 205.2
+2025-09-28 05:12:08,637 - __main__ - INFO - 🎯 Top 3 training actions: #1(58842), #4(43273), #2(29693)
+2025-09-28 05:12:11,455 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:12:11,455 - __main__ - INFO - 📈 Episode stats: avg return = 0.45, avg length = 200.0
+2025-09-28 05:12:11,455 - __main__ - INFO - 🎯 Top 3 training actions: #1(59134), #4(43473), #2(29883)
+2025-09-28 05:12:14,253 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:12:14,253 - __main__ - INFO - 📈 Episode stats: avg return = 0.39, avg length = 207.5
+2025-09-28 05:12:14,253 - __main__ - INFO - 🎯 Top 3 training actions: #1(59417), #4(43694), #2(30049)
+2025-09-28 05:12:17,227 - __main__ - INFO - 📊 Episodes completed this rollout: 6
+2025-09-28 05:12:17,227 - __main__ - INFO - 📈 Episode stats: avg return = 0.46, avg length = 205.8
+2025-09-28 05:12:17,227 - __main__ - INFO - 🎯 Top 3 training actions: #1(59684), #4(43913), #2(30200)
+2025-09-28 05:12:20,031 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:12:20,031 - __main__ - INFO - 📈 Episode stats: avg return = 0.26, avg length = 264.0
+2025-09-28 05:12:20,032 - __main__ - INFO - 🎯 Top 3 training actions: #1(59981), #4(44109), #2(30326)
+2025-09-28 05:12:22,874 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:12:22,875 - __main__ - INFO - 📈 Episode stats: avg return = 0.20, avg length = 314.5
+2025-09-28 05:12:22,875 - __main__ - INFO - 🎯 Top 3 training actions: #1(60264), #4(44321), #2(30463)
+2025-09-28 05:12:23,869 - __main__ - INFO - 🔄 Synchronized model update at step 187,392
+2025-09-28 05:12:23,870 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 05:12:23,870 - __main__ - INFO - 🚫 Model training masking: 288/12288 timesteps masked (2.3%) due to negative rewards (invalid actions)
+2025-09-28 05:12:23,870 - __main__ - INFO - 🔄 VAE refresh starting at step 187,392 with replay size 8x1536
+2025-09-28 05:12:23,871 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 05:12:45,224 - __main__ - INFO -    VAE refresh complete: final_loss=1303.0599, avg_loss=1330.5851, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 05:12:45,226 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 05:12:47,073 - __main__ - INFO - 📊 Episodes completed this rollout: 2
+2025-09-28 05:12:47,074 - __main__ - INFO - 📈 Episode stats: avg return = -0.06, avg length = 350.0
+2025-09-28 05:12:47,074 - __main__ - INFO - 🎯 Top 3 training actions: #1(60563), #4(44512), #2(30599)
+2025-09-28 05:12:49,916 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:12:49,916 - __main__ - INFO - 📈 Episode stats: avg return = -0.00, avg length = 313.2
+2025-09-28 05:12:49,916 - __main__ - INFO - 🎯 Top 3 training actions: #1(60877), #4(44696), #2(30729)
+2025-09-28 05:12:52,745 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:12:52,746 - __main__ - INFO - 📈 Episode stats: avg return = 0.56, avg length = 183.4
+2025-09-28 05:12:52,746 - __main__ - INFO - 🎯 Top 3 training actions: #1(61156), #4(44928), #2(30848)
+2025-09-28 05:12:53,722 - __main__ - INFO - 🧪 Starting evaluation with 50 episodes...
+2025-09-28 05:12:53,722 - __main__ - INFO -    Eval seed: 51
+2025-09-28 05:12:53,722 - __main__ - INFO -    Max episode steps (eval): env default
+2025-09-28 05:12:53,723 - nle.env.base - INFO - Not saving any NLE data.
+2025-09-28 05:12:57,122 - __main__ - WARNING - ⚠️ Episode 1 terminated due to step limit.
+2025-09-28 05:13:00,416 - __main__ - WARNING - ⚠️ Episode 2 terminated due to step limit.
+2025-09-28 05:13:04,646 - __main__ - WARNING - ⚠️ Episode 4 terminated due to step limit.
+2025-09-28 05:13:07,956 - __main__ - WARNING - ⚠️ Episode 5 terminated due to step limit.
+2025-09-28 05:13:11,274 - __main__ - WARNING - ⚠️ Episode 6 terminated due to step limit.
+2025-09-28 05:13:15,352 - __main__ - WARNING - ⚠️ Episode 9 terminated due to step limit.
+2025-09-28 05:13:18,703 - __main__ - WARNING - ⚠️ Episode 10 terminated due to step limit.
+2025-09-28 05:13:22,654 - __main__ - WARNING - ⚠️ Episode 12 terminated due to step limit.
+2025-09-28 05:13:25,972 - __main__ - WARNING - ⚠️ Episode 13 terminated due to step limit.
+2025-09-28 05:13:29,672 - __main__ - WARNING - ⚠️ Episode 15 terminated due to step limit.
+2025-09-28 05:13:32,986 - __main__ - WARNING - ⚠️ Episode 16 terminated due to step limit.
+2025-09-28 05:13:36,294 - __main__ - WARNING - ⚠️ Episode 17 terminated due to step limit.
+2025-09-28 05:13:39,617 - __main__ - WARNING - ⚠️ Episode 18 terminated due to step limit.
+2025-09-28 05:13:46,079 - __main__ - WARNING - ⚠️ Episode 21 terminated due to step limit.
+2025-09-28 05:13:50,039 - __main__ - WARNING - ⚠️ Episode 23 terminated due to step limit.
+2025-09-28 05:13:53,385 - __main__ - WARNING - ⚠️ Episode 24 terminated due to step limit.
+2025-09-28 05:13:58,277 - __main__ - WARNING - ⚠️ Episode 26 terminated due to step limit.
+2025-09-28 05:14:01,594 - __main__ - WARNING - ⚠️ Episode 27 terminated due to step limit.
+2025-09-28 05:14:04,922 - __main__ - WARNING - ⚠️ Episode 28 terminated due to step limit.
+2025-09-28 05:14:08,318 - __main__ - WARNING - ⚠️ Episode 29 terminated due to step limit.
+2025-09-28 05:14:11,754 - __main__ - WARNING - ⚠️ Episode 30 terminated due to step limit.
+2025-09-28 05:14:16,041 - __main__ - WARNING - ⚠️ Episode 32 terminated due to step limit.
+2025-09-28 05:14:19,367 - __main__ - WARNING - ⚠️ Episode 33 terminated due to step limit.
+2025-09-28 05:14:22,774 - __main__ - WARNING - ⚠️ Episode 34 terminated due to step limit.
+2025-09-28 05:14:26,065 - __main__ - WARNING - ⚠️ Episode 35 terminated due to step limit.
+2025-09-28 05:14:29,353 - __main__ - WARNING - ⚠️ Episode 36 terminated due to step limit.
+2025-09-28 05:14:35,290 - __main__ - WARNING - ⚠️ Episode 38 terminated due to step limit.
+2025-09-28 05:14:38,592 - __main__ - WARNING - ⚠️ Episode 39 terminated due to step limit.
+2025-09-28 05:14:41,918 - __main__ - WARNING - ⚠️ Episode 40 terminated due to step limit.
+2025-09-28 05:14:47,096 - __main__ - WARNING - ⚠️ Episode 42 terminated due to step limit.
+2025-09-28 05:14:50,392 - __main__ - WARNING - ⚠️ Episode 43 terminated due to step limit.
+2025-09-28 05:14:53,729 - __main__ - WARNING - ⚠️ Episode 44 terminated due to step limit.
+2025-09-28 05:14:57,041 - __main__ - WARNING - ⚠️ Episode 45 terminated due to step limit.
+2025-09-28 05:15:01,147 - __main__ - WARNING - ⚠️ Episode 47 terminated due to step limit.
+2025-09-28 05:15:04,457 - __main__ - WARNING - ⚠️ Episode 48 terminated due to step limit.
+2025-09-28 05:15:07,784 - __main__ - WARNING - ⚠️ Episode 49 terminated due to step limit.
+2025-09-28 05:15:11,099 - __main__ - WARNING - ⚠️ Episode 50 terminated due to step limit.
+2025-09-28 05:15:11,102 - __main__ - INFO - 📊 Evaluation Results (Current Round):
+2025-09-28 05:15:11,102 - __main__ - INFO -    Episodes: 50
+2025-09-28 05:15:11,102 - __main__ - INFO -    Time: 137.4s (2.7s/ep)
+2025-09-28 05:15:11,102 - __main__ - INFO -    Average Return: 0.203 ± 0.425
+2025-09-28 05:15:11,102 - __main__ - INFO -    Success Rate: 26.0%
+2025-09-28 05:15:11,103 - __main__ - INFO -    Average Length: 288.6
+2025-09-28 05:15:11,103 - __main__ - INFO -    Average Coverage: 28.7 positions
+2025-09-28 05:15:11,103 - __main__ - INFO -    Episode Completions: 13 terminated (26.0%), 37 truncated (74.0%)
+2025-09-28 05:15:11,103 - __main__ - INFO - 📈 Total Evaluation Statistics:
+2025-09-28 05:15:11,103 - __main__ - INFO -    Total Episodes: 950
+2025-09-28 05:15:11,103 - __main__ - INFO -    Total Average Return: 0.311 ± 0.498
+2025-09-28 05:15:11,103 - __main__ - INFO -    Total Average Length: 244.0 ± 139.6
+2025-09-28 05:15:11,103 - __main__ - INFO -    Total Completions: 364 terminated (38.3%), 586 truncated (61.7%)
+2025-09-28 05:15:11,103 - __main__ - INFO -    Skill Entropy: 0.000
+2025-09-28 05:15:11,103 - __main__ - INFO -    Used Skills: 0.0
+2025-09-28 05:15:11,103 - __main__ - INFO -    Effective K: 0.00
+2025-09-28 05:15:11,104 - __main__ - INFO - 🎯 Action Usage Statistics:
+2025-09-28 05:15:11,104 - __main__ - INFO -    Unique actions in evaluation: 8
+2025-09-28 05:15:11,104 - __main__ - INFO -    Unique actions in training: 8
+2025-09-28 05:15:11,104 - __main__ - INFO -    Total unique actions: 8
+2025-09-28 05:15:11,104 - __main__ - INFO -    Action coverage: 6.6%
+2025-09-28 05:15:11,104 - __main__ - INFO -    Train action count: 190464
+2025-09-28 05:15:11,104 - __main__ - INFO -    Eval action count: 231807
+2025-09-28 05:15:11,104 - __main__ - INFO -    Train action entropy: 1.716
+2025-09-28 05:15:11,105 - __main__ - INFO -    Eval action entropy: 1.699
+2025-09-28 05:15:11,105 - __main__ - INFO -    Top 3 train actions: #1(61156), #4(44928), #2(30848)
+2025-09-28 05:15:11,105 - __main__ - INFO -    Top 3 eval actions: #1(74492), #4(56361), #2(37332)
+2025-09-28 05:15:12,915 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:15:12,915 - __main__ - INFO - 📈 Episode stats: avg return = 0.41, avg length = 205.0
+2025-09-28 05:15:12,916 - __main__ - INFO - 🎯 Top 3 training actions: #1(61454), #4(45112), #2(30983)
+2025-09-28 05:15:15,747 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:15:15,747 - __main__ - INFO - 📈 Episode stats: avg return = 0.33, avg length = 274.6
+2025-09-28 05:15:15,747 - __main__ - INFO - 🎯 Top 3 training actions: #1(61757), #4(45321), #2(31118)
+2025-09-28 05:15:18,572 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:15:18,573 - __main__ - INFO - 📈 Episode stats: avg return = 0.68, avg length = 156.5
+2025-09-28 05:15:18,573 - __main__ - INFO - 🎯 Top 3 training actions: #1(62080), #4(45479), #2(31257)
+2025-09-28 05:15:21,448 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:15:21,449 - __main__ - INFO - 📈 Episode stats: avg return = 0.15, avg length = 285.6
+2025-09-28 05:15:21,449 - __main__ - INFO - 🎯 Top 3 training actions: #1(62416), #4(45648), #2(31387)
+2025-09-28 05:15:24,318 - __main__ - INFO - 📊 Episodes completed this rollout: 1
+2025-09-28 05:15:24,318 - __main__ - INFO - 📈 Episode stats: avg return = -0.03, avg length = 350.0
+2025-09-28 05:15:24,318 - __main__ - INFO - 🎯 Top 3 training actions: #1(62734), #4(45845), #2(31530)
+2025-09-28 05:15:27,204 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:15:27,204 - __main__ - INFO - 📈 Episode stats: avg return = -0.07, avg length = 350.0
+2025-09-28 05:15:27,204 - __main__ - INFO - 🎯 Top 3 training actions: #1(63055), #4(46046), #2(31659)
+2025-09-28 05:15:30,029 - __main__ - INFO - 📊 Episodes completed this rollout: 5
+2025-09-28 05:15:30,029 - __main__ - INFO - 📈 Episode stats: avg return = 0.30, avg length = 235.4
+2025-09-28 05:15:30,029 - __main__ - INFO - 🎯 Top 3 training actions: #1(63352), #4(46214), #2(31818)
+2025-09-28 05:15:32,855 - __main__ - INFO - 📊 Episodes completed this rollout: 4
+2025-09-28 05:15:32,855 - __main__ - INFO - 📈 Episode stats: avg return = 0.40, avg length = 202.2
+2025-09-28 05:15:32,855 - __main__ - INFO - 🎯 Top 3 training actions: #1(63693), #4(46388), #2(31950)
+2025-09-28 05:15:35,698 - __main__ - INFO - 📊 Episodes completed this rollout: 3
+2025-09-28 05:15:35,698 - __main__ - INFO - 📈 Episode stats: avg return = -0.03, avg length = 350.0
+2025-09-28 05:15:35,699 - __main__ - INFO - 🎯 Top 3 training actions: #1(64011), #4(46592), #2(32083)
+2025-09-28 05:15:36,679 - __main__ - INFO - 🔄 Synchronized model update at step 199,680
+2025-09-28 05:15:36,679 - __main__ - INFO -    HMM interval: inf, VAE interval: 12,000
+2025-09-28 05:15:36,680 - __main__ - INFO - 🚫 Model training masking: 204/12288 timesteps masked (1.7%) due to negative rewards (invalid actions)
+2025-09-28 05:15:36,680 - __main__ - INFO - 🔄 VAE refresh starting at step 199,680 with replay size 8x1536
+2025-09-28 05:15:36,681 - __main__ - INFO -    Using span sampling (12288 timesteps, too large for full buffer)
+2025-09-28 05:15:58,127 - __main__ - INFO -    VAE refresh complete: final_loss=1321.3644, avg_loss=1335.1618, steps=4/4, trend=improving, total_timesteps=12288, span_sampling=32_requested×4_steps, span_len=64
+2025-09-28 05:15:58,129 - __main__ - INFO -    ✅ VAE updated (next in 12,000 steps)
+2025-09-28 05:15:58,132 - __main__ - INFO - ⏱️  Training completed in 3167.20 seconds
+2025-09-28 05:15:58,132 - __main__ - INFO - 💾 Saving final PPO checkpoint...
+2025-09-28 05:15:58,140 - __main__ - INFO - 💾 Final checkpoint saved: checkpoints/ablation_no_hmm_no_intrinsic_MiniHack_River_Narrow_v0_20250928-042305/ppo_policy.pth
+2025-09-28 05:15:58,144 - __main__ - INFO - 📊 Collected 268 training log entries
+2025-09-28 05:15:58,145 - __main__ - INFO - ☁️  Uploading all model components to HuggingFace...
+2025-09-28 05:15:58,282 - __main__ - INFO - 📦 Created/verified repository: CatkinChen/nethack-ppo-ablation-no_hmm_no_intrinsic
+2025-09-28 05:15:58,282 - __main__ - INFO - 📤 Uploading PPO policy checkpoint...
+2025-09-28 05:16:01,691 - __main__ - INFO - 📤 Uploading VAE model...
+2025-09-28 05:16:05,349 - __main__ - INFO - ✅ VAE model uploaded successfully
+2025-09-28 05:16:05,350 - __main__ - INFO - 📤 Uploading HMM model...
+2025-09-28 05:16:05,350 - __main__ - WARNING - ⚠️  HMM upload failed: 'NoneType' object has no attribute 'get_posterior_params'
+2025-09-28 05:16:05,350 - __main__ - INFO - 📝 Creating model card...
+2025-09-28 05:16:06,096 - __main__ - INFO - ✅ Model card uploaded successfully
+2025-09-28 05:16:06,096 - __main__ - INFO - 📄 Uploading training configuration...
+2025-09-28 05:16:06,679 - __main__ - INFO - ✅ Training configuration uploaded successfully
+2025-09-28 05:16:06,679 - __main__ - INFO - 🎉 All model components uploaded to: https://huggingface.co/CatkinChen/nethack-ppo-ablation-no_hmm_no_intrinsic
+2025-09-28 05:16:06,679 - __main__ - INFO - 📈 Uploading training artifacts...
+2025-09-28 05:16:10,046 - __main__ - INFO - ✅ Training artifacts uploaded successfully
+2025-09-28 05:16:10,661 - __main__ - INFO - 🎉 Training completed successfully!

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from math import fabs
-from typing import Optional, Tuple, Dict, List
+import math
+from typing import Optional, Tuple, Dict, List, Union
 
 import torch
 import torch.nn as nn
@@ -40,10 +40,41 @@ def chol_inv_logdet(S: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 @dataclass
 class NIWPrior:
-    mu0: torch.Tensor        # [D]
-    kappa0: float
-    Psi0: torch.Tensor       # [D,D] (scale matrix of IW)
-    nu0: float               # > D-1
+    """
+    Normal-Inverse-Wishart prior parameters.
+    Can be either universal (same for all states) or per-state.
+    
+    Universal format:
+        mu0: [D], kappa0: scalar, Psi0: [D,D], nu0: scalar
+    Per-state format:
+        mu0: [Kp1,D], kappa0: [Kp1], Psi0: [Kp1,D,D], nu0: [Kp1]
+    """
+    mu0: torch.Tensor        # [D] or [Kp1,D]
+    kappa0: Union[float, torch.Tensor]  # scalar or [Kp1]
+    Psi0: torch.Tensor       # [D,D] or [Kp1,D,D] (scale matrix of IW)
+    nu0: Union[float, torch.Tensor]     # scalar or [Kp1], > D-1
+    
+    def is_per_state(self) -> bool:
+        """Check if this is a per-state prior (True) or universal prior (False)."""
+        return self.mu0.ndim == 2
+    
+    def to_per_state(self, Kp1: int, device: torch.device, dtype: torch.dtype) -> 'NIWPrior':
+        """Convert universal prior to per-state format."""
+        if self.is_per_state():
+            return self  # Already per-state
+        
+        # Expand universal values to per-state
+        mu0_expanded = self.mu0.unsqueeze(0).expand(Kp1, -1).clone().to(device=device, dtype=dtype)
+        kappa0_expanded = torch.full((Kp1,), float(self.kappa0), device=device, dtype=dtype)
+        Psi0_expanded = self.Psi0.unsqueeze(0).expand(Kp1, -1, -1).clone().to(device=device, dtype=dtype)
+        nu0_expanded = torch.full((Kp1,), float(self.nu0), device=device, dtype=dtype)
+        
+        return NIWPrior(
+            mu0=mu0_expanded,
+            kappa0=kappa0_expanded,
+            Psi0=Psi0_expanded,
+            nu0=nu0_expanded
+        )
 
 @dataclass
 class NIWPosterior:
@@ -88,7 +119,8 @@ class StickyHDPHMMVI(nn.Module):
         p: StickyHDPHMMParams,
         niw_prior: NIWPrior,
         rho_emission: float = 0.05,
-        rho_transition: Optional[float] = None
+        rho_transition: Optional[float] = None,
+        phi_prior: Optional[torch.Tensor] = None  # [Kp1,Kp1] or None
     ):
         super().__init__()
         self.p = p
@@ -96,12 +128,15 @@ class StickyHDPHMMVI(nn.Module):
         Kp1 = K + 1
         dev, dt = p.device, p.dtype
 
+        # Convert to per-state format if needed
+        niw_prior_per_state = niw_prior.to_per_state(Kp1, dev, dt)
+
         # Emission NIW posteriors (now K+1 states)
         self.niw = NIWPosterior(
-            mu=torch.stack([niw_prior.mu0.clone().to(device=dev, dtype=dt) for _ in range(Kp1)], dim=0),
-            kappa=torch.full((Kp1,), niw_prior.kappa0, device=dev, dtype=dt),
-            Psi=torch.stack([niw_prior.Psi0.clone().to(device=dev, dtype=dt) for _ in range(Kp1)], dim=0),
-            nu=torch.full((Kp1,), niw_prior.nu0, device=dev, dtype=dt),
+            mu=niw_prior_per_state.mu0.clone(),
+            kappa=niw_prior_per_state.kappa0.clone(),
+            Psi=niw_prior_per_state.Psi0.clone(),
+            nu=niw_prior_per_state.nu0.clone(),
         )
 
         # Global sticks β for the first K components; π_{K+1} is the remainder mass
@@ -119,35 +154,55 @@ class StickyHDPHMMVI(nn.Module):
         self._E_Lambda = None          # [Kp1,D,D]
         self._E_logdet_Lambda = None   # [Kp1]
 
-        # Save NIW prior
-        self.register_buffer("mu0", niw_prior.mu0.to(device=dev, dtype=dt))
-        self.kappa0 = float(niw_prior.kappa0)
-        self.register_buffer("Psi0", niw_prior.Psi0.to(device=dev, dtype=dt))
-        self.nu0 = float(niw_prior.nu0)
+        # Save NIW prior (store in per-state format)
+        self.register_buffer("mu0", niw_prior_per_state.mu0)     # [Kp1,D]
+        self.register_buffer("kappa0", niw_prior_per_state.kappa0)  # [Kp1]
+        self.register_buffer("Psi0", niw_prior_per_state.Psi0)   # [Kp1,D,D]
+        self.register_buffer("nu0", niw_prior_per_state.nu0)     # [Kp1]
+        
+        # Store phi prior for transitions (updated by set_posterior_as_prior)
+        self.phi_prior_init = self._phi_prior_init()
+        self.register_buffer("phi_prior", self.phi_prior_init if phi_prior is None else phi_prior.to(device=dev, dtype=dt))  # [Kp1, Kp1]
 
         # Streaming defaults + lazy buffers
-        self.stream_rho = float(rho_emission)
+        self.stream_rho_niw = float(rho_emission)
         self.stream_rho_trans = float(rho_transition) if rho_transition is not None else None
         self._stream_allocated = False
+        self._no_stats = True
         self.streaming_reset()
         
-    def reset(self):
+        self.init_kmeans = None
+        
+    def reset(self, reset_streaming: bool = True, keep_mu: bool = False):
         """Reset model parameters to prior values."""
         Kp1, D = self.niw.mu.shape[0], self.p.D
-        self.niw = NIWPosterior(
-            mu=torch.stack([self.mu0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
-            kappa=torch.full((Kp1,), self.kappa0, device=self.p.device, dtype=self.p.dtype),
-            Psi=torch.stack([self.Psi0.clone().to(device=self.p.device, dtype=self.p.dtype) for _ in range(Kp1)], dim=0),
-            nu=torch.full((Kp1,), self.nu0, device=self.p.device, dtype=self.p.dtype),
-        )
+        if keep_mu:
+            self.niw = NIWPosterior(
+                mu=self.init_kmeans.clone() if self.init_kmeans is not None else self.niw.mu.clone(),
+                kappa=self.kappa0.clone(),
+                Psi=self.Psi0.clone(),
+                nu=self.nu0.clone(),
+            )
+        else:
+            self.niw = NIWPosterior(
+                mu=self.mu0.clone(),
+                kappa=self.kappa0.clone(),
+                Psi=self.Psi0.clone(),
+                nu=self.nu0.clone(),
+            )
         beta = torch.tensor([1.0 / (self.p.K + 2 - k) for k in range(1, Kp1)], device=self.p.device, dtype=self.p.dtype)
         self.u_beta.data.copy_(torch.log(beta) - torch.log1p(-beta))
-        pi_full = self._Epi() * self.p.alpha + self.p.kappa * torch.eye(Kp1, device=self.p.device, dtype=self.p.dtype)
-        self.dir.phi.data.copy_(pi_full)
+        # Now self.phi_prior contains the init phi prior and optional transition counts from previous run
+        # If the u_beta is reset, we need to reset the u_beta in init phi prior as well.
+        new_phi_prior_init = self._phi_prior_init()
+        self.phi_prior.data = self.phi_prior.data - self.phi_prior_init + new_phi_prior_init
+        self.phi_prior_init = new_phi_prior_init
+        self.dir.phi.data.copy_(self.phi_prior.data.clone())
         self._cache_fresh = False
-        self.streaming_reset()
+        if reset_streaming:
+            self.streaming_reset()
         
-    def reset_low_count_states(self, low_count_thresh, logger=None):
+    def reset_low_count_states(self, low_count_thresh, reset_streaming: bool=True, logger=None):
         """Reset states with low occupancy to prior values."""
         with torch.no_grad():
             # Compute state occupancies from transition matrix
@@ -158,11 +213,12 @@ class StickyHDPHMMVI(nn.Module):
                     logger.info(f"   - Resetting {low_count_states.sum().item()} low-count states (occupancy < {low_count_thresh:.4f})")
                     logger.info(f"     Low-count states: {torch.nonzero(low_count_states).squeeze(-1).cpu().numpy().tolist()}")
                 # Reset low-count states to prior values
-                self.niw.Psi[low_count_states] = self.Psi0.clone().to(device=self.Psi0.device, dtype=self.Psi0.dtype)
-                self.niw.nu[low_count_states] = self.nu0
-                self.niw.kappa[low_count_states] = self.kappa0
+                self.niw.Psi[low_count_states] = self.Psi0[low_count_states].clone()
+                self.niw.nu[low_count_states] = self.nu0[low_count_states]
+                self.niw.kappa[low_count_states] = self.kappa0[low_count_states]
         self._cache_fresh = False
-        self.streaming_reset()
+        if reset_streaming:
+            self.streaming_reset()
 
     # --- ELBO terms ------------------------------------------
 
@@ -205,7 +261,7 @@ class StickyHDPHMMVI(nn.Module):
         Uses the same parameterization as this module (Σ ~ IW(Ψ, ν), μ|Σ ~ N(μ0, Σ/κ0)).
         Returns scalar tensor.
         """
-        mu0, k0, Psi0, nu0 = self.mu0, self.kappa0, self.Psi0, self.nu0
+        mu0, k0, Psi0, nu0 = self.mu0, self.kappa0, self.Psi0, self.nu0  # All [Kp1, ...] now
         Kp1, D = mu_hat.shape[0], mu_hat.shape[1]
 
         # Expectations under q
@@ -213,22 +269,22 @@ class StickyHDPHMMVI(nn.Module):
 
         # --- IW part: -KL(q(Σ)||p(Σ)) ---
         # log Z_IW(q) - log Z_IW(p)
-        logZ_p = StickyHDPHMMVI._logZ_invwishart(Psi0, torch.tensor(nu0, device=Psi_hat.device, dtype=Psi_hat.dtype))
+        logZ_p = StickyHDPHMMVI._logZ_invwishart(Psi0, nu0)  # nu0 is now [Kp1]
         logZ_q = StickyHDPHMMVI._logZ_invwishart(Psi_hat, nu_hat)
-        logZ_term = logZ_q - logZ_p * Kp1
+        logZ_term = logZ_q - logZ_p
 
         # -0.5 * (ν_hat - ν₀) * E_q[log|Λ|]
         # Note: E_q[log|Σ|] = -E_q[log|Λ|]
         logdet_term = -0.5 * torch.sum((nu_hat - nu0) * E_logdet_Lambda)
 
         # +0.5 * Tr((Ψ_hat - Ψ₀) * E_q[Λ])
-        tr_term = 0.5 * torch.einsum('kij,kji->', (Psi_hat - Psi0.unsqueeze(0)), E_Lambda)
+        tr_term = 0.5 * torch.einsum('kij,kji->', (Psi_hat - Psi0), E_Lambda)
         
         iw_term = logZ_term + logdet_term + tr_term
 
         # Normal part: E_q[log N(μ | μ0, Σ/κ0)] - E_q[log N(μ | μ_hat, Σ/κ_hat)]
         # = 0.5 * ∑_k [ D*(log(κ0/κ_hat) + 1 - κ0/κ_hat) - κ0 (μ_hat_k - μ0)^T E[Λ]_k (μ_hat_k - μ0) ]
-        diff = (mu_hat - mu0.view(1, D)).unsqueeze(-1)           # [Kp1,D,1]
+        diff = (mu_hat - mu0).unsqueeze(-1)           # [Kp1,D,1]
         quad = torch.einsum('kde,kef,kdf->k', E_Lambda, diff, diff)  # [Kp1]
         log_k_ratio = torch.log(torch.clamp(k0 / k_hat, min=1e-9))
         normal_term = 0.5 * (D * (log_k_ratio + 1.0 - (k0 / k_hat)) - k0 * quad).sum()
@@ -576,6 +632,7 @@ class StickyHDPHMMVI(nn.Module):
         self.S_M1 = M1
         self.S_M2 = M2
         self.S_counts = xi_counts
+        self._no_stats = False
 
     @torch.no_grad()
     def _calc_NIW_posterior(self, Nk, M1, M2) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -583,11 +640,11 @@ class StickyHDPHMMVI(nn.Module):
         Kp1, D = M1.shape[0], M1.shape[1]
         mu0, k0, Psi0, nu0 = self.mu0, self.kappa0, self.Psi0, self.nu0
         k_hat = k0 + Nk
-        mu_hat = (k0 * mu0.unsqueeze(0) + M1) / k_hat.unsqueeze(1)
+        mu_hat = (k0.unsqueeze(1) * mu0 + M1) / k_hat.unsqueeze(1)
         nu_hat = nu0 + Nk
 
-        Psi_hat = Psi0.unsqueeze(0).expand(Kp1, D, D).clone()
-        Psi_hat = Psi_hat + M2 + k0 * torch.einsum('d,e->de', mu0, mu0).unsqueeze(0) \
+        Psi_hat = Psi0.clone()
+        Psi_hat = Psi_hat + M2 + torch.einsum('k,kd,ke->kde', k0, mu0, mu0) \
                   - torch.einsum('k,kd,ke->kde', k_hat, mu_hat, mu_hat)
 
         # small jitter to keep SPD
@@ -610,6 +667,10 @@ class StickyHDPHMMVI(nn.Module):
     @torch.no_grad()
     def _update_u_beta(self, u_beta: torch.Tensor):
         self.u_beta.data.copy_(u_beta.detach())
+        new_phi_prior_init = self._phi_prior_init()
+        self.phi_prior = self.phi_prior - self.phi_prior_init + new_phi_prior_init
+        self.phi_prior_init = new_phi_prior_init
+        
 
     # ---- transitions & π -----------------------------------------------------
     @torch.no_grad()
@@ -630,6 +691,14 @@ class StickyHDPHMMVI(nn.Module):
         pi_full = torch.cat([piK, rest.view(1)], dim=0)  # [Kp1]
         return pi_full
     
+    @torch.no_grad()
+    def _phi_prior_init(self)->torch.Tensor:
+        Kp1 = self.p.K + 1
+        dev = self.p.device
+        dt = self.p.dtype
+        phi_prior_init = self._Epi() * self.p.alpha + self.p.kappa * torch.eye(Kp1, device=dev, dtype=dt)
+        return phi_prior_init
+    
     @staticmethod
     def _calc_ElogA(phi: torch.Tensor) -> torch.Tensor:
         phi_stable = torch.clamp(phi, min=1e-8)
@@ -646,12 +715,25 @@ class StickyHDPHMMVI(nn.Module):
     @torch.no_grad()
     def _calc_dir_posterior(self, xihat: torch.Tensor, pi_star: torch.Tensor) -> torch.Tensor:
         """
-        Calculate row-wise Dirichlet params with sticky prior and counts.
-        xihat: [Kp1,Kp1], pi_star: [Kp1]
+        Calculate row-wise Dirichlet params with current prior and counts.
+        xihat: [Kp1,Kp1] - new transition counts to add
+        pi_star: [Kp1] - current stick-breaking probabilities (from current u_beta)
         returns phi: [Kp1,Kp1]
+        
+        Updates the pi part of phi_prior with current pi_star, then adds xihat.
+        phi_prior contains: old_pi * alpha + kappa * I + accumulated_counts
+        We want: pi_star * alpha + kappa * I + accumulated_counts + xihat
         """
+        # Get the current pi that's baked into phi_prior
+        current_pi = self._Epi()  # [Kp1]
+        
+        # Update phi_prior to use new pi_star instead of current_pi
+        # phi_prior - current_pi * alpha + pi_star * alpha + xihat
         Kp1 = pi_star.shape[0]
-        phi = self.p.alpha * pi_star.view(1, Kp1) + self.p.kappa * torch.eye(Kp1, device=xihat.device, dtype=xihat.dtype) + xihat
+        phi = (self.phi_prior 
+               - current_pi.unsqueeze(1) * self.p.alpha  # Remove old pi component
+               + pi_star.unsqueeze(1) * self.p.alpha     # Add new pi component  
+               + xihat)                                   # Add new counts
         return phi
 
     @torch.no_grad()
@@ -660,51 +742,8 @@ class StickyHDPHMMVI(nn.Module):
         Update row-wise Dirichlet params with sticky prior and counts.
         """
         self.dir.phi = phihat
-
-    def _optimize_pi_from_r1(self, r1: torch.Tensor, steps: int = 200, lr: float = 0.05) -> torch.Tensor:
-        """
-        Optimize global sticks β (via logits u_beta) using a β-restricted ELBO:
-            L(β) = E_q[log p(Φ | π)] + E_q[log p(h1 | π)] + log p(β),
-        with π = concat(SB(σ(u_beta)), remainder).
-        Args:
-            r1: average initial-state responsibilities (Kp1,)
-        Returns:
-            π* (detached, shape [Kp1])
-        """
-        K = self.p.K
-        alpha, kappa, gamma = self.p.alpha, self.p.kappa, self.p.gamma
-        ElogA = self._ElogA().detach()
-        r1 = r1.detach()
-
-        opt = torch.optim.Adam([self.u_beta], lr=lr)
-        for _ in range(steps):
-            opt.zero_grad(set_to_none=True)
-            beta = torch.sigmoid(self.u_beta)          # [K]
-            piK, rest = stick_breaking(beta)           # [K], scalar
-            pi = torch.cat([piK, rest.view(1)], dim=0) # [Kp1]
-            # Dirichlet prior rows a_k = α π + κ δ_k, with π sum=1
-            a = alpha * pi.unsqueeze(0) + kappa * torch.eye(K + 1, device=pi.device, dtype=pi.dtype)  # [Kp1,Kp1]
-            a = a.clamp(min=1e-8)  # avoid NaNs
-            # E_q[log p(Φ | π)] under q(Φ) with row-wise Dirichlet φ
-            const = (K + 1) * torch.lgamma(torch.tensor(alpha + kappa, device=pi.device, dtype=pi.dtype))
-            L1 = ((a - 1.0) * ElogA).sum() - torch.lgamma(a).sum() + const
-            # E_q[log p(h1 | π)]
-            L2 = torch.sum(r1 * torch.log(torch.clamp(pi, min=1e-30)))
-            # log p(β) with Beta(1,γ) sticks: ∑ (γ-1) log(1-β_k)
-            L3 = (gamma - 1.0) * torch.sum(torch.log(torch.clamp(1.0 - beta, min=1e-30)))
-            loss = -(L1 + L2 + L3)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_([self.u_beta], max_norm=10.0)
-            opt.step()
-            with torch.no_grad():
-                self.u_beta.clamp_(-10.0, 10.0)
-
-        with torch.no_grad():
-            beta = torch.sigmoid(self.u_beta)
-            piK, rest = stick_breaking(beta)
-            pi = torch.cat([piK, rest.view(1)], dim=0)
-        return pi.detach()
     
+    # ---- optimize u_beta -----------------------------------------------------
     @staticmethod
     def _optimize_u_beta(
         u_beta: torch.Tensor,
@@ -715,7 +754,9 @@ class StickyHDPHMMVI(nn.Module):
         gamma: float,
         K: int,
         steps: int = 200,
-        lr: float = 0.05
+        lr: float = 0.05,
+        early_stopping_patience: int = 10,
+        early_stopping_min_delta: float = 1e-5
     ) -> torch.Tensor:
         """
         Optimize global sticks β (via logits u_beta) using a β-restricted ELBO:
@@ -729,6 +770,8 @@ class StickyHDPHMMVI(nn.Module):
             K: number of explicit states
             steps: optimization steps
             lr: learning rate
+            early_stopping_patience: number of steps to wait for improvement before stopping
+            early_stopping_min_delta: minimum change in loss to be considered as improvement
         Returns:
             optimized u_beta (detached, shape [K])
         """
@@ -737,8 +780,13 @@ class StickyHDPHMMVI(nn.Module):
 
         u_beta_opt = u_beta.clone().requires_grad_(True)
         opt = torch.optim.Adam([u_beta_opt], lr=lr)
+        
+        # Early stopping variables
+        best_loss = float('inf')
+        patience_counter = 0
+        
         with torch.enable_grad():
-            for _ in range(steps):
+            for step in range(steps):
                 opt.zero_grad(set_to_none=True)
                 beta = torch.sigmoid(u_beta_opt)          # [K]
                 piK, rest = stick_breaking(beta)           # [K], scalar
@@ -754,6 +802,19 @@ class StickyHDPHMMVI(nn.Module):
                 # log p(β) with Beta(1,γ) sticks: ∑ (γ-1) log(1-β_k)
                 L3 = (gamma - 1.0) * torch.sum(torch.log(torch.clamp(1.0 - beta, min=1e-30)))
                 loss = -(L1 + L2 + L3)
+                
+                # Early stopping check
+                current_loss = loss.item()
+                if current_loss < best_loss - early_stopping_min_delta:
+                    best_loss = current_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= early_stopping_patience:
+                    # Early stopping triggered
+                    break
+                
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_([u_beta_opt], max_norm=10.0)
                 opt.step()
@@ -773,14 +834,49 @@ class StickyHDPHMMVI(nn.Module):
         self.register_buffer("S_M1",     torch.zeros(Kp1, D,    device=dev, dtype=dt))
         self.register_buffer("S_M2",     torch.zeros(Kp1, D, D, device=dev, dtype=dt))
         self.register_buffer("S_counts", torch.zeros(Kp1, Kp1,  device=dev, dtype=dt))
-        self.register_buffer("S_steps",  torch.tensor(0.0,      device=dev, dtype=dt))
         self._stream_allocated = True
 
     @torch.no_grad()
     def streaming_reset(self):
         self._alloc_stream_buffers()
         self.S_Nk.zero_(); self.S_M1.zero_(); self.S_M2.zero_(); self.S_counts.zero_()
-        self.S_steps.fill_(0.0)
+        self._no_stats = True
+
+    @torch.no_grad()
+    def seed_streaming_from_posterior(self):
+        """
+        Initialise streaming sufficient statistics (S_*) from current posterior
+        (mu_hat, kappa_hat, Psi_hat, nu_hat, phi). This preserves pre-trained
+        information as pseudo-counts for subsequent EMA blending.
+        """
+        self._alloc_stream_buffers()
+        Kp1, D = self.niw.mu.shape
+        mu_hat = self.niw.mu                  # [Kp1,D]
+        k_hat  = self.niw.kappa               # [Kp1]
+        Psi_hat= self.niw.Psi                 # [Kp1,D,D]
+        nu_hat = self.niw.nu                  # [Kp1]
+        mu0, k0, Psi0, nu0 = self.mu0, self.kappa0, self.Psi0, self.nu0
+
+        # NIW equivalent counts
+        Nk_kappa = (k_hat - k0).clamp_min(0.0)
+        Nk_nu    = (nu_hat - nu0).clamp_min(0.0)
+        Nk = torch.minimum(Nk_kappa, Nk_nu)   # be robust to small numeric mismatch
+
+        # First and second moments
+        S1 = (k_hat.view(Kp1,1) * mu_hat) - (k0.view(Kp1,1) * mu0)
+        outer_mu0 = torch.einsum('ki,kj->kij', mu0, mu0)  # [Kp1,D,D]
+        outer_muh = torch.einsum('ki,kj->kij', mu_hat, mu_hat)  # [Kp1,D,D]
+        S2 = Psi_hat - Psi0 - k0.view(Kp1,1,1) * outer_mu0 + k_hat.view(Kp1,1,1) * outer_muh
+
+        # Dirichlet row pseudo-counts from posterior φ: counts = φ - (α π + κ I)
+        counts = (self.dir.phi - self.phi_prior).clamp_min(0.0)
+
+        # Install
+        self.S_Nk.copy_(Nk)
+        self.S_M1.copy_(S1)
+        self.S_M2.copy_(S2)
+        self.S_counts.copy_(counts)
+        self._no_stats = False
 
     # ---- ELBO component calculations ----------------------------------------
     @staticmethod
@@ -826,7 +922,7 @@ class StickyHDPHMMVI(nn.Module):
             ElogA = StickyHDPHMMVI._calc_ElogA(phi)
 
         # Dirichlet prior parameters: a_k = α π + κ δ_k
-        a = (self.p.alpha * pi_full.unsqueeze(0) + 
+        a = self.phi_prior - self.phi_prior_init + (self.p.alpha * pi_full.unsqueeze(0) + 
              self.p.kappa * torch.eye(Kp1, device=self.mu0.device, dtype=self.mu0.dtype))
         
         # KL(q||p) = logC(φ) - logC(a) + (φ-a)ᵀ E[logΦ]
@@ -971,11 +1067,11 @@ class StickyHDPHMMVI(nn.Module):
         max_iters: int = 7,                            # inner full-loop limit
         tol: float = 0.01,                             # Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
         elbo_drop_tol: float = 0.01,                   # Relative ELBO drop tolerance for early stopping (fraction, e.g., 0.01 = 1%)
-        rho: Optional[float] = 1.0,                    # 1.0 => non-streaming; 0<rho<1 => EMA
         optimize_pi: bool = True,                      # optimize π using mean r1
         pi_steps: int = 200,                           # π opt steps
         pi_lr: float = 0.05,                           # π opt learning rate
-        offline: bool = False,                         # offline π opt (full data) if True
+        pi_early_stopping_patience: int = 10,         # early stopping patience for π optimization
+        pi_early_stopping_min_delta: float = 1e-5,    # early stopping min delta for π optimization
         logger: Optional[logging.Logger] = None        # for debug output
     ) -> Dict[str, torch.Tensor]:
         """
@@ -1010,13 +1106,8 @@ class StickyHDPHMMVI(nn.Module):
         B, T, D = mu_t.shape
         Kp1 = self.niw.mu.shape[0]
 
-        # Resolve streaming coefficients
-        if rho is None:
-            rho_eff = self.stream_rho
-        else:
-            rho_eff = float(max(0.0, min(1.0, rho)))
-        rho_tr = self.stream_rho_trans if self.stream_rho_trans is not None else rho_eff
-        rho_tr = float(max(0.0, min(1.0, rho_tr)))
+        rho_niw = self.stream_rho_niw
+        rho_tr = self.stream_rho_trans if self.stream_rho_trans is not None else rho_niw
 
         # ELBO trackers
         elbo_history = []
@@ -1133,10 +1224,18 @@ class StickyHDPHMMVI(nn.Module):
                 logger.debug(f"Iter {it}: ELBO after FB: {elbo_after_fb:.4f} (LL {this_ll:.4f}, Δ={(this_ll - ll_before_val):.4f})")
 
             # (3) Blend stats (EMA or full replace) and update NIW
-            this_S_Nk     = (1.0 if offline else (1.0 - rho_eff)) * self.S_Nk     + rho_eff * this_acc_Nk
-            this_S_M1     = (1.0 if offline else (1.0 - rho_eff)) * self.S_M1     + rho_eff * this_acc_M1
-            this_S_M2     = (1.0 if offline else (1.0 - rho_eff)) * self.S_M2     + rho_eff * this_acc_M2
-            this_S_counts = (1.0 if offline else (1.0 - rho_tr)) * self.S_counts + rho_tr  * this_acc_counts
+            if self._no_stats:  # first pass after reset
+                if logger: logger.debug(f"First pass after reset, using full stats.")
+                this_S_Nk     = this_acc_Nk
+                this_S_M1     = this_acc_M1
+                this_S_M2     = this_acc_M2
+                this_S_counts = this_acc_counts
+            else:
+                if logger: logger.debug(f"Blending stats with ρ_niw={rho_niw:.4f}, ρ_tr={rho_tr:.4f}.")
+                this_S_Nk     = (1.0 - rho_niw) * self.S_Nk     + rho_niw * this_acc_Nk
+                this_S_M1     = (1.0 - rho_niw) * self.S_M1     + rho_niw * this_acc_M1
+                this_S_M2     = (1.0 - rho_niw) * self.S_M2     + rho_niw * this_acc_M2
+                this_S_counts = (1.0 - rho_tr) * self.S_counts + rho_tr  * this_acc_counts
 
             this_mu_hat, this_k_hat, this_Psi_hat, this_nu_hat = \
                 self._calc_NIW_posterior(this_S_Nk, this_S_M1, this_S_M2)
@@ -1191,7 +1290,9 @@ class StickyHDPHMMVI(nn.Module):
                 this_u_beta = StickyHDPHMMVI._optimize_u_beta(
                     this_u_beta, r1_mean, this_ElogA,
                     self.p.alpha, self.p.kappa, self.p.gamma, self.p.K,
-                    steps=pi_steps, lr=pi_lr
+                    steps=pi_steps, lr=pi_lr,
+                    early_stopping_patience=pi_early_stopping_patience, 
+                    early_stopping_min_delta=pi_early_stopping_min_delta
                 )
                 elbo_after_beta_all = self.calculate_elbo(
                     mu_t, diag_var_t, F_t, mask,
@@ -1314,6 +1415,17 @@ class StickyHDPHMMVI(nn.Module):
             "phi": self.dir.phi.detach(),      # [Kp1,Kp1]
             "beta_u": self.u_beta.detach(),    # [K]
         }
+        
+    def get_niw_prior_params(self) -> NIWPrior:
+        return NIWPrior(
+            mu0=self.mu0.detach(),          # [Kp1,D]
+            kappa0=self.kappa0.detach(),    # [Kp1]
+            Psi0=self.Psi0.detach(),        # [Kp1,D,D]
+            nu0=self.nu0.detach()           # [Kp1]
+        )
+
+    def get_phi_prior_params(self) -> Dict[str, torch.Tensor]:
+        return self.phi_prior.detach()    # [Kp1,Kp1]
 
     def get_emission_expectations(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.niw.mu, self._get_E_Lambda(), self._get_E_logdet_Lambda()
@@ -1325,14 +1437,135 @@ class StickyHDPHMMVI(nn.Module):
         self.niw.Psi   = params["Psi"].to(device=dev, dtype=dt)
         self.niw.nu    = params["nu"].to(device=dev, dtype=dt)
         if "phi" in params:     self.dir.phi.copy_(params["phi"].to(device=dev, dtype=dt))
-        if "beta_u" in params:  self.u_beta.data.copy_(params["beta_u"].to(device=dev, dtype=dt))
+        if "beta_u" in params:  self._update_u_beta(params["beta_u"].to(device=dev, dtype=dt))
         self._cache_fresh = False
+        
+    def set_posterior_as_prior(
+        self, 
+        temper_weight: float = 1.0, 
+        skip_remainder_state: bool = True
+    ) -> None:
+        """
+        Sets current posterior as the new prior with tempered statistics and reset.
+        
+        This method:
+        1. Uses seed_streaming_from_posterior() to extract sufficient statistics
+        2. Applies temper_weight to shrink those statistics  
+        3. Adds tempered statistics to original prior to get tempered posterior
+        4. Sets this tempered posterior as the new prior
+        
+        Args:
+            temper_weight: Weight to shrink statistics (0=use original prior, 1=full posterior).
+                          Controls strength of regularization to avoid over-confidence.
+            skip_remainder_state: If True, keeps remainder state (K+1) at original prior.
+                                This is useful since remainder state is not a "true skill".
+        """
+        with torch.no_grad():
+            Kp1 = self.p.K + 1
+            D = self.p.D
+            
+            # Special case: if temper_weight is 0, just reset streaming and return
+            if temper_weight == 0.0:
+                self._cache_fresh = False
+                self.streaming_reset()
+                return
+            
+            # Determine which states to update
+            if skip_remainder_state:
+                # Update only first K states, keep remainder state at original prior
+                update_mask = torch.zeros(Kp1, dtype=torch.bool, device=self.mu0.device)
+                update_mask[:self.p.K] = True
+            else:
+                # Update all states including remainder
+                update_mask = torch.ones(Kp1, dtype=torch.bool, device=self.mu0.device)
+            
+            # Extract sufficient statistics using existing centralized method
+            self.seed_streaming_from_posterior()
+            
+            # Apply temper weight to shrink statistics
+            Nk_tempered = temper_weight * self.S_Nk
+            M1_tempered = temper_weight * self.S_M1  
+            M2_tempered = temper_weight * self.S_M2
+            
+            # Compute tempered posterior from original prior + tempered statistics
+            k_tempered = self.kappa0 + Nk_tempered
+            nu_tempered = self.nu0 + Nk_tempered
+            mu_tempered = (self.kappa0.unsqueeze(1) * self.mu0 + M1_tempered) / k_tempered.unsqueeze(1)
+            
+            outer_mu0_orig = torch.einsum('kd,ke->kde', self.mu0, self.mu0) 
+            outer_mu_tempered = torch.einsum('kd,ke->kde', mu_tempered, mu_tempered)
+            Psi_tempered = (self.Psi0 + M2_tempered 
+                           + torch.einsum('k,kde->kde', self.kappa0, outer_mu0_orig)
+                           - torch.einsum('k,kde->kde', k_tempered, outer_mu_tempered))
+            
+            # Add small jitter to keep SPD only if we actually modified anything (temper_weight > 0)
+            if temper_weight > 0:
+                eps = 1e-6
+                I = torch.eye(D, device=Psi_tempered.device, dtype=Psi_tempered.dtype)
+                Psi_tempered = Psi_tempered + eps * I.unsqueeze(0)
+            
+            # Update priors for selected states only
+            new_mu0 = self.mu0.clone()
+            new_kappa0 = self.kappa0.clone()
+            new_Psi0 = self.Psi0.clone()
+            new_nu0 = self.nu0.clone()
+            
+            new_mu0[update_mask] = mu_tempered[update_mask]
+            new_kappa0[update_mask] = k_tempered[update_mask]
+            new_Psi0[update_mask] = Psi_tempered[update_mask]
+            new_nu0[update_mask] = nu_tempered[update_mask]
+            
+            # Copy back to buffers
+            self.mu0.copy_(new_mu0)
+            self.kappa0.copy_(new_kappa0)
+            self.Psi0.copy_(new_Psi0)
+            self.nu0.copy_(new_nu0)
+            
+            # Update NIW posteriors to reflect the tempered distributions
+            self.niw.mu = mu_tempered
+            self.niw.kappa = k_tempered
+            self.niw.Psi = Psi_tempered
+            self.niw.nu = nu_tempered
+            
+            # Invalidate cache since prior has changed
+            self._cache_fresh = False
+            
+            # Handle phi (Dirichlet transition parameters) tempering
+            # Extract transition statistics using centralized method
+            with torch.no_grad():
+                # Get current phi and current phi prior
+                current_phi = self.dir.phi  # (K+1, K+1)
+                current_phi_prior = self.phi_prior  # (K+1, K+1)
+                
+                # Extract sufficient statistics (transition counts)
+                trans_stats = current_phi - current_phi_prior  # (K+1, K+1)
+                
+                # Apply tempering to transition statistics
+                trans_stats_tempered = trans_stats * temper_weight
+                
+                # Compute new phi: current prior + tempered statistics
+                new_phi = current_phi_prior + trans_stats_tempered
+                
+                # Apply remainder state masking - only update states 0 to K-1
+                # Leave remainder state (K) unchanged to maintain proper structure
+                remainder_mask = torch.zeros(self.p.K + 1, dtype=torch.bool, device=new_phi.device)
+                remainder_mask[self.p.K] = True  # Mark remainder state
+                new_phi[remainder_mask] = current_phi_prior[remainder_mask]
+                new_phi[:, remainder_mask] = current_phi_prior[:, remainder_mask]
+                
+                # Update phi posterior
+                self.dir.phi.copy_(new_phi)
+                
+                self.phi_prior.copy_(new_phi)
+            
+            # Reset streaming statistics to start fresh with new baseline
+            self.streaming_reset()
 
     # --- compact accessors ----------------------------------------------------
     @torch.no_grad()
     def get_rho_emission(self) -> torch.Tensor:
         """Alias for streaming rho used in code paths that expect get_rho_emission()."""
-        return torch.tensor(float(self.stream_rho), device=self.mu0.device, dtype=self.mu0.dtype)
+        return torch.tensor(float(self.stream_rho_niw), device=self.mu0.device, dtype=self.mu0.dtype)
 
     @torch.no_grad()
     def get_rho_transition(self) -> torch.Tensor:
@@ -1422,5 +1655,235 @@ class StickyHDPHMMVI(nn.Module):
             "p_stay": p_stay,
             "expected_dwell_length_per_state": mean_geo,
             "empirical_dwell_length_per_state": emp_mean,
-            "all_lengths": all_lens
+            "all_lengths": all_lens,
+            "r_hat": r_all,
+            "viterbi_paths": paths
         }
+
+    # -----------------------------------------------------------------------
+    #                       C A U S A L   F I L T E R
+    # -----------------------------------------------------------------------
+    @dataclass
+    class FilterState:
+        """Minimal per‑sequence filter state."""
+        log_alpha: torch.Tensor  # [Kp1] normalized (log) filtering marginals
+        loglik: float = 0.0      # cumulative log-likelihood
+
+
+    # ---- Unified emission helper for ONLINE filtering (used by both curiosity and policy features)
+    @torch.no_grad()
+    def make_logB_for_filter(
+        self,
+        mu: torch.Tensor,            # [B,T,D] or [B,D]
+        diagvar: torch.Tensor,       # [B,T,D] or [B,D]
+        F: Optional[torch.Tensor],   # [B,T,D,R] or [B,D,R] or None
+        mask: Optional[torch.Tensor] = None,  # [B,T] or None
+        emission_mode: str = "sample",  # "sample", "mean", "expected", or "student_t"
+        student_t_use_sample: bool = False, # use sample in student_t mode
+        student_t_scale_temp: float = 1.0    # τ_emit: widen Student‑t predictive scale
+    ) -> torch.Tensor:
+        """
+        Build emission log-likelihoods for ONLINE filtering under the configured mode.
+        Returns: logB with shape [B,T,Kp1] (or [B,Kp1] if input is [B,D], but we always
+        upcast to [B,1,Kp1] and squeeze at the caller to simplify broadcasting).
+        
+        Modes:
+        - "sample": sample z_t ~ N(μ,diagvar + FF^T) and compute log-likelihood under NIW mixture
+        - "mean": use z_t = μ and compute log-likelihood under NIW mixture
+        - "expected": compute expected log-likelihood under N(μ,diagvar) and NIW mixture, VB style
+        - "student_t": compute log-likelihood under multivariate Student-t predictive distribution
+          (optionally using z_t ~ N(μ,diagvar) if student_t_use_sample is True, otherwise z_t = μ)
+        """
+        # Ensure [B,T,D] shape
+        input_was_2d = (mu.dim() == 2)
+        if input_was_2d:
+            mu = mu.unsqueeze(1); diagvar = diagvar.unsqueeze(1)
+            F = F.unsqueeze(1) if (F is not None and F.dim() == 2) else F
+            mask = mask.unsqueeze(1) if (mask is not None and mask.dim() == 1) else mask
+        B, T, D = mu.shape
+        Kp1 = self.niw.mu.size(0)
+
+        if emission_mode == "expected":
+            diagvar = diagvar.clamp_min(1e-6)
+            logB = StickyHDPHMMVI.expected_emission_loglik(
+                self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
+                mu, diagvar, F, mask)
+        elif emission_mode == "mean":
+            logB = StickyHDPHMMVI.expected_emission_loglik(
+                self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
+                mu, None, None, mask)
+        elif emission_mode == "sample":
+            eps = torch.randn_like(mu)
+            z = mu + eps * (diagvar.clamp_min(1e-6).sqrt())
+            if F is not None:
+                R = F.size(-1)
+                eps_lr = torch.randn(B, T, R, device=mu.device, dtype=mu.dtype)
+                z = z + torch.einsum('btr,btdr->btd', eps_lr, F)
+            logB = StickyHDPHMMVI.expected_emission_loglik(
+                self.niw.mu, self.niw.kappa, self.niw.Psi, self.niw.nu,
+                z, None, None, mask)
+        elif emission_mode == "student_t":
+            # Multivariate Student-t predictive under NIW posterior
+            mu_hat  = self.niw.mu         # [Kp1,D]
+            k_hat   = self.niw.kappa      # [Kp1]
+            Psi_hat = self.niw.Psi        # [Kp1,D,D]
+            nu_hat  = self.niw.nu         # [Kp1]
+            # degrees of freedom and scale
+            dof = (nu_hat - D + 1.0)  # [Kp1]
+            assert (dof > 0).all(), "NIW nu too small for Student-t!"
+            scale = ((k_hat + 1.0) / (k_hat * dof)).view(Kp1, 1, 1) * Psi_hat                # [Kp1,D,D]
+            # Apply scale temperature to avoid overconfidence online
+            scale = student_t_scale_temp * scale
+            # Cholesky of scale
+            L = torch.linalg.cholesky(scale)                                                 # [Kp1,D,D]
+            logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)           # [Kp1]
+            # choose point
+            if student_t_use_sample:
+                eps = torch.randn_like(mu); z = mu + eps * (diagvar.clamp_min(1e-6).sqrt())
+                if F is not None:
+                    R = F.size(-1); eps_lr = torch.randn(B, T, R, device=mu.device, dtype=mu.dtype)
+                    z = z + torch.einsum('btr,btdr->btd', eps_lr, F)
+            else:
+                z = mu
+            # quadratic form δ^T Σ^{-1} δ via Cholesky solve
+            delta = z.unsqueeze(2) - mu_hat.view(1, 1, Kp1, D)                            # [B,T,Kp1,D]
+            # y = L^{-1} δ
+            # Add extra dimension for triangular solve: [B,T,Kp1,D] -> [B,T,Kp1,D,1]
+            delta_expanded = delta.unsqueeze(-1)  # [B,T,Kp1,D,1]
+            y = torch.linalg.solve_triangular(
+                L.view(1,1,Kp1,D,D).expand(B,T,-1,-1,-1), delta_expanded, upper=False)
+            y = y.squeeze(-1)  # Remove the extra dimension: [B,T,Kp1,D,1] -> [B,T,Kp1,D]
+            quad = (y**2).sum(-1)                                                               # [B,T,Kp1]
+            c1 = torch.lgamma((dof + D)*0.5) - torch.lgamma(dof*0.5)
+            c2 = -0.5*logdet - (D/2.0)*torch.log(dof*math.pi)
+            logB = (c1 + c2) + (-(dof + D)/2.0) * torch.log1p(quad / dof)
+            if mask is not None:
+                logB = logB * mask.unsqueeze(-1)
+        else:
+            raise ValueError(f"Unknown emission_mode: {emission_mode}")
+
+        return logB if not input_was_2d else logB.squeeze(1)  # [B,T,Kp1] or [B,Kp1]
+
+    @torch.no_grad()
+    def make_logA_for_filter(self, mode: str = "elog", temperature: float = 1.0) -> torch.Tensor:
+        """Build transition log‑potentials for ONLINE filtering with optional temperature.
+        mode: "elog" (default), "mean", or "map".
+        temperature τ>0 softens rows via log-softmax(ElogA/τ).
+        Returns logA [Kp1,Kp1].
+        """
+        if mode == "elog":
+            logA = self._ElogA()
+        elif mode in ("mean", "map") and hasattr(self, "dir") and hasattr(self.dir, "phi"):
+            phi = self.dir.phi  # [Kp1,Kp1]
+            if mode == "mean":
+                A = phi / phi.sum(-1, keepdim=True)
+                logA = torch.log(A.clamp_min(1e-20))
+            else:
+                Kp1 = phi.size(-1)
+                num = (phi - 1.0).clamp_min(1e-6)
+                den = (phi.sum(-1, keepdim=True) - Kp1).clamp_min(1e-6)
+                A = num / den
+                logA = torch.log(A.clamp_min(1e-20))
+        else:
+            logA = self._ElogA()
+        if temperature != 1.0:
+            # logA_temp = log softmax(logA / τ) row-wise
+            logA = (logA / temperature)
+            logA = logA - torch.logsumexp(logA, dim=-1, keepdim=True)
+        return logA
+
+    @torch.no_grad()
+    def filter_init_from_logB(self, logB0: torch.Tensor) -> "StickyHDPHMMVI.FilterState":
+        """
+        Initialise causal filter with the first observation.
+        logB0: [Kp1] emission log-likelihoods for t=0.
+        """
+        log_pi = torch.log(torch.clamp(self._Epi(), min=1e-30)).to(torch.float64)  # [Kp1]
+        log_alpha0 = (log_pi + logB0.to(torch.float64))
+        c0 = torch.logsumexp(log_alpha0, dim=-1)
+        return StickyHDPHMMVI.FilterState(log_alpha=log_alpha0 - c0, loglik=float(c0.item()))
+
+    @torch.no_grad()
+    def filter_step(
+        self,
+        state: "StickyHDPHMMVI.FilterState",
+        logB_t: torch.Tensor,               # [Kp1]
+        ElogA: Optional[torch.Tensor] = None
+    ) -> Tuple["StickyHDPHMMVI.FilterState",
+               torch.Tensor,                # alpha_t probs [Kp1]
+               torch.Tensor,                # xi_{t-1}(i,j) [Kp1,Kp1]
+               float,                       # boundary_prob_t = 1 - sum_i xi_ii
+               float]:                      # skill_entropy_t = H(alpha_t)
+        """
+        One causal filtering update:
+          α_{t|t-1}(j) ∝ ∑_i α_{t-1}(i) A_{ij}
+          α_t(j) ∝ B_t(j) * α_{t|t-1}(j)
+          ξ_{t-1,t}(i,j) ∝ α_{t-1}(i) * A_{ij} * B_t(j)
+        Works entirely in log-domain for stability.
+        """
+        if ElogA is None:
+            ElogA = self._ElogA()  # [Kp1,Kp1]
+        # log predictive prior: log ∑_i exp(log_alpha_{t-1}(i) + ElogA(i,j))
+        log_pred = torch.logsumexp(state.log_alpha.unsqueeze(1).to(torch.float64) + ElogA.to(torch.float64),
+                                   dim=0)  # [Kp1]
+        # new α
+        log_alpha_t_un = log_pred + logB_t.to(torch.float64)         # [Kp1]
+        c_t = torch.logsumexp(log_alpha_t_un, dim=-1)
+        log_alpha_t = log_alpha_t_un - c_t
+        alpha_t = torch.exp(log_alpha_t.to(torch.float32))           # [Kp1]
+
+        # pair posterior ξ_{t-1,t}(i,j) given z_{1:t}
+        log_xi_num = (state.log_alpha.unsqueeze(1).to(torch.float64)
+                      + ElogA.to(torch.float64)
+                      + logB_t.view(1, -1).to(torch.float64))        # [Kp1,Kp1]
+        logZ = torch.logsumexp(log_xi_num.view(-1), dim=0)
+        xi_t = torch.exp((log_xi_num - logZ).to(torch.float32))      # [Kp1,Kp1]
+
+        # boundary prob and entropy on this step
+        p_same = torch.diagonal(xi_t, 0).sum().item()
+        boundary_prob = float(max(0.0, min(1.0, 1.0 - p_same)))
+        # entropy H(α_t)
+        eps = 1e-12
+        skill_entropy = float((-(alpha_t.clamp_min(eps) * alpha_t.clamp_min(eps).log()).sum()).item())
+
+        new_state = StickyHDPHMMVI.FilterState(log_alpha=log_alpha_t, loglik=state.loglik + float(c_t.item()))
+        return new_state, alpha_t, xi_t, boundary_prob, skill_entropy
+
+    @torch.no_grad()
+    def filter_sequence(
+        self,
+        logB: torch.Tensor,                 # [T,Kp1]
+        ElogA: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Run causal filter over a whole sequence (useful for evaluation).
+        Returns:
+          alpha: [T,Kp1],  xi: [T-1,Kp1,Kp1],
+          boundary_prob: [T] (first step set to NaN),
+          skill_entropy: [T],
+          loglik: scalar
+        """
+        T, Kp1 = logB.shape
+        if ElogA is None:
+            ElogA = self._ElogA()
+        # t=0
+        st = self.filter_init_from_logB(logB[0])
+        alpha_list = [torch.exp(st.log_alpha.to(torch.float32)).view(1, -1)]
+        boundary_list = [torch.tensor(float('nan'), device=logB.device)]
+        entropy_list = [-(alpha_list[0].clamp_min(1e-12).log() * alpha_list[0]).sum()]
+        xi_all = []
+        # t>=1
+        for t in range(1, T):
+            st, a_t, xi_t, p_change, H = self.filter_step(st, logB[t], ElogA)
+            alpha_list.append(a_t.view(1, -1))
+            xi_all.append(xi_t.unsqueeze(0))
+            boundary_list.append(torch.tensor(p_change, device=logB.device))
+            entropy_list.append(torch.tensor(H, device=logB.device))
+        out = {
+            "alpha": torch.cat(alpha_list, dim=0),               # [T,Kp1]
+            "xi": torch.cat(xi_all, dim=0) if len(xi_all) else torch.zeros(0, Kp1, Kp1, device=logB.device),
+            "boundary_prob": torch.stack(boundary_list),         # [T]
+            "skill_entropy": torch.stack(entropy_list),          # [T]
+            "loglik": torch.tensor(st.loglik, device=logB.device)
+        }
+        return out

@@ -1,0 +1,613 @@
+2025-09-13 23:18:31,053 - __main__ - INFO - 🤗 Loading pretrained VAE from HuggingFace: CatkinChen/nethack-vae
+2025-09-13 23:18:31,633 - __main__ - INFO - ✅ Loaded pretrained VAE checkpoint (plain prior).
+2025-09-13 23:18:31,633 - __main__ - INFO - 🧠 Initializing new Sticky-HDP-HMM: latent_dim=96, skills=40
+2025-09-13 23:18:31,685 - __main__ - INFO - Sticky-HDP-HMM initialized with NIW streaming rho: 1.0, transition rho: 1.0
+2025-09-13 23:18:31,685 - __main__ - INFO - 🔍 Initializing NIW mean with k-means on VAE latents...
+2025-09-13 23:18:48,042 - __main__ - INFO - ========== EM Round 1/4: E-step ==========
+2025-09-13 23:19:40,708 - __main__ - DEBUG - Initial ELBO: -12871853.8713
+2025-09-13 23:19:40,709 - __main__ - DEBUG - Relative tol: 0.0100
+2025-09-13 23:19:40,709 - __main__ - DEBUG - Relative elbo_drop_tol: 0.0100
+2025-09-13 23:19:40,709 - __main__ - DEBUG - - Init -118.8343
+2025-09-13 23:19:40,709 - __main__ - DEBUG - - Trans -222671.7065
+2025-09-13 23:19:40,709 - __main__ - DEBUG - - Emit -12648801.8438
+2025-09-13 23:19:40,709 - __main__ - DEBUG - - Entropy 1495.4781
+2025-09-13 23:19:40,709 - __main__ - DEBUG - - Dir 0.0000
+2025-09-13 23:19:40,709 - __main__ - DEBUG - - NIW -1742.1105
+2025-09-13 23:19:40,709 - __main__ - DEBUG - - Beta prior -14.8543
+2025-09-13 23:20:23,485 - __main__ - DEBUG - Iter 0: ELBO after FB: -12871853.8713 (LL -12870096.9065, Δ=0.0000)
+2025-09-13 23:20:23,485 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:20:23,523 - __main__ - DEBUG - Iter 0: ELBO after NIW update: -4121198.8858 (Emit LL -3545841.5312, NIW term -354047.4375, Δ=8750654.9855)
+2025-09-13 23:20:23,561 - __main__ - DEBUG - Iter 0: ELBO after Dirichlet update: -3926694.9011 (Trans LL -26483.1476, Dir term -1684.5742, Δ=194503.9847)
+2025-09-13 23:21:06,368 - __main__ - DEBUG - Iter 1: ELBO after FB: -3917094.8008 (LL -3561347.9348, Δ=9600.1003)
+2025-09-13 23:21:06,369 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:21:06,406 - __main__ - DEBUG - Iter 1: ELBO after NIW update: -3909994.3398 (Emit LL -3527949.2734, NIW term -355387.1250, Δ=7100.4609)
+2025-09-13 23:21:06,443 - __main__ - DEBUG - Iter 1: ELBO after Dirichlet update: -3909314.4057 (Trans LL -25670.4469, Dir term -1582.2734, Δ=679.9341)
+2025-09-13 23:21:06,444 - __main__ - DEBUG - Early stopping: ELBO improvement 17380.4954 < tolerance
+2025-09-13 23:21:57,399 - __main__ - INFO - [E-step] Multi-batch 1/1 (x100 batches) - HMM Diagnostics:
+2025-09-13 23:21:57,400 - __main__ - INFO -   - Avg log-likelihood per step: -38.4955
+2025-09-13 23:21:57,400 - __main__ - INFO -   - Inner ELBO (final): -3909314.4057
+2025-09-13 23:21:57,400 - __main__ - INFO -   - ELBO progression (2 iters): [-3926695.00, -3909314.50] (Δ=17380.5000)
+2025-09-13 23:21:57,400 - __main__ - INFO -   - Effective number of skills: 37.82
+2025-09-13 23:21:57,400 - __main__ - INFO -   - State entropy: 0.061
+2025-09-13 23:21:57,400 - __main__ - INFO -   - Transition stickiness: 0.896
+2025-09-13 23:21:57,400 - __main__ - INFO -   - Top 5 skills: [13, 3, 6, 22, 15] (probs: ['0.047', '0.044', '0.041', '0.038', '0.037'])
+2025-09-13 23:21:57,400 - __main__ - INFO -   - Combined time length: 3200 (original T=32, multiples=100)
+2025-09-13 23:21:57,402 - __main__ - INFO - 🔍 Computing HMM diagnostics...
+2025-09-13 23:23:00,246 - __main__ - INFO - 📊 HMM Diagnostics for Round 1:
+2025-09-13 23:23:00,248 - __main__ - INFO -   - Avg log-likelihood per step: -38.5945
+2025-09-13 23:23:00,248 - __main__ - INFO -   - State entropy: 0.0640
+2025-09-13 23:23:00,248 - __main__ - INFO -   - Effective number of skills: 37.83
+2025-09-13 23:23:00,248 - __main__ - INFO -   - Transition stickiness (diag): 0.8955
+2025-09-13 23:23:00,248 - __main__ - INFO -   - Top 5 skill occupancies: [0.04734393209218979, 0.043690748512744904, 0.04075536131858826, 0.03832312673330307, 0.036494139581918716]
+2025-09-13 23:23:00,248 - __main__ - INFO -   - Top 5 skill indices: [13, 3, 6, 22, 15]
+2025-09-13 23:23:00,249 - __main__ - INFO -     - Skill 30: emp= 22.52  E[1/(1-p)]: 56.96  p_stay=0.982
+2025-09-13 23:23:00,249 - __main__ - INFO -     - Skill 2: emp= 22.55  E[1/(1-p)]: 55.04  p_stay=0.982
+2025-09-13 23:23:00,249 - __main__ - INFO -     - Skill 28: emp= 20.83  E[1/(1-p)]: 39.50  p_stay=0.975
+2025-09-13 23:23:00,249 - __main__ - INFO -     - Skill 3: emp= 19.58  E[1/(1-p)]: 37.54  p_stay=0.973
+2025-09-13 23:23:00,249 - __main__ - INFO -     - Skill 15: emp= 16.93  E[1/(1-p)]: 35.50  p_stay=0.972
+2025-09-13 23:23:00,249 - __main__ - INFO - 🖼️  Rendering HMM visualizations for round 1
+2025-09-13 23:24:10,962 - __main__ - INFO - 💾 Saved HMM posterior → checkpoints_hmm/hmm_round1.pt
+2025-09-13 23:24:10,963 - __main__ - INFO - 🤗 Uploading HMM round 1 to HuggingFace: CatkinChen/nethack-hmm
+2025-09-13 23:24:16,573 - __main__ - INFO - ✅ HMM uploaded to: https://huggingface.co/CatkinChen/nethack-hmm
+2025-09-13 23:24:16,573 - __main__ - INFO - ========== EM Round 1/4: M-step ==========
+2025-09-13 23:24:16,573 - __main__ - INFO - 🔧 Fine-tuning VAE with HMM prior for 1 epochs...
+2025-09-13 23:24:16,573 - __main__ - INFO - 📊 M-step 1 parameter schedule:
+2025-09-13 23:24:16,573 - __main__ - INFO -   - prior_blend_alpha: 0.300 → 0.400 (cosine)
+2025-09-13 23:24:16,573 - __main__ - INFO -   - mi_beta: 0.200 → 0.333 (linear)
+2025-09-13 23:24:16,573 - __main__ - INFO -   - tc_beta: 0.000 → 0.067 (linear)
+2025-09-13 23:24:16,573 - __main__ - INFO -   - dw_beta: 0.500 → 0.667 (linear)
+2025-09-13 23:24:17,796 - __main__ - INFO - Weights & Biases initialized
+2025-09-13 23:24:17,796 - __main__ - INFO - 🔥Training MultiModalHackVAE with 100 train batches, 20 test batches
+2025-09-13 23:24:17,796 - __main__ - INFO -    Epochs: 1
+2025-09-13 23:24:17,796 - __main__ - INFO -    Batch size: 32
+2025-09-13 23:24:17,796 - __main__ - INFO -    Sequence size: 32
+2025-09-13 23:24:17,796 - __main__ - INFO -    Device: cuda
+2025-09-13 23:24:17,796 - __main__ - INFO -    Mixed Precision: BF16 = False
+2025-09-13 23:24:17,797 - __main__ - INFO -    LR Scheduler: constant
+2025-09-13 23:24:17,797 - __main__ - INFO -    Shuffle batches: True
+2025-09-13 23:24:17,797 - __main__ - INFO -    Shuffle within batch: False
+2025-09-13 23:24:17,797 - __main__ - INFO -    VAE Configuration:
+2025-09-13 23:24:17,797 - __main__ - INFO -      - Latent dimension: 96
+2025-09-13 23:24:17,797 - __main__ - INFO -      - Encoder dropout: 0.1
+2025-09-13 23:24:17,797 - __main__ - INFO -      - Decoder dropout: 0.1
+2025-09-13 23:24:17,797 - __main__ - INFO -    Adaptive Loss Weighting:
+2025-09-13 23:24:17,797 - __main__ - INFO -      - MI beta: 0.200 → 0.333
+2025-09-13 23:24:17,797 - __main__ - INFO -      - TC beta: 0.000 → 0.067
+2025-09-13 23:24:17,797 - __main__ - INFO -      - DW beta: 0.500 → 0.667
+2025-09-13 23:24:17,798 - __main__ - INFO -      - Blend alpha: 0.300 → 0.400
+2025-09-13 23:24:17,798 - __main__ - INFO -      - Warmup epochs: 0 out of 1 total epochs
+2025-09-13 23:24:17,798 - __main__ - INFO -    Free bits: 0.75
+2025-09-13 23:24:17,798 - __main__ - INFO -    Focal loss: alpha=0.5, gamma=2.0
+2025-09-13 23:24:17,798 - __main__ - INFO -    Early Stopping:
+2025-09-13 23:24:17,798 - __main__ - INFO -      - Enabled: False
+2025-09-13 23:24:17,798 - __main__ - INFO -    HMM Prior: Enabled
+2025-09-13 23:24:18,727 - __main__ - INFO - 🔧 Using FP32 precision training
+2025-09-13 23:24:18,728 - __main__ - INFO - Model has latent dimension: 96
+2025-09-13 23:24:18,728 - __main__ - INFO - 🎯 Starting training for 1 epochs (starting from epoch 0)...
+2025-09-13 23:24:18,728 - __main__ - INFO -    Total training steps: 100
+2025-09-13 23:24:18,729 - __main__ - INFO -    Warmup steps: 20
+2025-09-13 23:24:18,729 - __main__ - INFO - 🎯 Epoch 1/1 - Starting epoch...
+2025-09-13 23:24:18,730 - __main__ - DEBUG - Shuffled 100 training batches for epoch 1
+2025-09-13 23:24:18,730 - __main__ - DEBUG - Shuffled 20 testing batches for epoch 1
+2025-09-13 23:24:19,303 - __main__ - DEBUG - Step 0/100 - Adaptive weights: mi_beta=0.200, tc_beta=0.000, dw_beta=0.500, blend_alpha=0.300
+2025-09-13 23:27:28,087 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:29,570 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:31,058 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:32,549 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:33,994 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:35,538 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:37,011 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:38,518 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:39,982 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:41,422 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:42,678 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:44,240 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:45,727 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:47,249 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:48,801 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:50,362 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:51,787 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:53,236 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:54,678 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:56,098 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:56,950 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:27:56,950 - __main__ - INFO - 
+=== Epoch 1/1 Summary ===
+2025-09-13 23:27:56,950 - __main__ - INFO - Average Train Loss: 3897.096 | Average Test Loss: 2815.254
+2025-09-13 23:27:56,950 - __main__ - INFO - Current KL Betas: mi=0.333, tc=0.067, dw=0.667, blend_alpha=0.400
+2025-09-13 23:27:56,951 - __main__ - INFO - Global Step: 100/100 (100.0%)
+2025-09-13 23:27:56,951 - __main__ - INFO - Final Training Batch Details:
+2025-09-13 23:27:56,951 - __main__ - INFO -   Raw Losses: hero_loc: 3.318 | occupy: 1642.506 | bag: 451.011 | stats: 79.067 | msg: 24.415 | ego_char: 28.566 | ego_color: 120.403 | ego_class: 30.174 | passability: 0.595 | reward: 32.441 | done: 0.013 | value_k: 5.379 | safety: 0.669 | goal: 0.319 | forward: 44.474 | inverse: 2.905
+2025-09-13 23:27:56,951 - __main__ - INFO - Final Testing Batch Details:
+2025-09-13 23:27:56,951 - __main__ - INFO -   Raw Losses: hero_loc: 3.199 | occupy: 1541.389 | bag: 428.954 | stats: 80.317 | msg: 30.678 | ego_char: 28.008 | ego_color: 104.601 | ego_class: 30.829 | passability: 0.584 | reward: 16.344 | done: 0.012 | value_k: 2.259 | safety: 0.671 | goal: 0.098 | forward: 30.201 | inverse: 3.110
+2025-09-13 23:27:56,952 - __main__ - INFO - Variance of model output (mu): 0.0955, 0.1463, 0.1647, 0.1228, 0.0953, 0.1083, 0.1189, 0.1052, 0.1324, 0.0907, 0.0945, 0.1185, 0.1108, 0.1314, 0.1383, 0.0876, 0.0865, 0.0752, 0.0723, 0.0867, 0.0797, 0.0648, 0.0803, 0.0857, 0.1011, 0.0796, 0.0863, 0.0767, 0.0736, 0.0744, 0.0682, 0.0965, 0.0781, 0.0775, 0.0630, 0.0731, 0.0781, 0.0827, 0.0795, 0.0641, 0.0730, 0.0775, 0.0639, 0.0604, 0.0956, 0.0818, 0.0855, 0.0829, 0.0813, 0.0801, 0.0648, 0.0794, 0.0606, 0.0898, 0.0783, 0.0857, 0.0966, 0.0889, 0.0832, 0.0718, 0.0701, 0.0929, 0.0800, 0.0826, 0.0718, 0.0791, 0.0777, 0.0803, 0.0849, 0.0915, 0.0770, 0.0782, 0.0690, 0.1007, 0.1098, 0.0710, 0.0795, 0.0868, 0.0735, 0.0718, 0.0652, 0.0662, 0.0711, 0.0755, 0.0751, 0.0765, 0.0769, 0.0821, 0.0767, 0.0782, 0.0614, 0.0789, 0.0722, 0.0702, 0.0879, 0.0839
+2025-09-13 23:27:56,952 - __main__ - INFO - Per-dim KL: 0.8703, 3.6786, 6.8026, 3.3550, 2.9768, 4.3843, 6.3577, 1.1342, 9.3370, 2.1666, 0.7649, 5.1040, 6.2337, 7.1021, 10.1838, 0.8611, 0.5253, 0.4850, 0.4553, 0.4554, 0.4434, 0.5173, 0.4134, 0.5258, 0.5629, 0.4172, 0.5490, 0.4589, 0.2234, 0.7491, 0.5412, 0.5026, 0.5213, 0.2653, 0.4065, 0.6021, 0.5973, 0.5894, 0.5809, 0.5980, 0.5619, 0.9415, 0.5858, 0.5567, 0.4131, 0.3940, 0.2828, 0.4618, 0.4423, 0.5861, 0.5811, 0.4543, 0.7441, 0.5716, 0.4501, 0.3092, 0.4299, 0.3895, 0.3564, 0.4483, 0.5997, 0.5811, 0.4954, 0.4705, 0.5550, 0.5989, 0.3995, 0.5714, 0.4252, 0.4329, 0.6094, 0.7331, 0.7294, 0.5743, 0.6428, 0.5649, 0.2841, 0.5361, 0.5645, 0.6543, 0.4239, 0.4772, 0.3738, 0.5347, 0.6042, 0.5984, 0.5407, 0.5315, 0.3123, 0.5638, 0.5657, 0.5767, 0.5212, 0.4019, 0.4075, 0.5235
+2025-09-13 23:27:56,952 - __main__ - INFO - Eigenvalues of latent space: 0.5765, 0.4656, 0.4329, 0.4211, 0.3861, 0.3683, 0.3638, 0.3407, 0.3391, 0.3311, 0.3207, 0.3058, 0.3004, 0.2892, 0.2844, 0.2771, 0.2721, 0.2626, 0.2615, 0.2567, 0.2453, 0.2416, 0.2354, 0.2284, 0.2270, 0.2176, 0.2141, 0.2118, 0.2055, 0.2032, 0.1988, 0.1948, 0.1936, 0.1912, 0.1850, 0.1825, 0.1791, 0.1743, 0.1736, 0.1695, 0.1679, 0.1666, 0.1613, 0.1585, 0.1551, 0.1524, 0.1505, 0.1488, 0.1480, 0.1468, 0.1439, 0.1408, 0.1381, 0.1367, 0.1349, 0.1337, 0.1329, 0.1315, 0.1298, 0.1274, 0.1230, 0.1216, 0.1197, 0.1186, 0.1154, 0.1136, 0.1121, 0.1098, 0.1078, 0.1074, 0.1054, 0.1048, 0.1040, 0.1022, 0.0991, 0.0989, 0.0978, 0.0967, 0.0935, 0.0927, 0.0896, 0.0886, 0.0877, 0.0865, 0.0850, 0.0832, 0.0821, 0.0809, 0.0800, 0.0770, 0.0750, 0.0729, 0.0721, 0.0697, 0.0653, 0.0569
+2025-09-13 23:27:56,952 - __main__ - INFO - KL Eigenvalues: 0.0636, 0.1150, 0.1351, 0.1430, 0.1688, 0.1836, 0.1875, 0.2088, 0.2103, 0.2182, 0.2290, 0.2453, 0.2515, 0.2649, 0.2708, 0.2802, 0.2869, 0.2999, 0.3014, 0.3082, 0.3253, 0.3310, 0.3410, 0.3525, 0.3549, 0.3713, 0.3778, 0.3819, 0.3939, 0.3984, 0.4071, 0.4153, 0.4179, 0.4229, 0.4362, 0.4418, 0.4495, 0.4605, 0.4622, 0.4721, 0.4762, 0.4794, 0.4929, 0.5003, 0.5093, 0.5169, 0.5221, 0.5270, 0.5292, 0.5328, 0.5411, 0.5507, 0.5588, 0.5632, 0.5689, 0.5730, 0.5756, 0.5800, 0.5857, 0.5937, 0.6095, 0.6144, 0.6212, 0.6255, 0.6374, 0.6443, 0.6501, 0.6596, 0.6678, 0.6692, 0.6779, 0.6804, 0.6838, 0.6917, 0.7053, 0.7062, 0.7114, 0.7166, 0.7315, 0.7356, 0.7509, 0.7562, 0.7608, 0.7672, 0.7749, 0.7846, 0.7911, 0.7978, 0.8027, 0.8202, 0.8329, 0.8458, 0.8509, 0.8669, 0.8972, 0.9615
+2025-09-13 23:27:56,952 - __main__ - INFO - Variance explained by eigenvalues: 0.0335, 0.0605, 0.0856, 0.1100, 0.1325, 0.1538, 0.1749, 0.1947, 0.2144, 0.2336, 0.2522, 0.2700, 0.2874, 0.3042, 0.3207, 0.3368, 0.3526, 0.3678, 0.3830, 0.3979, 0.4121, 0.4262, 0.4398, 0.4531, 0.4662, 0.4789, 0.4913, 0.5036, 0.5155, 0.5273, 0.5389, 0.5502, 0.5614, 0.5725, 0.5832, 0.5938, 0.6042, 0.6143, 0.6244, 0.6342, 0.6440, 0.6537, 0.6630, 0.6722, 0.6812, 0.6901, 0.6988, 0.7074, 0.7160, 0.7245, 0.7329, 0.7411, 0.7491, 0.7570, 0.7648, 0.7726, 0.7803, 0.7880, 0.7955, 0.8029, 0.8100, 0.8171, 0.8240, 0.8309, 0.8376, 0.8442, 0.8507, 0.8571, 0.8633, 0.8696, 0.8757, 0.8818, 0.8878, 0.8937, 0.8995, 0.9052, 0.9109, 0.9165, 0.9219, 0.9273, 0.9325, 0.9376, 0.9427, 0.9478, 0.9527, 0.9575, 0.9623, 0.9670, 0.9716, 0.9761, 0.9804, 0.9847, 0.9889, 0.9929, 0.9967, 1.0000
+2025-09-13 23:27:56,952 - __main__ - INFO - ==================================================
+2025-09-13 23:27:56,953 - __main__ - INFO - 
+✅ MultiModalVAE training completed!
+2025-09-13 23:27:56,953 - __main__ - INFO -   - Completed all 1 epochs
+2025-09-13 23:27:56,953 - __main__ - INFO -   - Final train loss: 3897.0957
+2025-09-13 23:27:56,953 - __main__ - INFO -   - Final test loss: 2815.2545
+2025-09-13 23:27:56,976 - __main__ - INFO - 💾 Model saved locally: checkpoints_hmm/vae_hmm_round1_temp.pth
+2025-09-13 23:27:57,950 - __main__ - DEBUG - 🗑️  Removed temporary file: checkpoints_hmm/vae_hmm_round1_temp.pth
+2025-09-13 23:27:57,950 - __main__ - INFO - ✅ M-step completed: final_train_loss=3897.0957, final_test_loss=2815.2545
+2025-09-13 23:27:57,979 - __main__ - INFO - 💾 Saved VAE+HMM → checkpoints_hmm/vae_with_hmm_round1.pt
+2025-09-13 23:27:57,979 - __main__ - INFO - 🤗 Uploading VAE+HMM round 1 to HuggingFace: CatkinChen/nethack-vae-hmm
+2025-09-13 23:28:02,543 - huggingface_hub.hf_api - WARNING - No files have been modified since last commit. Skipping to prevent empty commit.
+2025-09-13 23:28:07,359 - __main__ - INFO - ✅ VAE+HMM uploaded to: https://huggingface.co/CatkinChen/nethack-vae-hmm
+2025-09-13 23:28:11,816 - __main__ - INFO - ========== EM Round 2/4: E-step ==========
+2025-09-13 23:28:11,816 - __main__ - INFO -    - Resetting HMM to prior
+2025-09-13 23:28:11,818 - __main__ - INFO -    - Resetting HMM streaming statistics
+2025-09-13 23:28:28,657 - __main__ - INFO -    - Re-initialized NIW mean with k-means on VAE latents
+2025-09-13 23:29:20,792 - __main__ - DEBUG - Initial ELBO: -11942344.5736
+2025-09-13 23:29:20,792 - __main__ - DEBUG - Relative tol: 0.0100
+2025-09-13 23:29:20,792 - __main__ - DEBUG - Relative elbo_drop_tol: 0.0100
+2025-09-13 23:29:20,792 - __main__ - DEBUG - - Init -118.8343
+2025-09-13 23:29:20,792 - __main__ - DEBUG - - Trans -183785.2485
+2025-09-13 23:29:20,792 - __main__ - DEBUG - - Emit -11749613.1562
+2025-09-13 23:29:20,792 - __main__ - DEBUG - - Entropy 698.1330
+2025-09-13 23:29:20,792 - __main__ - DEBUG - - Dir 0.0000
+2025-09-13 23:29:20,792 - __main__ - DEBUG - - NIW -9510.6133
+2025-09-13 23:29:20,793 - __main__ - DEBUG - - Beta prior -14.8543
+2025-09-13 23:30:03,560 - __main__ - DEBUG - Iter 0: ELBO after FB: -11942344.5736 (LL -11932819.1061, Δ=0.0000)
+2025-09-13 23:30:03,561 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:30:03,599 - __main__ - DEBUG - Iter 0: ELBO after NIW update: -2063813.9877 (Emit LL -1376462.8398, NIW term -504130.3438, Δ=9878530.5859)
+2025-09-13 23:30:03,636 - __main__ - DEBUG - Iter 0: ELBO after Dirichlet update: -1885212.7100 (Trans LL -3922.4909, Dir term -1261.4800, Δ=178601.2777)
+2025-09-13 23:30:46,326 - __main__ - DEBUG - Iter 1: ELBO after FB: -1869231.9997 (LL -1363825.3217, Δ=15980.7103)
+2025-09-13 23:30:46,326 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:30:46,364 - __main__ - DEBUG - Iter 1: ELBO after NIW update: -1824738.1130 (Emit LL -1372030.0859, NIW term -447689.6562, Δ=44493.8867)
+2025-09-13 23:30:46,401 - __main__ - DEBUG - Iter 1: ELBO after Dirichlet update: -1824278.4585 (Trans LL -4141.4322, Dir term -1143.9136, Δ=459.6545)
+2025-09-13 23:31:29,118 - __main__ - DEBUG - Iter 2: ELBO after FB: -1795050.8737 (LL -1346202.4496, Δ=29227.5848)
+2025-09-13 23:31:29,118 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:31:29,156 - __main__ - DEBUG - Iter 2: ELBO after NIW update: -1702788.6315 (Emit LL -1347639.1914, NIW term -350562.8750, Δ=92262.2422)
+2025-09-13 23:31:29,194 - __main__ - DEBUG - Iter 2: ELBO after Dirichlet update: -1702197.0964 (Trans LL -3796.7530, Dir term -858.0928, Δ=591.5351)
+2025-09-13 23:32:11,835 - __main__ - DEBUG - Iter 3: ELBO after FB: -1685984.4649 (LL -1334548.6429, Δ=16212.6315)
+2025-09-13 23:32:11,835 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:32:11,873 - __main__ - DEBUG - Iter 3: ELBO after NIW update: -1652533.9024 (Emit LL -1336179.5078, NIW term -312436.0312, Δ=33450.5625)
+2025-09-13 23:32:11,911 - __main__ - DEBUG - Iter 3: ELBO after Dirichlet update: -1652329.8876 (Trans LL -3620.5509, Dir term -719.1074, Δ=204.0149)
+2025-09-13 23:32:54,760 - __main__ - DEBUG - Iter 4: ELBO after FB: -1645025.0169 (LL -1331855.0239, Δ=7304.8707)
+2025-09-13 23:32:54,760 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:32:54,798 - __main__ - DEBUG - Iter 4: ELBO after NIW update: -1636192.9388 (Emit LL -1330208.6211, NIW term -302364.2188, Δ=8832.0781)
+2025-09-13 23:32:54,835 - __main__ - DEBUG - Iter 4: ELBO after Dirichlet update: -1636128.3142 (Trans LL -3508.4123, Dir term -675.0583, Δ=64.6246)
+2025-09-13 23:32:54,836 - __main__ - DEBUG - Early stopping: ELBO improvement 16201.5734 < tolerance
+2025-09-13 23:33:47,806 - __main__ - INFO - [E-step] Multi-batch 1/1 (x100 batches) - HMM Diagnostics:
+2025-09-13 23:33:47,807 - __main__ - INFO -   - Avg log-likelihood per step: -14.3861
+2025-09-13 23:33:47,807 - __main__ - INFO -   - Inner ELBO (final): -1636128.3142
+2025-09-13 23:33:47,807 - __main__ - INFO -   - ELBO progression (5 iters): [-1885212.75, ..., -1636128.38] (Δ=249084.3750)
+2025-09-13 23:33:47,807 - __main__ - INFO -   - Effective number of skills: 16.17
+2025-09-13 23:33:47,807 - __main__ - INFO -   - State entropy: 0.035
+2025-09-13 23:33:47,807 - __main__ - INFO -   - Transition stickiness: 0.580
+2025-09-13 23:33:47,807 - __main__ - INFO -   - Top 5 skills: [8, 20, 10, 26, 33] (probs: ['0.194', '0.082', '0.070', '0.070', '0.066'])
+2025-09-13 23:33:47,807 - __main__ - INFO -   - Combined time length: 3200 (original T=32, multiples=100)
+2025-09-13 23:33:47,809 - __main__ - INFO - 🔍 Computing HMM diagnostics...
+2025-09-13 23:34:51,088 - __main__ - INFO - 📊 HMM Diagnostics for Round 2:
+2025-09-13 23:34:51,089 - __main__ - INFO -   - Avg log-likelihood per step: -14.5042
+2025-09-13 23:34:51,089 - __main__ - INFO -   - State entropy: 0.0472
+2025-09-13 23:34:51,089 - __main__ - INFO -   - Effective number of skills: 16.13
+2025-09-13 23:34:51,089 - __main__ - INFO -   - Transition stickiness (diag): 0.5795
+2025-09-13 23:34:51,089 - __main__ - INFO -   - Top 5 skill occupancies: [0.195371612906456, 0.08226245641708374, 0.07082846760749817, 0.0707348883152008, 0.06551411002874374]
+2025-09-13 23:34:51,090 - __main__ - INFO -   - Top 5 skill indices: [8, 20, 26, 10, 33]
+2025-09-13 23:34:51,090 - __main__ - INFO -     - Skill 5: emp= 29.15  E[1/(1-p)]:527.06  p_stay=0.998
+2025-09-13 23:34:51,090 - __main__ - INFO -     - Skill 3: emp= 27.75  E[1/(1-p)]:298.60  p_stay=0.997
+2025-09-13 23:34:51,090 - __main__ - INFO -     - Skill 14: emp= 27.66  E[1/(1-p)]:264.02  p_stay=0.996
+2025-09-13 23:34:51,090 - __main__ - INFO -     - Skill 20: emp= 27.29  E[1/(1-p)]:252.49  p_stay=0.996
+2025-09-13 23:34:51,090 - __main__ - INFO -     - Skill 1: emp= 27.95  E[1/(1-p)]:244.79  p_stay=0.996
+2025-09-13 23:34:51,090 - __main__ - INFO - 🖼️  Rendering HMM visualizations for round 2
+2025-09-13 23:36:01,614 - __main__ - INFO - 💾 Saved HMM posterior → checkpoints_hmm/hmm_round2.pt
+2025-09-13 23:36:01,614 - __main__ - INFO - 🤗 Uploading HMM round 2 to HuggingFace: CatkinChen/nethack-hmm
+2025-09-13 23:36:07,029 - __main__ - INFO - ✅ HMM uploaded to: https://huggingface.co/CatkinChen/nethack-hmm
+2025-09-13 23:36:07,029 - __main__ - INFO - ========== EM Round 2/4: M-step ==========
+2025-09-13 23:36:07,029 - __main__ - INFO - 🔧 Fine-tuning VAE with HMM prior for 1 epochs...
+2025-09-13 23:36:07,029 - __main__ - INFO - 📊 M-step 2 parameter schedule:
+2025-09-13 23:36:07,029 - __main__ - INFO -   - prior_blend_alpha: 0.400 → 0.600 (cosine)
+2025-09-13 23:36:07,029 - __main__ - INFO -   - mi_beta: 0.333 → 0.467 (linear)
+2025-09-13 23:36:07,029 - __main__ - INFO -   - tc_beta: 0.067 → 0.133 (linear)
+2025-09-13 23:36:07,029 - __main__ - INFO -   - dw_beta: 0.667 → 0.833 (linear)
+2025-09-13 23:36:07,721 - __main__ - INFO - Weights & Biases initialized
+2025-09-13 23:36:07,721 - __main__ - INFO - 🔥Training MultiModalHackVAE with 100 train batches, 20 test batches
+2025-09-13 23:36:07,721 - __main__ - INFO -    Epochs: 1
+2025-09-13 23:36:07,722 - __main__ - INFO -    Batch size: 32
+2025-09-13 23:36:07,722 - __main__ - INFO -    Sequence size: 32
+2025-09-13 23:36:07,722 - __main__ - INFO -    Device: cuda
+2025-09-13 23:36:07,722 - __main__ - INFO -    Mixed Precision: BF16 = False
+2025-09-13 23:36:07,722 - __main__ - INFO -    LR Scheduler: constant
+2025-09-13 23:36:07,722 - __main__ - INFO -    Shuffle batches: True
+2025-09-13 23:36:07,722 - __main__ - INFO -    Shuffle within batch: False
+2025-09-13 23:36:07,722 - __main__ - INFO -    VAE Configuration:
+2025-09-13 23:36:07,723 - __main__ - INFO -      - Latent dimension: 96
+2025-09-13 23:36:07,723 - __main__ - INFO -      - Encoder dropout: 0.1
+2025-09-13 23:36:07,723 - __main__ - INFO -      - Decoder dropout: 0.1
+2025-09-13 23:36:07,723 - __main__ - INFO -    Adaptive Loss Weighting:
+2025-09-13 23:36:07,723 - __main__ - INFO -      - MI beta: 0.333 → 0.467
+2025-09-13 23:36:07,723 - __main__ - INFO -      - TC beta: 0.067 → 0.133
+2025-09-13 23:36:07,723 - __main__ - INFO -      - DW beta: 0.667 → 0.833
+2025-09-13 23:36:07,723 - __main__ - INFO -      - Blend alpha: 0.400 → 0.600
+2025-09-13 23:36:07,723 - __main__ - INFO -      - Warmup epochs: 0 out of 1 total epochs
+2025-09-13 23:36:07,723 - __main__ - INFO -    Free bits: 0.75
+2025-09-13 23:36:07,723 - __main__ - INFO -    Focal loss: alpha=0.5, gamma=2.0
+2025-09-13 23:36:07,724 - __main__ - INFO -    Early Stopping:
+2025-09-13 23:36:07,724 - __main__ - INFO -      - Enabled: False
+2025-09-13 23:36:07,724 - __main__ - INFO -    HMM Prior: Enabled
+2025-09-13 23:36:07,750 - __main__ - INFO - 🔧 Using FP32 precision training
+2025-09-13 23:36:07,751 - __main__ - INFO - Model has latent dimension: 96
+2025-09-13 23:36:07,751 - __main__ - INFO - 🎯 Starting training for 1 epochs (starting from epoch 0)...
+2025-09-13 23:36:07,751 - __main__ - INFO -    Total training steps: 100
+2025-09-13 23:36:07,751 - __main__ - INFO -    Warmup steps: 20
+2025-09-13 23:36:07,751 - __main__ - INFO - 🎯 Epoch 1/1 - Starting epoch...
+2025-09-13 23:36:07,752 - __main__ - DEBUG - Shuffled 100 training batches for epoch 1
+2025-09-13 23:36:07,752 - __main__ - DEBUG - Shuffled 20 testing batches for epoch 1
+2025-09-13 23:36:08,430 - __main__ - DEBUG - Step 0/100 - Adaptive weights: mi_beta=0.333, tc_beta=0.067, dw_beta=0.667, blend_alpha=0.400
+2025-09-13 23:39:16,803 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:18,287 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:19,779 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:21,295 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:22,741 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:24,284 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:25,758 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:27,259 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:28,729 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:30,167 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:31,422 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:32,986 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:34,463 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:35,982 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:37,527 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:39,082 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:40,500 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:41,940 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:43,386 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:44,802 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:45,659 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:39:45,659 - __main__ - INFO - 
+=== Epoch 1/1 Summary ===
+2025-09-13 23:39:45,660 - __main__ - INFO - Average Train Loss: 3811.563 | Average Test Loss: 2642.533
+2025-09-13 23:39:45,660 - __main__ - INFO - Current KL Betas: mi=0.467, tc=0.133, dw=0.833, blend_alpha=0.600
+2025-09-13 23:39:45,660 - __main__ - INFO - Global Step: 100/100 (100.0%)
+2025-09-13 23:39:45,660 - __main__ - INFO - Final Training Batch Details:
+2025-09-13 23:39:45,660 - __main__ - INFO -   Raw Losses: hero_loc: 3.657 | occupy: 1647.281 | bag: 392.340 | stats: 74.864 | msg: 24.292 | ego_char: 26.736 | ego_color: 130.958 | ego_class: 29.286 | passability: 0.593 | reward: 32.727 | done: 0.016 | value_k: 5.388 | safety: 0.666 | goal: 0.316 | forward: 43.245 | inverse: 2.922
+2025-09-13 23:39:45,660 - __main__ - INFO - Final Testing Batch Details:
+2025-09-13 23:39:45,661 - __main__ - INFO -   Raw Losses: hero_loc: 3.465 | occupy: 1601.958 | bag: 367.521 | stats: 76.268 | msg: 30.492 | ego_char: 26.720 | ego_color: 115.377 | ego_class: 30.056 | passability: 0.581 | reward: 16.162 | done: 0.015 | value_k: 2.258 | safety: 0.665 | goal: 0.086 | forward: 30.969 | inverse: 3.145
+2025-09-13 23:39:45,661 - __main__ - INFO - Variance of model output (mu): 0.1014, 0.1133, 0.1119, 0.0916, 0.1111, 0.1080, 0.0724, 0.0910, 0.0715, 0.1223, 0.1105, 0.1164, 0.1822, 0.1189, 0.0940, 0.1009, 0.0775, 0.0680, 0.0847, 0.0712, 0.0684, 0.0737, 0.0772, 0.0752, 0.0879, 0.0610, 0.0784, 0.0668, 0.0799, 0.0901, 0.0820, 0.0773, 0.0902, 0.0716, 0.0880, 0.0774, 0.0691, 0.0822, 0.0718, 0.0794, 0.0797, 0.0865, 0.0591, 0.0555, 0.0803, 0.0763, 0.0753, 0.0561, 0.0884, 0.0823, 0.0672, 0.0721, 0.0718, 0.0757, 0.0857, 0.0855, 0.0676, 0.0721, 0.0815, 0.0733, 0.0698, 0.0777, 0.0754, 0.0812, 0.0746, 0.0824, 0.0795, 0.0855, 0.0696, 0.0772, 0.1005, 0.0719, 0.0772, 0.0758, 0.0730, 0.0861, 0.0635, 0.0860, 0.0738, 0.0768, 0.0806, 0.0781, 0.0703, 0.0551, 0.0783, 0.0632, 0.0805, 0.0717, 0.0717, 0.0647, 0.0734, 0.0758, 0.0694, 0.0645, 0.0655, 0.0642
+2025-09-13 23:39:45,661 - __main__ - INFO - Per-dim KL: 0.4596, 6.7389, 5.1243, 1.3962, 1.7467, 4.7247, 0.9246, 0.8411, 2.6471, 2.4004, 0.8221, 9.5370, 7.0517, 3.7997, 1.3568, 4.0897, 0.5455, 0.5601, 0.5509, 0.6477, 0.7544, 0.6379, 0.3514, 0.4968, 0.4251, 0.3203, 0.5720, 0.5816, 0.4332, 0.3648, 0.7535, 0.4045, 0.5296, 0.6075, 0.5497, 0.5393, 0.4897, 0.6761, 0.5598, 0.4920, 0.5704, 0.5624, 0.7385, 0.6500, 0.5457, 0.7528, 0.4853, 0.7507, 0.3723, 0.4381, 0.4344, 0.7436, 0.6131, 0.6100, 0.6081, 0.4975, 0.4377, 0.4230, 0.5649, 0.6394, 0.7409, 0.3564, 0.4607, 0.7500, 0.6221, 0.5344, 0.5949, 0.4549, 0.5874, 0.4977, 0.2530, 0.6449, 0.7747, 0.4053, 0.7434, 0.4219, 0.4878, 0.3969, 0.5966, 0.2238, 0.4067, 0.5026, 0.6075, 0.5710, 0.7384, 0.6398, 0.3811, 0.3033, 0.5339, 0.6595, 0.6125, 0.4149, 0.7306, 0.5958, 0.7708, 0.6474
+2025-09-13 23:39:45,661 - __main__ - INFO - Eigenvalues of latent space: 0.4744, 0.4469, 0.4427, 0.4061, 0.3969, 0.3927, 0.3725, 0.3630, 0.3461, 0.3420, 0.3256, 0.3211, 0.3093, 0.3013, 0.2926, 0.2884, 0.2776, 0.2722, 0.2672, 0.2644, 0.2545, 0.2488, 0.2452, 0.2414, 0.2342, 0.2327, 0.2298, 0.2261, 0.2188, 0.2163, 0.2129, 0.2078, 0.2037, 0.2005, 0.1972, 0.1949, 0.1942, 0.1913, 0.1860, 0.1831, 0.1828, 0.1765, 0.1752, 0.1729, 0.1717, 0.1690, 0.1630, 0.1621, 0.1607, 0.1582, 0.1553, 0.1496, 0.1480, 0.1472, 0.1462, 0.1436, 0.1410, 0.1374, 0.1360, 0.1348, 0.1328, 0.1300, 0.1266, 0.1254, 0.1242, 0.1207, 0.1203, 0.1182, 0.1166, 0.1138, 0.1116, 0.1105, 0.1097, 0.1081, 0.1058, 0.1030, 0.1026, 0.1020, 0.0989, 0.0979, 0.0962, 0.0954, 0.0930, 0.0907, 0.0900, 0.0897, 0.0863, 0.0856, 0.0843, 0.0828, 0.0815, 0.0800, 0.0769, 0.0758, 0.0716, 0.0699
+2025-09-13 23:39:45,661 - __main__ - INFO - KL Eigenvalues: 0.1100, 0.1262, 0.1288, 0.1536, 0.1605, 0.1637, 0.1800, 0.1882, 0.2036, 0.2075, 0.2239, 0.2285, 0.2413, 0.2504, 0.2608, 0.2659, 0.2796, 0.2867, 0.2934, 0.2973, 0.3115, 0.3199, 0.3255, 0.3313, 0.3429, 0.3454, 0.3502, 0.3565, 0.3692, 0.3737, 0.3799, 0.3894, 0.3974, 0.4037, 0.4104, 0.4150, 0.4166, 0.4225, 0.4340, 0.4405, 0.4411, 0.4555, 0.4585, 0.4639, 0.4669, 0.4734, 0.4884, 0.4908, 0.4943, 0.5010, 0.5087, 0.5248, 0.5293, 0.5317, 0.5343, 0.5423, 0.5501, 0.5612, 0.5656, 0.5695, 0.5757, 0.5851, 0.5968, 0.6010, 0.6049, 0.6177, 0.6191, 0.6268, 0.6328, 0.6435, 0.6522, 0.6568, 0.6600, 0.6666, 0.6760, 0.6882, 0.6900, 0.6924, 0.7065, 0.7108, 0.7186, 0.7223, 0.7343, 0.7452, 0.7489, 0.7506, 0.7680, 0.7720, 0.7791, 0.7869, 0.7941, 0.8027, 0.8208, 0.8276, 0.8540, 0.8655
+2025-09-13 23:39:45,662 - __main__ - INFO - Variance explained by eigenvalues: 0.0264, 0.0512, 0.0759, 0.0984, 0.1205, 0.1423, 0.1631, 0.1832, 0.2025, 0.2215, 0.2396, 0.2575, 0.2747, 0.2914, 0.3077, 0.3237, 0.3392, 0.3543, 0.3692, 0.3839, 0.3980, 0.4119, 0.4255, 0.4389, 0.4520, 0.4649, 0.4777, 0.4903, 0.5024, 0.5144, 0.5263, 0.5378, 0.5492, 0.5603, 0.5713, 0.5821, 0.5929, 0.6036, 0.6139, 0.6241, 0.6343, 0.6441, 0.6538, 0.6634, 0.6730, 0.6824, 0.6914, 0.7005, 0.7094, 0.7182, 0.7268, 0.7352, 0.7434, 0.7516, 0.7597, 0.7677, 0.7755, 0.7832, 0.7907, 0.7982, 0.8056, 0.8128, 0.8199, 0.8269, 0.8338, 0.8405, 0.8472, 0.8537, 0.8602, 0.8665, 0.8728, 0.8789, 0.8850, 0.8910, 0.8969, 0.9026, 0.9083, 0.9140, 0.9195, 0.9249, 0.9303, 0.9356, 0.9408, 0.9458, 0.9508, 0.9558, 0.9606, 0.9654, 0.9700, 0.9747, 0.9792, 0.9836, 0.9879, 0.9921, 0.9961, 1.0000
+2025-09-13 23:39:45,662 - __main__ - INFO - ==================================================
+2025-09-13 23:39:45,662 - __main__ - INFO - 
+✅ MultiModalVAE training completed!
+2025-09-13 23:39:45,662 - __main__ - INFO -   - Completed all 1 epochs
+2025-09-13 23:39:45,662 - __main__ - INFO -   - Final train loss: 3811.5632
+2025-09-13 23:39:45,662 - __main__ - INFO -   - Final test loss: 2642.5331
+2025-09-13 23:39:45,685 - __main__ - INFO - 💾 Model saved locally: checkpoints_hmm/vae_hmm_round2_temp.pth
+2025-09-13 23:39:46,649 - __main__ - DEBUG - 🗑️  Removed temporary file: checkpoints_hmm/vae_hmm_round2_temp.pth
+2025-09-13 23:39:46,649 - __main__ - INFO - ✅ M-step completed: final_train_loss=3811.5632, final_test_loss=2642.5331
+2025-09-13 23:39:46,677 - __main__ - INFO - 💾 Saved VAE+HMM → checkpoints_hmm/vae_with_hmm_round2.pt
+2025-09-13 23:39:46,677 - __main__ - INFO - 🤗 Uploading VAE+HMM round 2 to HuggingFace: CatkinChen/nethack-vae-hmm
+2025-09-13 23:39:51,529 - huggingface_hub.hf_api - WARNING - No files have been modified since last commit. Skipping to prevent empty commit.
+2025-09-13 23:39:56,320 - __main__ - INFO - ✅ VAE+HMM uploaded to: https://huggingface.co/CatkinChen/nethack-vae-hmm
+2025-09-13 23:39:59,980 - __main__ - INFO - ========== EM Round 3/4: E-step ==========
+2025-09-13 23:39:59,980 - __main__ - INFO -    - Resetting HMM to prior
+2025-09-13 23:39:59,982 - __main__ - INFO -    - Resetting HMM streaming statistics
+2025-09-13 23:40:15,109 - __main__ - INFO -    - Re-initialized NIW mean with k-means on VAE latents
+2025-09-13 23:41:08,327 - __main__ - DEBUG - Initial ELBO: -12094746.4032
+2025-09-13 23:41:08,328 - __main__ - DEBUG - Relative tol: 0.0100
+2025-09-13 23:41:08,328 - __main__ - DEBUG - Relative elbo_drop_tol: 0.0100
+2025-09-13 23:41:08,328 - __main__ - DEBUG - - Init -118.8343
+2025-09-13 23:41:08,328 - __main__ - DEBUG - - Trans -181262.0977
+2025-09-13 23:41:08,328 - __main__ - DEBUG - - Emit -11904257.0625
+2025-09-13 23:41:08,328 - __main__ - DEBUG - - Entropy 240.6721
+2025-09-13 23:41:08,328 - __main__ - DEBUG - - Dir 0.0000
+2025-09-13 23:41:08,328 - __main__ - DEBUG - - NIW -9334.2266
+2025-09-13 23:41:08,328 - __main__ - DEBUG - - Beta prior -14.8543
+2025-09-13 23:41:51,211 - __main__ - DEBUG - Iter 0: ELBO after FB: -12094746.4032 (LL -12085397.3224, Δ=0.0000)
+2025-09-13 23:41:51,212 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:41:51,250 - __main__ - DEBUG - Iter 0: ELBO after NIW update: -2492638.3212 (Emit LL -1836551.9883, NIW term -474931.2188, Δ=9602108.0820)
+2025-09-13 23:41:51,287 - __main__ - DEBUG - Iter 0: ELBO after Dirichlet update: -2313987.8818 (Trans LL -1440.6234, Dir term -1171.0349, Δ=178650.4394)
+2025-09-13 23:42:34,212 - __main__ - DEBUG - Iter 1: ELBO after FB: -2301734.5878 (LL -1825617.4798, Δ=12253.2940)
+2025-09-13 23:42:34,212 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:42:34,250 - __main__ - DEBUG - Iter 1: ELBO after NIW update: -2240746.4003 (Emit LL -1827901.4375, NIW term -410042.3750, Δ=60988.1875)
+2025-09-13 23:42:34,288 - __main__ - DEBUG - Iter 1: ELBO after Dirichlet update: -2240269.8583 (Trans LL -1373.7402, Dir term -1024.6057, Δ=476.5419)
+2025-09-13 23:43:16,960 - __main__ - DEBUG - Iter 2: ELBO after FB: -2218292.6849 (LL -1807210.8499, Δ=21977.1735)
+2025-09-13 23:43:16,960 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:43:16,998 - __main__ - DEBUG - Iter 2: ELBO after NIW update: -2140505.1028 (Emit LL -1803452.3164, NIW term -334475.7812, Δ=77787.5820)
+2025-09-13 23:43:17,036 - __main__ - DEBUG - Iter 2: ELBO after Dirichlet update: -2140037.5615 (Trans LL -1416.3026, Dir term -805.0432, Δ=467.5413)
+2025-09-13 23:43:59,468 - __main__ - DEBUG - Iter 3: ELBO after FB: -2131926.9311 (LL -1796631.2523, Δ=8110.6304)
+2025-09-13 23:43:59,468 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:43:59,506 - __main__ - DEBUG - Iter 3: ELBO after NIW update: -2110156.2397 (Emit LL -1798867.6484, NIW term -309091.3750, Δ=21770.6914)
+2025-09-13 23:43:59,543 - __main__ - DEBUG - Iter 3: ELBO after Dirichlet update: -2110034.0159 (Trans LL -1427.9111, Dir term -740.8097, Δ=122.2238)
+2025-09-13 23:44:41,933 - __main__ - DEBUG - Iter 4: ELBO after FB: -2103958.9124 (LL -1794111.8734, Δ=6075.1035)
+2025-09-13 23:44:41,933 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:44:41,971 - __main__ - DEBUG - Iter 4: ELBO after NIW update: -2098690.0061 (Emit LL -1794483.1250, NIW term -302080.7500, Δ=5268.9062)
+2025-09-13 23:44:42,008 - __main__ - DEBUG - Iter 4: ELBO after Dirichlet update: -2098624.5094 (Trans LL -1464.6416, Dir term -706.0791, Δ=65.4968)
+2025-09-13 23:44:42,009 - __main__ - DEBUG - Early stopping: ELBO improvement 11409.5065 < tolerance
+2025-09-13 23:45:34,492 - __main__ - INFO - [E-step] Multi-batch 1/1 (x100 batches) - HMM Diagnostics:
+2025-09-13 23:45:34,492 - __main__ - INFO -   - Avg log-likelihood per step: -19.3770
+2025-09-13 23:45:34,493 - __main__ - INFO -   - Inner ELBO (final): -2098624.5094
+2025-09-13 23:45:34,493 - __main__ - INFO -   - ELBO progression (5 iters): [-2313988.00, ..., -2098624.50] (Δ=215363.5000)
+2025-09-13 23:45:34,493 - __main__ - INFO -   - Effective number of skills: 16.93
+2025-09-13 23:45:34,493 - __main__ - INFO -   - State entropy: 0.022
+2025-09-13 23:45:34,493 - __main__ - INFO -   - Transition stickiness: 0.621
+2025-09-13 23:45:34,493 - __main__ - INFO -   - Top 5 skills: [24, 2, 21, 7, 4] (probs: ['0.148', '0.095', '0.091', '0.089', '0.086'])
+2025-09-13 23:45:34,493 - __main__ - INFO -   - Combined time length: 3200 (original T=32, multiples=100)
+2025-09-13 23:45:34,495 - __main__ - INFO - 🔍 Computing HMM diagnostics...
+2025-09-13 23:46:37,929 - __main__ - INFO - 📊 HMM Diagnostics for Round 3:
+2025-09-13 23:46:37,929 - __main__ - INFO -   - Avg log-likelihood per step: -19.4963
+2025-09-13 23:46:37,929 - __main__ - INFO -   - State entropy: 0.0364
+2025-09-13 23:46:37,929 - __main__ - INFO -   - Effective number of skills: 16.72
+2025-09-13 23:46:37,930 - __main__ - INFO -   - Transition stickiness (diag): 0.6213
+2025-09-13 23:46:37,930 - __main__ - INFO -   - Top 5 skill occupancies: [0.14978720247745514, 0.09602642059326172, 0.09152121841907501, 0.09062017500400543, 0.08595234155654907]
+2025-09-13 23:46:37,930 - __main__ - INFO -   - Top 5 skill indices: [24, 2, 7, 21, 4]
+2025-09-13 23:46:37,930 - __main__ - INFO -     - Skill 23: emp= 29.56  E[1/(1-p)]:1097.12  p_stay=0.999
+2025-09-13 23:46:37,930 - __main__ - INFO -     - Skill 2: emp= 30.01  E[1/(1-p)]:942.75  p_stay=0.999
+2025-09-13 23:46:37,930 - __main__ - INFO -     - Skill 4: emp= 28.65  E[1/(1-p)]:752.98  p_stay=0.999
+2025-09-13 23:46:37,930 - __main__ - INFO -     - Skill 24: emp= 27.68  E[1/(1-p)]:570.38  p_stay=0.998
+2025-09-13 23:46:37,930 - __main__ - INFO -     - Skill 15: emp= 29.07  E[1/(1-p)]:552.46  p_stay=0.998
+2025-09-13 23:46:37,930 - __main__ - INFO - 🖼️  Rendering HMM visualizations for round 3
+2025-09-13 23:47:48,457 - __main__ - INFO - 💾 Saved HMM posterior → checkpoints_hmm/hmm_round3.pt
+2025-09-13 23:47:48,457 - __main__ - INFO - 🤗 Uploading HMM round 3 to HuggingFace: CatkinChen/nethack-hmm
+2025-09-13 23:47:53,873 - __main__ - INFO - ✅ HMM uploaded to: https://huggingface.co/CatkinChen/nethack-hmm
+2025-09-13 23:47:53,873 - __main__ - INFO - ========== EM Round 3/4: M-step ==========
+2025-09-13 23:47:53,873 - __main__ - INFO - 🔧 Fine-tuning VAE with HMM prior for 1 epochs...
+2025-09-13 23:47:53,874 - __main__ - INFO - 📊 M-step 3 parameter schedule:
+2025-09-13 23:47:53,874 - __main__ - INFO -   - prior_blend_alpha: 0.600 → 1.000 (cosine)
+2025-09-13 23:47:53,874 - __main__ - INFO -   - mi_beta: 0.467 → 0.600 (linear)
+2025-09-13 23:47:53,874 - __main__ - INFO -   - tc_beta: 0.133 → 0.200 (linear)
+2025-09-13 23:47:53,874 - __main__ - INFO -   - dw_beta: 0.833 → 1.000 (linear)
+2025-09-13 23:47:54,514 - __main__ - INFO - Weights & Biases initialized
+2025-09-13 23:47:54,514 - __main__ - INFO - 🔥Training MultiModalHackVAE with 100 train batches, 20 test batches
+2025-09-13 23:47:54,515 - __main__ - INFO -    Epochs: 1
+2025-09-13 23:47:54,515 - __main__ - INFO -    Batch size: 32
+2025-09-13 23:47:54,515 - __main__ - INFO -    Sequence size: 32
+2025-09-13 23:47:54,515 - __main__ - INFO -    Device: cuda
+2025-09-13 23:47:54,515 - __main__ - INFO -    Mixed Precision: BF16 = False
+2025-09-13 23:47:54,515 - __main__ - INFO -    LR Scheduler: constant
+2025-09-13 23:47:54,515 - __main__ - INFO -    Shuffle batches: True
+2025-09-13 23:47:54,515 - __main__ - INFO -    Shuffle within batch: False
+2025-09-13 23:47:54,515 - __main__ - INFO -    VAE Configuration:
+2025-09-13 23:47:54,516 - __main__ - INFO -      - Latent dimension: 96
+2025-09-13 23:47:54,516 - __main__ - INFO -      - Encoder dropout: 0.1
+2025-09-13 23:47:54,516 - __main__ - INFO -      - Decoder dropout: 0.1
+2025-09-13 23:47:54,516 - __main__ - INFO -    Adaptive Loss Weighting:
+2025-09-13 23:47:54,516 - __main__ - INFO -      - MI beta: 0.467 → 0.600
+2025-09-13 23:47:54,516 - __main__ - INFO -      - TC beta: 0.133 → 0.200
+2025-09-13 23:47:54,516 - __main__ - INFO -      - DW beta: 0.833 → 1.000
+2025-09-13 23:47:54,516 - __main__ - INFO -      - Blend alpha: 0.600 → 1.000
+2025-09-13 23:47:54,516 - __main__ - INFO -      - Warmup epochs: 0 out of 1 total epochs
+2025-09-13 23:47:54,516 - __main__ - INFO -    Free bits: 0.75
+2025-09-13 23:47:54,516 - __main__ - INFO -    Focal loss: alpha=0.5, gamma=2.0
+2025-09-13 23:47:54,517 - __main__ - INFO -    Early Stopping:
+2025-09-13 23:47:54,517 - __main__ - INFO -      - Enabled: False
+2025-09-13 23:47:54,517 - __main__ - INFO -    HMM Prior: Enabled
+2025-09-13 23:47:54,544 - __main__ - INFO - 🔧 Using FP32 precision training
+2025-09-13 23:47:54,545 - __main__ - INFO - Model has latent dimension: 96
+2025-09-13 23:47:54,545 - __main__ - INFO - 🎯 Starting training for 1 epochs (starting from epoch 0)...
+2025-09-13 23:47:54,545 - __main__ - INFO -    Total training steps: 100
+2025-09-13 23:47:54,545 - __main__ - INFO -    Warmup steps: 20
+2025-09-13 23:47:54,545 - __main__ - INFO - 🎯 Epoch 1/1 - Starting epoch...
+2025-09-13 23:47:54,546 - __main__ - DEBUG - Shuffled 100 training batches for epoch 1
+2025-09-13 23:47:54,546 - __main__ - DEBUG - Shuffled 20 testing batches for epoch 1
+2025-09-13 23:47:55,106 - __main__ - DEBUG - Step 0/100 - Adaptive weights: mi_beta=0.467, tc_beta=0.133, dw_beta=0.833, blend_alpha=0.600
+2025-09-13 23:51:04,428 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:05,923 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:07,423 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:08,912 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:10,366 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:11,918 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:13,402 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:14,919 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:16,393 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:17,841 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:19,110 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:20,681 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:22,170 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:23,714 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:25,264 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:26,824 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:28,252 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:29,700 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:31,150 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:32,590 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:33,444 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-13 23:51:33,444 - __main__ - INFO - 
+=== Epoch 1/1 Summary ===
+2025-09-13 23:51:33,444 - __main__ - INFO - Average Train Loss: 3840.725 | Average Test Loss: 2775.164
+2025-09-13 23:51:33,445 - __main__ - INFO - Current KL Betas: mi=0.600, tc=0.200, dw=1.000, blend_alpha=1.000
+2025-09-13 23:51:33,445 - __main__ - INFO - Global Step: 100/100 (100.0%)
+2025-09-13 23:51:33,445 - __main__ - INFO - Final Training Batch Details:
+2025-09-13 23:51:33,445 - __main__ - INFO -   Raw Losses: hero_loc: 3.106 | occupy: 1642.936 | bag: 449.683 | stats: 79.432 | msg: 24.593 | ego_char: 27.540 | ego_color: 105.368 | ego_class: 29.149 | passability: 0.598 | reward: 32.662 | done: 0.011 | value_k: 5.379 | safety: 0.668 | goal: 0.309 | forward: 43.710 | inverse: 2.938
+2025-09-13 23:51:33,445 - __main__ - INFO - Final Testing Batch Details:
+2025-09-13 23:51:33,445 - __main__ - INFO -   Raw Losses: hero_loc: 3.062 | occupy: 1545.681 | bag: 422.946 | stats: 81.540 | msg: 31.081 | ego_char: 27.379 | ego_color: 90.997 | ego_class: 29.813 | passability: 0.588 | reward: 16.317 | done: 0.010 | value_k: 2.250 | safety: 0.667 | goal: 0.074 | forward: 29.563 | inverse: 3.121
+2025-09-13 23:51:33,446 - __main__ - INFO - Variance of model output (mu): 0.1105, 0.0757, 0.0803, 0.0965, 0.0862, 0.0651, 0.0974, 0.0650, 0.1253, 0.1393, 0.0760, 0.0842, 0.0927, 0.0823, 0.0829, 0.0798, 0.0681, 0.0649, 0.0593, 0.0658, 0.0725, 0.0896, 0.0683, 0.0683, 0.0616, 0.0739, 0.0547, 0.0639, 0.0698, 0.0792, 0.0794, 0.0693, 0.0726, 0.0701, 0.0604, 0.0643, 0.0656, 0.0583, 0.0694, 0.0736, 0.0676, 0.0761, 0.0633, 0.0536, 0.0855, 0.0651, 0.0634, 0.0679, 0.0736, 0.0822, 0.0793, 0.0586, 0.0685, 0.0682, 0.0636, 0.0758, 0.0686, 0.0717, 0.0513, 0.0704, 0.0770, 0.0715, 0.0823, 0.0596, 0.0812, 0.0882, 0.0725, 0.0734, 0.0842, 0.0698, 0.0645, 0.0727, 0.0629, 0.0796, 0.0731, 0.0670, 0.0630, 0.0616, 0.0668, 0.0715, 0.0679, 0.0608, 0.0743, 0.0689, 0.0637, 0.0702, 0.0807, 0.0692, 0.0694, 0.0720, 0.0692, 0.0675, 0.0729, 0.0665, 0.0680, 0.0741
+2025-09-13 23:51:33,446 - __main__ - INFO - Per-dim KL: 10.5147, 1.0154, 0.4199, 1.0633, 2.8609, 0.7784, 3.6551, 0.7604, 2.7499, 8.6678, 3.0717, 0.5860, 1.0284, 2.3858, 0.7804, 1.6678, 0.5033, 0.6681, 0.6231, 0.6404, 0.4482, 0.4305, 0.6703, 0.4458, 0.5218, 0.5708, 0.5207, 0.6874, 0.5617, 0.4849, 0.3988, 0.3331, 0.4948, 0.5446, 0.7608, 0.5382, 0.5214, 0.6547, 0.5674, 0.5119, 0.6348, 0.6009, 0.5620, 0.5627, 0.5021, 0.6024, 0.5609, 0.5764, 0.4632, 0.4461, 0.5418, 0.4048, 0.5909, 0.3180, 0.2224, 0.5453, 0.3966, 0.5505, 0.3010, 0.5035, 0.6500, 0.5827, 0.4897, 0.4772, 0.5783, 0.4159, 0.6364, 0.5080, 0.6475, 0.5785, 0.4813, 0.5103, 0.5827, 0.4945, 0.6493, 0.4060, 0.5447, 0.5553, 0.5410, 0.5026, 0.6277, 0.5377, 0.5926, 0.3478, 0.5164, 0.3988, 0.5209, 0.5085, 0.5344, 0.5302, 0.5360, 0.6021, 0.4849, 0.6710, 0.6291, 0.5831
+2025-09-13 23:51:33,446 - __main__ - INFO - Eigenvalues of latent space: 0.4554, 0.4293, 0.3825, 0.3527, 0.3400, 0.3254, 0.3160, 0.3076, 0.2962, 0.2929, 0.2823, 0.2677, 0.2658, 0.2615, 0.2550, 0.2518, 0.2418, 0.2380, 0.2274, 0.2241, 0.2194, 0.2167, 0.2134, 0.2128, 0.2092, 0.2010, 0.1995, 0.1940, 0.1881, 0.1859, 0.1825, 0.1810, 0.1746, 0.1734, 0.1685, 0.1644, 0.1615, 0.1571, 0.1539, 0.1537, 0.1513, 0.1486, 0.1449, 0.1437, 0.1414, 0.1390, 0.1378, 0.1352, 0.1318, 0.1297, 0.1280, 0.1258, 0.1247, 0.1236, 0.1225, 0.1199, 0.1189, 0.1172, 0.1154, 0.1141, 0.1128, 0.1119, 0.1095, 0.1075, 0.1062, 0.1044, 0.1034, 0.1025, 0.1006, 0.0994, 0.0984, 0.0947, 0.0946, 0.0936, 0.0924, 0.0905, 0.0900, 0.0891, 0.0880, 0.0860, 0.0847, 0.0833, 0.0827, 0.0813, 0.0794, 0.0772, 0.0760, 0.0750, 0.0743, 0.0715, 0.0703, 0.0697, 0.0648, 0.0640, 0.0630, 0.0586
+2025-09-13 23:51:33,446 - __main__ - INFO - KL Eigenvalues: 0.1210, 0.1374, 0.1718, 0.1974, 0.2095, 0.2241, 0.2340, 0.2432, 0.2564, 0.2604, 0.2736, 0.2927, 0.2954, 0.3014, 0.3107, 0.3154, 0.3307, 0.3368, 0.3543, 0.3599, 0.3681, 0.3730, 0.3790, 0.3802, 0.3868, 0.4028, 0.4057, 0.4170, 0.4294, 0.4343, 0.4419, 0.4452, 0.4600, 0.4629, 0.4746, 0.4850, 0.4923, 0.5039, 0.5126, 0.5133, 0.5198, 0.5275, 0.5384, 0.5418, 0.5486, 0.5560, 0.5599, 0.5680, 0.5792, 0.5860, 0.5918, 0.5993, 0.6033, 0.6073, 0.6111, 0.6206, 0.6240, 0.6305, 0.6376, 0.6425, 0.6474, 0.6511, 0.6608, 0.6690, 0.6742, 0.6822, 0.6862, 0.6904, 0.6985, 0.7041, 0.7085, 0.7258, 0.7264, 0.7312, 0.7369, 0.7467, 0.7492, 0.7534, 0.7592, 0.7698, 0.7764, 0.7843, 0.7877, 0.7955, 0.8061, 0.8193, 0.8263, 0.8327, 0.8371, 0.8548, 0.8628, 0.8664, 0.9007, 0.9063, 0.9138, 0.9477
+2025-09-13 23:51:33,447 - __main__ - INFO - Variance explained by eigenvalues: 0.0294, 0.0571, 0.0818, 0.1046, 0.1265, 0.1475, 0.1679, 0.1878, 0.2069, 0.2258, 0.2441, 0.2614, 0.2785, 0.2954, 0.3119, 0.3281, 0.3437, 0.3591, 0.3738, 0.3883, 0.4024, 0.4164, 0.4302, 0.4439, 0.4574, 0.4704, 0.4833, 0.4958, 0.5080, 0.5200, 0.5317, 0.5434, 0.5547, 0.5659, 0.5768, 0.5874, 0.5978, 0.6079, 0.6179, 0.6278, 0.6376, 0.6472, 0.6565, 0.6658, 0.6749, 0.6839, 0.6928, 0.7015, 0.7100, 0.7184, 0.7267, 0.7348, 0.7429, 0.7508, 0.7587, 0.7665, 0.7742, 0.7817, 0.7892, 0.7965, 0.8038, 0.8111, 0.8181, 0.8251, 0.8319, 0.8387, 0.8453, 0.8519, 0.8584, 0.8649, 0.8712, 0.8773, 0.8834, 0.8895, 0.8954, 0.9013, 0.9071, 0.9128, 0.9185, 0.9241, 0.9296, 0.9349, 0.9403, 0.9455, 0.9506, 0.9556, 0.9605, 0.9654, 0.9702, 0.9748, 0.9793, 0.9838, 0.9880, 0.9921, 0.9962, 1.0000
+2025-09-13 23:51:33,447 - __main__ - INFO - ==================================================
+2025-09-13 23:51:33,447 - __main__ - INFO - 
+✅ MultiModalVAE training completed!
+2025-09-13 23:51:33,447 - __main__ - INFO -   - Completed all 1 epochs
+2025-09-13 23:51:33,447 - __main__ - INFO -   - Final train loss: 3840.7254
+2025-09-13 23:51:33,447 - __main__ - INFO -   - Final test loss: 2775.1636
+2025-09-13 23:51:33,473 - __main__ - INFO - 💾 Model saved locally: checkpoints_hmm/vae_hmm_round3_temp.pth
+2025-09-13 23:51:34,439 - __main__ - DEBUG - 🗑️  Removed temporary file: checkpoints_hmm/vae_hmm_round3_temp.pth
+2025-09-13 23:51:34,440 - __main__ - INFO - ✅ M-step completed: final_train_loss=3840.7254, final_test_loss=2775.1636
+2025-09-13 23:51:34,470 - __main__ - INFO - 💾 Saved VAE+HMM → checkpoints_hmm/vae_with_hmm_round3.pt
+2025-09-13 23:51:34,470 - __main__ - INFO - 🤗 Uploading VAE+HMM round 3 to HuggingFace: CatkinChen/nethack-vae-hmm
+2025-09-13 23:51:39,218 - huggingface_hub.hf_api - WARNING - No files have been modified since last commit. Skipping to prevent empty commit.
+2025-09-13 23:51:43,870 - __main__ - INFO - ✅ VAE+HMM uploaded to: https://huggingface.co/CatkinChen/nethack-vae-hmm
+2025-09-13 23:51:47,582 - __main__ - INFO - ========== EM Round 4/4: E-step ==========
+2025-09-13 23:51:47,582 - __main__ - INFO -    - Resetting HMM to prior
+2025-09-13 23:51:47,584 - __main__ - INFO -    - Resetting HMM streaming statistics
+2025-09-13 23:52:03,153 - __main__ - INFO -    - Re-initialized NIW mean with k-means on VAE latents
+2025-09-13 23:52:55,514 - __main__ - DEBUG - Initial ELBO: -11809637.6834
+2025-09-13 23:52:55,515 - __main__ - DEBUG - Relative tol: 0.0100
+2025-09-13 23:52:55,515 - __main__ - DEBUG - Relative elbo_drop_tol: 0.0100
+2025-09-13 23:52:55,515 - __main__ - DEBUG - - Init -118.8343
+2025-09-13 23:52:55,515 - __main__ - DEBUG - - Trans -182073.1294
+2025-09-13 23:52:55,515 - __main__ - DEBUG - - Emit -11622315.4375
+2025-09-13 23:52:55,515 - __main__ - DEBUG - - Entropy 443.2732
+2025-09-13 23:52:55,515 - __main__ - DEBUG - - Dir 0.0000
+2025-09-13 23:52:55,515 - __main__ - DEBUG - - NIW -5558.7012
+2025-09-13 23:52:55,515 - __main__ - DEBUG - - Beta prior -14.8543
+2025-09-13 23:53:38,700 - __main__ - DEBUG - Iter 0: ELBO after FB: -11809637.6834 (LL -11804064.1280, Δ=0.0000)
+2025-09-13 23:53:38,701 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:53:38,738 - __main__ - DEBUG - Iter 0: ELBO after NIW update: -1694199.2655 (Emit LL -992610.4707, NIW term -519825.2500, Δ=10115438.4180)
+2025-09-13 23:53:38,775 - __main__ - DEBUG - Iter 0: ELBO after Dirichlet update: -1515601.3569 (Trans LL -2286.7887, Dir term -1188.4321, Δ=178597.9086)
+2025-09-13 23:54:21,963 - __main__ - DEBUG - Iter 1: ELBO after FB: -1493395.8536 (LL -972367.3171, Δ=22205.5033)
+2025-09-13 23:54:21,963 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:54:22,000 - __main__ - DEBUG - Iter 1: ELBO after NIW update: -1430781.3965 (Emit LL -975701.9551, NIW term -451529.4062, Δ=62614.4570)
+2025-09-13 23:54:22,038 - __main__ - DEBUG - Iter 1: ELBO after Dirichlet update: -1430337.0176 (Trans LL -2445.5276, Dir term -1024.1934, Δ=444.3790)
+2025-09-13 23:55:05,226 - __main__ - DEBUG - Iter 2: ELBO after FB: -1406092.7153 (LL -953524.2615, Δ=24244.3022)
+2025-09-13 23:55:05,226 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:55:05,263 - __main__ - DEBUG - Iter 2: ELBO after NIW update: -1328851.7681 (Emit LL -953943.1680, NIW term -371758.3125, Δ=77240.9473)
+2025-09-13 23:55:05,301 - __main__ - DEBUG - Iter 2: ELBO after Dirichlet update: -1328428.4047 (Trans LL -2248.8605, Dir term -821.6104, Δ=423.3633)
+2025-09-13 23:55:48,528 - __main__ - DEBUG - Iter 3: ELBO after FB: -1316061.7218 (LL -943466.9447, Δ=12366.6829)
+2025-09-13 23:55:48,528 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:55:48,565 - __main__ - DEBUG - Iter 3: ELBO after NIW update: -1279457.5050 (Emit LL -948125.6250, NIW term -328535.8750, Δ=36604.2168)
+2025-09-13 23:55:48,603 - __main__ - DEBUG - Iter 3: ELBO after Dirichlet update: -1279288.0620 (Trans LL -2287.7420, Dir term -714.1038, Δ=169.4430)
+2025-09-13 23:56:31,846 - __main__ - DEBUG - Iter 4: ELBO after FB: -1268908.3236 (LL -939643.4905, Δ=10379.7384)
+2025-09-13 23:56:31,847 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:56:31,884 - __main__ - DEBUG - Iter 4: ELBO after NIW update: -1254561.3822 (Emit LL -942543.0703, NIW term -309369.2188, Δ=14346.9414)
+2025-09-13 23:56:31,921 - __main__ - DEBUG - Iter 4: ELBO after Dirichlet update: -1254472.8865 (Trans LL -2270.0175, Dir term -657.5781, Δ=88.4956)
+2025-09-13 23:57:15,002 - __main__ - DEBUG - Iter 5: ELBO after FB: -1249064.1269 (LL -939022.4757, Δ=5408.7597)
+2025-09-13 23:57:15,002 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:57:15,040 - __main__ - DEBUG - Iter 5: ELBO after NIW update: -1230222.2655 (Emit LL -940178.2617, NIW term -287528.3750, Δ=18841.8613)
+2025-09-13 23:57:15,083 - __main__ - DEBUG - Iter 5: ELBO after Dirichlet update: -1230177.4847 (Trans LL -2215.1892, Dir term -617.3442, Δ=44.7809)
+2025-09-13 23:57:57,903 - __main__ - DEBUG - Iter 6: ELBO after FB: -1227135.7196 (LL -938975.1461, Δ=3041.7651)
+2025-09-13 23:57:57,904 - __main__ - DEBUG - First pass after reset, using full stats.
+2025-09-13 23:57:57,941 - __main__ - DEBUG - Iter 6: ELBO after NIW update: -1220611.4442 (Emit LL -941070.2051, NIW term -277158.2188, Δ=6524.2754)
+2025-09-13 23:57:57,978 - __main__ - DEBUG - Iter 6: ELBO after Dirichlet update: -1220566.8483 (Trans LL -2081.4860, Dir term -592.7349, Δ=44.5960)
+2025-09-13 23:57:57,979 - __main__ - DEBUG - Early stopping: ELBO improvement 9610.6364 < tolerance
+2025-09-13 23:58:49,532 - __main__ - INFO - [E-step] Multi-batch 1/1 (x100 batches) - HMM Diagnostics:
+2025-09-13 23:58:49,532 - __main__ - INFO -   - Avg log-likelihood per step: -10.1380
+2025-09-13 23:58:49,532 - __main__ - INFO -   - Inner ELBO (final): -1220566.8483
+2025-09-13 23:58:49,533 - __main__ - INFO -   - ELBO progression (7 iters): [-1515601.38, ..., -1220566.88] (Δ=295034.5000)
+2025-09-13 23:58:49,533 - __main__ - INFO -   - Effective number of skills: 12.58
+2025-09-13 23:58:49,533 - __main__ - INFO -   - State entropy: 0.026
+2025-09-13 23:58:49,533 - __main__ - INFO -   - Transition stickiness: 0.541
+2025-09-13 23:58:49,533 - __main__ - INFO -   - Top 5 skills: [2, 8, 16, 31, 9] (probs: ['0.273', '0.089', '0.088', '0.071', '0.056'])
+2025-09-13 23:58:49,533 - __main__ - INFO -   - Combined time length: 3200 (original T=32, multiples=100)
+2025-09-13 23:58:49,535 - __main__ - INFO - 🔍 Computing HMM diagnostics...
+2025-09-13 23:59:52,133 - __main__ - INFO - 📊 HMM Diagnostics for Round 4:
+2025-09-13 23:59:52,134 - __main__ - INFO -   - Avg log-likelihood per step: -10.2582
+2025-09-13 23:59:52,134 - __main__ - INFO -   - State entropy: 0.0394
+2025-09-13 23:59:52,134 - __main__ - INFO -   - Effective number of skills: 12.46
+2025-09-13 23:59:52,134 - __main__ - INFO -   - Transition stickiness (diag): 0.5411
+2025-09-13 23:59:52,134 - __main__ - INFO -   - Top 5 skill occupancies: [0.2777639925479889, 0.0887686237692833, 0.0876115933060646, 0.07085607200860977, 0.055870383977890015]
+2025-09-13 23:59:52,134 - __main__ - INFO -   - Top 5 skill indices: [2, 8, 16, 31, 9]
+2025-09-13 23:59:52,134 - __main__ - INFO -     - Skill 8: emp= 28.79  E[1/(1-p)]:1282.86  p_stay=0.999
+2025-09-13 23:59:52,134 - __main__ - INFO -     - Skill 16: emp= 28.29  E[1/(1-p)]:701.68  p_stay=0.999
+2025-09-13 23:59:52,134 - __main__ - INFO -     - Skill 14: emp= 29.07  E[1/(1-p)]:552.46  p_stay=0.998
+2025-09-13 23:59:52,134 - __main__ - INFO -     - Skill 38: emp= 29.91  E[1/(1-p)]:463.43  p_stay=0.998
+2025-09-13 23:59:52,134 - __main__ - INFO -     - Skill 24: emp= 28.26  E[1/(1-p)]:429.36  p_stay=0.998
+2025-09-13 23:59:52,134 - __main__ - INFO - 🖼️  Rendering HMM visualizations for round 4
+2025-09-14 00:01:02,118 - __main__ - INFO - 💾 Saved HMM posterior → checkpoints_hmm/hmm_round4.pt
+2025-09-14 00:01:02,119 - __main__ - INFO - 🤗 Uploading HMM round 4 to HuggingFace: CatkinChen/nethack-hmm
+2025-09-14 00:01:08,746 - __main__ - INFO - ✅ HMM uploaded to: https://huggingface.co/CatkinChen/nethack-hmm
+2025-09-14 00:01:08,746 - __main__ - INFO - ========== EM Round 4/4: M-step ==========
+2025-09-14 00:01:08,746 - __main__ - INFO - 🔧 Fine-tuning VAE with HMM prior for 1 epochs...
+2025-09-14 00:01:08,746 - __main__ - INFO - 📊 M-step 4 parameter schedule:
+2025-09-14 00:01:08,746 - __main__ - INFO -   - prior_blend_alpha: 1.000 → 1.000 (constant)
+2025-09-14 00:01:08,746 - __main__ - INFO -   - mi_beta: 0.600 → 0.600 (linear)
+2025-09-14 00:01:08,746 - __main__ - INFO -   - tc_beta: 0.200 → 0.200 (linear)
+2025-09-14 00:01:08,747 - __main__ - INFO -   - dw_beta: 1.000 → 1.000 (linear)
+2025-09-14 00:01:09,371 - __main__ - INFO - Weights & Biases initialized
+2025-09-14 00:01:09,371 - __main__ - INFO - 🔥Training MultiModalHackVAE with 100 train batches, 20 test batches
+2025-09-14 00:01:09,371 - __main__ - INFO -    Epochs: 1
+2025-09-14 00:01:09,371 - __main__ - INFO -    Batch size: 32
+2025-09-14 00:01:09,371 - __main__ - INFO -    Sequence size: 32
+2025-09-14 00:01:09,372 - __main__ - INFO -    Device: cuda
+2025-09-14 00:01:09,372 - __main__ - INFO -    Mixed Precision: BF16 = False
+2025-09-14 00:01:09,372 - __main__ - INFO -    LR Scheduler: constant
+2025-09-14 00:01:09,372 - __main__ - INFO -    Shuffle batches: True
+2025-09-14 00:01:09,372 - __main__ - INFO -    Shuffle within batch: False
+2025-09-14 00:01:09,372 - __main__ - INFO -    VAE Configuration:
+2025-09-14 00:01:09,372 - __main__ - INFO -      - Latent dimension: 96
+2025-09-14 00:01:09,372 - __main__ - INFO -      - Encoder dropout: 0.1
+2025-09-14 00:01:09,372 - __main__ - INFO -      - Decoder dropout: 0.1
+2025-09-14 00:01:09,372 - __main__ - INFO -    Adaptive Loss Weighting:
+2025-09-14 00:01:09,373 - __main__ - INFO -      - MI beta: 0.600 → 0.600
+2025-09-14 00:01:09,373 - __main__ - INFO -      - TC beta: 0.200 → 0.200
+2025-09-14 00:01:09,373 - __main__ - INFO -      - DW beta: 1.000 → 1.000
+2025-09-14 00:01:09,373 - __main__ - INFO -      - Blend alpha: 1.000 → 1.000
+2025-09-14 00:01:09,373 - __main__ - INFO -      - Warmup epochs: 0 out of 1 total epochs
+2025-09-14 00:01:09,373 - __main__ - INFO -    Free bits: 0.75
+2025-09-14 00:01:09,373 - __main__ - INFO -    Focal loss: alpha=0.5, gamma=2.0
+2025-09-14 00:01:09,373 - __main__ - INFO -    Early Stopping:
+2025-09-14 00:01:09,373 - __main__ - INFO -      - Enabled: False
+2025-09-14 00:01:09,373 - __main__ - INFO -    HMM Prior: Enabled
+2025-09-14 00:01:09,397 - __main__ - INFO - 🔧 Using FP32 precision training
+2025-09-14 00:01:09,398 - __main__ - INFO - Model has latent dimension: 96
+2025-09-14 00:01:09,398 - __main__ - INFO - 🎯 Starting training for 1 epochs (starting from epoch 0)...
+2025-09-14 00:01:09,398 - __main__ - INFO -    Total training steps: 100
+2025-09-14 00:01:09,398 - __main__ - INFO -    Warmup steps: 20
+2025-09-14 00:01:09,398 - __main__ - INFO - 🎯 Epoch 1/1 - Starting epoch...
+2025-09-14 00:01:09,399 - __main__ - DEBUG - Shuffled 100 training batches for epoch 1
+2025-09-14 00:01:09,399 - __main__ - DEBUG - Shuffled 20 testing batches for epoch 1
+2025-09-14 00:01:09,959 - __main__ - DEBUG - Step 0/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:17,766 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:19,238 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:20,726 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:22,214 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:23,651 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:25,189 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:26,656 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:28,152 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:29,615 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:31,045 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:32,295 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:33,854 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:35,330 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:36,841 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:38,376 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:39,937 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:41,356 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:42,791 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:44,222 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:45,634 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:46,483 - __main__ - DEBUG - Step 100/100 - Adaptive weights: mi_beta=0.600, tc_beta=0.200, dw_beta=1.000, blend_alpha=1.000
+2025-09-14 00:04:46,484 - __main__ - INFO - 
+=== Epoch 1/1 Summary ===
+2025-09-14 00:04:46,484 - __main__ - INFO - Average Train Loss: 3936.374 | Average Test Loss: 2782.529
+2025-09-14 00:04:46,484 - __main__ - INFO - Current KL Betas: mi=0.600, tc=0.200, dw=1.000, blend_alpha=1.000
+2025-09-14 00:04:46,484 - __main__ - INFO - Global Step: 100/100 (100.0%)
+2025-09-14 00:04:46,484 - __main__ - INFO - Final Training Batch Details:
+2025-09-14 00:04:46,484 - __main__ - INFO -   Raw Losses: hero_loc: 3.961 | occupy: 1641.442 | bag: 434.877 | stats: 77.921 | msg: 25.186 | ego_char: 27.455 | ego_color: 130.633 | ego_class: 30.244 | passability: 0.600 | reward: 32.487 | done: 0.017 | value_k: 5.371 | safety: 0.672 | goal: 0.319 | forward: 49.963 | inverse: 2.911
+2025-09-14 00:04:46,485 - __main__ - INFO - Final Testing Batch Details:
+2025-09-14 00:04:46,485 - __main__ - INFO -   Raw Losses: hero_loc: 3.518 | occupy: 1553.726 | bag: 405.803 | stats: 81.022 | msg: 31.538 | ego_char: 27.052 | ego_color: 114.662 | ego_class: 30.899 | passability: 0.588 | reward: 16.291 | done: 0.015 | value_k: 2.243 | safety: 0.667 | goal: 0.116 | forward: 34.378 | inverse: 3.102
+2025-09-14 00:04:46,485 - __main__ - INFO - Variance of model output (mu): 0.0785, 0.1050, 0.1198, 0.1650, 0.1017, 0.1025, 0.0781, 0.0891, 0.1069, 0.0991, 0.1133, 0.0793, 0.1159, 0.0981, 0.0987, 0.1442, 0.0614, 0.0797, 0.0842, 0.0607, 0.0627, 0.0554, 0.0687, 0.0747, 0.0606, 0.0658, 0.0704, 0.0824, 0.0749, 0.0781, 0.0815, 0.0810, 0.1021, 0.0683, 0.0716, 0.0799, 0.0953, 0.0751, 0.0753, 0.0655, 0.0707, 0.0593, 0.0796, 0.0801, 0.0859, 0.0698, 0.0638, 0.0734, 0.0846, 0.0901, 0.0726, 0.0730, 0.0580, 0.0781, 0.0758, 0.0849, 0.0736, 0.0632, 0.0690, 0.0639, 0.0875, 0.0568, 0.0716, 0.0773, 0.0671, 0.0626, 0.0826, 0.0711, 0.0759, 0.0535, 0.0609, 0.0667, 0.0728, 0.0808, 0.0745, 0.0700, 0.0675, 0.0724, 0.0799, 0.0628, 0.0719, 0.0740, 0.0729, 0.0698, 0.0781, 0.0649, 0.0708, 0.0699, 0.0852, 0.0866, 0.0910, 0.0700, 0.0735, 0.0785, 0.0851, 0.0757
+2025-09-14 00:04:46,485 - __main__ - INFO - Per-dim KL: 0.6909, 1.4307, 4.3683, 4.9592, 4.1378, 0.4989, 0.7787, 1.3626, 0.7456, 0.9304, 0.9087, 1.3078, 4.5791, 7.3648, 1.9687, 4.8811, 0.6023, 0.3873, 0.4858, 0.6684, 0.7272, 0.6747, 0.5946, 0.4603, 0.5720, 0.5477, 0.5587, 0.5623, 0.6778, 0.5695, 0.4905, 0.5486, 0.6016, 0.6729, 0.6228, 0.6331, 0.3233, 0.6067, 0.6528, 0.6507, 0.4558, 0.6373, 0.6857, 0.6514, 0.4067, 0.5755, 0.6833, 0.5162, 0.3210, 0.5242, 0.3899, 0.6251, 0.6102, 0.4832, 0.3395, 0.6398, 0.5289, 0.5504, 0.6311, 0.6797, 0.5799, 0.5846, 0.6315, 0.4592, 0.6962, 0.6846, 0.6245, 0.4656, 0.6527, 0.6917, 0.6786, 0.6199, 0.7120, 0.5149, 0.5784, 0.5580, 0.5419, 0.5629, 0.5893, 0.5363, 0.4702, 0.5876, 0.4988, 0.4755, 0.6475, 0.7194, 0.6523, 0.5498, 0.6408, 0.6069, 0.6343, 0.6510, 0.6756, 0.4331, 0.5511, 0.4257
+2025-09-14 00:04:46,485 - __main__ - INFO - Eigenvalues of latent space: 0.4985, 0.3792, 0.3703, 0.3575, 0.3315, 0.3086, 0.3045, 0.2961, 0.2925, 0.2838, 0.2698, 0.2639, 0.2509, 0.2464, 0.2330, 0.2301, 0.2285, 0.2228, 0.2218, 0.2134, 0.2102, 0.2048, 0.2002, 0.1943, 0.1926, 0.1896, 0.1852, 0.1778, 0.1746, 0.1729, 0.1689, 0.1638, 0.1620, 0.1566, 0.1558, 0.1534, 0.1488, 0.1440, 0.1424, 0.1381, 0.1372, 0.1318, 0.1308, 0.1284, 0.1257, 0.1249, 0.1226, 0.1191, 0.1187, 0.1176, 0.1140, 0.1125, 0.1115, 0.1084, 0.1053, 0.1035, 0.1021, 0.1001, 0.0982, 0.0971, 0.0961, 0.0952, 0.0924, 0.0916, 0.0914, 0.0890, 0.0875, 0.0862, 0.0843, 0.0834, 0.0829, 0.0807, 0.0802, 0.0791, 0.0778, 0.0760, 0.0754, 0.0733, 0.0727, 0.0721, 0.0697, 0.0686, 0.0678, 0.0673, 0.0661, 0.0652, 0.0637, 0.0630, 0.0607, 0.0596, 0.0574, 0.0565, 0.0558, 0.0540, 0.0530, 0.0491
+2025-09-14 00:04:46,486 - __main__ - INFO - KL Eigenvalues: 0.0973, 0.1745, 0.1819, 0.1930, 0.2178, 0.2421, 0.2468, 0.2566, 0.2609, 0.2716, 0.2900, 0.2980, 0.3168, 0.3237, 0.3449, 0.3497, 0.3523, 0.3622, 0.3639, 0.3791, 0.3850, 0.3952, 0.4044, 0.4163, 0.4199, 0.4262, 0.4359, 0.4525, 0.4600, 0.4639, 0.4736, 0.4866, 0.4911, 0.5054, 0.5076, 0.5140, 0.5269, 0.5409, 0.5458, 0.5590, 0.5617, 0.5793, 0.5823, 0.5906, 0.5997, 0.6025, 0.6109, 0.6235, 0.6250, 0.6291, 0.6429, 0.6487, 0.6527, 0.6654, 0.6782, 0.6860, 0.6920, 0.7008, 0.7095, 0.7146, 0.7193, 0.7235, 0.7371, 0.7409, 0.7417, 0.7540, 0.7620, 0.7684, 0.7786, 0.7840, 0.7867, 0.7986, 0.8015, 0.8080, 0.8158, 0.8266, 0.8302, 0.8430, 0.8470, 0.8510, 0.8667, 0.8742, 0.8794, 0.8832, 0.8913, 0.8980, 0.9084, 0.9142, 0.9315, 0.9402, 0.9579, 0.9651, 0.9712, 0.9863, 0.9950, 1.0314
+2025-09-14 00:04:46,486 - __main__ - INFO - Variance explained by eigenvalues: 0.0351, 0.0618, 0.0879, 0.1131, 0.1365, 0.1582, 0.1797, 0.2005, 0.2211, 0.2411, 0.2602, 0.2787, 0.2964, 0.3138, 0.3302, 0.3464, 0.3625, 0.3782, 0.3938, 0.4089, 0.4237, 0.4381, 0.4522, 0.4659, 0.4795, 0.4928, 0.5059, 0.5184, 0.5307, 0.5429, 0.5548, 0.5663, 0.5777, 0.5888, 0.5997, 0.6106, 0.6210, 0.6312, 0.6412, 0.6510, 0.6606, 0.6699, 0.6791, 0.6882, 0.6970, 0.7058, 0.7145, 0.7229, 0.7312, 0.7395, 0.7475, 0.7555, 0.7633, 0.7709, 0.7784, 0.7857, 0.7928, 0.7999, 0.8068, 0.8137, 0.8204, 0.8271, 0.8336, 0.8401, 0.8465, 0.8528, 0.8590, 0.8651, 0.8710, 0.8769, 0.8827, 0.8884, 0.8941, 0.8996, 0.9051, 0.9105, 0.9158, 0.9209, 0.9261, 0.9311, 0.9361, 0.9409, 0.9457, 0.9504, 0.9551, 0.9596, 0.9641, 0.9686, 0.9729, 0.9770, 0.9811, 0.9851, 0.9890, 0.9928, 0.9965, 1.0000
+2025-09-14 00:04:46,486 - __main__ - INFO - ==================================================
+2025-09-14 00:04:46,486 - __main__ - INFO - 
+✅ MultiModalVAE training completed!
+2025-09-14 00:04:46,486 - __main__ - INFO -   - Completed all 1 epochs
+2025-09-14 00:04:46,486 - __main__ - INFO -   - Final train loss: 3936.3743
+2025-09-14 00:04:46,487 - __main__ - INFO -   - Final test loss: 2782.5294
+2025-09-14 00:04:46,509 - __main__ - INFO - 💾 Model saved locally: checkpoints_hmm/vae_hmm_round4_temp.pth
+2025-09-14 00:04:47,448 - __main__ - DEBUG - 🗑️  Removed temporary file: checkpoints_hmm/vae_hmm_round4_temp.pth
+2025-09-14 00:04:47,448 - __main__ - INFO - ✅ M-step completed: final_train_loss=3936.3743, final_test_loss=2782.5294
+2025-09-14 00:04:47,476 - __main__ - INFO - 💾 Saved VAE+HMM → checkpoints_hmm/vae_with_hmm_round4.pt
+2025-09-14 00:04:47,476 - __main__ - INFO - 🤗 Uploading VAE+HMM round 4 to HuggingFace: CatkinChen/nethack-vae-hmm
+2025-09-14 00:04:52,970 - huggingface_hub.hf_api - WARNING - No files have been modified since last commit. Skipping to prevent empty commit.
+2025-09-14 00:04:57,937 - __main__ - INFO - ✅ VAE+HMM uploaded to: https://huggingface.co/CatkinChen/nethack-vae-hmm
+2025-09-14 00:05:01,780 - __main__ - INFO - 
+🎉 EM training completed! Summary:
+2025-09-14 00:05:01,780 - __main__ - INFO -   - EM rounds: 4
+2025-09-14 00:05:01,780 - __main__ - INFO -   - M-step epochs per round: 1
+2025-09-14 00:05:01,780 - __main__ - INFO -   - HMM checkpoints: 4
+2025-09-14 00:05:01,780 - __main__ - INFO -   - VAE+HMM checkpoints: 4
+2025-09-14 00:05:01,780 - __main__ - INFO -   - HuggingFace repos:
+2025-09-14 00:05:01,780 - __main__ - INFO -     * HMM: https://huggingface.co/CatkinChen/nethack-hmm
+2025-09-14 00:05:01,780 - __main__ - INFO -     * VAE+HMM: https://huggingface.co/CatkinChen/nethack-vae-hmm
+2025-09-14 00:05:01,780 - __main__ - INFO - 📊 Training Configuration:
+2025-09-14 00:05:01,780 - __main__ - INFO -   - Mode: EM
+2025-09-14 00:05:01,780 - __main__ - INFO -   - HMM params: α=5.0, κ=1.0, γ=5.0, K=40, D=96
+2025-09-14 00:05:01,780 - __main__ - INFO -   - NIW params: μ₀=0.0, κ₀=1.0, Ψ₀=30.0, ν₀=106
+2025-09-14 00:05:01,780 - __main__ - INFO -   - Checkpoints: HMM=4, VAE+HMM=4
+2025-09-14 00:05:01,780 - __main__ - INFO -   - HF repos: HMM=CatkinChen/nethack-hmm, VAE+HMM=CatkinChen/nethack-vae-hmm

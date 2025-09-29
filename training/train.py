@@ -106,14 +106,14 @@ def fit_sticky_hmm_one_pass(
     dataset, 
     device, 
     hmm: StickyHDPHMMVI, 
-    offline: bool = True,
-    streaming_rho: float = 1.0, 
     max_iters: int = 10,
     elbo_drop_tol: float = 0.01,  # Relative ELBO drop tolerance (1%)
     elbo_tol: float = 0.01,       # Relative ELBO gain tolerance (1%)
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    pi_early_stopping_patience: int = 10,
+    pi_early_stopping_min_delta: float = 1e-5,
     max_batches: int | None = None, 
     batch_multiples: int = 1,
     logger=None, 
@@ -126,8 +126,6 @@ def fit_sticky_hmm_one_pass(
         dataset: Dataset to process
         device: Device to run on
         hmm: HMM model to update
-        offline: Whether to use offline mode
-        streaming_rho: Streaming parameter
         max_iters: Maximum iterations for HMM update
         elbo_drop_tol: Relative ELBO drop tolerance (fraction, e.g., 0.01 = 1%)
         elbo_tol: Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
@@ -187,10 +185,10 @@ def fit_sticky_hmm_one_pass(
                 
                 # forward encode only (keep no_grad for model inference)
                 with torch.no_grad():
-                    out = model(batch_dev)  # returns 'mu', 'logvar', optionally 'lowrank_factors'
-                    mu    = out['mu'].detach()  # Detach from computation graph
-                    logvar= out['logvar'].detach()  # Detach from computation graph
-                    F     = out.get('lowrank_factors', None)
+                    enc = model.batch_encode(batch_dev)
+                    mu    = enc['mu'].detach()  # Detach from computation graph
+                    logvar= enc['logvar'].detach()  # Detach from computation graph
+                    F     = enc.get('lowrank_factors', None)
                     if F is not None:
                         F = F.detach()  # Detach from computation graph
                     valid = batch_dev['valid_screen'].view(B,T)
@@ -214,9 +212,12 @@ def fit_sticky_hmm_one_pass(
 
             # HMM update with combined batch
             hmm_out = hmm.update(mu_combined, var_combined, F_combined, mask=valid_combined, 
-                               max_iters=(1 if multi_batch_idx < 0 else max_iters), tol=elbo_tol, elbo_drop_tol=elbo_drop_tol, rho=streaming_rho, 
-                               optimize_pi=(multi_batch_idx > -1 and (multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
-                               pi_steps=pi_iters, pi_lr=pi_lr, offline=offline, logger=logger)
+                               max_iters=max_iters, tol=elbo_tol, elbo_drop_tol=elbo_drop_tol, 
+                               optimize_pi=((multi_batch_idx + 1) % optimize_pi_every_n_steps == 0), 
+                               pi_steps=pi_iters, pi_lr=pi_lr,
+                               pi_early_stopping_patience=pi_early_stopping_patience,
+                               pi_early_stopping_min_delta=pi_early_stopping_min_delta,
+                               logger=logger)
 
             # Extract ELBO from HMM update
             inner_elbo = hmm_out.get('inner_elbo', torch.tensor(float('nan')))
@@ -259,7 +260,7 @@ def fit_sticky_hmm_one_pass(
                 pbar.set_postfix({
                     'multi_batch': f"{multi_batch_idx+1}/{effective_batches}",
                     'time_len': f"{mu_combined.shape[1]}",
-                    'rho': f"{streaming_rho:.3f}",
+                    'rho': f"{hmm.stream_rho:.3f}",
                     'elbo': f"{inner_elbo:.2f}{elbo_change}",
                     'iters': f"{n_iterations}"
                 })
@@ -277,6 +278,8 @@ def fit_sticky_hmm_with_batch_accumulation(
     max_batches: int | None = None,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    pi_early_stopping_patience: int = 10,
+    pi_early_stopping_min_delta: float = 1e-5,
     logger=None, 
     use_wandb: bool = False):
     """
@@ -446,7 +449,9 @@ def fit_sticky_hmm_with_batch_accumulation(
             optimized_u_beta = hmm._optimize_u_beta(
                 hmm.u_beta, r1_mean, ElogA_for_pi,
                 hmm.p.alpha, hmm.p.kappa, hmm.p.gamma, hmm.p.K,
-                steps=pi_iters, lr=pi_lr
+                steps=pi_iters, lr=pi_lr,
+                early_stopping_patience=pi_early_stopping_patience, 
+                early_stopping_min_delta=pi_early_stopping_min_delta
             )
             
             # Update β parameters
@@ -503,14 +508,14 @@ def fit_sticky_hmm_with_game_grouped_data(
     grouped_data: Dict, 
     device, 
     hmm: StickyHDPHMMVI, 
-    offline: bool = True,
-    streaming_rho: float = 1.0, 
     max_iters: int = 10,
     elbo_tol: float = 0.01,       # Relative ELBO gain tolerance (1%)
     elbo_drop_tol: float = 0.01,  # Relative ELBO drop tolerance (1%)
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    pi_early_stopping_patience: int = 10,
+    pi_early_stopping_min_delta: float = 1e-5,
     max_games: int | None = None,
     logger=None, 
     use_wandb: bool = False):
@@ -523,8 +528,6 @@ def fit_sticky_hmm_with_game_grouped_data(
         grouped_data: Dictionary with game_id -> {'sequence_data': {...}, 'total_length': int, 'is_complete': bool}
         device: Device to run on
         hmm: HMM model to update
-        offline: Whether to use offline mode
-        streaming_rho: Streaming parameter
         max_iters: Maximum iterations for HMM update
         elbo_tol: Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
         elbo_drop_tol: Relative ELBO drop tolerance (fraction, e.g., 0.01 = 1%)
@@ -625,14 +628,14 @@ def fit_sticky_hmm_with_game_grouped_data(
             hmm_out = hmm.update(
                 mu_bt, var_bt, F_bt, 
                 mask=valid, 
-                max_iters=1 if game_idx < 0 else max_iters, 
+                max_iters=max_iters, 
                 tol=elbo_tol,
                 elbo_drop_tol=elbo_drop_tol, 
-                rho=streaming_rho, 
-                optimize_pi=(game_idx > -1 and (game_idx + 1) % optimize_pi_every_n_steps == 0), 
+                optimize_pi=((game_idx + 1) % optimize_pi_every_n_steps == 0), 
                 pi_steps=pi_iters, 
-                pi_lr=pi_lr, 
-                offline=offline,
+                pi_lr=pi_lr,
+                pi_early_stopping_patience=pi_early_stopping_patience,
+                pi_early_stopping_min_delta=pi_early_stopping_min_delta,
                 logger=logger
             )
             
@@ -1267,48 +1270,12 @@ def train_multimodalhack_vae(
                     batch_device['original_batch_shape'] = (B, T)
                     batch_device['batch_size'] = B
                 
+                if use_hmm_prior and hmm is not None:
+                    batch_device['sticky_hmm'] = hmm
+                
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
-                    model_output = model(batch_device)
-                    
-                    # ==== (M‑step) HMM prior cache for this batch (no gradients) ====
-                    if use_hmm_prior and (hmm is not None):
-                        with torch.no_grad():
-                            B,T = batch_device['original_batch_shape']
-                            valid_bt = batch_device['valid_screen'].view(B,T)
-                            mu_bt    = model_output['mu'].view(B,T,-1)
-                            var_bt   = model_output['logvar'].exp().clamp_min(1e-6).view(B,T,-1)
-                            F_btr    = model_output.get('lowrank_factors', None)
-                            F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
-                            # emission expected log-likelihood per (b,t,k)
-                            logB = StickyHDPHMMVI.expected_emission_loglik(hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu, mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
-                            pi_star  = hmm._Epi()                              # [K]
-                            ElogA    = hmm._ElogA()                            # [K,K]
-                            log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
-                            
-                            # Process each sequence in the batch individually
-                            r_hat_list = []
-                            for b in range(B):
-                                r_hat_b, xi_hat_b, ll_b = hmm.forward_backward(log_pi, ElogA, logB[b])
-                                r_hat_list.append(r_hat_b)
-                            r_hat = torch.stack(r_hat_list, dim=0)  # [B,T,K]
-                            
-                            # prior Gaussians
-                            mu_k, E_Lambda, _ = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
-                            # log|Σ_k| = - log|Λ_k|
-                            L = torch.linalg.cholesky(E_Lambda)                       # [Kp1,D,D]
-                            logdet_E_Lambda = 2.0 * torch.log(torch.diagonal(L,  dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
-                            logdet_Sigma_k = -logdet_E_Lambda                           # [Kp1]
-                            # flatten responsibilities to align with valid_screen
-                            r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
-                        # stash cache into batch so vae_loss can pick it up
-                        batch_device['sticky_hmm'] = hmm
-                        batch_device['hmm_cache'] = {
-                            'mu_k': mu_k.to(model_output['mu'].dtype),
-                            'E_Lambda': E_Lambda.to(model_output['mu'].dtype),
-                            'logdet_Sigma_k': logdet_Sigma_k.to(model_output['mu'].dtype),
-                            'r_hat_flat': r_hat_flat.to(model_output['mu'].dtype),
-                        }
+                    model_output = model(batch_device, logger)
 
                     # Calculate adaptive weights for this step
                     mi_beta, tc_beta, dw_beta, blend_alpha = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
@@ -1494,49 +1461,13 @@ def train_multimodalhack_vae(
                     B, T = batch['game_chars'].shape[:2]
                     batch_device['original_batch_shape'] = (B, T)
                     batch_device['batch_size'] = B
+                    
+                if use_hmm_prior and hmm is not None:
+                    batch_device['sticky_hmm'] = hmm
                 
                 # Forward pass with mixed precision if enabled
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(use_bf16 and device.type == 'cuda')):
-                    model_output = model(batch_device)
-                    
-                    # ==== (M‑step) HMM prior cache for this batch (no gradients) ====
-                    if use_hmm_prior and (hmm is not None):
-                        with torch.no_grad():
-                            B,T = batch_device['original_batch_shape']
-                            valid_bt = batch_device['valid_screen'].view(B,T)
-                            mu_bt    = model_output['mu'].view(B,T,-1)
-                            var_bt   = model_output['logvar'].exp().clamp_min(1e-6).view(B,T,-1)
-                            F_btr    = model_output.get('lowrank_factors', None)
-                            F_bt     = None if F_btr is None else F_btr.view(B,T,F_btr.size(-2),F_btr.size(-1))
-                            # emission expected log-likelihood per (b,t,k)
-                            logB = StickyHDPHMMVI.expected_emission_loglik(hmm.niw.mu, hmm.niw.kappa, hmm.niw.Psi, hmm.niw.nu, mu_bt, var_bt, F_bt, mask=valid_bt)  # [B,T,K]
-                            pi_star  = hmm._Epi()                              # [K]
-                            ElogA    = hmm._ElogA()                            # [K,K]
-                            log_pi   = torch.log(torch.clamp(pi_star, min=1e-30))
-                            
-                            # Process each sequence in the batch individually
-                            r_hat_list = []
-                            for b in range(B):
-                                r_hat_b, xi_hat_b, ll_b = hmm.forward_backward(log_pi, ElogA, logB[b])
-                                r_hat_list.append(r_hat_b)
-                            r_hat = torch.stack(r_hat_list, dim=0)  # [B,T,K]
-                            
-                            # prior Gaussians
-                            mu_k, E_Lambda, _ = hmm.get_emission_expectations() # mu_k:[K,D], E_Lambda:[K,D,D]
-                            # log|Σ_k| = - log|Λ_k|  (approx with E[Λ])
-                            L = torch.linalg.cholesky(E_Lambda)                       # [Kp1,D,D]
-                            logdet_E_Lambda = 2.0 * torch.log(torch.diagonal(L,  dim1=-2, dim2=-1)).sum(dim=-1)  # [Kp1]
-                            logdet_Sigma_k = -logdet_E_Lambda                         # [Kp1]
-                            # flatten responsibilities to align with valid_screen
-                            r_hat_flat = r_hat[valid_bt]   # [valid_B, K]
-                        # stash cache into batch so vae_loss can pick it up
-                        batch_device['sticky_hmm'] = hmm
-                        batch_device['hmm_cache'] = {
-                            'mu_k': mu_k.to(model_output['mu'].dtype),
-                            'E_Lambda': E_Lambda.to(model_output['mu'].dtype),
-                            'logdet_Sigma_k': logdet_Sigma_k.to(model_output['mu'].dtype),
-                            'r_hat_flat': r_hat_flat.to(model_output['mu'].dtype),
-                        }
+                    model_output = model(batch_device, logger)
                         
                     # Calculate adaptive weights for this step (use current global step for consistency)
                     mi_beta, tc_beta, dw_beta, blend_alpha = get_adaptive_weights(global_step, total_train_steps, custom_kl_beta_function)
@@ -2007,15 +1938,18 @@ def train_vae_with_sticky_hmm_em(
     device: torch.device = torch.device('cuda'),
     use_bf16: bool = False,
     logger=None,
-    offline: bool = True,
-    streaming_rho: float = 1.0,
+    streaming_rho_niw: float = 1.0,
+    streaming_rho_trans: float = 1.0,
     max_iters: int = 10,
     elbo_drop_tol: float = 0.01,  # Relative ELBO drop tolerance (1%)
     elbo_tol: float = 0.01,       # Relative ELBO gain tolerance (1%)
     optimize_pi_every_n_steps: int = 5,
     pi_iters: int = 10,
     pi_lr: float = 0.001,
+    pi_early_stopping_patience: int = 10,
+    pi_early_stopping_min_delta: float = 1e-5,
     reset_to_prior: bool = False,
+    reset_streaming: bool = False,
     reset_low_count_states: bool = True,
     low_count_thresh: float = 0.002,  # States with <0.2% occupancy will be reset
     # Game-grouped data options for E-step
@@ -2077,8 +2011,8 @@ def train_vae_with_sticky_hmm_em(
         device: Device for training
         use_bf16: Whether to use BF16 mixed precision
         logger: Logger instance
-        offline: Whether to use offline mode (no streaming)
-        streaming_rho: rho used for streaming on statistics
+        streaming_rho_niw: rho used for streaming on niw statistics
+        streaming_rho_trans: rho used for streaming on transition statistics
         max_iters: max iterations in hmm update
         elbo_drop_tol: Relative ELBO drop tolerance (fraction, e.g., 0.01 = 1%)
         elbo_tol: Relative ELBO gain tolerance (fraction, e.g., 0.01 = 1%)
@@ -2086,6 +2020,7 @@ def train_vae_with_sticky_hmm_em(
         pi_iters: number of iterations for pi optimization
         pi_lr: learning rate for pi optimization
         reset_to_prior: If True, resets HMM to prior between E-steps
+        reset_streaming: If True, resets streaming statistics between E-steps
         reset_low_count_states: If True, resets low-count states during E-step fitting
         low_count_thresh: Threshold for low-count state reset (fraction of total counts, e.g., 0.002 = 0.2%)
         use_game_grouped_data: If True, use game-id grouped data for E-step instead of batched data
@@ -2171,7 +2106,7 @@ def train_vae_with_sticky_hmm_em(
     # 1) Load the pretrained VAE from HuggingFace or local checkpoint
     if pretrained_hf_repo:
         if logger: logger.info(f"🤗 Loading pretrained VAE from HuggingFace: {pretrained_hf_repo}")
-        model = load_model_from_huggingface(
+        model, _ = load_model_from_huggingface(
             repo_name=pretrained_hf_repo,
             token=hf_token,
             device=device
@@ -2232,7 +2167,7 @@ def train_vae_with_sticky_hmm_em(
         if logger: logger.info(f"✅ Loaded pre-trained HMM: latent_dim={hmm.p.D}, skills={hmm.p.K+1}")
         if metadata:
             if logger: logger.info(f"   🏷️  HMM Round: {metadata.get('round', 'unknown')}")
-            if logger: logger.info(f"   📅 Created: {metadata.get('created', 'unknown')}")
+            if logger: logger.info(f"   📅 Created: {metadata.get('training_timestamp', 'unknown')}")
         
         # Verify HMM dimensions match VAE config
         if hmm.p.D != D:
@@ -2287,16 +2222,19 @@ def train_vae_with_sticky_hmm_em(
             alpha=alpha, 
             kappa=kappa, 
             gamma=gamma,
-            K=K-1, # exclude the remainder
+            K=K, # exclude the remainder
             D=D,
             device=device
         )
+        assert streaming_rho_niw > 0.0 and streaming_rho_niw <= 1.0, "streaming_rho_niw must be in (0, 1]"
+        assert streaming_rho_trans > 0.0 and streaming_rho_trans <= 1.0, "streaming_rho_trans must be in (0, 1]"
         hmm = StickyHDPHMMVI(
             p=hmm_params,
             niw_prior=niw,
-            rho_emission=1.0,
-            rho_transition=1.0
+            rho_emission=streaming_rho_niw,
+            rho_transition=streaming_rho_trans
         )
+        if logger: logger.info(f"Sticky-HDP-HMM initialized with NIW streaming rho: {streaming_rho_niw}, transition rho: {streaming_rho_trans}")
 
     def _kmeans_init_hmm(hmm, model, dataset, device, max_frames=20000):
         model.eval()
@@ -2315,8 +2253,8 @@ def train_vae_with_sticky_hmm_em(
                             bdev[k] = x
                     else:
                         bdev[k] = v
-                out = model(bdev)
-                mu_bt = out['mu'].view(B, T, -1).detach().cpu()
+                enc = model.batch_encode(bdev)
+                mu_bt = enc['mu'].view(B, T, -1).detach().cpu()
                 valid = bdev['valid_screen'].view(B, T).cpu().bool()
                 X.append(mu_bt[valid])
                 collected += int(valid.sum().item())
@@ -2332,6 +2270,7 @@ def train_vae_with_sticky_hmm_em(
         with torch.no_grad():
             hmm.niw.mu[:Kp1] = centers[:Kp1].to(hmm.niw.mu)
             hmm._cache_fresh = False
+            hmm.init_kmeans = centers[:Kp1].clone().to(hmm.niw.mu)
 
     if init_niw_mu_with_kmean and not vae_only_with_hmm:
         if logger: logger.info("🔍 Initializing NIW mean with k-means on VAE latents...")
@@ -2400,16 +2339,34 @@ def train_vae_with_sticky_hmm_em(
                             logger.info(f"     Cov diag: {global_var}")
                 if reset_to_prior:
                     if logger: logger.info("   - Resetting HMM to prior")
-                    hmm.reset()
-                    if init_niw_mu_with_kmean and not vae_only_with_hmm:
-                        _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
+                    hmm.reset(reset_streaming=reset_streaming, keep_mu=True)
+                    if reset_streaming:
+                        if logger: logger.info("   - Resetting HMM streaming statistics")
+                        if init_niw_mu_with_kmean and not vae_only_with_hmm:
+                            _kmeans_init_hmm(hmm, model, train_dataset, device, max_frames=100000)
+                            if logger: logger.info("   - Re-initialized NIW mean with k-means on VAE latents")
+                        else:
+                            if logger: logger.info("   - Keeping NIW mean as is (no k-means re-init)")
+                    else:
+                        if logger: 
+                            logger.info("   - Continuing HMM streaming statistics from previous round but resetting to prior")
+                            logger.info("   - Keeping NIW mean as is (no k-means re-init)")
+
                 elif reset_low_count_states:
                     if logger: logger.info("   - Resetting NIW low-count states to prior")
-                    hmm.reset_low_count_states(low_count_thresh=low_count_thresh, logger=logger)
+                    if reset_streaming:
+                        if logger: logger.info("   - Resetting HMM streaming statistics")
+                    else:
+                        if logger: logger.info("   - Continuing HMM streaming statistics from previous round but resetting to prior")
+                    hmm.reset_low_count_states(low_count_thresh=low_count_thresh, reset_streaming=reset_streaming, logger=logger)
+                elif reset_streaming:
+                    if logger: logger.info("   - Resetting HMM streaming statistics")
+                    hmm.reset_streaming()
                 else:
-                    if logger: logger.info("   - Continuing HMM from previous round")
-                    hmm.streaming_reset()
-            
+                    if logger:
+                        logger.info("   - Continuing HMM from previous round with no reset")
+                        logger.info(f"     use streaming_rho_niw: {hmm.stream_rho_niw}, streaming_rho_trans: {hmm.stream_rho_trans}")
+
             # E-step: Fit HMM posterior using current VAE representations
             if use_game_grouped_data:
                 # Load or create game-grouped data
@@ -2428,20 +2385,23 @@ def train_vae_with_sticky_hmm_em(
                 # Use game-grouped E-step
                 fit_sticky_hmm_with_game_grouped_data(
                     model, grouped_data, device, hmm, 
-                    offline=offline, streaming_rho=streaming_rho, 
-                    max_iters=max_iters, elbo_drop_tol=elbo_drop_tol,
-                    optimize_pi_every_n_steps=optimize_pi_every_n_steps,
+                    max_iters=(max_iters if r == (em_rounds - 1) else 1), elbo_drop_tol=elbo_drop_tol,
+                    optimize_pi_every_n_steps=(optimize_pi_every_n_steps if r == (em_rounds - 1) else 1000),
                     pi_iters=pi_iters, pi_lr=pi_lr, 
+                    pi_early_stopping_patience=pi_early_stopping_patience,
+                    pi_early_stopping_min_delta=pi_early_stopping_min_delta,
                     max_games=max_games_per_estep,
                     logger=logger, use_wandb=use_wandb
                 )
             else:
                 # Use standard batched E-step
                 fit_sticky_hmm_one_pass(model, train_dataset, device, hmm, 
-                                        offline=offline, streaming_rho=streaming_rho, 
-                                        max_iters=max_iters, elbo_drop_tol=elbo_drop_tol, elbo_tol=elbo_tol,
-                                        optimize_pi_every_n_steps=optimize_pi_every_n_steps,
-                                        pi_iters=pi_iters, pi_lr=pi_lr, batch_multiples=batch_multiples,
+                                        max_iters=(max_iters if r == (em_rounds - 1) else 1), elbo_drop_tol=elbo_drop_tol, elbo_tol=elbo_tol,
+                                        optimize_pi_every_n_steps=(optimize_pi_every_n_steps if r == (em_rounds - 1) else 1000),
+                                        pi_iters=pi_iters, pi_lr=pi_lr,
+                                        pi_early_stopping_patience=pi_early_stopping_patience,
+                                        pi_early_stopping_min_delta=pi_early_stopping_min_delta,
+                                        batch_multiples=batch_multiples,
                                         logger=logger, use_wandb=use_wandb)
             
             # Optional: Additional batch accumulation pass after initial HMM fitting
@@ -2451,6 +2411,8 @@ def train_vae_with_sticky_hmm_em(
                     model, train_dataset, device, hmm,
                     max_batches=accumulation_max_batches,
                     pi_iters=pi_iters, pi_lr=pi_lr,
+                    pi_early_stopping_patience=pi_early_stopping_patience,
+                    pi_early_stopping_min_delta=pi_early_stopping_min_delta,
                     logger=logger, use_wandb=use_wandb
                 )
 

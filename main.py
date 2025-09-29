@@ -23,7 +23,63 @@ Commands:
         Batch accumulation: Additional pass that freezes HMM, accumulates statistics, then batch updates
         VAE-only with HMM: Skip E-step HMM training, load pre-trained HMM, only train VAE with HMM prior
     
-    vae_analysis <repo_name>       - Run VAE analysis and visualization
+    rl [model_mode] [reward_mode] [options]   - Train online PPO agent with pretrained VAE+HMM models
+                                    
+        Ablation Modes:
+            Model Layer (choose one):
+                baseline               - VAE+HMM+PPO (default)
+                no_hmm                 - VAE+PPO (no HMM integration)
+            
+            Reward Layer (choose one):
+                full_curiosity         - All three intrinsic rewards: dynamics + skill entropy + transition novelty (default)
+                curiosity_dyn_only     - Only dynamics surprise
+                curiosity_skill_only   - Only skill entropy (requires HMM)
+                curiosity_trans_only   - Only transition novelty (requires HMM)
+                rnd                    - Random Network Distillation
+                no_intrinsic           - No intrinsic rewards (extrinsic only)
+            
+            Usage: python main.py rl [model_mode] [reward_mode] [options]
+            Examples:
+                python main.py rl baseline full_curiosity    # VAE+HMM with all curiosity
+                python main.py rl no_hmm curiosity_dyn_only  # VAE-only with dynamics curiosity
+                python main.py rl baseline rnd               # VAE+HMM with RND
+                python main.py rl no_hmm no_intrinsic        # VAE-only with no intrinsic rewards
+            
+        Options:
+            --env ENV_NAME         - Environment (default: MiniHack-Room-5x5-v0)
+            --steps N              - Total training steps (default: 1M)
+            --seed N               - Random seed for both training and evaluation (default: 42)
+            --train_seed N         - Random seed for training environments (default: 42)
+            --eval_seed N          - Random seed for evaluation environments (default: 42)
+            --max_episode_steps_train N    - Max steps per episode during training (default: None, uses env default)
+            --max_episode_steps_eval N     - Max steps per episode during evaluation (default: None, uses env default)
+            --wandb                - Enable W&B logging
+            --no_upload            - Disable HuggingFace uploads
+            --resume REPO_ID       - Resume training from unified HuggingFace repo
+                                     (loads VAE, HMM, and PPO from same repo)
+            --resume_local PATH    - Resume training from local PPO checkpoint file
+                                     (loads VAE/HMM from separate repos)
+            --vae_revision REV     - HuggingFace revision for VAE model (branch/tag/commit)
+            --hmm_revision REV     - HuggingFace revision for HMM model (branch/tag/commit)
+                                    
+        Model Loading Patterns:
+        - Fresh Training: VAE from vae_repo_id, HMM from hmm_repo_id (separate repos)
+        - Resume Training: VAE, HMM, PPO from same unified repo (--resume)
+        - Resume Local: PPO from local file, VAE/HMM from separate repos (--resume_local)
+                                    
+        Uses configuration objects for fine-grained control over:
+        - PPO hyperparameters (learning rate, rollout length, etc.)
+        - Curiosity-driven exploration (dynamics surprise, skill entropy, transition novelty)
+        - HMM online learning (update frequency, fitting window)
+        - Training setup (environment, device, logging, checkpointing)
+    
+    vae_analysis [repo_name] [options] - Run VAE analysis and visualization
+        Options:
+            --revision REV          - VAE model revision (default: None/latest)
+            --save_dir DIR          - Save directory (default: vae_analysis)
+            --seed N                - Analysis seed (default: 50)
+            --hmm_repo REPO         - HMM repository (default: None)
+            --hmm_revision REV      - HMM model revision (default: None/latest)
     bin_count_analysis [top_k]     - Analyze glyph character/color distributions  
     hmm_analysis <repo_name>       - Run HMM analysis and visualization
     plot_bin_count <data_path>     - Plot from saved bin count data
@@ -37,8 +93,41 @@ Examples:
     python main.py train vae_hmm game_grouped
     python main.py train vae_only_with_hmm CatkinChen/nethack-hmm
     python main.py train vae_only_with_hmm CatkinChen/nethack-hmm 2
+    
+    # RL Ablation Studies
+    python main.py rl                                    # Default: VAE+HMM+PPO with full curiosity
+    python main.py rl baseline --wandb                   # Same as default with W&B logging
+    python main.py rl no_hmm --steps 2000000             # VAE+PPO (no HMM)
+    python main.py rl rnd --env MiniHack-Quest-Medium-v0  # VAE+HMM+PPO with RND
+    python main.py rl no_intrinsic --seed 123            # VAE+HMM+PPO with no intrinsic rewards
+    python main.py rl curiosity_dyn_only                 # VAE+HMM+PPO with dynamics curiosity only
+    python main.py rl curiosity_skill_only               # VAE+HMM+PPO with skill entropy only
+    python main.py rl curiosity_trans_only               # VAE+HMM+PPO with transition novelty only
+    
+    # Continue training from existing checkpoints
+    python main.py rl baseline --resume CatkinChen/nethack-ppo-unified     # Resume from unified repo (VAE+HMM+PPO)
+    python main.py rl baseline --resume_local ./checkpoints/ppo_policy.pth  # Resume from local PPO, load VAE/HMM separately
+    
+    # VAE Analysis Examples
+    python main.py vae_analysis                                                   # Default analysis with default repo
+    python main.py vae_analysis CatkinChen/nethack-vae                           # Specify VAE repo
+    python main.py vae_analysis CatkinChen/nethack-vae --revision main           # Use specific revision
+    python main.py vae_analysis --save_dir custom_output --seed 42               # Custom save dir and seed
+    python main.py vae_analysis --hmm_repo CatkinChen/nethack-hmm                # With HMM from separate repo
+    python main.py vae_analysis --revision v1.0 --hmm_repo CatkinChen/nethack-hmm --hmm_revision v2.0  # Full specification
+    
+    Note for vae_analysis:
+    - If config.prior_mode == 'hmm' or hmm_repo is specified, β-KL will be calculated against HMM prior instead of N(0,I)
+    - Random seed affects batch shuffling and latent space analysis sampling
+    - HMM can be loaded from a separate repository (common setup: VAE and HMM trained separately)
+    - If HMM loading fails, analysis will fallback to standard Normal prior with a warning
+    
+    # Load specific model revisions
+    python main.py rl baseline --vae_revision v1.0 --hmm_revision main      # Use VAE v1.0 and latest HMM
+    python main.py rl no_hmm --vae_revision experimental                    # Use experimental VAE branch
 """
 import logging
+import math
 import os
 import sys
 import torch
@@ -46,6 +135,8 @@ from datetime import datetime
 from src.data_collection import NetHackDataCollector, BLStatsAdapter
 from training.train import train_multimodalhack_vae, VAEConfig, load_datasets, train_vae_with_sticky_hmm_em
 from utils.analysis import create_visualization_demo, analyze_glyph_char_color_pairs, plot_glyph_char_color_pairs_from_saved
+from training.online_rl import train_online_ppo_with_pretrained_models
+from rl.ppo import PPOConfig, CuriosityConfig, HMMOnlineConfig, VAEOnlineConfig, RNDConfig, TrainConfig
 
 if __name__ == "__main__":
     
@@ -61,12 +152,52 @@ if __name__ == "__main__":
     
     
     if len(sys.argv) > 1 and sys.argv[1] == "vae_analysis":
-        # Demo mode: python train.py vae_analysis <repo_name> [revision_name]
-        repo_name = sys.argv[2] if len(sys.argv) > 2 else "CatkinChen/nethack-vae"
-        revision_name = sys.argv[3] if len(sys.argv) > 3 else None
+        # Parse vae_analysis command with flag-based arguments
+        # Usage: python main.py vae_analysis [repo_name] [options]
+        repo_name = "CatkinChen/nethack-vae"  # default
+        revision_name = None
+        save_dir = "vae_analysis"
+        analysis_seed = 50
+        hmm_repo_name = None
+        hmm_revision_name = None
+        
+        # Parse positional repo_name (if not starting with --)
+        i = 2
+        if i < len(sys.argv) and not sys.argv[i].startswith('--'):
+            repo_name = sys.argv[i]
+            i += 1
+        
+        # Parse flag-based arguments
+        while i < len(sys.argv):
+            if sys.argv[i] == '--revision' and i + 1 < len(sys.argv):
+                revision_name = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--save_dir' and i + 1 < len(sys.argv):
+                save_dir = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--seed' and i + 1 < len(sys.argv):
+                analysis_seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--hmm_repo' and i + 1 < len(sys.argv):
+                hmm_repo_name = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--hmm_revision' and i + 1 < len(sys.argv):
+                hmm_revision_name = sys.argv[i + 1]
+                i += 2
+            else:
+                print(f"⚠️  Unknown option: {sys.argv[i]}")
+                i += 1
         
         print(f"🚀 Running VAE Analysis Demo")
-        print(f"📦 Repository: {repo_name}")
+        print(f"📦 VAE Repository: {repo_name}")
+        if revision_name:
+            print(f"   VAE Revision: {revision_name}")
+        if hmm_repo_name:
+            print(f"🧠 HMM Repository: {hmm_repo_name}")
+            if hmm_revision_name:
+                print(f"   HMM Revision: {hmm_revision_name}")
+        print(f"📁 Save Directory: {save_dir}")
+        print(f"🎲 Analysis Seed: {analysis_seed}")
         
         # Create both training and test data
         print(f"📊 Preparing training and test data...")
@@ -103,14 +234,16 @@ if __name__ == "__main__":
             results = create_visualization_demo(
                 repo_name=repo_name,
                 train_dataset=train_dataset,
-                test_dataset=test_dataset,
+                test_dataset=None,
                 revision_name=revision_name,
+                hmm_repo_name=hmm_repo_name,
+                hmm_revision_name=hmm_revision_name,
                 device="cpu",  # Use CPU for demo
                 num_samples=10,
                 max_latent_samples=1000,  # More samples since we have both datasets
-                save_dir="vae_analysis",
+                save_dir=save_dir,
                 random_sampling=True,  # Enable random sampling
-                random_seed=50,  # For reproducible results
+                random_seed=analysis_seed,  # For reproducible results
                 use_mean=True,  # Use mean for latent space
                 map_occ_thresh=0.5,
                 bag_presence_thresh=0.5,
@@ -340,7 +473,7 @@ if __name__ == "__main__":
             print(f"   📐 Latent dim: {hmm.p.D}")
             if metadata:
                 print(f"   🏷️  Round: {metadata.get('round', 'unknown')}")
-                print(f"   📅 Created: {metadata.get('created', 'unknown')}")
+                print(f"   📅 Created: {metadata.get('training_timestamp', 'unknown')}")
             
             # Load VAE model for encoding data
             print(f"🎨 Loading VAE model for data encoding...")
@@ -349,12 +482,12 @@ if __name__ == "__main__":
             vae_repo = repo_name.replace('-hmm', '-vae')  # e.g., nethack-hmm -> nethack-vae
             try:
                 from training.train import load_model_from_huggingface
-                model = load_model_from_huggingface(vae_repo, device=str(device))
+                model, _ = load_model_from_huggingface(vae_repo, device=str(device))
                 print(f"✅ VAE loaded from {vae_repo}")
             except Exception as e:
                 print(f"⚠️  Could not load VAE from {vae_repo}: {e}")
                 print(f"🔄 Trying fallback VAE repo...")
-                model = load_model_from_huggingface("CatkinChen/nethack-vae", device=str(device))
+                model, _ = load_model_from_huggingface("CatkinChen/nethack-vae", device=str(device))
                 print(f"✅ VAE loaded from fallback repo")
             
             # Set up analysis directory
@@ -604,6 +737,12 @@ if __name__ == "__main__":
                 final_prior_blend_alpha=0.6,
                 prior_blend_shape='cosine'
             )
+            
+            # HMM Training Schedule:
+            # - EM Rounds 1-3: Only 1 HMM iteration per round (quick updates)
+            # - EM Round 4 (last): Up to 10 HMM iterations with pi optimization every iteration
+            # This allows fast initial learning followed by fine-grained optimization
+            
             model, hmm, training_info = train_vae_with_sticky_hmm_em(
                 # Load from HuggingFace
                 pretrained_hf_repo="CatkinChen/nethack-vae",
@@ -630,15 +769,18 @@ if __name__ == "__main__":
                 niw_kappa0 = 1.0, 
                 niw_Psi0 = 30.0,
                 niw_nu0 = vae_config.latent_dim + 10,
-                offline = True,
-                streaming_rho = 1.0,
-                max_iters = 10,
+                streaming_rho_niw = 1.0,
+                streaming_rho_trans = 1.0,
+                max_iters = 10,  # Used only in last round; first 3 rounds use 1 iteration
                 elbo_drop_tol = 0.01,  # 1% relative tolerance
                 elbo_tol = 0.01,       # 1% relative tolerance
-                optimize_pi_every_n_steps = 100,
-                pi_iters = 10,
-                pi_lr = 5.0e-4,
+                optimize_pi_every_n_steps = 1,  # Optimize pi in every iteration of the last round
+                pi_iters = 200,
+                pi_lr = 1.0e-3,
+                pi_early_stopping_patience = 5,  # Early stop if no improvement for 5 steps
+                pi_early_stopping_min_delta = 1e-3,  # Minimum improvement threshold
                 reset_to_prior = True,
+                reset_streaming = True,
                 reset_low_count_states = False,
                 low_count_thresh = 0.01,  # States with <1% of total counts will be reset
                 # Game-grouped data options
@@ -681,3 +823,454 @@ if __name__ == "__main__":
             print(f"✅ Training completed!")
             print(f"📊 HMM checkpoints: {len(training_info['hmm_paths'])}")
             print(f"📊 VAE+HMM checkpoints: {len(training_info['vae_hmm_paths'])}")
+            
+    elif len(sys.argv) > 1 and sys.argv[1] == "rl":
+        print(f"🎮 Reinforcement Learning mode activated")
+        
+        # Define valid modes for ablation studies
+        valid_model_modes = ["baseline", "no_hmm"]
+        valid_reward_modes = ["full_curiosity", "curiosity_dyn_only", "curiosity_skill_only", 
+                             "curiosity_trans_only", "rnd", "no_intrinsic"]
+        
+        # Parse ablation mode and options
+        model_mode = "baseline"  # default: VAE+HMM
+        reward_mode = "full_curiosity"  # default: all intrinsic rewards
+        env_name = "MiniHack-Room-Random-15x15-v0"  # default
+        total_steps = 1_000_000  # default 1M steps
+        train_seed = 42  # default training seed
+        eval_seed = 42   # default evaluation seed
+        max_episode_steps_train = None   # default: use env-specific max_episode_steps
+        max_episode_steps_eval = None    # default: use env-specific max_episode_steps
+        use_wandb_flag = False
+        disable_upload = False
+        resume_repo_id = None  # HuggingFace repo for resuming
+        resume_local_path = None  # Local checkpoint path for resuming
+        reset_global_steps = False  # Whether to reset global step when resuming
+        vae_revision = None  # HuggingFace VAE model revision
+        hmm_revision = None  # HuggingFace HMM model revision
+        
+        # Parse command line arguments
+        i = 2
+        no_hmm_flag = False
+        no_intrinsic_flag = False
+        
+        positional_args = []
+        # Collect all positional arguments (non-flag arguments)
+        while i < len(sys.argv) and not sys.argv[i].startswith('--'):
+            positional_args.append(sys.argv[i])
+            i += 1
+        
+        # Parse positional arguments flexibly
+        for arg in positional_args:
+            if arg in valid_model_modes:
+                model_mode = arg
+            elif arg in valid_reward_modes:
+                reward_mode = arg
+            else:
+                # Legacy compatibility: try to map old single-mode names
+                legacy_mappings = {
+                    "rnd": ("baseline", "rnd"),
+                    "rnd_only": ("baseline", "rnd"),
+                    "skill_entropy_only": ("baseline", "curiosity_skill_only"),
+                    "skill_transition_only": ("baseline", "curiosity_trans_only"),
+                }
+                if arg in legacy_mappings:
+                    legacy_model, legacy_reward = legacy_mappings[arg]
+                    if model_mode == "baseline":  # Only override if still default
+                        model_mode = legacy_model
+                    if reward_mode == "full_curiosity":  # Only override if still default
+                        reward_mode = legacy_reward
+                else:
+                    print(f"❌ Unknown argument: {arg}")
+                    print(f"   Valid model modes: {valid_model_modes}")
+                    print(f"   Valid reward modes: {valid_reward_modes}")
+                    print("   Use: python main.py rl [model_mode] [reward_mode] [options]")
+                    print("   Arguments can be in any order!")
+                    sys.exit(1)
+        
+        # Smart default: if no_hmm is specified but reward_mode is still default, 
+        # use a compatible reward mode
+        if model_mode == "no_hmm" and reward_mode == "full_curiosity":
+            reward_mode = "curiosity_dyn_only"  # Safe default for no_hmm
+            print(f"🔧 Auto-adjusted: Using '{reward_mode}' reward mode with '{model_mode}' (skill-based rewards require HMM)")
+        
+        while i < len(sys.argv):
+            if sys.argv[i] == '--env' and i + 1 < len(sys.argv):
+                env_name = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--steps' and i + 1 < len(sys.argv):
+                total_steps = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--seed' and i + 1 < len(sys.argv):
+                # Set both seeds to the same value for backward compatibility
+                train_seed = eval_seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--train_seed' and i + 1 < len(sys.argv):
+                train_seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--eval_seed' and i + 1 < len(sys.argv):
+                eval_seed = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--max_episode_steps_train' and i + 1 < len(sys.argv):
+                max_episode_steps_train = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--max_episode_steps_eval' and i + 1 < len(sys.argv):
+                max_episode_steps_eval = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == '--wandb':
+                use_wandb_flag = True
+                i += 1
+            elif sys.argv[i] == '--no_upload':
+                disable_upload = True
+                i += 1
+            elif sys.argv[i] == '--no_hmm':
+                model_mode = "no_hmm"
+                i += 1
+            elif sys.argv[i] == '--no_intrinsic':
+                reward_mode = "no_intrinsic"
+                i += 1
+            elif sys.argv[i] == '--resume' and i + 1 < len(sys.argv):
+                resume_repo_id = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--resume_local' and i + 1 < len(sys.argv):
+                resume_local_path = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--vae_revision' and i + 1 < len(sys.argv):
+                vae_revision = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--hmm_revision' and i + 1 < len(sys.argv):
+                hmm_revision = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == '--reset_step':
+                reset_global_steps = True
+                i += 1
+            else:
+                print(f"⚠️  Unknown option: {sys.argv[i]}")
+                i += 1
+        
+        # Smart default: if no_hmm is specified but reward_mode is still default, 
+        # use a compatible reward mode
+        if model_mode == "no_hmm" and reward_mode == "full_curiosity":
+            reward_mode = "curiosity_dyn_only"  # Safe default for no_hmm
+            print(f"🔧 Auto-adjusted: Using '{reward_mode}' reward mode with '{model_mode}' (skill-based rewards require HMM)")
+        
+        # Validate that skill-based rewards require HMM
+        skill_based_rewards = ["curiosity_skill_only", "curiosity_trans_only", "full_curiosity"]
+        if model_mode == "no_hmm" and reward_mode in skill_based_rewards:
+            print(f"❌ Invalid combination: {reward_mode} requires HMM but model_mode is {model_mode}")
+            print(f"   Skill-based rewards (skill entropy, transition novelty) require HMM")
+            print(f"   Use 'curiosity_dyn_only', 'rnd', or 'no_intrinsic' with 'no_hmm'")
+            sys.exit(1)
+        
+        # Create combined ablation name for logging and identification
+        ablation_name = f"{model_mode}_{reward_mode}"
+        
+        print(f"🔬 Ablation Study Configuration:")
+        print(f"   Model Layer: {model_mode}")
+        print(f"   Reward Layer: {reward_mode}")
+        print(f"   Combined Name: {ablation_name}")
+        print(f"🎮 Environment: {env_name}")
+        print(f"📊 Total Steps: {total_steps:,}")
+        print(f"🌱 Train Seed: {train_seed}")
+        print(f"🌱 Eval Seed: {eval_seed}")
+        print(f"⏰ Max Episode Steps (Train): {max_episode_steps_train if max_episode_steps_train is not None else 'env default'}")
+        print(f"⏰ Max Episode Steps (Eval): {max_episode_steps_eval if max_episode_steps_eval is not None else 'env default'}")
+        print(f"📊 W&B Logging: {use_wandb_flag}")
+        print(f"☁️  HF Upload: {not disable_upload}")
+        if vae_revision:
+            print(f"🎨 VAE Revision: {vae_revision}")
+        if hmm_revision:
+            print(f"🧠 HMM Revision: {hmm_revision}")
+        
+        # Set up logging with file output
+        os.makedirs("logs", exist_ok=True)  # Create logs directory
+        log_filename = f"logs/rl_{ablation_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_filename),  # Save to file
+                logging.StreamHandler()  # Also show in console
+            ]
+        )
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.DEBUG)
+        
+        print(f"📝 Logging to file: {log_filename}")
+        
+        # Calculate PPO updates from total steps
+        num_envs = 8
+        rollout_len = 128
+        ppo_updates = total_steps // (num_envs * rollout_len)
+        
+        # Base PPO Configuration (same for all ablations)
+        ppo_config = PPOConfig(
+            num_envs=num_envs,
+            rollout_len=rollout_len,
+            total_updates=ppo_updates,
+            minibatch_envs=4,
+            epochs_per_update=4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_coef=0.2,
+            ent_coef=0.01,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            learning_rate=3e-4,
+            vf_learning_rate=None,  # Use same as learning_rate
+            policy_uses_skill=True,  # Will be overridden for no_hmm mode
+            deterministic_eval=False
+        )
+        
+        # Configure curiosity and RND based on reward mode
+        if reward_mode == "full_curiosity":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=True,           # Dynamics surprise
+                use_skill_entropy=True,    # Skill entropy with boundary gating
+                use_skill_transition_novelty=True,  # Skill transition novelty
+                use_rnd=False,
+                # Skill boundary gating
+                use_skill_boundary_gate=True,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
+            )
+            reward_description = "full curiosity (dynamics + skill entropy + transition novelty)"
+            
+        elif reward_mode == "curiosity_dyn_only":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=True,           # Only dynamics surprise
+                use_skill_entropy=False,
+                use_skill_transition_novelty=False,
+                use_rnd=False,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
+            )
+            reward_description = "dynamics curiosity only"
+            
+        elif reward_mode == "curiosity_skill_only":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,
+                use_skill_entropy=True,    # Only skill entropy
+                use_skill_transition_novelty=False,
+                use_rnd=False,
+                use_skill_boundary_gate=True,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
+            )
+            reward_description = "skill entropy curiosity only"
+            
+        elif reward_mode == "curiosity_trans_only":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,
+                use_skill_entropy=False,
+                use_skill_transition_novelty=True,  # Only skill transition novelty
+                use_rnd=False,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
+            )
+            reward_description = "skill transition novelty only"
+            
+        elif reward_mode == "rnd":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,          # Disable curiosity components
+                use_skill_entropy=False,
+                use_skill_transition_novelty=False,
+                use_rnd=True,             # Enable RND
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
+            )
+            reward_description = "RND intrinsic motivation"
+            
+        elif reward_mode == "no_intrinsic":
+            curiosity_config = CuriosityConfig(
+                use_dyn_kl=False,          # Disable all intrinsic rewards
+                use_skill_entropy=False,
+                use_skill_transition_novelty=False,
+                use_rnd=False,
+                tau_dyn=total_steps / math.log(20),
+                tau_hdp=total_steps / math.log(20),
+                tau_stn=total_steps / math.log(20),
+                tau_rnd=total_steps / math.log(20),
+                intr_tau_dyn=180.0 if model_mode == "baseline" else 50.0,
+                intr_tau_hdp=1.0,
+                intr_tau_trans=1.0,
+                intr_tau_rnd=1.0
+            )
+            reward_description = "no intrinsic rewards (extrinsic only)"
+        
+        # Create full description
+        model_description = "VAE+HMM+PPO" if model_mode == "baseline" else "VAE+PPO (no HMM)"
+        description = f"{model_description} with {reward_description}"
+        
+        # Configure PPO based on model mode
+        if model_mode == "no_hmm":
+            ppo_config.policy_uses_skill = False  # No skill features for policy
+            hmm_config = None
+            
+            if resume_repo_id is None and resume_local_path is None:
+                # Set VAE repo to VAE-only model
+                vae_repo_id = "CatkinChen/nethack-vae"
+            else:
+                vae_repo_id = None  # Resume from existing PPO checkpoint which already has VAE
+            hmm_repo_id = None  # Will use dummy HMM
+        else:
+            hmm_config = HMMOnlineConfig(
+                hmm_update_every=5_120,   # Update HMM every ~5 rollouts
+                hmm_update_growth=1.2,    # Growth factor for update interval
+                hmm_update_every_cap=12_000, # Cap for update interval
+                hmm_fit_window=400_000,    # Use 400k steps for HMM fitting
+                hmm_max_batch_size=128,    # Cap batch size to prevent OOM (was causing 20GB allocations)
+                hmm_max_iters=5,           # Up to 5 iterations per update
+                hmm_tol=1e-2,
+                hmm_elbo_drop_tol=1e-2,
+                rho_emission=0.05,        # Streaming blend rate
+                rho_transition=None,       # Use same as emission
+                optimise_pi=True,
+                pi_steps=10,                # π optimization steps
+                pi_lr=5e-4,                 # π optimization learning rate
+                pi_early_stopping_patience=1,    # Early stopping patience
+                pi_early_stopping_min_delta=1e-2, # Early stopping min delta
+                emission_mode = "student_t",          # "sample" or "mean" or "expected" or "student_t"
+                student_t_use_sample = True      # if using student_t, use sampled z for logB (else mean)
+            )
+            if resume_repo_id is None and resume_local_path is None:
+                # Set VAE and HMM repos to pre-trained models
+                vae_repo_id = "CatkinChen/nethack-vae-hmm"
+                hmm_repo_id = "CatkinChen/nethack-hmm"
+            else:
+                vae_repo_id = None  # Resume from existing PPO checkpoint which already has VAE+HMM
+                hmm_repo_id = None  # Resume from existing PPO checkpoint which already has VAE+HMM
+        
+        # VAE Online Configuration - synchronized with HMM updates
+        vae_config = VAEOnlineConfig(
+            vae_update_every=5_120,       # Match HMM update frequency
+            vae_update_growth=1.2,        # Same growth pattern as HMM
+            vae_update_every_cap=12_000,  # Same cap as HMM
+            vae_lr=3e-5,                  # Learning rate for VAE updates
+            vae_steps_per_call=4,        # Number of gradient steps per VAE update
+        )
+        
+        # RND Configuration (used only for RND ablation)
+        rnd_config = RNDConfig(
+            proj_dim=128,
+            hidden=256,
+            lr=1e-3,
+            update_per_rollout=2
+        )
+        
+        # Training Configuration
+        run_name = f"ablation_{ablation_name}_{env_name.replace('-', '_')}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        train_config = TrainConfig(
+            env_id=env_name,
+            train_seed=train_seed,
+            eval_seed=eval_seed,
+            max_episode_steps_train=max_episode_steps_train,
+            max_episode_steps_eval=max_episode_steps_eval,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            log_dir=f"./runs/{run_name}",
+            save_every=10_000,
+            eval_every=10_000,
+            eval_episodes=50,
+            use_hmm=(model_mode != "no_hmm")
+        )
+        
+        print(f"\n🔧 Ablation Configuration:")
+        print(f"   Description: {description}")
+        print(f"   Environment: {train_config.env_id}")
+        print(f"   Device: {train_config.device}")
+        print(f"   Total Steps: {total_steps:,}")
+        print(f"   PPO Updates: {ppo_config.total_updates:,}")
+        print(f"   Policy Uses Skills: {ppo_config.policy_uses_skill}")
+        print(f"   VAE Repository: {vae_repo_id}")
+        print(f"   HMM Repository: {hmm_repo_id if hmm_repo_id else 'None (no HMM)'}")
+        print(f"\n🧠 Intrinsic Rewards:")
+        print(f"   Dynamics KL: {curiosity_config.use_dyn_kl}")
+        print(f"   Skill Entropy: {curiosity_config.use_skill_entropy}")
+        print(f"   Skill Transition: {curiosity_config.use_skill_transition_novelty}")
+        print(f"   RND: {curiosity_config.use_rnd}")
+        if model_mode != "no_hmm":
+            print(f"\n🔄 HMM Updates:")
+            print(f"   Every: {hmm_config.hmm_update_every:,} steps")
+            print(f"   Growth: {hmm_config.hmm_update_growth}")
+            print(f"   Cap: {hmm_config.hmm_update_every_cap:,}")
+        print(f"\n🎨 VAE Updates:")
+        print(f"   Every: {vae_config.vae_update_every:,} steps")
+        print(f"   Learning Rate: {vae_config.vae_lr}")
+        
+        # Train with the configured ablation
+        try:
+            results = train_online_ppo_with_pretrained_models(
+                vae_repo_id,
+                hmm_repo_id,
+                
+                # Use config objects for full control
+                ppo_config,
+                curiosity_config,
+                hmm_config,
+                vae_config,
+                rnd_config,
+                train_config,
+                
+                # Model revision control
+                vae_revision=vae_revision,
+                hmm_revision=hmm_revision,
+                
+                # Resume training from existing PPO checkpoint (new!)
+                ppo_repo_id=resume_repo_id,
+                ppo_checkpoint_path=resume_local_path,
+                resume_training=resume_repo_id is not None or resume_local_path is not None,
+                reset_global_steps=reset_global_steps,
+                
+                # Monitoring and uploading
+                use_wandb=use_wandb_flag,
+                wandb_project="SequentialSkillRL-Ablations",
+                wandb_run_name=run_name,
+                wandb_tags=["ablation", ablation_name, env_name.split('-')[1] if '-' in env_name else env_name],
+                wandb_notes=f"Ablation study: {description}",
+                
+                push_to_hub=not disable_upload,
+                hub_repo_id=f"CatkinChen/nethack-ppo-ablation-{ablation_name}",
+                hf_upload_artifacts=True,
+                logger=logger,
+            )
+            
+            print(f"\n🎉 Ablation study '{ablation_name}' completed successfully!")
+            print(f"📊 Run name: {run_name}")
+            print(f"📁 Results: {results.get('final_checkpoint', 'N/A')}")
+            
+        except Exception as e:
+            print(f"\n❌ Ablation study '{ablation_name}' failed: {e}")
+            import traceback
+            traceback.print_exc()
+            logger.error(f"Ablation study failed", exc_info=True)
+            sys.exit(1)
