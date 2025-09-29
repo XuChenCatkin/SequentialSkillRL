@@ -8,6 +8,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import copy
 
 # MiniHack / Gym
 import gymnasium as gym
@@ -2844,6 +2845,7 @@ class PPOTrainer:
         successful_viterbi_paths = []  # List of Viterbi skill paths for successful episodes
         successful_returns = []  # Returns for successful episodes only
         successful_lengths = []  # Lengths for successful episodes only
+        successful_indices = []  # Indices of successful episodes, start from 1
 
         # Create progress bar for evaluation episodes
         eval_pbar = tqdm(
@@ -2856,7 +2858,7 @@ class PPOTrainer:
 
         for ep_idx in eval_pbar:
             ep_start_time = time.time()
-            o, _ = env.reset(seed=self.run_cfg.eval_seed + ep_idx)  # Use different seed for each episode
+            o, _ = env.reset(seed=self.run_cfg.eval_seed if ep_idx == 0 else None)
             episode_start = [True]
             eval_filt_state = None  # Reset filter state for new episode
             self._update_hero_info_from_obs(o, 1, episode_start, hero_info)
@@ -2871,13 +2873,14 @@ class PPOTrainer:
             obs_trajectory = []  # Store raw observations
             actions_trajectory = []  # Store global actions taken
             rewards_trajectory = []  # Store rewards received
+            skill_trajectory = []  # Store skills inferred (if HMM present)
             
             # Track negative reward masking for HMM filter (similar to training)
             prev_negative_reward = False
 
             while not done:
                 # Store current observation for trajectory
-                obs_trajectory.append(o.copy() if isinstance(o, dict) else o)
+                obs_trajectory.append({key: copy.deepcopy(value) for key, value in o.items()} if isinstance(o, dict) else copy.deepcopy(o))
                 
                 # coverage proxy from blstats (x,y)
                 if isinstance(o, dict) and "blstats" in o:
@@ -2922,6 +2925,7 @@ class PPOTrainer:
                     
                     # Drop remainder state for policy features (same as training)
                     skill_feat = alpha_b[:Kp1-1].unsqueeze(0)  # [1, K] - add batch dim for consistency
+                    skill_trajectory.append(skill_feat.squeeze(0).cpu().numpy())  # Store skill for trajectory (remove batch dim)
                 
                 mu_seq.append(enc["mu"].squeeze(0).cpu())
                 logvar_seq.append(enc["logvar"].squeeze(0).cpu())
@@ -3000,10 +3004,12 @@ class PPOTrainer:
                 successful_trajectories.append({
                     'observations': obs_trajectory,
                     'actions': actions_trajectory, 
-                    'rewards': rewards_trajectory
+                    'rewards': rewards_trajectory,
+                    'skills': skill_trajectory if skill_trajectory else None
                 })
                 successful_returns.append(ret)
                 successful_lengths.append(ep_len)
+                successful_indices.append(ep_idx + 1)  # 1-based index for reporting
                 
                 # Compute Viterbi path for successful episode if HMM is available
                 if self.has_hmm and len(mu_seq) > 0:
@@ -3022,9 +3028,9 @@ class PPOTrainer:
                         mask_t = torch.tensor(mask_seq, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1, T]
                         
                         # Compute Viterbi path using HMM
-                        viterbi_paths = self.hmm.viterbi_paths(mu_t.squeeze(0), diag_var_t.squeeze(0), 
-                                                             F_t.squeeze(0) if F_t is not None else None, 
-                                                             mask_t.squeeze(0))
+                        viterbi_paths = self.hmm.viterbi_paths(mu_t, diag_var_t, 
+                                                             F_t if F_t is not None else None, 
+                                                             mask_t)
                         
                         # Store the path (should be a list with one element for single episode)
                         if len(viterbi_paths) > 0:
@@ -3304,6 +3310,7 @@ class PPOTrainer:
             'success_rate': float(final_success_rate),
             'successful_returns': successful_returns,
             'successful_lengths': successful_lengths,
+            'successful_indices': successful_indices,
             
             # Additional evaluation metrics
             'all_returns': ret_list,

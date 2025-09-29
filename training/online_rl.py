@@ -155,7 +155,7 @@ def train_online_ppo_with_pretrained_models(
     # Create run name if not provided
     if wandb_run_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        mode_str = "test" if test_mode else "train"
+        mode_str = "test" if train_config.test_mode else "train"
         wandb_run_name = f"online_ppo_{train_config.env_id}_{mode_str}_{timestamp}"
 
     # W&B will be initialized later after config objects are created
@@ -283,7 +283,7 @@ def train_online_ppo_with_pretrained_models(
         
         if hmm_model is not None:
             hmm_model.set_posterior_as_prior(hmm_config.temper_weight, skip_remainder_state=True)
-            logger.info("🔄 HMM posterior set as prior for online updates with tempered weight {}".format(hmm_config.temper_weight))
+            if logger: logger.info("🔄 HMM posterior set as prior for online updates with tempered weight {}".format(hmm_config.temper_weight))
             hmm_model.stream_rho_niw = hmm_config.rho_emission
             hmm_model.stream_rho_trans = hmm_config.rho_transition
         
@@ -502,57 +502,7 @@ def train_online_ppo_with_pretrained_models(
         # Test mode: run evaluation episodes
         if train_config.test_mode:
             if logger: logger.info(f"🧪 Running {train_config.eval_episodes} test episodes...")
-            test_results = []
-
-            for episode in range(train_config.eval_episodes):
-                if logger: logger.info(f"Episode {episode + 1}/{train_config.eval_episodes}")
-
-                obs, _ = env.reset()
-                done = False
-                episode_reward = 0
-                episode_length = 0
-                
-                while not done:
-                    # Get action from trained policy
-                    with torch.no_grad():
-                        action, _, _, _ = trainer.policy.step(obs)
-                    
-                    obs, reward, terminated, truncated, _ = env.step(action)
-                    done = terminated or truncated
-                    episode_reward += reward
-                    episode_length += 1
-                
-                test_results.append({
-                    'episode': episode + 1,
-                    'reward': episode_reward,
-                    'length': episode_length
-                })
-                
-                if logger: logger.info(f"   Reward: {episode_reward}, Length: {episode_length}")
-            
-            # Calculate test statistics
-            rewards = [r['reward'] for r in test_results]
-            lengths = [r['length'] for r in test_results]
-            
-            test_stats = {
-                'mean_reward': np.mean(rewards),
-                'std_reward': np.std(rewards),
-                'min_reward': np.min(rewards),
-                'max_reward': np.max(rewards),
-                'mean_length': np.mean(lengths),
-                'std_length': np.std(lengths)
-            }
-            
-            if logger: logger.info("📈 Test Results:")
-            if logger: logger.info(f"   Mean Reward: {test_stats['mean_reward']:.2f} ± {test_stats['std_reward']:.2f}")
-            if logger: logger.info(f"   Min/Max Reward: {test_stats['min_reward']:.2f} / {test_stats['max_reward']:.2f}")
-            if logger: logger.info(f"   Mean Length: {test_stats['mean_length']:.1f} ± {test_stats['std_length']:.1f}")
-            
-            return {
-                'test_results': test_results,
-                'test_stats': test_stats,
-                'run_name': wandb_run_name
-            }
+            return trainer.evaluate(train_config.eval_episodes, logger)
         
         # Training mode
         if logger: logger.info("🏋️  Starting PPO training...")
