@@ -318,6 +318,132 @@ python main.py rl baseline full_curiosity \
   --reset_step
 ```
 
+## PPO Ablation Highlights (from the Thesis)
+
+Section 4.3 of the [master's thesis](thesis.pdf) details a comprehensive PPO ablation comparing VAE+PPO baselines against the proposed VAE+HMM+PPO agent across MiniHack environments. The tables and discussion below condense those findings and are accompanied by the plots in [`ppo_analysis/`](ppo_analysis).
+
+### MiniHack Room (Random 15x15)
+
+- **HMM prior improves stability:** Even without intrinsic bonuses, adding the sticky HDP-HMM prior raises success from 37.08% to 42.99% by enforcing persistent latent skills and reducing dithering in partially observed rooms.
+- **Dynamics surprise drives exploration:** The dynamics-only bonus is the dominant curiosity signal, lifting success to 45.10% with HMMs (41.78% without) before decaying as the world model becomes confident.
+- **Full curiosity = best completion rate:** Combining all curiosity terms yields the highest success (45.30%) and shortest episodes (217.8 ± 106.9 steps), although the extra exploration penalties mean the extrinsic return is slightly lower than dynamics-only runs.
+- **Skill entropy & transition novelty are gated off:** In single-skill rooms these signals rarely activate, so performance gains over dynamics-only curiosity are marginal.
+
+| Configuration | Success Rate (%) | Extrinsic Return | Episode Length |
+| --- | ---: | ---: | ---: |
+| No HMM, no intrinsic | 37.08 | 0.243 ± 0.548 | 230.2 ± 103.8 |
+| No HMM, dynamics only | 41.78 | 0.258 ± 0.583 | 223.2 ± 106.0 |
+| No HMM, RND | 41.94 | 0.259 ± 0.576 | 220.5 ± 108.4 |
+| HMM, no intrinsic | 42.99 | 0.168 ± 0.618 | 226.1 ± 102.7 |
+| HMM, dynamics only | 45.10 | 0.190 ± 0.630 | 221.3 ± 105.4 |
+| HMM, skill entropy only | 40.05 | 0.133 ± 0.622 | 230.1 ± 101.9 |
+| HMM, transition novelty only | 42.52 | 0.174 ± 0.626 | 223.2 ± 106.2 |
+| HMM, full curiosity | 45.30 | 0.195 ± 0.630 | 217.8 ± 106.9 |
+| HMM, RND | 43.20 | 0.165 ± 0.645 | 223.3 ± 105.5 |
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/success_rate_hmm_dyn_rnd_room.png" alt="Room success rates across HMM curiosity variants" />
+      <br /><sub><strong>Success rates</strong> for HMM + curiosity variants.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/success_rate_no_intri_room.png" alt="Room success rates without intrinsic bonuses" />
+      <br /><sub><strong>Success rates</strong> without intrinsic bonuses (HMM vs. no HMM).</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/dyn_room.png" alt="Dynamics curiosity signal on Room" />
+      <br /><sub><strong>Dynamics surprise</strong> shaping early exploration.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/rnd_room.png" alt="RND curiosity signal on Room" />
+      <br /><sub><strong>Random Network Distillation</strong> inducing longer wandering.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/hdp_room.png" alt="HDP-HMM prior contributions on Room" />
+      <br /><sub><strong>Sticky HDP-HMM</strong> prior encouraging consistent skills.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/trans_room.png" alt="Transition novelty reward on Room" />
+      <br /><sub><strong>Transition novelty</strong> rarely activates in single-skill rooms.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="ppo_analysis/total_int_room.png" alt="Intrinsic reward decomposition on Room" />
+      <br /><sub><strong>Intrinsic reward decomposition</strong> showing dynamics dominance.</sub>
+    </td>
+  </tr>
+</table>
+
+### MiniHack River (Narrow)
+
+- **Dynamics + HMM wins:** Transferring the pretrained models into MiniHack River shows the HMM with dynamics-only curiosity achieving the best success (46.93%), beating both no-HMM baselines (38.58% / 37.22%) and the full curiosity variant (42.69%).
+- **Skill-aware representation matters:** The sticky HMM stabilises PPO inputs, enabling faster transfer from Room training and more reliable execution of the navigation→push skill sequence.
+- **Targeted novelty beats generic exploration:** The dynamics KL bonus focuses on contact uncertainty (e.g., boulder pushes), providing low-interference guidance, whereas RND encourages wandering, yielding the longest episodes (263.6 steps) and the lowest mean returns (0.145).
+- **Success rate is the most faithful metric:** Sparse rewards and penalty accumulation mean extrinsic returns lag behind completion rates; monitoring success is more indicative of real progress on this contact-heavy task.
+
+| Configuration | Success Rate (%) | Extrinsic Return | Episode Length |
+| --- | ---: | ---: | ---: |
+| No HMM, no intrinsic | 38.58 | 0.323 ± 0.486 | 242.2 ± 140.6 |
+| No HMM, dynamics only | 37.22 | 0.326 ± 0.485 | 251.3 ± 133.6 |
+| HMM, dynamics only | 46.93 | 0.240 ± 0.544 | 246.9 ± 122.6 |
+| HMM, full curiosity | 42.69 | 0.230 ± 0.522 | 252.1 ± 124.5 |
+| HMM, RND | 37.90 | 0.145 ± 0.527 | 263.6 ± 121.6 |
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/success_rate_hmm_dyn_full_river.png" alt="River success rates for HMM curiosity variants" />
+      <br /><sub><strong>Success rates</strong> for HMM curiosity combinations in River.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/success_rate_hmm_dyn_rnd_river.png" alt="River success rates comparing HMM dynamics vs. RND" />
+      <br /><sub><strong>Success rates</strong> contrasting dynamics vs. RND bonuses.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/success_rate_no_hmm_river.png" alt="River success rates without HMM" />
+      <br /><sub><strong>No-HMM baselines</strong> highlighting transfer gap.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/success_rate_dyn_river.png" alt="River dynamics curiosity success rates" />
+      <br /><sub><strong>Dynamics-only transfer</strong> across checkpoints.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/dyn_river.png" alt="Dynamics curiosity signal on River" />
+      <br /><sub><strong>Dynamics surprise</strong> focusing on contact interactions.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/rnd_river.png" alt="RND curiosity signal on River" />
+      <br /><sub><strong>RND exploration</strong> yielding longer episodes.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/hdp_river.png" alt="HDP-HMM prior contributions on River" />
+      <br /><sub><strong>HDP-HMM prior</strong> stabilising latent skill transitions.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="ppo_analysis/trans_river.png" alt="Transition novelty reward on River" />
+      <br /><sub><strong>Transition novelty</strong> emphasising skill sequencing.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="ppo_analysis/total_int_river.png" alt="Intrinsic reward decomposition on River" />
+      <br /><sub><strong>Intrinsic reward decomposition</strong> showing dynamics dominance.</sub>
+    </td>
+  </tr>
+</table>
+
 ## Project Structure
 
 ```
